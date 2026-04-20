@@ -25,6 +25,13 @@ struct CudaDeviceBufferF32 {
   std::size_t count = 0;
 };
 
+bool begin_inference_session(
+  std::size_t max_input_count,
+  std::size_t max_output_count,
+  std::string & error_message);
+
+void end_inference_session();
+
 bool upload_matrix_f32(
   const std::vector<float> & host_data,
   int rows,
@@ -40,6 +47,12 @@ bool run_matvec_f32(
   std::vector<float> & output,
   std::string & error_message);
 
+bool run_matvec_f32_device(
+  const CudaDeviceMatrixF32 & matrix,
+  const CudaDeviceBufferF32 & input,
+  CudaDeviceBufferF32 & output,
+  std::string & error_message);
+
 bool allocate_buffer_f32(
   std::size_t count,
   CudaDeviceBufferF32 & out_buffer,
@@ -52,6 +65,20 @@ bool upload_to_buffer_f32(
   std::size_t count,
   const CudaDeviceBufferF32 & buffer,
   std::size_t buffer_offset,
+  std::string & error_message);
+
+bool download_from_buffer_f32(
+  const CudaDeviceBufferF32 & buffer,
+  std::size_t count,
+  std::size_t buffer_offset,
+  std::vector<float> & out_data,
+  std::string & error_message);
+
+bool run_silu_mul_f32(
+  const CudaDeviceBufferF32 & a,
+  const CudaDeviceBufferF32 & b,
+  std::size_t count,
+  CudaDeviceBufferF32 & out,
   std::string & error_message);
 
 void reset_transfer_stats();

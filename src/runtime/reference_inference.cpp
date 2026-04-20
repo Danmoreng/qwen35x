@@ -107,6 +107,15 @@ struct ModelState {
   std::vector<LinearAttentionState> linear_states;
 };
 
+struct CudaForwardWorkspace {
+  cuda::CudaDeviceBufferF32 hidden_in;
+  cuda::CudaDeviceBufferF32 intermediate_a;
+  cuda::CudaDeviceBufferF32 intermediate_b;
+  cuda::CudaDeviceBufferF32 intermediate_hidden;
+  cuda::CudaDeviceBufferF32 hidden_out;
+  bool has_device_buffers = false;
+};
+
 struct DecodeProfilingAccumulator {
   double embedding_ms = 0.0;
   double attention_ms = 0.0;
@@ -580,6 +589,39 @@ void release_model_state_cuda(ModelState & state) {
     cuda::free_buffer_f32(ls.recurrent_state_device);
     ls.has_device_state = false;
   }
+}
+
+bool allocate_forward_workspace_cuda(
+  const RuntimeDims & dims,
+  CudaForwardWorkspace & workspace,
+  std::string & error_message) {
+  if (!cuda::allocate_buffer_f32(static_cast<std::size_t>(dims.hidden), workspace.hidden_in, error_message) ||
+      !cuda::allocate_buffer_f32(static_cast<std::size_t>(dims.intermediate), workspace.intermediate_a, error_message) ||
+      !cuda::allocate_buffer_f32(static_cast<std::size_t>(dims.intermediate), workspace.intermediate_b, error_message) ||
+      !cuda::allocate_buffer_f32(static_cast<std::size_t>(dims.intermediate), workspace.intermediate_hidden, error_message) ||
+      !cuda::allocate_buffer_f32(static_cast<std::size_t>(dims.hidden), workspace.hidden_out, error_message)) {
+    cuda::free_buffer_f32(workspace.hidden_in);
+    cuda::free_buffer_f32(workspace.intermediate_a);
+    cuda::free_buffer_f32(workspace.intermediate_b);
+    cuda::free_buffer_f32(workspace.intermediate_hidden);
+    cuda::free_buffer_f32(workspace.hidden_out);
+    return false;
+  }
+
+  workspace.has_device_buffers = true;
+  return true;
+}
+
+void release_forward_workspace_cuda(CudaForwardWorkspace & workspace) {
+  if (!workspace.has_device_buffers) {
+    return;
+  }
+  cuda::free_buffer_f32(workspace.hidden_in);
+  cuda::free_buffer_f32(workspace.intermediate_a);
+  cuda::free_buffer_f32(workspace.intermediate_b);
+  cuda::free_buffer_f32(workspace.intermediate_hidden);
+  cuda::free_buffer_f32(workspace.hidden_out);
+  workspace.has_device_buffers = false;
 }
 
 bool sync_full_state_token_to_cuda(
@@ -1084,6 +1126,48 @@ bool generated_ends_with_sequence(
   return true;
 }
 
+bool run_mlp_block_cuda_hybrid(
+  const LayerWeights & layer,
+  const std::vector<float> & post_norm,
+  CudaForwardWorkspace & workspace,
+  std::vector<float> & mlp_out,
+  std::string & error_message) {
+  if (!workspace.has_device_buffers) {
+    error_message = "CUDA forward workspace is not initialized.";
+    return false;
+  }
+  if (!layer.mlp_gate.has_device_matrix || !layer.mlp_up.has_device_matrix || !layer.mlp_down.has_device_matrix) {
+    error_message = "CUDA MLP path requested but one or more MLP weights are not uploaded.";
+    return false;
+  }
+
+  const std::size_t hidden_count = post_norm.size();
+  const std::size_t intermediate_count = static_cast<std::size_t>(layer.mlp_gate.shape[0]);
+  const std::size_t out_hidden_count = static_cast<std::size_t>(layer.mlp_down.shape[0]);
+  if (workspace.hidden_in.count < hidden_count || workspace.hidden_out.count < out_hidden_count ||
+      workspace.intermediate_a.count < intermediate_count || workspace.intermediate_b.count < intermediate_count ||
+      workspace.intermediate_hidden.count < intermediate_count) {
+    error_message = "CUDA forward workspace buffer sizes do not match model dimensions.";
+    return false;
+  }
+
+  if (!cuda::upload_to_buffer_f32(post_norm.data(), hidden_count, workspace.hidden_in, 0, error_message) ||
+      !cuda::run_matvec_f32_device(layer.mlp_gate.device_matrix, workspace.hidden_in, workspace.intermediate_a, error_message) ||
+      !cuda::run_matvec_f32_device(layer.mlp_up.device_matrix, workspace.hidden_in, workspace.intermediate_b, error_message) ||
+      !cuda::run_silu_mul_f32(
+        workspace.intermediate_a,
+        workspace.intermediate_b,
+        intermediate_count,
+        workspace.intermediate_hidden,
+        error_message) ||
+      !cuda::run_matvec_f32_device(layer.mlp_down.device_matrix, workspace.intermediate_hidden, workspace.hidden_out, error_message) ||
+      !cuda::download_from_buffer_f32(workspace.hidden_out, out_hidden_count, 0, mlp_out, error_message)) {
+    return false;
+  }
+
+  return true;
+}
+
 bool run_forward_single_token(
   const ModelWeights & weights,
   const RuntimeDims & dims,
@@ -1092,6 +1176,7 @@ bool run_forward_single_token(
   const int position,
   const bool use_cuda,
   std::vector<float> & next_logits,
+  CudaForwardWorkspace * cuda_workspace,
   DecodeProfilingAccumulator * profiling,
   std::string & error_message) {
   if (token_id < 0 || token_id >= dims.vocab_size) {
@@ -1165,16 +1250,22 @@ bool run_forward_single_token(
     }
 
     rms_norm_qwen3next(residual, layer.post_attention_layernorm, dims.rms_eps, post_norm);
-    if (!matvec_2d(layer.mlp_gate, post_norm, mlp_gate, use_cuda, error_message) ||
-        !matvec_2d(layer.mlp_up, post_norm, mlp_up, use_cuda, error_message)) {
-      return false;
-    }
-    mlp_hidden.resize(mlp_gate.size());
-    for (std::size_t i = 0; i < mlp_gate.size(); ++i) {
-      mlp_hidden[i] = siluf(mlp_gate[i]) * mlp_up[i];
-    }
-    if (!matvec_2d(layer.mlp_down, mlp_hidden, mlp_out, use_cuda, error_message)) {
-      return false;
+    if (use_cuda && cuda_workspace != nullptr && cuda_workspace->has_device_buffers) {
+      if (!run_mlp_block_cuda_hybrid(layer, post_norm, *cuda_workspace, mlp_out, error_message)) {
+        return false;
+      }
+    } else {
+      if (!matvec_2d(layer.mlp_gate, post_norm, mlp_gate, use_cuda, error_message) ||
+          !matvec_2d(layer.mlp_up, post_norm, mlp_up, use_cuda, error_message)) {
+        return false;
+      }
+      mlp_hidden.resize(mlp_gate.size());
+      for (std::size_t i = 0; i < mlp_gate.size(); ++i) {
+        mlp_hidden[i] = siluf(mlp_gate[i]) * mlp_up[i];
+      }
+      if (!matvec_2d(layer.mlp_down, mlp_hidden, mlp_out, use_cuda, error_message)) {
+        return false;
+      }
     }
 
     x.resize(residual.size());
@@ -1365,8 +1456,47 @@ bool run_reference_qwen35_inference(
     }
   }
 
+  CudaForwardWorkspace cuda_forward_workspace;
+  CudaForwardWorkspace * cuda_workspace_ptr = nullptr;
+  if (options.use_cuda) {
+    const std::size_t max_input_count = std::max<std::size_t>({
+      static_cast<std::size_t>(dims.hidden),
+      static_cast<std::size_t>(dims.intermediate),
+      static_cast<std::size_t>(dims.linear_conv_channels),
+      static_cast<std::size_t>(dims.linear_v_dim),
+      static_cast<std::size_t>(dims.linear_q_dim),
+      static_cast<std::size_t>(dims.n_heads * dims.head_dim),
+      static_cast<std::size_t>(dims.n_kv_heads * dims.head_dim),
+      1u
+    });
+    const std::size_t max_output_count = std::max<std::size_t>({
+      static_cast<std::size_t>(dims.hidden),
+      static_cast<std::size_t>(dims.intermediate),
+      static_cast<std::size_t>(dims.vocab_size),
+      static_cast<std::size_t>(dims.linear_conv_channels),
+      static_cast<std::size_t>(dims.linear_v_dim),
+      static_cast<std::size_t>(dims.n_heads * dims.head_dim * 2),
+      static_cast<std::size_t>(dims.n_kv_heads * dims.head_dim),
+      1u
+    });
+    if (!cuda::begin_inference_session(max_input_count, max_output_count, error_message)) {
+      release_model_state_cuda(state);
+      release_model_weights_cuda(weights);
+      return false;
+    }
+    if (!allocate_forward_workspace_cuda(dims, cuda_forward_workspace, error_message)) {
+      cuda::end_inference_session();
+      release_model_state_cuda(state);
+      release_model_weights_cuda(weights);
+      return false;
+    }
+    cuda_workspace_ptr = &cuda_forward_workspace;
+  }
+
   auto release_cuda_resources = [&]() {
     if (options.use_cuda) {
+      release_forward_workspace_cuda(cuda_forward_workspace);
+      cuda::end_inference_session();
       release_model_state_cuda(state);
       release_model_weights_cuda(weights);
     }
@@ -1415,6 +1545,7 @@ bool run_reference_qwen35_inference(
           position,
           options.use_cuda,
           predicted_logits,
+          cuda_workspace_ptr,
           &profiling,
           error_message)) {
       release_cuda_resources();
@@ -1474,6 +1605,7 @@ bool run_reference_qwen35_inference(
           position,
           options.use_cuda,
           predicted_logits,
+          cuda_workspace_ptr,
           &profiling,
           error_message)) {
       release_cuda_resources();
