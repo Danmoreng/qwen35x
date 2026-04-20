@@ -1,0 +1,13 @@
+build/
+out/
+models/
+benchmarks/
+
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+
+.DS_Store
+Thumbs.db
