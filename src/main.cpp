@@ -3,9 +3,104 @@
 #include "qwen35x/runtime/runtime.h"
 #include "qwen35x/tokenizer/tokenizer.h"
 
+#include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <string>
 #include <vector>
+
+namespace {
+
+std::string json_escape(const std::string & input) {
+  std::string out;
+  out.reserve(input.size() + 8);
+  for (const char ch : input) {
+    switch (ch) {
+      case '\\':
+        out += "\\\\";
+        break;
+      case '\"':
+        out += "\\\"";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        out.push_back(ch);
+        break;
+    }
+  }
+  return out;
+}
+
+bool write_profile_json(
+  const std::string & output_path,
+  const qwen35x::ReferenceInferenceOptions & options,
+  const qwen35x::ReferenceInferenceResult & result,
+  const std::string & backend,
+  std::string & error_message) {
+  std::ofstream out(output_path, std::ios::binary | std::ios::trunc);
+  if (!out.is_open()) {
+    error_message = "Failed to open profile JSON path: " + output_path;
+    return false;
+  }
+
+  out << std::fixed << std::setprecision(6);
+  out << "{\n";
+  out << "  \"backend\": \"" << json_escape(backend) << "\",\n";
+  out << "  \"prompt_tokens\": " << options.prompt_tokens.size() << ",\n";
+  out << "  \"generated_tokens\": " << result.generated_tokens.size() << ",\n";
+  out << "  \"forward_pass_tokens\": " << result.forward_pass_tokens << ",\n";
+  out << "  \"load_time_ms\": " << result.load_time_ms << ",\n";
+  out << "  \"decode_time_ms\": " << result.decode_time_ms << ",\n";
+  out << "  \"tokens_per_second\": " << result.tokens_per_second << ",\n";
+  out << "  \"sampling\": {\n";
+  out << "    \"temperature\": " << options.sampling.temperature << ",\n";
+  out << "    \"top_p\": " << options.sampling.top_p << ",\n";
+  out << "    \"top_k\": " << options.sampling.top_k << ",\n";
+  out << "    \"repeat_penalty\": " << options.sampling.repetition_penalty << ",\n";
+  out << "    \"seed\": " << options.sampling.seed << "\n";
+  out << "  },\n";
+  out << "  \"stages_ms\": {\n";
+  out << "    \"embedding\": " << result.timing_breakdown.embedding_ms << ",\n";
+  out << "    \"attention\": " << result.timing_breakdown.attention_ms << ",\n";
+  out << "    \"mlp\": " << result.timing_breakdown.mlp_ms << ",\n";
+  out << "    \"logits\": " << result.timing_breakdown.logits_ms << ",\n";
+  out << "    \"sampling\": " << result.timing_breakdown.sampling_ms << ",\n";
+  out << "    \"stop_checks\": " << result.timing_breakdown.stop_checks_ms << "\n";
+  out << "  },\n";
+  out << "  \"cuda_transfers\": {\n";
+  out << "    \"host_to_device_bytes\": " << result.transfer_breakdown.host_to_device_bytes << ",\n";
+  out << "    \"device_to_host_bytes\": " << result.transfer_breakdown.device_to_host_bytes << ",\n";
+  out << "    \"other_bytes\": " << result.transfer_breakdown.other_bytes << ",\n";
+  out << "    \"copy_calls\": " << result.transfer_breakdown.copy_calls << ",\n";
+  out << "    \"host_to_device_bytes_per_forward_token\": " << result.host_to_device_bytes_per_forward_token << ",\n";
+  out << "    \"device_to_host_bytes_per_forward_token\": " << result.device_to_host_bytes_per_forward_token << "\n";
+  out << "  },\n";
+  out << "  \"output_token_ids\": [";
+  for (std::size_t i = 0; i < result.generated_tokens.size(); ++i) {
+    if (i > 0) {
+      out << ", ";
+    }
+    out << result.generated_tokens[i];
+  }
+  out << "]\n";
+  out << "}\n";
+  if (!out.good()) {
+    error_message = "Failed to write profile JSON: " + output_path;
+    return false;
+  }
+
+  return true;
+}
+
+} // namespace
 
 int main(int argc, char ** argv) {
   std::string profile_path = "configs/qwen3_5_0_8b.profile.json";
@@ -16,6 +111,7 @@ int main(int argc, char ** argv) {
   std::string stop_tokens_csv;
   std::vector<std::string> stop_texts;
   bool stop_on_im_end = false;
+  std::string profile_json_path;
   qwen35x::RuntimeTarget target;
   bool bench_bf16 = false;
   bool infer_reference = false;
@@ -68,6 +164,8 @@ int main(int argc, char ** argv) {
       stop_texts.push_back(argv[++i]);
     } else if (arg == "--stop-on-im-end") {
       stop_on_im_end = true;
+    } else if (arg == "--profile-json" && i + 1 < argc) {
+      profile_json_path = argv[++i];
     } else if (arg == "--sm" && i + 1 < argc) {
       target.sm_version = std::stoi(argv[++i]);
     } else if (arg == "--cpu") {
@@ -81,7 +179,7 @@ int main(int argc, char ** argv) {
       std::cout << "       qwen35x --infer-reference --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "       qwen35x --infer-gpu --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "               [--temperature <float>] [--top-p <float>] [--top-k <int>] [--repeat-penalty <float>] [--seed <int64>]\n";
-      std::cout << "               [--stop-token <csv>] [--stop-text <text>] [--stop-on-im-end]\n";
+      std::cout << "               [--stop-token <csv>] [--stop-text <text>] [--stop-on-im-end] [--profile-json <path>]\n";
       return 0;
     }
   }
@@ -218,6 +316,17 @@ int main(int argc, char ** argv) {
     std::cout << "  load_time_ms: " << infer_result.load_time_ms << "\n";
     std::cout << "  decode_time_ms: " << infer_result.decode_time_ms << "\n";
     std::cout << "  tokens_per_second: " << infer_result.tokens_per_second << "\n";
+    std::cout << "  stage_ms: embedding=" << infer_result.timing_breakdown.embedding_ms
+              << " attention=" << infer_result.timing_breakdown.attention_ms
+              << " mlp=" << infer_result.timing_breakdown.mlp_ms
+              << " logits=" << infer_result.timing_breakdown.logits_ms
+              << " sampling=" << infer_result.timing_breakdown.sampling_ms
+              << " stop_checks=" << infer_result.timing_breakdown.stop_checks_ms << "\n";
+    std::cout << "  cuda_transfers: h2d_bytes=" << infer_result.transfer_breakdown.host_to_device_bytes
+              << " d2h_bytes=" << infer_result.transfer_breakdown.device_to_host_bytes
+              << " copy_calls=" << infer_result.transfer_breakdown.copy_calls
+              << " h2d_per_forward_token=" << infer_result.host_to_device_bytes_per_forward_token
+              << " d2h_per_forward_token=" << infer_result.device_to_host_bytes_per_forward_token << "\n";
     std::cout << "  sampling: temperature=" << infer_options.sampling.temperature
               << " top_p=" << infer_options.sampling.top_p
               << " top_k=" << infer_options.sampling.top_k
@@ -238,6 +347,18 @@ int main(int argc, char ** argv) {
       } else {
         std::cerr << "token decode warning: " << error_message << "\n";
       }
+    }
+    if (!profile_json_path.empty()) {
+      if (!write_profile_json(
+            profile_json_path,
+            infer_options,
+            infer_result,
+            infer_options.use_cuda ? "cuda-hybrid" : "cpu-reference",
+            error_message)) {
+        std::cerr << "profile json write failed: " << error_message << "\n";
+        return 14;
+      }
+      std::cout << "  profile_json: " << profile_json_path << "\n";
     }
     return 0;
   }

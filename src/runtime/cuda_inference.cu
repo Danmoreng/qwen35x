@@ -16,6 +16,34 @@ bool check_cuda(cudaError_t status, const char * step, std::string & error_messa
   return false;
 }
 
+CudaTransferStats g_transfer_stats;
+
+bool tracked_memcpy(
+  void * dst,
+  const void * src,
+  const std::size_t bytes,
+  const cudaMemcpyKind kind,
+  const char * step,
+  std::string & error_message) {
+  if (!check_cuda(cudaMemcpy(dst, src, bytes, kind), step, error_message)) {
+    return false;
+  }
+
+  ++g_transfer_stats.copy_calls;
+  switch (kind) {
+    case cudaMemcpyHostToDevice:
+      g_transfer_stats.host_to_device_bytes += static_cast<std::uint64_t>(bytes);
+      break;
+    case cudaMemcpyDeviceToHost:
+      g_transfer_stats.device_to_host_bytes += static_cast<std::uint64_t>(bytes);
+      break;
+    default:
+      g_transfer_stats.other_bytes += static_cast<std::uint64_t>(bytes);
+      break;
+  }
+  return true;
+}
+
 __global__ void f32_matvec_kernel(
   const float * weights,
   const float * input,
@@ -91,8 +119,11 @@ bool upload_matrix_f32(
   if (!check_cuda(cudaMalloc(&device_ptr, expected_count * sizeof(float)), "cudaMalloc(matrix)", error_message)) {
     return false;
   }
-  if (!check_cuda(
-        cudaMemcpy(device_ptr, host_data.data(), expected_count * sizeof(float), cudaMemcpyHostToDevice),
+  if (!tracked_memcpy(
+        device_ptr,
+        host_data.data(),
+        expected_count * sizeof(float),
+        cudaMemcpyHostToDevice,
         "cudaMemcpy(matrix)",
         error_message)) {
     cudaFree(device_ptr);
@@ -132,8 +163,11 @@ bool run_matvec_f32(
     return false;
   }
 
-  if (!check_cuda(
-        cudaMemcpy(g_workspace_input, input.data(), input.size() * sizeof(float), cudaMemcpyHostToDevice),
+  if (!tracked_memcpy(
+        g_workspace_input,
+        input.data(),
+        input.size() * sizeof(float),
+        cudaMemcpyHostToDevice,
         "cudaMemcpy(input)",
         error_message)) {
     return false;
@@ -150,8 +184,11 @@ bool run_matvec_f32(
   }
 
   output.resize(static_cast<std::size_t>(matrix.rows));
-  if (!check_cuda(
-        cudaMemcpy(output.data(), g_workspace_output, output.size() * sizeof(float), cudaMemcpyDeviceToHost),
+  if (!tracked_memcpy(
+        output.data(),
+        g_workspace_output,
+        output.size() * sizeof(float),
+        cudaMemcpyDeviceToHost,
         "cudaMemcpy(output)",
         error_message)) {
     return false;
@@ -215,10 +252,18 @@ bool upload_to_buffer_f32(
   }
 
   float * dst = static_cast<float *>(buffer.data) + buffer_offset;
-  if (!check_cuda(cudaMemcpy(dst, host_data, count * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy(buffer)", error_message)) {
+  if (!tracked_memcpy(dst, host_data, count * sizeof(float), cudaMemcpyHostToDevice, "cudaMemcpy(buffer)", error_message)) {
     return false;
   }
   return true;
+}
+
+void reset_transfer_stats() {
+  g_transfer_stats = CudaTransferStats{};
+}
+
+void get_transfer_stats(CudaTransferStats & out_stats) {
+  out_stats = g_transfer_stats;
 }
 
 } // namespace qwen35x::cuda

@@ -27,11 +27,32 @@ struct ReferenceInferenceOptions {
   std::vector<std::vector<std::int32_t>> stop_token_sequences;
 };
 
+struct ReferenceTimingBreakdown {
+  double embedding_ms = 0.0;
+  double attention_ms = 0.0;
+  double mlp_ms = 0.0;
+  double logits_ms = 0.0;
+  double sampling_ms = 0.0;
+  double stop_checks_ms = 0.0;
+};
+
+struct ReferenceTransferBreakdown {
+  std::uint64_t host_to_device_bytes = 0;
+  std::uint64_t device_to_host_bytes = 0;
+  std::uint64_t other_bytes = 0;
+  std::uint64_t copy_calls = 0;
+};
+
 struct ReferenceInferenceResult {
   std::vector<std::int32_t> generated_tokens;
   double load_time_ms = 0.0;
   double decode_time_ms = 0.0;
   double tokens_per_second = 0.0;
+  int forward_pass_tokens = 0;
+  double host_to_device_bytes_per_forward_token = 0.0;
+  double device_to_host_bytes_per_forward_token = 0.0;
+  ReferenceTimingBreakdown timing_breakdown;
+  ReferenceTransferBreakdown transfer_breakdown;
 };
 
 bool parse_token_list_csv(

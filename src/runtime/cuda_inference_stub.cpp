@@ -47,6 +47,13 @@ bool upload_to_buffer_f32(
   return false;
 }
 
+void reset_transfer_stats() {
+}
+
+void get_transfer_stats(CudaTransferStats & out_stats) {
+  out_stats = CudaTransferStats{};
+}
+
 } // namespace qwen35x::cuda
 
 #endif

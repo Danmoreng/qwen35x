@@ -107,6 +107,20 @@ struct ModelState {
   std::vector<LinearAttentionState> linear_states;
 };
 
+struct DecodeProfilingAccumulator {
+  double embedding_ms = 0.0;
+  double attention_ms = 0.0;
+  double mlp_ms = 0.0;
+  double logits_ms = 0.0;
+  double sampling_ms = 0.0;
+  double stop_checks_ms = 0.0;
+  int forward_pass_tokens = 0;
+};
+
+double elapsed_ms(const std::chrono::steady_clock::time_point start_time) {
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start_time).count();
+}
+
 float sigmoidf_stable(const float x) {
   if (x >= 0.0f) {
     const float z = std::exp(-x);
@@ -1078,16 +1092,25 @@ bool run_forward_single_token(
   const int position,
   const bool use_cuda,
   std::vector<float> & next_logits,
+  DecodeProfilingAccumulator * profiling,
   std::string & error_message) {
   if (token_id < 0 || token_id >= dims.vocab_size) {
     error_message = "Token id out of vocabulary range.";
     return false;
   }
 
+  if (profiling != nullptr) {
+    ++profiling->forward_pass_tokens;
+  }
+
+  const auto embedding_start = std::chrono::steady_clock::now();
   std::vector<float> x(static_cast<std::size_t>(dims.hidden), 0.0f);
   const float * emb_row = weights.embed_tokens.data.data() +
                          static_cast<std::size_t>(token_id) * static_cast<std::size_t>(dims.hidden);
   std::memcpy(x.data(), emb_row, static_cast<std::size_t>(dims.hidden) * sizeof(float));
+  if (profiling != nullptr) {
+    profiling->embedding_ms += elapsed_ms(embedding_start);
+  }
 
   int full_idx = 0;
   int linear_idx = 0;
@@ -1104,6 +1127,7 @@ bool run_forward_single_token(
     const LayerWeights & layer = weights.layers[static_cast<std::size_t>(il)];
     rms_norm_qwen3next(x, layer.input_layernorm, dims.rms_eps, normed);
 
+    const auto attention_start = std::chrono::steady_clock::now();
     if (layer.is_linear) {
       if (!run_linear_attention_step(
             layer,
@@ -1130,7 +1154,11 @@ bool run_forward_single_token(
       }
       ++full_idx;
     }
+    if (profiling != nullptr) {
+      profiling->attention_ms += elapsed_ms(attention_start);
+    }
 
+    const auto mlp_start = std::chrono::steady_clock::now();
     residual.resize(x.size());
     for (std::size_t i = 0; i < x.size(); ++i) {
       residual[i] = x[i] + attn_out[i];
@@ -1153,11 +1181,20 @@ bool run_forward_single_token(
     for (std::size_t i = 0; i < residual.size(); ++i) {
       x[i] = residual[i] + mlp_out[i];
     }
+    if (profiling != nullptr) {
+      profiling->mlp_ms += elapsed_ms(mlp_start);
+    }
   }
 
+  const auto logits_start = std::chrono::steady_clock::now();
   std::vector<float> final_hidden;
   rms_norm_qwen3next(x, weights.final_norm, dims.rms_eps, final_hidden);
-  return compute_next_logits_from_embedding(weights.embed_tokens, final_hidden, use_cuda, next_logits, error_message);
+  const bool ok =
+    compute_next_logits_from_embedding(weights.embed_tokens, final_hidden, use_cuda, next_logits, error_message);
+  if (profiling != nullptr) {
+    profiling->logits_ms += elapsed_ms(logits_start);
+  }
+  return ok;
 }
 
 } // namespace
@@ -1203,6 +1240,8 @@ bool run_reference_qwen35_inference(
   const ReferenceInferenceOptions & options,
   ReferenceInferenceResult & result,
   std::string & error_message) {
+  result = ReferenceInferenceResult{};
+
   if (profile.family != "qwen3.5") {
     error_message = "Reference inference path currently supports only qwen3.5 family.";
     return false;
@@ -1337,6 +1376,9 @@ bool run_reference_qwen35_inference(
   result.load_time_ms = std::chrono::duration<double, std::milli>(load_end - load_start).count();
 
   const auto decode_start = std::chrono::steady_clock::now();
+  if (options.use_cuda) {
+    cuda::reset_transfer_stats();
+  }
 
   std::mt19937 rng;
   if (options.sampling.seed >= 0) {
@@ -1360,10 +1402,21 @@ bool run_reference_qwen35_inference(
     }
   }
 
+  DecodeProfilingAccumulator profiling;
+
   int position = 0;
   std::vector<float> predicted_logits;
   for (const std::int32_t prompt_token : options.prompt_tokens) {
-    if (!run_forward_single_token(weights, dims, state, prompt_token, position, options.use_cuda, predicted_logits, error_message)) {
+    if (!run_forward_single_token(
+          weights,
+          dims,
+          state,
+          prompt_token,
+          position,
+          options.use_cuda,
+          predicted_logits,
+          &profiling,
+          error_message)) {
       release_cuda_resources();
       return false;
     }
@@ -1373,6 +1426,7 @@ bool run_reference_qwen35_inference(
   result.generated_tokens.clear();
   result.generated_tokens.reserve(static_cast<std::size_t>(options.max_new_tokens));
   for (int i = 0; i < options.max_new_tokens; ++i) {
+    const auto sampling_start = std::chrono::steady_clock::now();
     int current = 0;
     if (!sample_token_from_logits(
           predicted_logits,
@@ -1384,12 +1438,14 @@ bool run_reference_qwen35_inference(
       release_cuda_resources();
       return false;
     }
+    profiling.sampling_ms += elapsed_ms(sampling_start);
 
     result.generated_tokens.push_back(current);
     if (current >= 0 && current < dims.vocab_size) {
       token_counts[static_cast<std::size_t>(current)] += 1;
     }
 
+    const auto stop_checks_start = std::chrono::steady_clock::now();
     bool should_stop = false;
     std::size_t trim_count = 0;
     if (stop_token_set.find(current) != stop_token_set.end()) {
@@ -1402,6 +1458,7 @@ bool run_reference_qwen35_inference(
         trim_count = std::max(trim_count, stop_sequence.size());
       }
     }
+    profiling.stop_checks_ms += elapsed_ms(stop_checks_start);
     if (should_stop) {
       if (trim_count > 0 && trim_count <= result.generated_tokens.size()) {
         result.generated_tokens.resize(result.generated_tokens.size() - trim_count);
@@ -1409,7 +1466,16 @@ bool run_reference_qwen35_inference(
       break;
     }
 
-    if (!run_forward_single_token(weights, dims, state, current, position, options.use_cuda, predicted_logits, error_message)) {
+    if (!run_forward_single_token(
+          weights,
+          dims,
+          state,
+          current,
+          position,
+          options.use_cuda,
+          predicted_logits,
+          &profiling,
+          error_message)) {
       release_cuda_resources();
       return false;
     }
@@ -1422,6 +1488,28 @@ bool run_reference_qwen35_inference(
     (result.decode_time_ms > 0.0)
       ? (static_cast<double>(result.generated_tokens.size()) * 1000.0 / result.decode_time_ms)
       : 0.0;
+  result.forward_pass_tokens = profiling.forward_pass_tokens;
+  result.timing_breakdown.embedding_ms = profiling.embedding_ms;
+  result.timing_breakdown.attention_ms = profiling.attention_ms;
+  result.timing_breakdown.mlp_ms = profiling.mlp_ms;
+  result.timing_breakdown.logits_ms = profiling.logits_ms;
+  result.timing_breakdown.sampling_ms = profiling.sampling_ms;
+  result.timing_breakdown.stop_checks_ms = profiling.stop_checks_ms;
+  if (options.use_cuda) {
+    cuda::CudaTransferStats transfer_stats;
+    cuda::get_transfer_stats(transfer_stats);
+    result.transfer_breakdown.host_to_device_bytes = transfer_stats.host_to_device_bytes;
+    result.transfer_breakdown.device_to_host_bytes = transfer_stats.device_to_host_bytes;
+    result.transfer_breakdown.other_bytes = transfer_stats.other_bytes;
+    result.transfer_breakdown.copy_calls = transfer_stats.copy_calls;
+  }
+  if (result.forward_pass_tokens > 0) {
+    const double forward_tokens = static_cast<double>(result.forward_pass_tokens);
+    result.host_to_device_bytes_per_forward_token =
+      static_cast<double>(result.transfer_breakdown.host_to_device_bytes) / forward_tokens;
+    result.device_to_host_bytes_per_forward_token =
+      static_cast<double>(result.transfer_breakdown.device_to_host_bytes) / forward_tokens;
+  }
 
   release_cuda_resources();
   return true;
