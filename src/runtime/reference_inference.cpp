@@ -624,58 +624,6 @@ void release_forward_workspace_cuda(CudaForwardWorkspace & workspace) {
   workspace.has_device_buffers = false;
 }
 
-bool sync_full_state_token_to_cuda(
-  const FullAttentionState & state,
-  const RuntimeDims & dims,
-  const int position,
-  std::string & error_message) {
-  if (!state.has_device_state) {
-    return true;
-  }
-  const std::size_t token_stride = static_cast<std::size_t>(dims.n_kv_heads * dims.head_dim);
-  const std::size_t offset = static_cast<std::size_t>(position) * token_stride;
-  if (!cuda::upload_to_buffer_f32(
-        state.k_cache.data() + offset,
-        token_stride,
-        state.k_cache_device,
-        offset,
-        error_message)) {
-    return false;
-  }
-  if (!cuda::upload_to_buffer_f32(
-        state.v_cache.data() + offset,
-        token_stride,
-        state.v_cache_device,
-        offset,
-        error_message)) {
-    return false;
-  }
-  return true;
-}
-
-bool sync_linear_state_to_cuda(const LinearAttentionState & state, std::string & error_message) {
-  if (!state.has_device_state) {
-    return true;
-  }
-  if (!cuda::upload_to_buffer_f32(
-        state.conv_state.data(),
-        state.conv_state.size(),
-        state.conv_state_device,
-        0,
-        error_message)) {
-    return false;
-  }
-  if (!cuda::upload_to_buffer_f32(
-        state.recurrent_state.data(),
-        state.recurrent_state.size(),
-        state.recurrent_state_device,
-        0,
-        error_message)) {
-    return false;
-  }
-  return true;
-}
-
 bool run_linear_attention_step(
   const LayerWeights & layer,
   const RuntimeDims & dims,
@@ -807,9 +755,6 @@ bool run_linear_attention_step(
   if (!matvec_2d(layer.linear.out_proj, gated_norm, out, use_cuda, error_message)) {
     return false;
   }
-  if (use_cuda && !sync_linear_state_to_cuda(state, error_message)) {
-    return false;
-  }
   return true;
 }
 
@@ -859,9 +804,6 @@ bool run_full_attention_step(
     state.v_cache.data() + static_cast<std::size_t>(position) * token_stride,
     v_flat.data(),
     token_stride * sizeof(float));
-  if (use_cuda && !sync_full_state_token_to_cuda(state, dims, position, error_message)) {
-    return false;
-  }
 
   const int n_rep = dims.n_heads / dims.n_kv_heads;
   const float scale = 1.0f / std::sqrt(static_cast<float>(dims.head_dim));
@@ -1421,15 +1363,6 @@ bool run_reference_qwen35_inference(
     fs.v_cache.resize(
       static_cast<std::size_t>(options.max_context) * static_cast<std::size_t>(dims.n_kv_heads) *
       static_cast<std::size_t>(dims.head_dim));
-    if (options.use_cuda) {
-      if (!cuda::allocate_buffer_f32(fs.k_cache.size(), fs.k_cache_device, error_message) ||
-          !cuda::allocate_buffer_f32(fs.v_cache.size(), fs.v_cache_device, error_message)) {
-        release_model_state_cuda(state);
-        release_model_weights_cuda(weights);
-        return false;
-      }
-      fs.has_device_state = true;
-    }
   }
 
   state.linear_states.resize(static_cast<std::size_t>(linear_layers));
@@ -1440,20 +1373,6 @@ bool run_reference_qwen35_inference(
       static_cast<std::size_t>(dims.linear_num_v_heads) * static_cast<std::size_t>(dims.linear_head_v_dim) *
       static_cast<std::size_t>(dims.linear_head_v_dim),
       0.0f);
-    if (options.use_cuda) {
-      if (!cuda::allocate_buffer_f32(ls.conv_state.size(), ls.conv_state_device, error_message) ||
-          !cuda::allocate_buffer_f32(ls.recurrent_state.size(), ls.recurrent_state_device, error_message)) {
-        release_model_state_cuda(state);
-        release_model_weights_cuda(weights);
-        return false;
-      }
-      ls.has_device_state = true;
-      if (!sync_linear_state_to_cuda(ls, error_message)) {
-        release_model_state_cuda(state);
-        release_model_weights_cuda(weights);
-        return false;
-      }
-    }
   }
 
   CudaForwardWorkspace cuda_forward_workspace;
