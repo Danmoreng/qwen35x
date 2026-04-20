@@ -87,6 +87,22 @@ bool run_silu_mul_f32(
   return false;
 }
 
+bool run_full_attention_decode_gqa(
+  const CudaDeviceBufferF32 &,
+  const CudaDeviceBufferF32 &,
+  const CudaDeviceBufferF32 &,
+  const CudaDeviceBufferF32 &,
+  int,
+  int,
+  int,
+  int,
+  CudaDeviceBufferF32 &,
+  CudaDeviceBufferF32 &,
+  std::string & error_message) {
+  error_message = "CUDA is not enabled in this build.";
+  return false;
+}
+
 void reset_transfer_stats() {
 }
 

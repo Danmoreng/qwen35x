@@ -114,6 +114,10 @@ struct CudaForwardWorkspace {
   cuda::CudaDeviceBufferF32 intermediate_hidden;
   cuda::CudaDeviceBufferF32 hidden_out;
   cuda::CudaDeviceBufferF32 projection_out;
+  cuda::CudaDeviceBufferF32 full_q;
+  cuda::CudaDeviceBufferF32 full_gate;
+  cuda::CudaDeviceBufferF32 full_attn;
+  cuda::CudaDeviceBufferF32 full_scores;
   bool has_device_buffers = false;
 };
 
@@ -601,8 +605,11 @@ void release_model_state_cuda(ModelState & state) {
 
 bool allocate_forward_workspace_cuda(
   const RuntimeDims & dims,
+  const int max_context,
   CudaForwardWorkspace & workspace,
   std::string & error_message) {
+  const std::size_t full_q_count = static_cast<std::size_t>(dims.n_heads * dims.head_dim);
+  const std::size_t full_scores_count = static_cast<std::size_t>(dims.n_heads) * static_cast<std::size_t>(std::max(1, max_context));
   const std::size_t projection_out_count = std::max<std::size_t>({
     static_cast<std::size_t>(dims.hidden),
     static_cast<std::size_t>(dims.n_heads * dims.head_dim * 2),
@@ -618,13 +625,21 @@ bool allocate_forward_workspace_cuda(
       !cuda::allocate_buffer_f32(static_cast<std::size_t>(dims.intermediate), workspace.intermediate_b, error_message) ||
       !cuda::allocate_buffer_f32(static_cast<std::size_t>(dims.intermediate), workspace.intermediate_hidden, error_message) ||
       !cuda::allocate_buffer_f32(static_cast<std::size_t>(dims.hidden), workspace.hidden_out, error_message) ||
-      !cuda::allocate_buffer_f32(projection_out_count, workspace.projection_out, error_message)) {
+      !cuda::allocate_buffer_f32(projection_out_count, workspace.projection_out, error_message) ||
+      !cuda::allocate_buffer_f32(full_q_count, workspace.full_q, error_message) ||
+      !cuda::allocate_buffer_f32(full_q_count, workspace.full_gate, error_message) ||
+      !cuda::allocate_buffer_f32(full_q_count, workspace.full_attn, error_message) ||
+      !cuda::allocate_buffer_f32(full_scores_count, workspace.full_scores, error_message)) {
     cuda::free_buffer_f32(workspace.hidden_in);
     cuda::free_buffer_f32(workspace.intermediate_a);
     cuda::free_buffer_f32(workspace.intermediate_b);
     cuda::free_buffer_f32(workspace.intermediate_hidden);
     cuda::free_buffer_f32(workspace.hidden_out);
     cuda::free_buffer_f32(workspace.projection_out);
+    cuda::free_buffer_f32(workspace.full_q);
+    cuda::free_buffer_f32(workspace.full_gate);
+    cuda::free_buffer_f32(workspace.full_attn);
+    cuda::free_buffer_f32(workspace.full_scores);
     return false;
   }
 
@@ -642,6 +657,10 @@ void release_forward_workspace_cuda(CudaForwardWorkspace & workspace) {
   cuda::free_buffer_f32(workspace.intermediate_hidden);
   cuda::free_buffer_f32(workspace.hidden_out);
   cuda::free_buffer_f32(workspace.projection_out);
+  cuda::free_buffer_f32(workspace.full_q);
+  cuda::free_buffer_f32(workspace.full_gate);
+  cuda::free_buffer_f32(workspace.full_attn);
+  cuda::free_buffer_f32(workspace.full_scores);
   workspace.has_device_buffers = false;
 }
 
@@ -872,6 +891,40 @@ bool run_full_attention_step(
     state.v_cache.data() + static_cast<std::size_t>(position) * token_stride,
     v_flat.data(),
     token_stride * sizeof(float));
+
+  const bool use_cuda_full_kernel =
+    use_cuda && state.has_device_state && cuda_workspace != nullptr && cuda_workspace->has_device_buffers &&
+    layer.full.o_proj.has_device_matrix;
+  if (use_cuda_full_kernel) {
+    const std::size_t offset = static_cast<std::size_t>(position) * token_stride;
+    const std::size_t full_q_count = static_cast<std::size_t>(dims.n_heads * dims.head_dim);
+    if (!cuda::upload_to_buffer_f32(k_normed.data(), token_stride, state.k_cache_device, offset, error_message) ||
+        !cuda::upload_to_buffer_f32(v_flat.data(), token_stride, state.v_cache_device, offset, error_message) ||
+        !cuda::upload_to_buffer_f32(q_normed.data(), full_q_count, cuda_workspace->full_q, 0, error_message) ||
+        !cuda::upload_to_buffer_f32(gate.data(), full_q_count, cuda_workspace->full_gate, 0, error_message) ||
+        !cuda::run_full_attention_decode_gqa(
+          cuda_workspace->full_q,
+          cuda_workspace->full_gate,
+          state.k_cache_device,
+          state.v_cache_device,
+          dims.n_heads,
+          dims.n_kv_heads,
+          dims.head_dim,
+          position + 1,
+          cuda_workspace->full_attn,
+          cuda_workspace->full_scores,
+          error_message) ||
+        !cuda::run_matvec_f32_device(layer.full.o_proj.device_matrix, cuda_workspace->full_attn, cuda_workspace->hidden_out, error_message) ||
+        !cuda::download_from_buffer_f32(
+          cuda_workspace->hidden_out,
+          static_cast<std::size_t>(dims.hidden),
+          0,
+          out,
+          error_message)) {
+      return false;
+    }
+    return true;
+  }
 
   const int n_rep = dims.n_heads / dims.n_kv_heads;
   const float scale = 1.0f / std::sqrt(static_cast<float>(dims.head_dim));
@@ -1462,6 +1515,15 @@ bool run_reference_qwen35_inference(
     fs.v_cache.resize(
       static_cast<std::size_t>(options.max_context) * static_cast<std::size_t>(dims.n_kv_heads) *
       static_cast<std::size_t>(dims.head_dim));
+    if (options.use_cuda) {
+      if (!cuda::allocate_buffer_f32(fs.k_cache.size(), fs.k_cache_device, error_message) ||
+          !cuda::allocate_buffer_f32(fs.v_cache.size(), fs.v_cache_device, error_message)) {
+        release_model_state_cuda(state);
+        release_model_weights_cuda(weights);
+        return false;
+      }
+      fs.has_device_state = true;
+    }
   }
 
   state.linear_states.resize(static_cast<std::size_t>(linear_layers));
@@ -1502,7 +1564,7 @@ bool run_reference_qwen35_inference(
       release_model_weights_cuda(weights);
       return false;
     }
-    if (!allocate_forward_workspace_cuda(dims, cuda_forward_workspace, error_message)) {
+    if (!allocate_forward_workspace_cuda(dims, options.max_context, cuda_forward_workspace, error_message)) {
       cuda::end_inference_session();
       release_model_state_cuda(state);
       release_model_weights_cuda(weights);

@@ -168,6 +168,95 @@ __global__ void silu_mul_kernel(
   out[idx] = (av * sig) * b[idx];
 }
 
+__global__ void full_attention_decode_gqa_kernel(
+  const float * q,
+  const float * gate,
+  const float * k_cache,
+  const float * v_cache,
+  float * out,
+  float * scratch_scores,
+  const int n_heads,
+  const int n_kv_heads,
+  const int head_dim,
+  const int seq_len) {
+  const int head = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (head >= n_heads || seq_len <= 0) {
+    return;
+  }
+
+  const int n_rep = n_heads / n_kv_heads;
+  const int kvh = head / n_rep;
+  const int kv_stride = n_kv_heads * head_dim;
+
+  const float * q_ptr = q + static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim);
+  const float * gate_ptr = gate + static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim);
+  float * out_ptr = out + static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim);
+  float * scores_ptr = scratch_scores + static_cast<std::size_t>(head) * static_cast<std::size_t>(seq_len);
+
+  __shared__ float reduction[256];
+  const float scale = rsqrtf(static_cast<float>(head_dim));
+
+  for (int t = 0; t < seq_len; ++t) {
+    const float * k_ptr = k_cache +
+                          (static_cast<std::size_t>(t) * static_cast<std::size_t>(kv_stride)) +
+                          (static_cast<std::size_t>(kvh) * static_cast<std::size_t>(head_dim));
+
+    float partial = 0.0f;
+    if (tid < head_dim) {
+      partial = q_ptr[tid] * k_ptr[tid];
+    }
+    reduction[tid] = partial;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        reduction[tid] += reduction[tid + stride];
+      }
+      __syncthreads();
+    }
+
+    if (tid == 0) {
+      scores_ptr[t] = reduction[0] * scale;
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    float max_score = -1.0e30f;
+    for (int t = 0; t < seq_len; ++t) {
+      max_score = fmaxf(max_score, scores_ptr[t]);
+    }
+    float denom = 0.0f;
+    for (int t = 0; t < seq_len; ++t) {
+      const float ev = expf(scores_ptr[t] - max_score);
+      scores_ptr[t] = ev;
+      denom += ev;
+    }
+    if (denom <= 0.0f) {
+      denom = 1.0f;
+    }
+    const float inv_denom = 1.0f / denom;
+    for (int t = 0; t < seq_len; ++t) {
+      scores_ptr[t] *= inv_denom;
+    }
+  }
+  __syncthreads();
+
+  if (tid < head_dim) {
+    float acc = 0.0f;
+    for (int t = 0; t < seq_len; ++t) {
+      const float * v_ptr = v_cache +
+                            (static_cast<std::size_t>(t) * static_cast<std::size_t>(kv_stride)) +
+                            (static_cast<std::size_t>(kvh) * static_cast<std::size_t>(head_dim));
+      acc += scores_ptr[t] * v_ptr[tid];
+    }
+    const float g = gate_ptr[tid];
+    const float sig = 1.0f / (1.0f + expf(-g));
+    out_ptr[tid] = acc * sig;
+  }
+}
+
 } // namespace
 
 bool begin_inference_session(
@@ -470,6 +559,68 @@ bool run_silu_mul_f32(
     static_cast<float *>(out.data),
     count);
   return check_cuda(cudaGetLastError(), "silu_mul_kernel", error_message);
+}
+
+bool run_full_attention_decode_gqa(
+  const CudaDeviceBufferF32 & q,
+  const CudaDeviceBufferF32 & gate,
+  const CudaDeviceBufferF32 & k_cache,
+  const CudaDeviceBufferF32 & v_cache,
+  const int n_heads,
+  const int n_kv_heads,
+  const int head_dim,
+  const int seq_len,
+  CudaDeviceBufferF32 & out,
+  CudaDeviceBufferF32 & scratch_scores,
+  std::string & error_message) {
+  if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || seq_len <= 0) {
+    error_message = "Invalid dimensions for full attention decode.";
+    return false;
+  }
+  if ((n_heads % n_kv_heads) != 0) {
+    error_message = "Invalid GQA ratio for full attention decode.";
+    return false;
+  }
+
+  const std::size_t q_count = static_cast<std::size_t>(n_heads) * static_cast<std::size_t>(head_dim);
+  const std::size_t kv_stride = static_cast<std::size_t>(n_kv_heads) * static_cast<std::size_t>(head_dim);
+  const std::size_t kv_count = static_cast<std::size_t>(seq_len) * kv_stride;
+  const std::size_t scores_count = static_cast<std::size_t>(n_heads) * static_cast<std::size_t>(seq_len);
+  if (q.data == nullptr || gate.data == nullptr || k_cache.data == nullptr || v_cache.data == nullptr ||
+      out.data == nullptr || scratch_scores.data == nullptr) {
+    error_message = "One or more CUDA buffers are not initialized for full attention decode.";
+    return false;
+  }
+  if (q.count < q_count || gate.count < q_count || out.count < q_count || k_cache.count < kv_count ||
+      v_cache.count < kv_count || scratch_scores.count < scores_count) {
+    error_message = "CUDA buffer range is out of bounds for full attention decode.";
+    return false;
+  }
+
+  int block_size = 1;
+  while (block_size < head_dim && block_size < 256) {
+    block_size <<= 1;
+  }
+  if (block_size < 32) {
+    block_size = 32;
+  }
+  if (block_size > 256) {
+    block_size = 256;
+  }
+
+  const cudaStream_t stream = active_stream();
+  full_attention_decode_gqa_kernel<<<n_heads, block_size, 0, stream>>>(
+    static_cast<const float *>(q.data),
+    static_cast<const float *>(gate.data),
+    static_cast<const float *>(k_cache.data),
+    static_cast<const float *>(v_cache.data),
+    static_cast<float *>(out.data),
+    static_cast<float *>(scratch_scores.data),
+    n_heads,
+    n_kv_heads,
+    head_dim,
+    seq_len);
+  return check_cuda(cudaGetLastError(), "full_attention_decode_gqa_kernel", error_message);
 }
 
 void reset_transfer_stats() {

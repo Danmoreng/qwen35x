@@ -81,6 +81,19 @@ bool run_silu_mul_f32(
   CudaDeviceBufferF32 & out,
   std::string & error_message);
 
+bool run_full_attention_decode_gqa(
+  const CudaDeviceBufferF32 & q,
+  const CudaDeviceBufferF32 & gate,
+  const CudaDeviceBufferF32 & k_cache,
+  const CudaDeviceBufferF32 & v_cache,
+  int n_heads,
+  int n_kv_heads,
+  int head_dim,
+  int seq_len,
+  CudaDeviceBufferF32 & out,
+  CudaDeviceBufferF32 & scratch_scores,
+  std::string & error_message);
+
 void reset_transfer_stats();
 
 void get_transfer_stats(CudaTransferStats & out_stats);
