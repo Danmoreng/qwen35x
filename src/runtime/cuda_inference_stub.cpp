@@ -103,6 +103,30 @@ bool run_full_attention_decode_gqa(
   return false;
 }
 
+bool run_linear_attention_decode(
+  const CudaDeviceBufferF32 &,
+  const CudaDeviceBufferF32 &,
+  const CudaDeviceBufferF32 &,
+  const CudaDeviceBufferF32 &,
+  const CudaDeviceMatrixF32 &,
+  const CudaDeviceBufferF32 &,
+  const CudaDeviceBufferF32 &,
+  const CudaDeviceBufferF32 &,
+  int,
+  int,
+  int,
+  int,
+  int,
+  float,
+  CudaDeviceBufferF32 &,
+  CudaDeviceBufferF32 &,
+  CudaDeviceBufferF32 &,
+  CudaDeviceBufferF32 &,
+  std::string & error_message) {
+  error_message = "CUDA is not enabled in this build.";
+  return false;
+}
+
 void reset_transfer_stats() {
 }
 

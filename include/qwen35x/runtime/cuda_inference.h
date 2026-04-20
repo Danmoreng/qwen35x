@@ -94,6 +94,27 @@ bool run_full_attention_decode_gqa(
   CudaDeviceBufferF32 & scratch_scores,
   std::string & error_message);
 
+bool run_linear_attention_decode(
+  const CudaDeviceBufferF32 & mixed_qkv,
+  const CudaDeviceBufferF32 & z,
+  const CudaDeviceBufferF32 & b,
+  const CudaDeviceBufferF32 & a,
+  const CudaDeviceMatrixF32 & conv1d,
+  const CudaDeviceBufferF32 & norm,
+  const CudaDeviceBufferF32 & dt_bias,
+  const CudaDeviceBufferF32 & ssm_a,
+  int linear_kernel,
+  int linear_num_k_heads,
+  int linear_num_v_heads,
+  int linear_head_k_dim,
+  int linear_head_v_dim,
+  float rms_eps,
+  CudaDeviceBufferF32 & conv_state,
+  CudaDeviceBufferF32 & recurrent_state,
+  CudaDeviceBufferF32 & scratch_conv_out,
+  CudaDeviceBufferF32 & out_gated_norm,
+  std::string & error_message);
+
 void reset_transfer_stats();
 
 void get_transfer_stats(CudaTransferStats & out_stats);

@@ -257,6 +257,162 @@ __global__ void full_attention_decode_gqa_kernel(
   }
 }
 
+__device__ float sigmoidf_device(const float x) {
+  return 1.0f / (1.0f + expf(-x));
+}
+
+__device__ float softplusf_device(const float x) {
+  if (x > 20.0f) {
+    return x;
+  }
+  if (x < -20.0f) {
+    return expf(x);
+  }
+  return log1pf(expf(x));
+}
+
+__global__ void linear_conv_update_kernel(
+  const float * mixed_qkv,
+  const float * conv_weights,
+  float * conv_state,
+  float * conv_out,
+  const int channels,
+  const int kernel_size) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= channels) {
+    return;
+  }
+
+  const int history = kernel_size - 1;
+  const float * w_ptr = conv_weights + static_cast<std::size_t>(c) * static_cast<std::size_t>(kernel_size);
+  float sum = 0.0f;
+  for (int k = 0; k < history; ++k) {
+    sum += conv_state[static_cast<std::size_t>(k) * static_cast<std::size_t>(channels) + static_cast<std::size_t>(c)] * w_ptr[k];
+  }
+  sum += mixed_qkv[c] * w_ptr[history];
+  conv_out[c] = sum * sigmoidf_device(sum);
+
+  for (int r = 0; r + 1 < history; ++r) {
+    conv_state[static_cast<std::size_t>(r) * static_cast<std::size_t>(channels) + static_cast<std::size_t>(c)] =
+      conv_state[static_cast<std::size_t>(r + 1) * static_cast<std::size_t>(channels) + static_cast<std::size_t>(c)];
+  }
+  if (history > 0) {
+    conv_state[static_cast<std::size_t>(history - 1) * static_cast<std::size_t>(channels) + static_cast<std::size_t>(c)] =
+      mixed_qkv[c];
+  }
+}
+
+__global__ void linear_recurrent_decode_kernel(
+  const float * conv_out,
+  const float * z,
+  const float * b,
+  const float * a,
+  const float * norm,
+  const float * dt_bias,
+  const float * ssm_a,
+  float * recurrent_state,
+  float * out_gated_norm,
+  const int linear_num_k_heads,
+  const int linear_num_v_heads,
+  const int head_k_dim,
+  const int head_v_dim,
+  const float rms_eps) {
+  const int h = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (h >= linear_num_v_heads) {
+    return;
+  }
+
+  const int q_dim = linear_num_k_heads * head_k_dim;
+  const int v_dim = linear_num_v_heads * head_v_dim;
+  const int q_base = h * head_k_dim;
+  const int v_base = h * head_v_dim;
+  if (q_base + head_k_dim > q_dim || v_base + head_v_dim > v_dim) {
+    return;
+  }
+
+  float * s = recurrent_state +
+              static_cast<std::size_t>(h) * static_cast<std::size_t>(head_v_dim) * static_cast<std::size_t>(head_v_dim);
+  const float * q_ptr = conv_out + q_base;
+  const float * k_ptr = conv_out + q_dim + q_base;
+  const float * v_ptr = conv_out + 2 * q_dim + v_base;
+  const float * z_ptr = z + v_base;
+  float * out_ptr = out_gated_norm + v_base;
+
+  __shared__ float sh_inv_q;
+  __shared__ float sh_inv_k;
+  __shared__ float sh_alpha;
+  __shared__ float sh_beta;
+  __shared__ float sh_inv_norm;
+  extern __shared__ float shared[];
+  float * sh_sk = shared;
+  float * sh_core = shared + head_v_dim;
+
+  if (tid == 0) {
+    float sq_q = 0.0f;
+    float sq_k = 0.0f;
+    for (int d = 0; d < head_k_dim; ++d) {
+      sq_q += q_ptr[d] * q_ptr[d];
+      sq_k += k_ptr[d] * k_ptr[d];
+    }
+    sh_inv_q = rsqrtf(sq_q + 1.0e-6f) * rsqrtf(static_cast<float>(head_k_dim));
+    sh_inv_k = rsqrtf(sq_k + 1.0e-6f);
+    sh_beta = sigmoidf_device(b[h]);
+    const float pre_gate = softplusf_device(a[h] + dt_bias[h]);
+    sh_alpha = expf(pre_gate * ssm_a[h]);
+  }
+  __syncthreads();
+
+  const int state_count = head_v_dim * head_v_dim;
+  for (int idx = tid; idx < state_count; idx += blockDim.x) {
+    s[idx] *= sh_alpha;
+  }
+  __syncthreads();
+
+  for (int i = tid; i < head_v_dim; i += blockDim.x) {
+    float sk = 0.0f;
+    const float * row = s + static_cast<std::size_t>(i) * static_cast<std::size_t>(head_v_dim);
+    for (int j = 0; j < head_v_dim; ++j) {
+      sk += row[j] * (k_ptr[j] * sh_inv_k);
+    }
+    sh_sk[i] = sk;
+  }
+  __syncthreads();
+
+  for (int i = tid; i < head_v_dim; i += blockDim.x) {
+    const float delta = (v_ptr[i] - sh_sk[i]) * sh_beta;
+    float * row = s + static_cast<std::size_t>(i) * static_cast<std::size_t>(head_v_dim);
+    for (int j = 0; j < head_v_dim; ++j) {
+      row[j] += delta * (k_ptr[j] * sh_inv_k);
+    }
+  }
+  __syncthreads();
+
+  for (int i = tid; i < head_v_dim; i += blockDim.x) {
+    float core = 0.0f;
+    const float * row = s + static_cast<std::size_t>(i) * static_cast<std::size_t>(head_v_dim);
+    for (int j = 0; j < head_v_dim; ++j) {
+      core += row[j] * (q_ptr[j] * sh_inv_q);
+    }
+    sh_core[i] = core;
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    float sq_sum = 0.0f;
+    for (int i = 0; i < head_v_dim; ++i) {
+      sq_sum += sh_core[i] * sh_core[i];
+    }
+    sh_inv_norm = rsqrtf(sq_sum / static_cast<float>(head_v_dim) + rms_eps);
+  }
+  __syncthreads();
+
+  for (int i = tid; i < head_v_dim; i += blockDim.x) {
+    const float zv = z_ptr[i];
+    out_ptr[i] = sh_core[i] * sh_inv_norm * norm[i] * (zv * sigmoidf_device(zv));
+  }
+}
+
 } // namespace
 
 bool begin_inference_session(
@@ -621,6 +777,109 @@ bool run_full_attention_decode_gqa(
     head_dim,
     seq_len);
   return check_cuda(cudaGetLastError(), "full_attention_decode_gqa_kernel", error_message);
+}
+
+bool run_linear_attention_decode(
+  const CudaDeviceBufferF32 & mixed_qkv,
+  const CudaDeviceBufferF32 & z,
+  const CudaDeviceBufferF32 & b,
+  const CudaDeviceBufferF32 & a,
+  const CudaDeviceMatrixF32 & conv1d,
+  const CudaDeviceBufferF32 & norm,
+  const CudaDeviceBufferF32 & dt_bias,
+  const CudaDeviceBufferF32 & ssm_a,
+  const int linear_kernel,
+  const int linear_num_k_heads,
+  const int linear_num_v_heads,
+  const int linear_head_k_dim,
+  const int linear_head_v_dim,
+  const float rms_eps,
+  CudaDeviceBufferF32 & conv_state,
+  CudaDeviceBufferF32 & recurrent_state,
+  CudaDeviceBufferF32 & scratch_conv_out,
+  CudaDeviceBufferF32 & out_gated_norm,
+  std::string & error_message) {
+  if (linear_kernel <= 1 || linear_num_k_heads <= 0 || linear_num_v_heads <= 0 || linear_head_k_dim <= 0 ||
+      linear_head_v_dim <= 0) {
+    error_message = "Invalid dimensions for linear attention decode.";
+    return false;
+  }
+  if (linear_head_k_dim != linear_head_v_dim) {
+    error_message = "Linear attention decode expects head_k_dim == head_v_dim.";
+    return false;
+  }
+
+  const int linear_q_dim = linear_num_k_heads * linear_head_k_dim;
+  const int linear_v_dim = linear_num_v_heads * linear_head_v_dim;
+  const int linear_conv_channels = linear_q_dim * 2 + linear_v_dim;
+  const int conv_hist = linear_kernel - 1;
+
+  if (mixed_qkv.data == nullptr || z.data == nullptr || b.data == nullptr || a.data == nullptr ||
+      conv1d.data == nullptr || norm.data == nullptr || dt_bias.data == nullptr || ssm_a.data == nullptr ||
+      conv_state.data == nullptr || recurrent_state.data == nullptr || scratch_conv_out.data == nullptr ||
+      out_gated_norm.data == nullptr) {
+    error_message = "One or more CUDA buffers are not initialized for linear attention decode.";
+    return false;
+  }
+  if (mixed_qkv.count < static_cast<std::size_t>(linear_conv_channels) || z.count < static_cast<std::size_t>(linear_v_dim) ||
+      b.count < static_cast<std::size_t>(linear_num_v_heads) || a.count < static_cast<std::size_t>(linear_num_v_heads) ||
+      norm.count < static_cast<std::size_t>(linear_head_v_dim) || dt_bias.count < static_cast<std::size_t>(linear_num_v_heads) ||
+      ssm_a.count < static_cast<std::size_t>(linear_num_v_heads) ||
+      conv_state.count < static_cast<std::size_t>(conv_hist * linear_conv_channels) ||
+      recurrent_state.count <
+        static_cast<std::size_t>(linear_num_v_heads) * static_cast<std::size_t>(linear_head_v_dim) *
+          static_cast<std::size_t>(linear_head_v_dim) ||
+      scratch_conv_out.count < static_cast<std::size_t>(linear_conv_channels) ||
+      out_gated_norm.count < static_cast<std::size_t>(linear_v_dim)) {
+    error_message = "CUDA buffer range is out of bounds for linear attention decode.";
+    return false;
+  }
+  if (conv1d.rows != linear_conv_channels || conv1d.cols != linear_kernel) {
+    error_message = "conv1d device matrix dimensions do not match linear attention dimensions.";
+    return false;
+  }
+
+  const cudaStream_t stream = active_stream();
+  const int conv_block = 256;
+  const int conv_grid = (linear_conv_channels + conv_block - 1) / conv_block;
+  linear_conv_update_kernel<<<conv_grid, conv_block, 0, stream>>>(
+    static_cast<const float *>(mixed_qkv.data),
+    static_cast<const float *>(conv1d.data),
+    static_cast<float *>(conv_state.data),
+    static_cast<float *>(scratch_conv_out.data),
+    linear_conv_channels,
+    linear_kernel);
+  if (!check_cuda(cudaGetLastError(), "linear_conv_update_kernel", error_message)) {
+    return false;
+  }
+
+  int block_size = 1;
+  while (block_size < linear_head_v_dim && block_size < 256) {
+    block_size <<= 1;
+  }
+  if (block_size < 32) {
+    block_size = 32;
+  }
+  if (block_size > 256) {
+    block_size = 256;
+  }
+  const std::size_t shared_bytes = static_cast<std::size_t>(2 * linear_head_v_dim) * sizeof(float);
+  linear_recurrent_decode_kernel<<<linear_num_v_heads, block_size, shared_bytes, stream>>>(
+    static_cast<const float *>(scratch_conv_out.data),
+    static_cast<const float *>(z.data),
+    static_cast<const float *>(b.data),
+    static_cast<const float *>(a.data),
+    static_cast<const float *>(norm.data),
+    static_cast<const float *>(dt_bias.data),
+    static_cast<const float *>(ssm_a.data),
+    static_cast<float *>(recurrent_state.data),
+    static_cast<float *>(out_gated_norm.data),
+    linear_num_k_heads,
+    linear_num_v_heads,
+    linear_head_k_dim,
+    linear_head_v_dim,
+    rms_eps);
+  return check_cuda(cudaGetLastError(), "linear_recurrent_decode_kernel", error_message);
 }
 
 void reset_transfer_stats() {

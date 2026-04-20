@@ -44,6 +44,10 @@ struct LinearAttentionWeights {
   TensorData a_log;
   TensorData dt_bias;
   std::vector<float> ssm_a;
+  cuda::CudaDeviceBufferF32 norm_device;
+  cuda::CudaDeviceBufferF32 dt_bias_device;
+  cuda::CudaDeviceBufferF32 ssm_a_device;
+  bool has_device_params = false;
 };
 
 struct LayerWeights {
@@ -118,6 +122,12 @@ struct CudaForwardWorkspace {
   cuda::CudaDeviceBufferF32 full_gate;
   cuda::CudaDeviceBufferF32 full_attn;
   cuda::CudaDeviceBufferF32 full_scores;
+  cuda::CudaDeviceBufferF32 linear_mixed_qkv;
+  cuda::CudaDeviceBufferF32 linear_z;
+  cuda::CudaDeviceBufferF32 linear_b;
+  cuda::CudaDeviceBufferF32 linear_a;
+  cuda::CudaDeviceBufferF32 linear_conv_out;
+  cuda::CudaDeviceBufferF32 linear_gated_norm;
   bool has_device_buffers = false;
 };
 
@@ -527,6 +537,21 @@ bool upload_tensor_2d_to_cuda(TensorData & tensor, const std::string & name, std
   return true;
 }
 
+bool upload_vector_to_cuda(
+  const std::vector<float> & host_values,
+  cuda::CudaDeviceBufferF32 & out_buffer,
+  std::string & error_message) {
+  if (!cuda::allocate_buffer_f32(host_values.size(), out_buffer, error_message)) {
+    return false;
+  }
+  if (!host_values.empty() &&
+      !cuda::upload_to_buffer_f32(host_values.data(), host_values.size(), out_buffer, 0, error_message)) {
+    cuda::free_buffer_f32(out_buffer);
+    return false;
+  }
+  return true;
+}
+
 void release_tensor_cuda(TensorData & tensor) {
   if (tensor.has_device_matrix || tensor.device_matrix.data != nullptr) {
     cuda::free_matrix_f32(tensor.device_matrix);
@@ -558,6 +583,12 @@ bool upload_model_weights_to_cuda(ModelWeights & weights, std::string & error_me
           !upload_tensor_2d_to_cuda(layer.linear.out_proj, prefix + "linear.out_proj", error_message)) {
         return false;
       }
+      if (!upload_vector_to_cuda(layer.linear.norm.data, layer.linear.norm_device, error_message) ||
+          !upload_vector_to_cuda(layer.linear.dt_bias.data, layer.linear.dt_bias_device, error_message) ||
+          !upload_vector_to_cuda(layer.linear.ssm_a, layer.linear.ssm_a_device, error_message)) {
+        return false;
+      }
+      layer.linear.has_device_params = true;
     } else {
       if (!upload_tensor_2d_to_cuda(layer.full.q_proj, prefix + "full.q_proj", error_message) ||
           !upload_tensor_2d_to_cuda(layer.full.k_proj, prefix + "full.k_proj", error_message) ||
@@ -587,6 +618,10 @@ void release_model_weights_cuda(ModelWeights & weights) {
     release_tensor_cuda(layer.linear.in_proj_a);
     release_tensor_cuda(layer.linear.conv1d);
     release_tensor_cuda(layer.linear.out_proj);
+    cuda::free_buffer_f32(layer.linear.norm_device);
+    cuda::free_buffer_f32(layer.linear.dt_bias_device);
+    cuda::free_buffer_f32(layer.linear.ssm_a_device);
+    layer.linear.has_device_params = false;
   }
 }
 
@@ -620,6 +655,9 @@ bool allocate_forward_workspace_cuda(
     static_cast<std::size_t>(dims.intermediate),
     1u
   });
+  const std::size_t linear_q_dim = static_cast<std::size_t>(dims.linear_num_k_heads * dims.linear_head_k_dim);
+  const std::size_t linear_v_dim = static_cast<std::size_t>(dims.linear_num_v_heads * dims.linear_head_v_dim);
+  const std::size_t linear_conv_channels = linear_q_dim * 2 + linear_v_dim;
   if (!cuda::allocate_buffer_f32(static_cast<std::size_t>(dims.hidden), workspace.hidden_in, error_message) ||
       !cuda::allocate_buffer_f32(static_cast<std::size_t>(dims.intermediate), workspace.intermediate_a, error_message) ||
       !cuda::allocate_buffer_f32(static_cast<std::size_t>(dims.intermediate), workspace.intermediate_b, error_message) ||
@@ -629,7 +667,13 @@ bool allocate_forward_workspace_cuda(
       !cuda::allocate_buffer_f32(full_q_count, workspace.full_q, error_message) ||
       !cuda::allocate_buffer_f32(full_q_count, workspace.full_gate, error_message) ||
       !cuda::allocate_buffer_f32(full_q_count, workspace.full_attn, error_message) ||
-      !cuda::allocate_buffer_f32(full_scores_count, workspace.full_scores, error_message)) {
+      !cuda::allocate_buffer_f32(full_scores_count, workspace.full_scores, error_message) ||
+      !cuda::allocate_buffer_f32(linear_conv_channels, workspace.linear_mixed_qkv, error_message) ||
+      !cuda::allocate_buffer_f32(linear_v_dim, workspace.linear_z, error_message) ||
+      !cuda::allocate_buffer_f32(static_cast<std::size_t>(dims.linear_num_v_heads), workspace.linear_b, error_message) ||
+      !cuda::allocate_buffer_f32(static_cast<std::size_t>(dims.linear_num_v_heads), workspace.linear_a, error_message) ||
+      !cuda::allocate_buffer_f32(linear_conv_channels, workspace.linear_conv_out, error_message) ||
+      !cuda::allocate_buffer_f32(linear_v_dim, workspace.linear_gated_norm, error_message)) {
     cuda::free_buffer_f32(workspace.hidden_in);
     cuda::free_buffer_f32(workspace.intermediate_a);
     cuda::free_buffer_f32(workspace.intermediate_b);
@@ -640,6 +684,12 @@ bool allocate_forward_workspace_cuda(
     cuda::free_buffer_f32(workspace.full_gate);
     cuda::free_buffer_f32(workspace.full_attn);
     cuda::free_buffer_f32(workspace.full_scores);
+    cuda::free_buffer_f32(workspace.linear_mixed_qkv);
+    cuda::free_buffer_f32(workspace.linear_z);
+    cuda::free_buffer_f32(workspace.linear_b);
+    cuda::free_buffer_f32(workspace.linear_a);
+    cuda::free_buffer_f32(workspace.linear_conv_out);
+    cuda::free_buffer_f32(workspace.linear_gated_norm);
     return false;
   }
 
@@ -661,6 +711,12 @@ void release_forward_workspace_cuda(CudaForwardWorkspace & workspace) {
   cuda::free_buffer_f32(workspace.full_gate);
   cuda::free_buffer_f32(workspace.full_attn);
   cuda::free_buffer_f32(workspace.full_scores);
+  cuda::free_buffer_f32(workspace.linear_mixed_qkv);
+  cuda::free_buffer_f32(workspace.linear_z);
+  cuda::free_buffer_f32(workspace.linear_b);
+  cuda::free_buffer_f32(workspace.linear_a);
+  cuda::free_buffer_f32(workspace.linear_conv_out);
+  cuda::free_buffer_f32(workspace.linear_gated_norm);
   workspace.has_device_buffers = false;
 }
 
@@ -677,6 +733,49 @@ bool run_linear_attention_step(
   std::vector<float> z_vec;
   std::vector<float> b_vec;
   std::vector<float> a_vec;
+  const bool use_cuda_linear_kernel =
+    use_cuda && cuda_workspace != nullptr && cuda_workspace->has_device_buffers && state.has_device_state &&
+    layer.linear.has_device_params && layer.linear.in_proj_qkv.has_device_matrix && layer.linear.in_proj_z.has_device_matrix &&
+    layer.linear.in_proj_b.has_device_matrix && layer.linear.in_proj_a.has_device_matrix && layer.linear.conv1d.has_device_matrix &&
+    layer.linear.out_proj.has_device_matrix;
+  if (use_cuda_linear_kernel) {
+    if (!cuda::upload_to_buffer_f32(x.data(), x.size(), cuda_workspace->hidden_in, 0, error_message) ||
+        !cuda::run_matvec_f32_device(layer.linear.in_proj_qkv.device_matrix, cuda_workspace->hidden_in, cuda_workspace->linear_mixed_qkv, error_message) ||
+        !cuda::run_matvec_f32_device(layer.linear.in_proj_z.device_matrix, cuda_workspace->hidden_in, cuda_workspace->linear_z, error_message) ||
+        !cuda::run_matvec_f32_device(layer.linear.in_proj_b.device_matrix, cuda_workspace->hidden_in, cuda_workspace->linear_b, error_message) ||
+        !cuda::run_matvec_f32_device(layer.linear.in_proj_a.device_matrix, cuda_workspace->hidden_in, cuda_workspace->linear_a, error_message) ||
+        !cuda::run_linear_attention_decode(
+          cuda_workspace->linear_mixed_qkv,
+          cuda_workspace->linear_z,
+          cuda_workspace->linear_b,
+          cuda_workspace->linear_a,
+          layer.linear.conv1d.device_matrix,
+          layer.linear.norm_device,
+          layer.linear.dt_bias_device,
+          layer.linear.ssm_a_device,
+          dims.linear_kernel,
+          dims.linear_num_k_heads,
+          dims.linear_num_v_heads,
+          dims.linear_head_k_dim,
+          dims.linear_head_v_dim,
+          dims.rms_eps,
+          state.conv_state_device,
+          state.recurrent_state_device,
+          cuda_workspace->linear_conv_out,
+          cuda_workspace->linear_gated_norm,
+          error_message) ||
+        !cuda::run_matvec_f32_device(layer.linear.out_proj.device_matrix, cuda_workspace->linear_gated_norm, cuda_workspace->hidden_out, error_message) ||
+        !cuda::download_from_buffer_f32(
+          cuda_workspace->hidden_out,
+          static_cast<std::size_t>(dims.hidden),
+          0,
+          out,
+          error_message)) {
+      return false;
+    }
+    return true;
+  }
+
   const bool use_cuda_projection_batch =
     use_cuda && cuda_workspace != nullptr && cuda_workspace->has_device_buffers;
   if (use_cuda_projection_batch) {
@@ -1534,6 +1633,15 @@ bool run_reference_qwen35_inference(
       static_cast<std::size_t>(dims.linear_num_v_heads) * static_cast<std::size_t>(dims.linear_head_v_dim) *
       static_cast<std::size_t>(dims.linear_head_v_dim),
       0.0f);
+    if (options.use_cuda) {
+      if (!cuda::allocate_buffer_f32(ls.conv_state.size(), ls.conv_state_device, error_message) ||
+          !cuda::allocate_buffer_f32(ls.recurrent_state.size(), ls.recurrent_state_device, error_message)) {
+        release_model_state_cuda(state);
+        release_model_weights_cuda(weights);
+        return false;
+      }
+      ls.has_device_state = true;
+    }
   }
 
   CudaForwardWorkspace cuda_forward_workspace;
