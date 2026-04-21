@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <numeric>
@@ -111,7 +112,10 @@ struct FullAttentionState {
   std::vector<float> v_cache;
   cuda::CudaDeviceBufferF32 k_cache_device;
   cuda::CudaDeviceBufferF32 v_cache_device;
+  cuda::CudaDeviceBufferBF16 k_cache_bf16_device;
+  cuda::CudaDeviceBufferBF16 v_cache_bf16_device;
   bool has_device_state = false;
+  bool has_device_state_bf16 = false;
 };
 
 struct LinearAttentionState {
@@ -129,14 +133,22 @@ struct ModelState {
 
 struct CudaForwardWorkspace {
   cuda::CudaDeviceBufferF32 hidden_in;
+  cuda::CudaDeviceBufferBF16 hidden_in_bf16;
   cuda::CudaDeviceBufferF32 intermediate_a;
+  cuda::CudaDeviceBufferBF16 intermediate_a_bf16;
   cuda::CudaDeviceBufferF32 intermediate_b;
+  cuda::CudaDeviceBufferBF16 intermediate_b_bf16;
   cuda::CudaDeviceBufferF32 intermediate_hidden;
+  cuda::CudaDeviceBufferBF16 intermediate_hidden_bf16;
   cuda::CudaDeviceBufferF32 hidden_out;
+  cuda::CudaDeviceBufferBF16 hidden_out_bf16;
   cuda::CudaDeviceBufferF32 projection_out;
+  cuda::CudaDeviceBufferBF16 projection_out_bf16;
   cuda::CudaDeviceBufferF32 full_q;
+  cuda::CudaDeviceBufferBF16 full_q_bf16;
   cuda::CudaDeviceBufferF32 full_gate;
   cuda::CudaDeviceBufferF32 full_attn;
+  cuda::CudaDeviceBufferBF16 full_attn_bf16;
   cuda::CudaDeviceBufferF32 full_scores;
   cuda::CudaDeviceBufferF32 linear_mixed_qkv;
   cuda::CudaDeviceBufferF32 linear_z;
@@ -803,7 +815,10 @@ void release_model_state_cuda(ModelState & state) {
   for (auto & fs : state.full_states) {
     cuda::free_buffer_f32(fs.k_cache_device);
     cuda::free_buffer_f32(fs.v_cache_device);
+    cuda::free_buffer_bf16(fs.k_cache_bf16_device);
+    cuda::free_buffer_bf16(fs.v_cache_bf16_device);
     fs.has_device_state = false;
+    fs.has_device_state_bf16 = false;
   }
   for (auto & ls : state.linear_states) {
     cuda::free_buffer_f32(ls.conv_state_device);
@@ -843,14 +858,22 @@ bool allocate_forward_workspace_cuda(
   const std::size_t linear_v_dim = static_cast<std::size_t>(dims.linear_num_v_heads * dims.linear_head_v_dim);
   const std::size_t linear_conv_channels = linear_q_dim * 2 + linear_v_dim;
   if (!cuda::allocate_buffer_f32(static_cast<std::size_t>(dims.hidden), workspace.hidden_in, error_message) ||
+      !cuda::allocate_buffer_bf16(static_cast<std::size_t>(dims.hidden), workspace.hidden_in_bf16, error_message) ||
       !cuda::allocate_buffer_f32(static_cast<std::size_t>(dims.intermediate), workspace.intermediate_a, error_message) ||
+      !cuda::allocate_buffer_bf16(static_cast<std::size_t>(dims.intermediate), workspace.intermediate_a_bf16, error_message) ||
       !cuda::allocate_buffer_f32(static_cast<std::size_t>(dims.intermediate), workspace.intermediate_b, error_message) ||
+      !cuda::allocate_buffer_bf16(static_cast<std::size_t>(dims.intermediate), workspace.intermediate_b_bf16, error_message) ||
       !cuda::allocate_buffer_f32(static_cast<std::size_t>(dims.intermediate), workspace.intermediate_hidden, error_message) ||
+      !cuda::allocate_buffer_bf16(static_cast<std::size_t>(dims.intermediate), workspace.intermediate_hidden_bf16, error_message) ||
       !cuda::allocate_buffer_f32(static_cast<std::size_t>(dims.hidden), workspace.hidden_out, error_message) ||
+      !cuda::allocate_buffer_bf16(static_cast<std::size_t>(dims.hidden), workspace.hidden_out_bf16, error_message) ||
       !cuda::allocate_buffer_f32(projection_out_count, workspace.projection_out, error_message) ||
+      !cuda::allocate_buffer_bf16(projection_out_count, workspace.projection_out_bf16, error_message) ||
       !cuda::allocate_buffer_f32(full_q_count, workspace.full_q, error_message) ||
+      !cuda::allocate_buffer_bf16(full_q_count, workspace.full_q_bf16, error_message) ||
       !cuda::allocate_buffer_f32(full_q_count, workspace.full_gate, error_message) ||
       !cuda::allocate_buffer_f32(full_q_count, workspace.full_attn, error_message) ||
+      !cuda::allocate_buffer_bf16(full_q_count, workspace.full_attn_bf16, error_message) ||
       !cuda::allocate_buffer_f32(full_scores_count, workspace.full_scores, error_message) ||
       !cuda::allocate_buffer_f32(linear_conv_channels, workspace.linear_mixed_qkv, error_message) ||
       !cuda::allocate_buffer_f32(linear_v_dim, workspace.linear_z, error_message) ||
@@ -863,14 +886,22 @@ bool allocate_forward_workspace_cuda(
       !cuda::allocate_buffer_f32(static_cast<std::size_t>(kCudaSamplingMaxTopK), workspace.topk_values_scratch, error_message) ||
       !cuda::allocate_buffer_f32(static_cast<std::size_t>(kCudaSamplingMaxTopK), workspace.topk_indices_scratch, error_message)) {
     cuda::free_buffer_f32(workspace.hidden_in);
+    cuda::free_buffer_bf16(workspace.hidden_in_bf16);
     cuda::free_buffer_f32(workspace.intermediate_a);
+    cuda::free_buffer_bf16(workspace.intermediate_a_bf16);
     cuda::free_buffer_f32(workspace.intermediate_b);
+    cuda::free_buffer_bf16(workspace.intermediate_b_bf16);
     cuda::free_buffer_f32(workspace.intermediate_hidden);
+    cuda::free_buffer_bf16(workspace.intermediate_hidden_bf16);
     cuda::free_buffer_f32(workspace.hidden_out);
+    cuda::free_buffer_bf16(workspace.hidden_out_bf16);
     cuda::free_buffer_f32(workspace.projection_out);
+    cuda::free_buffer_bf16(workspace.projection_out_bf16);
     cuda::free_buffer_f32(workspace.full_q);
+    cuda::free_buffer_bf16(workspace.full_q_bf16);
     cuda::free_buffer_f32(workspace.full_gate);
     cuda::free_buffer_f32(workspace.full_attn);
+    cuda::free_buffer_bf16(workspace.full_attn_bf16);
     cuda::free_buffer_f32(workspace.full_scores);
     cuda::free_buffer_f32(workspace.linear_mixed_qkv);
     cuda::free_buffer_f32(workspace.linear_z);
@@ -907,14 +938,22 @@ void release_forward_workspace_cuda(CudaForwardWorkspace & workspace) {
     return;
   }
   cuda::free_buffer_f32(workspace.hidden_in);
+  cuda::free_buffer_bf16(workspace.hidden_in_bf16);
   cuda::free_buffer_f32(workspace.intermediate_a);
+  cuda::free_buffer_bf16(workspace.intermediate_a_bf16);
   cuda::free_buffer_f32(workspace.intermediate_b);
+  cuda::free_buffer_bf16(workspace.intermediate_b_bf16);
   cuda::free_buffer_f32(workspace.intermediate_hidden);
+  cuda::free_buffer_bf16(workspace.intermediate_hidden_bf16);
   cuda::free_buffer_f32(workspace.hidden_out);
+  cuda::free_buffer_bf16(workspace.hidden_out_bf16);
   cuda::free_buffer_f32(workspace.projection_out);
+  cuda::free_buffer_bf16(workspace.projection_out_bf16);
   cuda::free_buffer_f32(workspace.full_q);
+  cuda::free_buffer_bf16(workspace.full_q_bf16);
   cuda::free_buffer_f32(workspace.full_gate);
   cuda::free_buffer_f32(workspace.full_attn);
+  cuda::free_buffer_bf16(workspace.full_attn_bf16);
   cuda::free_buffer_f32(workspace.full_scores);
   cuda::free_buffer_f32(workspace.linear_mixed_qkv);
   cuda::free_buffer_f32(workspace.linear_z);
@@ -951,6 +990,19 @@ cuda::CudaDeviceBufferF32 buffer_slice_f32(
     return out;
   }
   out.data = static_cast<float *>(buffer.data) + offset;
+  out.count = count;
+  return out;
+}
+
+cuda::CudaDeviceBufferBF16 buffer_slice_bf16(
+  const cuda::CudaDeviceBufferBF16 & buffer,
+  const std::size_t offset,
+  const std::size_t count) {
+  cuda::CudaDeviceBufferBF16 out;
+  if (buffer.data == nullptr || offset > buffer.count || count > (buffer.count - offset)) {
+    return out;
+  }
+  out.data = static_cast<std::uint16_t *>(buffer.data) + offset;
   out.count = count;
   return out;
 }
@@ -1076,10 +1128,12 @@ bool run_full_attention_step_cuda_device(
   CudaForwardWorkspace & workspace,
   cuda::CudaDeviceBufferF32 & out_hidden,
   std::string & error_message) {
+  const bool use_bf16_cache = state.has_device_state_bf16;
+  const bool use_f32_cache = state.has_device_state;
   const bool has_packed_qkv = layer.full.has_device_qkv_proj && layer.full.qkv_proj_device.data != nullptr;
   const bool has_legacy_qkv =
     layer.full.has_device_kv_proj && layer.full.q_proj.has_device_matrix && layer.full.kv_proj_device.data != nullptr;
-  if (!state.has_device_state || !layer.full.has_device_norm || !layer.full.o_proj.has_device_matrix ||
+  if ((!use_f32_cache && !use_bf16_cache) || !layer.full.has_device_norm || !layer.full.o_proj.has_device_matrix ||
       (!has_packed_qkv && !has_legacy_qkv)) {
     error_message = "Full-attention CUDA device path is not fully initialized.";
     return false;
@@ -1091,35 +1145,218 @@ bool run_full_attention_step_cuda_device(
   const std::size_t qkv_packed_count = q_packed_count + kv_packed_count;
   const std::size_t cache_offset = static_cast<std::size_t>(position) * kv_count;
   const std::size_t required_projection_count = has_packed_qkv ? qkv_packed_count : kv_packed_count;
-  if ((!has_packed_qkv && workspace.logits.count < q_packed_count) || workspace.projection_out.count < required_projection_count ||
+  const bool bf16_matrix_ready =
+    (has_packed_qkv && layer.full.qkv_proj_device.data_bf16 != nullptr) ||
+    (has_legacy_qkv && layer.full.kv_proj_device.data_bf16 != nullptr);
+  const bool use_bf16_projection =
+    use_bf16_cache && bf16_matrix_ready && workspace.projection_out_bf16.data != nullptr &&
+    workspace.projection_out_bf16.count >= required_projection_count;
+
+  if ((!has_packed_qkv && workspace.logits.count < q_packed_count) ||
+      (!use_bf16_projection && workspace.projection_out.count < required_projection_count) ||
       workspace.full_q.count < static_cast<std::size_t>(dims.n_heads * dims.head_dim) ||
       workspace.full_gate.count < static_cast<std::size_t>(dims.n_heads * dims.head_dim) ||
-      workspace.full_attn.count < static_cast<std::size_t>(dims.n_heads * dims.head_dim)) {
+      workspace.full_attn.count < static_cast<std::size_t>(dims.n_heads * dims.head_dim) ||
+      (use_bf16_cache && workspace.full_attn_bf16.count < kv_count)) {
     error_message = "CUDA forward workspace is too small for full-attention device step.";
     return false;
   }
 
-  const cuda::CudaDeviceBufferF32 q_gate_packed = has_packed_qkv
+  const std::size_t kv_offset = has_packed_qkv ? q_packed_count : 0;
+  const cuda::CudaDeviceBufferF32 q_gate_packed_f32 = has_packed_qkv
     ? buffer_slice_f32(workspace.projection_out, 0, q_packed_count)
     : workspace.logits;
-  const std::size_t kv_offset = has_packed_qkv ? q_packed_count : 0;
-  const cuda::CudaDeviceBufferF32 k_raw = buffer_slice_f32(workspace.projection_out, kv_offset, kv_count);
-  const cuda::CudaDeviceBufferF32 v_raw = buffer_slice_f32(workspace.projection_out, kv_offset + kv_count, kv_count);
-  if (q_gate_packed.data == nullptr || k_raw.data == nullptr || v_raw.data == nullptr) {
-    error_message = "Failed to create packed KV projection slices.";
-    return false;
-  }
+  const cuda::CudaDeviceBufferBF16 q_gate_packed_bf16 = has_packed_qkv
+    ? buffer_slice_bf16(workspace.projection_out_bf16, 0, q_packed_count)
+    : cuda::CudaDeviceBufferBF16{};
+  const cuda::CudaDeviceBufferF32 k_raw_f32 = buffer_slice_f32(workspace.projection_out, kv_offset, kv_count);
+  const cuda::CudaDeviceBufferF32 v_raw_f32 = buffer_slice_f32(workspace.projection_out, kv_offset + kv_count, kv_count);
+  const cuda::CudaDeviceBufferBF16 k_raw_bf16 = buffer_slice_bf16(workspace.projection_out_bf16, kv_offset, kv_count);
+  const cuda::CudaDeviceBufferBF16 v_raw_bf16 = buffer_slice_bf16(workspace.projection_out_bf16, kv_offset + kv_count, kv_count);
 
   const auto run_qkv_projections = [&](std::string & run_error) -> bool {
     if (has_packed_qkv) {
+      if (use_bf16_projection) {
+        return cuda::run_matvec_bf16_device_output_bf16(layer.full.qkv_proj_device, x_in, workspace.projection_out_bf16, run_error);
+      }
       return cuda::run_matvec_f32_device(layer.full.qkv_proj_device, x_in, workspace.projection_out, run_error);
+    }
+    if (use_bf16_projection) {
+      return cuda::run_matvec_f32_device(layer.full.q_proj.device_matrix, x_in, workspace.logits, run_error) &&
+             cuda::run_matvec_bf16_device_output_bf16(layer.full.kv_proj_device, x_in, workspace.projection_out_bf16, run_error);
     }
     return cuda::run_matvec_f32_device(layer.full.q_proj.device_matrix, x_in, workspace.logits, run_error) &&
            cuda::run_matvec_f32_device(layer.full.kv_proj_device, x_in, workspace.projection_out, run_error);
   };
 
+  const auto split_q_gate = [&](std::string & run_error) -> bool {
+    if (has_packed_qkv && use_bf16_projection) {
+      if (q_gate_packed_bf16.data == nullptr) {
+        run_error = "Failed to create packed BF16 Q/G projection slice.";
+        return false;
+      }
+      return cuda::run_split_q_gate_bf16_to_f32(
+        q_gate_packed_bf16,
+        dims.n_heads,
+        dims.head_dim,
+        workspace.full_q,
+        workspace.full_gate,
+        run_error);
+    }
+    if (q_gate_packed_f32.data == nullptr) {
+      run_error = "Failed to create packed Q/G projection slice.";
+      return false;
+    }
+    return cuda::run_split_q_gate_f32(
+      q_gate_packed_f32,
+      dims.n_heads,
+      dims.head_dim,
+      workspace.full_q,
+      workspace.full_gate,
+      run_error);
+  };
+
+  const auto normalize_and_cache_kv = [&](std::string & run_error) -> bool {
+    if (use_bf16_cache) {
+      if (use_bf16_projection) {
+        if (k_raw_bf16.data == nullptr || v_raw_bf16.data == nullptr) {
+          run_error = "Failed to create packed BF16 KV projection slices.";
+          return false;
+        }
+        return cuda::run_rms_norm_per_head_bf16(
+                 k_raw_bf16,
+                 layer.full.k_norm_device,
+                 dims.n_kv_heads,
+                 dims.head_dim,
+                 dims.rms_eps,
+                 workspace.full_attn_bf16,
+                 run_error) &&
+               cuda::run_apply_rope_inplace_bf16(
+                 workspace.full_attn_bf16,
+                 dims.n_kv_heads,
+                 dims.head_dim,
+                 dims.rope_dim,
+                 position,
+                 dims.rope_theta,
+                 run_error) &&
+               cuda::copy_buffer_bf16(
+                 workspace.full_attn_bf16,
+                 kv_count,
+                 0,
+                 state.k_cache_bf16_device,
+                 cache_offset,
+                 run_error) &&
+               cuda::copy_buffer_bf16(
+                 v_raw_bf16,
+                 kv_count,
+                 0,
+                 state.v_cache_bf16_device,
+                 cache_offset,
+                 run_error);
+      }
+      if (k_raw_f32.data == nullptr || v_raw_f32.data == nullptr) {
+        run_error = "Failed to create packed KV projection slices.";
+        return false;
+      }
+      return cuda::run_rms_norm_per_head_f32(
+               k_raw_f32,
+               layer.full.k_norm_device,
+               dims.n_kv_heads,
+               dims.head_dim,
+               dims.rms_eps,
+               workspace.full_attn,
+               run_error) &&
+             cuda::run_apply_rope_inplace_f32(
+               workspace.full_attn,
+               dims.n_kv_heads,
+               dims.head_dim,
+               dims.rope_dim,
+               position,
+               dims.rope_theta,
+               run_error) &&
+             cuda::copy_buffer_f32_to_bf16(
+               workspace.full_attn,
+               kv_count,
+               0,
+               state.k_cache_bf16_device,
+               cache_offset,
+               run_error) &&
+             cuda::copy_buffer_f32_to_bf16(
+               v_raw_f32,
+               kv_count,
+               0,
+               state.v_cache_bf16_device,
+               cache_offset,
+               run_error);
+    }
+
+    if (k_raw_f32.data == nullptr || v_raw_f32.data == nullptr) {
+      run_error = "Failed to create packed KV projection slices.";
+      return false;
+    }
+    return cuda::run_rms_norm_per_head_f32(
+             k_raw_f32,
+             layer.full.k_norm_device,
+             dims.n_kv_heads,
+             dims.head_dim,
+             dims.rms_eps,
+             workspace.full_attn,
+             run_error) &&
+           cuda::run_apply_rope_inplace_f32(
+             workspace.full_attn,
+             dims.n_kv_heads,
+             dims.head_dim,
+             dims.rope_dim,
+             position,
+             dims.rope_theta,
+             run_error) &&
+           cuda::copy_buffer_f32(
+             workspace.full_attn,
+             kv_count,
+             0,
+             state.k_cache_device,
+             cache_offset,
+             run_error) &&
+           cuda::copy_buffer_f32(
+             v_raw_f32,
+             kv_count,
+             0,
+             state.v_cache_device,
+             cache_offset,
+             run_error);
+  };
+
+  const auto run_attention_decode = [&](std::string & run_error) -> bool {
+    if (use_bf16_cache) {
+      return cuda::run_full_attention_decode_gqa_bf16_cache(
+        workspace.full_q,
+        workspace.full_gate,
+        state.k_cache_bf16_device,
+        state.v_cache_bf16_device,
+        dims.n_heads,
+        dims.n_kv_heads,
+        dims.head_dim,
+        position + 1,
+        workspace.full_attn,
+        workspace.full_scores,
+        run_error);
+    }
+    return cuda::run_full_attention_decode_gqa(
+      workspace.full_q,
+      workspace.full_gate,
+      state.k_cache_device,
+      state.v_cache_device,
+      dims.n_heads,
+      dims.n_kv_heads,
+      dims.head_dim,
+      position + 1,
+      workspace.full_attn,
+      workspace.full_scores,
+      run_error);
+  };
+
   return run_qkv_projections(error_message) &&
-         cuda::run_split_q_gate_f32(q_gate_packed, dims.n_heads, dims.head_dim, workspace.full_q, workspace.full_gate, error_message) &&
+         split_q_gate(error_message) &&
          cuda::run_rms_norm_per_head_f32(
            workspace.full_q,
            layer.full.q_norm_device,
@@ -1128,14 +1365,6 @@ bool run_full_attention_step_cuda_device(
            dims.rms_eps,
            workspace.full_q,
            error_message) &&
-         cuda::run_rms_norm_per_head_f32(
-           k_raw,
-           layer.full.k_norm_device,
-           dims.n_kv_heads,
-           dims.head_dim,
-           dims.rms_eps,
-           workspace.full_attn,
-           error_message) &&
          cuda::run_apply_rope_inplace_f32(
            workspace.full_q,
            dims.n_heads,
@@ -1144,28 +1373,8 @@ bool run_full_attention_step_cuda_device(
            position,
            dims.rope_theta,
            error_message) &&
-         cuda::run_apply_rope_inplace_f32(
-           workspace.full_attn,
-           dims.n_kv_heads,
-           dims.head_dim,
-           dims.rope_dim,
-           position,
-           dims.rope_theta,
-           error_message) &&
-         cuda::copy_buffer_f32(workspace.full_attn, kv_count, 0, state.k_cache_device, cache_offset, error_message) &&
-         cuda::copy_buffer_f32(v_raw, kv_count, 0, state.v_cache_device, cache_offset, error_message) &&
-         cuda::run_full_attention_decode_gqa(
-           workspace.full_q,
-           workspace.full_gate,
-           state.k_cache_device,
-           state.v_cache_device,
-           dims.n_heads,
-           dims.n_kv_heads,
-           dims.head_dim,
-           position + 1,
-           workspace.full_attn,
-           workspace.full_scores,
-           error_message) &&
+         normalize_and_cache_kv(error_message) &&
+         run_attention_decode(error_message) &&
          cuda::run_matvec_f32_device(layer.full.o_proj.device_matrix, workspace.full_attn, out_hidden, error_message);
 }
 
@@ -1813,6 +2022,7 @@ bool run_forward_single_token_cuda_device_core(
   const RuntimeDims & dims,
   ModelState & state,
   const int position,
+  const bool use_bf16_residual_mlp,
   const bool use_cuda_gpu_sampling,
   const bool profile_cuda_sync,
   CudaForwardWorkspace & workspace,
@@ -1831,14 +2041,26 @@ bool run_forward_single_token_cuda_device_core(
       return false;
     }
 
-    if (!cuda::run_rms_norm_f32(
-          workspace.hidden_in,
-          layer.input_layernorm_device,
-          hidden_count,
-          dims.rms_eps,
-          workspace.full_q,
-          error_message)) {
-      return false;
+    if (use_bf16_residual_mlp) {
+      if (!cuda::run_rms_norm_bf16_to_f32(
+            workspace.hidden_in_bf16,
+            layer.input_layernorm_device,
+            hidden_count,
+            dims.rms_eps,
+            workspace.full_q,
+            error_message)) {
+        return false;
+      }
+    } else {
+      if (!cuda::run_rms_norm_f32(
+            workspace.hidden_in,
+            layer.input_layernorm_device,
+            hidden_count,
+            dims.rms_eps,
+            workspace.full_q,
+            error_message)) {
+        return false;
+      }
     }
 
     if (!maybe_sync_cuda_for_stage_timing(true, profile_cuda_sync, error_message)) {
@@ -1883,46 +2105,123 @@ bool run_forward_single_token_cuda_device_core(
       return false;
     }
     const auto mlp_start = std::chrono::steady_clock::now();
-    if (!cuda::run_add_f32(workspace.hidden_in, workspace.hidden_out, hidden_count, workspace.full_attn, error_message) ||
-        !cuda::run_rms_norm_f32(
-          workspace.full_attn,
-          layer.post_attention_layernorm_device,
-          hidden_count,
-          dims.rms_eps,
-          workspace.full_q,
-          error_message)) {
-      return false;
+    if (use_bf16_residual_mlp) {
+      if (!cuda::copy_buffer_f32_to_bf16(
+            workspace.hidden_out,
+            hidden_count,
+            0,
+            workspace.hidden_out_bf16,
+            0,
+            error_message) ||
+          !cuda::run_add_bf16(
+            workspace.hidden_in_bf16,
+            workspace.hidden_out_bf16,
+            hidden_count,
+            workspace.full_attn_bf16,
+            error_message) ||
+          !cuda::run_rms_norm_bf16(
+            workspace.full_attn_bf16,
+            layer.post_attention_layernorm_device,
+            hidden_count,
+            dims.rms_eps,
+            workspace.full_q_bf16,
+            error_message)) {
+        return false;
+      }
+    } else {
+      if (!cuda::run_add_f32(workspace.hidden_in, workspace.hidden_out, hidden_count, workspace.full_attn, error_message) ||
+          !cuda::run_rms_norm_f32(
+            workspace.full_attn,
+            layer.post_attention_layernorm_device,
+            hidden_count,
+            dims.rms_eps,
+            workspace.full_q,
+            error_message)) {
+        return false;
+      }
     }
 
     const auto run_mlp_direct = [&](std::string & run_error) -> bool {
       bool mlp_ok = false;
-      if (layer.has_device_mlp_gate_up && layer.mlp_gate_up_device.data != nullptr) {
-        const std::size_t packed_count = intermediate_count * 2;
-        if (workspace.projection_out.count < packed_count) {
-          run_error = "CUDA workspace projection buffer is too small for packed MLP projections.";
-          return false;
+      if (use_bf16_residual_mlp) {
+        if (layer.has_device_mlp_gate_up && layer.mlp_gate_up_device.data != nullptr) {
+          const std::size_t packed_count = intermediate_count * 2;
+          if (workspace.projection_out_bf16.count < packed_count) {
+            run_error = "CUDA BF16 workspace projection buffer is too small for packed MLP projections.";
+            return false;
+          }
+          const cuda::CudaDeviceBufferBF16 gate = buffer_slice_bf16(workspace.projection_out_bf16, 0, intermediate_count);
+          const cuda::CudaDeviceBufferBF16 up =
+            buffer_slice_bf16(workspace.projection_out_bf16, intermediate_count, intermediate_count);
+          if (gate.data == nullptr || up.data == nullptr) {
+            run_error = "Failed to create packed BF16 MLP projection slices.";
+            return false;
+          }
+          mlp_ok = cuda::run_matvec_bf16_device_input_bf16_output_bf16(
+                     layer.mlp_gate_up_device,
+                     workspace.full_q_bf16,
+                     workspace.projection_out_bf16,
+                     run_error) &&
+                   cuda::run_silu_mul_bf16(gate, up, intermediate_count, workspace.intermediate_hidden_bf16, run_error);
+        } else {
+          mlp_ok = cuda::run_matvec_bf16_device_input_bf16_output_bf16(
+                     layer.mlp_gate.device_matrix,
+                     workspace.full_q_bf16,
+                     workspace.intermediate_a_bf16,
+                     run_error) &&
+                   cuda::run_matvec_bf16_device_input_bf16_output_bf16(
+                     layer.mlp_up.device_matrix,
+                     workspace.full_q_bf16,
+                     workspace.intermediate_b_bf16,
+                     run_error) &&
+                   cuda::run_silu_mul_bf16(
+                     workspace.intermediate_a_bf16,
+                     workspace.intermediate_b_bf16,
+                     intermediate_count,
+                     workspace.intermediate_hidden_bf16,
+                     run_error);
         }
-        const cuda::CudaDeviceBufferF32 gate = buffer_slice_f32(workspace.projection_out, 0, intermediate_count);
-        const cuda::CudaDeviceBufferF32 up = buffer_slice_f32(workspace.projection_out, intermediate_count, intermediate_count);
-        if (gate.data == nullptr || up.data == nullptr) {
-          run_error = "Failed to create packed MLP projection slices.";
-          return false;
-        }
-        mlp_ok = cuda::run_matvec_f32_device(layer.mlp_gate_up_device, workspace.full_q, workspace.projection_out, run_error) &&
-                 cuda::run_silu_mul_f32(gate, up, intermediate_count, workspace.intermediate_hidden, run_error);
+        return mlp_ok &&
+               cuda::run_matvec_bf16_device_input_bf16_output_bf16(
+                 layer.mlp_down.device_matrix,
+                 workspace.intermediate_hidden_bf16,
+                 workspace.hidden_out_bf16,
+                 run_error) &&
+               cuda::run_add_bf16(
+                 workspace.full_attn_bf16,
+                 workspace.hidden_out_bf16,
+                 hidden_count,
+                 workspace.hidden_in_bf16,
+                 run_error);
       } else {
-        mlp_ok = cuda::run_matvec_f32_device(layer.mlp_gate.device_matrix, workspace.full_q, workspace.intermediate_a, run_error) &&
-                 cuda::run_matvec_f32_device(layer.mlp_up.device_matrix, workspace.full_q, workspace.intermediate_b, run_error) &&
-                 cuda::run_silu_mul_f32(
-                   workspace.intermediate_a,
-                   workspace.intermediate_b,
-                   intermediate_count,
-                   workspace.intermediate_hidden,
-                   run_error);
+        if (layer.has_device_mlp_gate_up && layer.mlp_gate_up_device.data != nullptr) {
+          const std::size_t packed_count = intermediate_count * 2;
+          if (workspace.projection_out.count < packed_count) {
+            run_error = "CUDA workspace projection buffer is too small for packed MLP projections.";
+            return false;
+          }
+          const cuda::CudaDeviceBufferF32 gate = buffer_slice_f32(workspace.projection_out, 0, intermediate_count);
+          const cuda::CudaDeviceBufferF32 up = buffer_slice_f32(workspace.projection_out, intermediate_count, intermediate_count);
+          if (gate.data == nullptr || up.data == nullptr) {
+            run_error = "Failed to create packed MLP projection slices.";
+            return false;
+          }
+          mlp_ok = cuda::run_matvec_f32_device(layer.mlp_gate_up_device, workspace.full_q, workspace.projection_out, run_error) &&
+                   cuda::run_silu_mul_f32(gate, up, intermediate_count, workspace.intermediate_hidden, run_error);
+        } else {
+          mlp_ok = cuda::run_matvec_f32_device(layer.mlp_gate.device_matrix, workspace.full_q, workspace.intermediate_a, run_error) &&
+                   cuda::run_matvec_f32_device(layer.mlp_up.device_matrix, workspace.full_q, workspace.intermediate_b, run_error) &&
+                   cuda::run_silu_mul_f32(
+                     workspace.intermediate_a,
+                     workspace.intermediate_b,
+                     intermediate_count,
+                     workspace.intermediate_hidden,
+                     run_error);
+        }
+        return mlp_ok &&
+               cuda::run_matvec_f32_device(layer.mlp_down.device_matrix, workspace.intermediate_hidden, workspace.hidden_out, run_error) &&
+               cuda::run_add_f32(workspace.full_attn, workspace.hidden_out, hidden_count, workspace.hidden_in, run_error);
       }
-      return mlp_ok &&
-             cuda::run_matvec_f32_device(layer.mlp_down.device_matrix, workspace.intermediate_hidden, workspace.hidden_out, run_error) &&
-             cuda::run_add_f32(workspace.full_attn, workspace.hidden_out, hidden_count, workspace.hidden_in, run_error);
     };
 
     bool mlp_done = false;
@@ -1989,14 +2288,26 @@ bool run_forward_single_token_cuda_device_core(
   }
   const auto logits_start = std::chrono::steady_clock::now();
   bool ok = false;
-  if (!cuda::run_rms_norm_f32(
-        workspace.hidden_in,
-        weights.final_norm_device,
-        hidden_count,
-        dims.rms_eps,
-        workspace.hidden_out,
-        error_message)) {
-    return false;
+  if (use_bf16_residual_mlp) {
+    if (!cuda::run_rms_norm_bf16_to_f32(
+          workspace.hidden_in_bf16,
+          weights.final_norm_device,
+          hidden_count,
+          dims.rms_eps,
+          workspace.hidden_out,
+          error_message)) {
+      return false;
+    }
+  } else {
+    if (!cuda::run_rms_norm_f32(
+          workspace.hidden_in,
+          weights.final_norm_device,
+          hidden_count,
+          dims.rms_eps,
+          workspace.hidden_out,
+          error_message)) {
+      return false;
+    }
   }
 
   if (use_cuda_gpu_sampling) {
@@ -2023,6 +2334,7 @@ bool run_forward_single_token_cuda_device(
   ModelState & state,
   const int token_id,
   const int position,
+  const bool use_bf16_residual_mlp,
   const bool use_cuda_gpu_sampling,
   const bool profile_cuda_sync,
   CudaForwardWorkspace & workspace,
@@ -2038,6 +2350,11 @@ bool run_forward_single_token_cuda_device(
     error_message = "Token id out of vocabulary range.";
     return false;
   }
+  if (use_bf16_residual_mlp &&
+      (workspace.hidden_in_bf16.data == nullptr || workspace.hidden_in_bf16.count < static_cast<std::size_t>(dims.hidden))) {
+    error_message = "CUDA BF16 hidden-state workspace is not initialized.";
+    return false;
+  }
 
   if (!maybe_sync_cuda_for_stage_timing(true, profile_cuda_sync, error_message)) {
     return false;
@@ -2046,52 +2363,13 @@ bool run_forward_single_token_cuda_device(
   if (!cuda::gather_matrix_row_f32(weights.embed_tokens.device_matrix, token_id, workspace.hidden_in, error_message)) {
     return false;
   }
-  if (!maybe_sync_cuda_for_stage_timing(true, profile_cuda_sync, error_message)) {
-    return false;
-  }
-  if (profiling != nullptr) {
-    profiling->embedding_ms += elapsed_ms(embedding_start);
-  }
-
-  return run_forward_single_token_cuda_device_core(
-    weights,
-    dims,
-    state,
-    position,
-    use_cuda_gpu_sampling,
-    profile_cuda_sync,
-    workspace,
-    next_logits,
-    profiling,
-    error_message);
-}
-
-bool run_forward_single_token_cuda_device_from_token_buffer(
-  const ModelWeights & weights,
-  const RuntimeDims & dims,
-  ModelState & state,
-  const cuda::CudaDeviceBufferF32 & token_id_device,
-  const int position,
-  const bool use_cuda_gpu_sampling,
-  const bool profile_cuda_sync,
-  CudaForwardWorkspace & workspace,
-  std::vector<float> & next_logits,
-  DecodeProfilingAccumulator * profiling,
-  std::string & error_message) {
-  if (!workspace.has_device_buffers || !workspace.has_gpu_sampling_buffers || !weights.has_device_final_norm ||
-      !weights.embed_tokens.has_device_matrix || weights.embed_tokens.device_matrix.data == nullptr) {
-    error_message = "CUDA forward device path is not fully initialized.";
-    return false;
-  }
-
-  if (!maybe_sync_cuda_for_stage_timing(true, profile_cuda_sync, error_message)) {
-    return false;
-  }
-  const auto embedding_start = std::chrono::steady_clock::now();
-  if (!cuda::gather_matrix_row_f32_from_token_f32(
-        weights.embed_tokens.device_matrix,
-        token_id_device,
+  if (use_bf16_residual_mlp &&
+      !cuda::copy_buffer_f32_to_bf16(
         workspace.hidden_in,
+        static_cast<std::size_t>(dims.hidden),
+        0,
+        workspace.hidden_in_bf16,
+        0,
         error_message)) {
     return false;
   }
@@ -2107,6 +2385,73 @@ bool run_forward_single_token_cuda_device_from_token_buffer(
     dims,
     state,
     position,
+    use_bf16_residual_mlp,
+    use_cuda_gpu_sampling,
+    profile_cuda_sync,
+    workspace,
+    next_logits,
+    profiling,
+    error_message);
+}
+
+bool run_forward_single_token_cuda_device_from_token_buffer(
+  const ModelWeights & weights,
+  const RuntimeDims & dims,
+  ModelState & state,
+  const cuda::CudaDeviceBufferF32 & token_id_device,
+  const int position,
+  const bool use_bf16_residual_mlp,
+  const bool use_cuda_gpu_sampling,
+  const bool profile_cuda_sync,
+  CudaForwardWorkspace & workspace,
+  std::vector<float> & next_logits,
+  DecodeProfilingAccumulator * profiling,
+  std::string & error_message) {
+  if (!workspace.has_device_buffers || !workspace.has_gpu_sampling_buffers || !weights.has_device_final_norm ||
+      !weights.embed_tokens.has_device_matrix || weights.embed_tokens.device_matrix.data == nullptr) {
+    error_message = "CUDA forward device path is not fully initialized.";
+    return false;
+  }
+  if (use_bf16_residual_mlp &&
+      (workspace.hidden_in_bf16.data == nullptr || workspace.hidden_in_bf16.count < static_cast<std::size_t>(dims.hidden))) {
+    error_message = "CUDA BF16 hidden-state workspace is not initialized.";
+    return false;
+  }
+
+  if (!maybe_sync_cuda_for_stage_timing(true, profile_cuda_sync, error_message)) {
+    return false;
+  }
+  const auto embedding_start = std::chrono::steady_clock::now();
+  if (!cuda::gather_matrix_row_f32_from_token_f32(
+        weights.embed_tokens.device_matrix,
+        token_id_device,
+        workspace.hidden_in,
+        error_message)) {
+    return false;
+  }
+  if (use_bf16_residual_mlp &&
+      !cuda::copy_buffer_f32_to_bf16(
+        workspace.hidden_in,
+        static_cast<std::size_t>(dims.hidden),
+        0,
+        workspace.hidden_in_bf16,
+        0,
+        error_message)) {
+    return false;
+  }
+  if (!maybe_sync_cuda_for_stage_timing(true, profile_cuda_sync, error_message)) {
+    return false;
+  }
+  if (profiling != nullptr) {
+    profiling->embedding_ms += elapsed_ms(embedding_start);
+  }
+
+  return run_forward_single_token_cuda_device_core(
+    weights,
+    dims,
+    state,
+    position,
+    use_bf16_residual_mlp,
     use_cuda_gpu_sampling,
     profile_cuda_sync,
     workspace,
@@ -2122,6 +2467,7 @@ bool run_forward_single_token(
   const int token_id,
   const int position,
   const bool use_cuda,
+  const bool use_bf16_residual_mlp,
   const bool profile_cuda_sync,
   std::vector<float> & next_logits,
   const bool use_cuda_gpu_sampling,
@@ -2147,6 +2493,7 @@ bool run_forward_single_token(
       state,
       token_id,
       position,
+      use_bf16_residual_mlp,
       use_cuda_gpu_sampling,
       profile_cuda_sync,
       *cuda_workspace,
@@ -2376,6 +2723,7 @@ bool run_reference_qwen35_inference(
 
   const auto load_start = std::chrono::steady_clock::now();
   const bool use_cuda_matvec_bf16 = options.use_cuda && options.use_cuda_matvec_bf16;
+  const bool use_cuda_kv_cache_bf16 = use_cuda_matvec_bf16;
 
   ModelWeights weights;
   if (!load_model_weights(options.model_dir, dims, profile, weights, error_message)) {
@@ -2413,6 +2761,15 @@ bool run_reference_qwen35_inference(
         return false;
       }
       fs.has_device_state = true;
+      if (use_cuda_kv_cache_bf16) {
+        if (!cuda::allocate_buffer_bf16(fs.k_cache.size(), fs.k_cache_bf16_device, error_message) ||
+            !cuda::allocate_buffer_bf16(fs.v_cache.size(), fs.v_cache_bf16_device, error_message)) {
+          release_model_state_cuda(state);
+          release_model_weights_cuda(weights);
+          return false;
+        }
+        fs.has_device_state_bf16 = true;
+      }
     }
   }
 
@@ -2564,6 +2921,7 @@ bool run_reference_qwen35_inference(
           prompt_token,
           position,
           options.use_cuda,
+          use_cuda_matvec_bf16,
           options.profile_cuda_sync,
           predicted_logits,
           use_cuda_gpu_sampling,
@@ -2638,6 +2996,7 @@ bool run_reference_qwen35_inference(
                 state,
                 sampled_token_device,
                 position,
+                use_cuda_matvec_bf16,
                 true,
                 options.profile_cuda_sync,
                 *cuda_workspace_ptr,
@@ -2739,6 +3098,7 @@ bool run_reference_qwen35_inference(
               current,
               position,
               options.use_cuda,
+              use_cuda_matvec_bf16,
               options.profile_cuda_sync,
               predicted_logits,
               true,
@@ -2812,6 +3172,7 @@ bool run_reference_qwen35_inference(
             current,
             position,
             options.use_cuda,
+            use_cuda_matvec_bf16,
             options.profile_cuda_sync,
             predicted_logits,
             false,

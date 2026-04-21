@@ -23,6 +23,7 @@ constexpr int kSamplingArgmaxBlockSize = 256;
 constexpr int kSamplingArgmaxChunkSize = 2048;
 
 __global__ void f32_to_bf16_kernel(const float * input, __nv_bfloat16 * output, int count);
+__global__ void bf16_to_f32_kernel(const __nv_bfloat16 * input, float * output, int count);
 
 const char * cublas_status_string(const cublasStatus_t status) {
   switch (status) {
@@ -65,6 +66,7 @@ struct MatvecPlan {
   int rows = 0;
   int cols = 0;
   bool use_bf16 = false;
+  bool output_bf16 = false;
   cublasLtMatmulDesc_t op_desc = nullptr;
   cublasLtMatrixLayout_t a_desc = nullptr;
   cublasLtMatrixLayout_t b_desc = nullptr;
@@ -363,9 +365,9 @@ bool ensure_sampling_workspace(const int vocab_size, std::string & error_message
   return true;
 }
 
-MatvecPlan * find_matvec_plan(const int rows, const int cols, const bool use_bf16) {
+MatvecPlan * find_matvec_plan(const int rows, const int cols, const bool use_bf16, const bool output_bf16) {
   for (auto & plan : g_session.matvec_plans) {
-    if (plan.rows == rows && plan.cols == cols && plan.use_bf16 == use_bf16) {
+    if (plan.rows == rows && plan.cols == cols && plan.use_bf16 == use_bf16 && plan.output_bf16 == output_bf16) {
       return &plan;
     }
   }
@@ -377,17 +379,19 @@ bool initialize_matvec_plan(
   const int rows,
   const int cols,
   const bool use_bf16,
+  const bool output_bf16,
   std::string & error_message) {
   plan.rows = rows;
   plan.cols = cols;
   plan.use_bf16 = use_bf16;
+  plan.output_bf16 = output_bf16;
 
   cublasOperation_t trans = CUBLAS_OP_N;
   const cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F;
   const cudaDataType_t scale_type = CUDA_R_32F;
   const cudaDataType_t a_type = use_bf16 ? CUDA_R_16BF : CUDA_R_32F;
   const cudaDataType_t b_type = use_bf16 ? CUDA_R_16BF : CUDA_R_32F;
-  const cudaDataType_t c_type = CUDA_R_32F;
+  const cudaDataType_t c_type = output_bf16 ? CUDA_R_16BF : CUDA_R_32F;
   if (!check_cublas(
         cublasLtMatmulDescCreate(&plan.op_desc, compute_type, scale_type),
         "cublasLtMatmulDescCreate",
@@ -534,10 +538,10 @@ bool run_matvec_f32_device_cublaslt(
     return false;
   }
 
-  MatvecPlan * plan = find_matvec_plan(matrix.rows, matrix.cols, false);
+  MatvecPlan * plan = find_matvec_plan(matrix.rows, matrix.cols, false, false);
   if (plan == nullptr) {
     MatvecPlan new_plan;
-    if (!initialize_matvec_plan(new_plan, matrix.rows, matrix.cols, false, error_message)) {
+    if (!initialize_matvec_plan(new_plan, matrix.rows, matrix.cols, false, false, error_message)) {
       return false;
     }
     g_session.matvec_plans.push_back(std::move(new_plan));
@@ -605,10 +609,10 @@ bool run_matvec_bf16_device_cublaslt(
     return false;
   }
 
-  MatvecPlan * plan = find_matvec_plan(matrix.rows, matrix.cols, true);
+  MatvecPlan * plan = find_matvec_plan(matrix.rows, matrix.cols, true, false);
   if (plan == nullptr) {
     MatvecPlan new_plan;
-    if (!initialize_matvec_plan(new_plan, matrix.rows, matrix.cols, true, error_message)) {
+    if (!initialize_matvec_plan(new_plan, matrix.rows, matrix.cols, true, false, error_message)) {
       return false;
     }
     g_session.matvec_plans.push_back(std::move(new_plan));
@@ -643,6 +647,141 @@ bool run_matvec_bf16_device_cublaslt(
     error_message);
 }
 
+bool run_matvec_bf16_device_cublaslt_to_bf16(
+  const CudaDeviceMatrixF32 & matrix,
+  const CudaDeviceBufferF32 & input,
+  CudaDeviceBufferBF16 & output,
+  std::string & error_message) {
+  if (g_session.cublas_lt == nullptr) {
+    error_message = "cuBLASLt handle is not initialized.";
+    return false;
+  }
+  if (matrix.data_bf16 == nullptr) {
+    error_message = "BF16 shadow matrix is not initialized.";
+    return false;
+  }
+  if (output.data == nullptr || output.count < static_cast<std::size_t>(matrix.rows)) {
+    error_message = "CUDA BF16 output buffer is invalid for matvec.";
+    return false;
+  }
+  if (!ensure_session_workspace_input_bf16(static_cast<std::size_t>(matrix.cols), error_message)) {
+    return false;
+  }
+
+  const cudaStream_t stream = active_stream();
+  if (stream == nullptr) {
+    error_message = "CUDA inference session stream is not initialized.";
+    return false;
+  }
+
+  const int convert_block = 256;
+  const int convert_grid = (matrix.cols + convert_block - 1) / convert_block;
+  f32_to_bf16_kernel<<<convert_grid, convert_block, 0, stream>>>(
+    static_cast<const float *>(input.data),
+    g_session.workspace_input_bf16,
+    matrix.cols);
+  if (!check_cuda(cudaGetLastError(), "f32_to_bf16_kernel", error_message)) {
+    return false;
+  }
+
+  MatvecPlan * plan = find_matvec_plan(matrix.rows, matrix.cols, true, true);
+  if (plan == nullptr) {
+    MatvecPlan new_plan;
+    if (!initialize_matvec_plan(new_plan, matrix.rows, matrix.cols, true, true, error_message)) {
+      return false;
+    }
+    g_session.matvec_plans.push_back(std::move(new_plan));
+    plan = &g_session.matvec_plans.back();
+  }
+  if (!plan->has_algo) {
+    error_message = "cuBLASLt BF16->BF16 matvec plan has no selected algorithm.";
+    return false;
+  }
+
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  return check_cublas(
+    cublasLtMatmul(
+      g_session.cublas_lt,
+      plan->op_desc,
+      &alpha,
+      matrix.data_bf16,
+      plan->a_desc,
+      g_session.workspace_input_bf16,
+      plan->b_desc,
+      &beta,
+      output.data,
+      plan->c_desc,
+      output.data,
+      plan->c_desc,
+      &plan->algo,
+      g_session.cublas_lt_workspace,
+      g_session.cublas_lt_workspace_bytes,
+      stream),
+    "cublasLtMatmul(matvec_bf16_to_bf16)",
+    error_message);
+}
+
+bool run_matvec_bf16_device_cublaslt_bf16_input_to_bf16(
+  const CudaDeviceMatrixF32 & matrix,
+  const CudaDeviceBufferBF16 & input,
+  CudaDeviceBufferBF16 & output,
+  std::string & error_message) {
+  if (g_session.cublas_lt == nullptr) {
+    error_message = "cuBLASLt handle is not initialized.";
+    return false;
+  }
+  if (matrix.data_bf16 == nullptr) {
+    error_message = "BF16 shadow matrix is not initialized.";
+    return false;
+  }
+  if (input.data == nullptr || input.count < static_cast<std::size_t>(matrix.cols)) {
+    error_message = "CUDA BF16 input buffer is invalid for matvec.";
+    return false;
+  }
+  if (output.data == nullptr || output.count < static_cast<std::size_t>(matrix.rows)) {
+    error_message = "CUDA BF16 output buffer is invalid for matvec.";
+    return false;
+  }
+
+  MatvecPlan * plan = find_matvec_plan(matrix.rows, matrix.cols, true, true);
+  if (plan == nullptr) {
+    MatvecPlan new_plan;
+    if (!initialize_matvec_plan(new_plan, matrix.rows, matrix.cols, true, true, error_message)) {
+      return false;
+    }
+    g_session.matvec_plans.push_back(std::move(new_plan));
+    plan = &g_session.matvec_plans.back();
+  }
+  if (!plan->has_algo) {
+    error_message = "cuBLASLt BF16(BF16 input)->BF16 matvec plan has no selected algorithm.";
+    return false;
+  }
+
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  return check_cublas(
+    cublasLtMatmul(
+      g_session.cublas_lt,
+      plan->op_desc,
+      &alpha,
+      matrix.data_bf16,
+      plan->a_desc,
+      input.data,
+      plan->b_desc,
+      &beta,
+      output.data,
+      plan->c_desc,
+      output.data,
+      plan->c_desc,
+      &plan->algo,
+      g_session.cublas_lt_workspace,
+      g_session.cublas_lt_workspace_bytes,
+      active_stream()),
+    "cublasLtMatmul(matvec_bf16_bf16_to_bf16)",
+    error_message);
+}
+
 __global__ void f32_matvec_kernel(
   const float * weights,
   const float * input,
@@ -671,6 +810,17 @@ __global__ void f32_to_bf16_kernel(
     return;
   }
   output[idx] = __float2bfloat16(input[idx]);
+}
+
+__global__ void bf16_to_f32_kernel(
+  const __nv_bfloat16 * input,
+  float * output,
+  const int count) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= count) {
+    return;
+  }
+  output[idx] = __bfloat162float(input[idx]);
 }
 
 __global__ void gather_matrix_row_kernel(
@@ -762,6 +912,22 @@ __global__ void silu_mul_kernel(
   out[idx] = (av * sig) * b[idx];
 }
 
+__global__ void silu_mul_bf16_kernel(
+  const __nv_bfloat16 * a,
+  const __nv_bfloat16 * b,
+  __nv_bfloat16 * out,
+  const std::size_t count) {
+  const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * static_cast<std::size_t>(blockDim.x) +
+                          static_cast<std::size_t>(threadIdx.x);
+  if (idx >= count) {
+    return;
+  }
+  const float av = __bfloat162float(a[idx]);
+  const float bv = __bfloat162float(b[idx]);
+  const float sig = 1.0f / (1.0f + expf(-av));
+  out[idx] = __float2bfloat16((av * sig) * bv);
+}
+
 __global__ void add_kernel(
   const float * a,
   const float * b,
@@ -773,6 +939,19 @@ __global__ void add_kernel(
     return;
   }
   out[idx] = a[idx] + b[idx];
+}
+
+__global__ void add_bf16_kernel(
+  const __nv_bfloat16 * a,
+  const __nv_bfloat16 * b,
+  __nv_bfloat16 * out,
+  const std::size_t count) {
+  const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * static_cast<std::size_t>(blockDim.x) +
+                          static_cast<std::size_t>(threadIdx.x);
+  if (idx >= count) {
+    return;
+  }
+  out[idx] = __float2bfloat16(__bfloat162float(a[idx]) + __bfloat162float(b[idx]));
 }
 
 __global__ void rms_norm_kernel(
@@ -810,6 +989,76 @@ __global__ void rms_norm_kernel(
   }
 }
 
+__global__ void rms_norm_bf16_kernel(
+  const __nv_bfloat16 * input,
+  const float * weight,
+  __nv_bfloat16 * out,
+  const int count,
+  const float eps) {
+  __shared__ float reduction[256];
+  const int tid = threadIdx.x;
+
+  float sum = 0.0f;
+  for (int i = tid; i < count; i += blockDim.x) {
+    const float v = __bfloat162float(input[i]);
+    sum += v * v;
+  }
+  reduction[tid] = sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduction[tid] += reduction[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  __shared__ float inv;
+  if (tid == 0) {
+    inv = rsqrtf((reduction[0] / static_cast<float>(count)) + eps);
+  }
+  __syncthreads();
+
+  for (int i = tid; i < count; i += blockDim.x) {
+    out[i] = __float2bfloat16(__bfloat162float(input[i]) * inv * (1.0f + weight[i]));
+  }
+}
+
+__global__ void rms_norm_bf16_to_f32_kernel(
+  const __nv_bfloat16 * input,
+  const float * weight,
+  float * out,
+  const int count,
+  const float eps) {
+  __shared__ float reduction[256];
+  const int tid = threadIdx.x;
+
+  float sum = 0.0f;
+  for (int i = tid; i < count; i += blockDim.x) {
+    const float v = __bfloat162float(input[i]);
+    sum += v * v;
+  }
+  reduction[tid] = sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduction[tid] += reduction[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  __shared__ float inv;
+  if (tid == 0) {
+    inv = rsqrtf((reduction[0] / static_cast<float>(count)) + eps);
+  }
+  __syncthreads();
+
+  for (int i = tid; i < count; i += blockDim.x) {
+    out[i] = __bfloat162float(input[i]) * inv * (1.0f + weight[i]);
+  }
+}
+
 __global__ void split_q_gate_kernel(
   const float * packed,
   float * out_q,
@@ -826,6 +1075,24 @@ __global__ void split_q_gate_kernel(
   const std::size_t dst = static_cast<std::size_t>(h) * static_cast<std::size_t>(head_dim) + static_cast<std::size_t>(d);
   out_q[dst] = packed[src];
   out_gate[dst] = packed[src + static_cast<std::size_t>(head_dim)];
+}
+
+__global__ void split_q_gate_bf16_to_f32_kernel(
+  const __nv_bfloat16 * packed,
+  float * out_q,
+  float * out_gate,
+  const int n_heads,
+  const int head_dim) {
+  const int h = blockIdx.x;
+  const int d = threadIdx.x;
+  if (h >= n_heads || d >= head_dim) {
+    return;
+  }
+  const int q_span = head_dim * 2;
+  const std::size_t src = static_cast<std::size_t>(h) * static_cast<std::size_t>(q_span) + static_cast<std::size_t>(d);
+  const std::size_t dst = static_cast<std::size_t>(h) * static_cast<std::size_t>(head_dim) + static_cast<std::size_t>(d);
+  out_q[dst] = __bfloat162float(packed[src]);
+  out_gate[dst] = __bfloat162float(packed[src + static_cast<std::size_t>(head_dim)]);
 }
 
 __global__ void rms_norm_per_head_kernel(
@@ -871,6 +1138,50 @@ __global__ void rms_norm_per_head_kernel(
   }
 }
 
+__global__ void rms_norm_per_head_bf16_kernel(
+  const __nv_bfloat16 * input,
+  const float * weight,
+  __nv_bfloat16 * out,
+  const int n_heads,
+  const int head_dim,
+  const float eps) {
+  __shared__ float reduction[256];
+  const int head = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (head >= n_heads) {
+    return;
+  }
+
+  const __nv_bfloat16 * in_ptr = input + static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim);
+  __nv_bfloat16 * out_ptr = out + static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim);
+
+  float sum = 0.0f;
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    const float v = __bfloat162float(in_ptr[d]);
+    sum += v * v;
+  }
+  reduction[tid] = sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduction[tid] += reduction[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  __shared__ float inv;
+  if (tid == 0) {
+    inv = rsqrtf((reduction[0] / static_cast<float>(head_dim)) + eps);
+  }
+  __syncthreads();
+
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    const float value = __bfloat162float(in_ptr[d]) * inv * (1.0f + weight[d]);
+    out_ptr[d] = __float2bfloat16(value);
+  }
+}
+
 __global__ void rope_inplace_kernel(
   float * values,
   const int n_heads,
@@ -904,6 +1215,41 @@ __global__ void rope_inplace_kernel(
   const float s = sinf(angle);
   ptr[i0] = x0 * c - x1 * s;
   ptr[i1] = x1 * c + x0 * s;
+}
+
+__global__ void rope_inplace_bf16_kernel(
+  __nv_bfloat16 * values,
+  const int n_heads,
+  const int head_dim,
+  const int rope_dim,
+  const int position,
+  const float rope_theta) {
+  const int head = blockIdx.x;
+  const int pair_idx = blockIdx.y * blockDim.x + threadIdx.x;
+  if (head >= n_heads) {
+    return;
+  }
+  const int half = rope_dim / 2;
+  if (pair_idx >= half) {
+    return;
+  }
+
+  const std::size_t base = static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim);
+  __nv_bfloat16 * ptr = values + base;
+  const int i0 = pair_idx;
+  const int i1 = pair_idx + half;
+  if (i1 >= head_dim) {
+    return;
+  }
+  const float x0 = __bfloat162float(ptr[i0]);
+  const float x1 = __bfloat162float(ptr[i1]);
+  const float inv_freq = expf(
+    -logf(rope_theta) * (static_cast<float>(2 * pair_idx) / static_cast<float>(rope_dim)));
+  const float angle = static_cast<float>(position) * inv_freq;
+  const float c = cosf(angle);
+  const float s = sinf(angle);
+  ptr[i0] = __float2bfloat16(x0 * c - x1 * s);
+  ptr[i1] = __float2bfloat16(x1 * c + x0 * s);
 }
 
 __device__ __forceinline__ float adjust_sampling_logit(
@@ -1221,11 +1567,22 @@ __global__ void sample_token_from_block_topk_kernel(
   out_token[0] = static_cast<float>(sampled);
 }
 
-__global__ void full_attention_decode_gqa_kernel_shared(
+template <typename CacheT>
+__device__ float kv_cache_load(const CacheT * ptr, const int idx) {
+  return ptr[idx];
+}
+
+template <>
+__device__ float kv_cache_load<__nv_bfloat16>(const __nv_bfloat16 * ptr, const int idx) {
+  return __bfloat162float(ptr[idx]);
+}
+
+template <typename CacheT>
+__global__ void full_attention_decode_gqa_kernel_shared_t(
   const float * q,
   const float * gate,
-  const float * k_cache,
-  const float * v_cache,
+  const CacheT * k_cache,
+  const CacheT * v_cache,
   float * out,
   const int n_heads,
   const int n_kv_heads,
@@ -1251,13 +1608,13 @@ __global__ void full_attention_decode_gqa_kernel_shared(
 
   const float scale = rsqrtf(static_cast<float>(head_dim));
   for (int t = 0; t < seq_len; ++t) {
-    const float * k_ptr = k_cache +
+    const CacheT * k_ptr = k_cache +
                           (static_cast<std::size_t>(t) * static_cast<std::size_t>(kv_stride)) +
                           (static_cast<std::size_t>(kvh) * static_cast<std::size_t>(head_dim));
 
     float partial = 0.0f;
     for (int d = tid; d < head_dim; d += blockDim.x) {
-      partial += q_ptr[d] * k_ptr[d];
+      partial += q_ptr[d] * kv_cache_load(k_ptr, d);
     }
     reduction[tid] = partial;
     __syncthreads();
@@ -1318,10 +1675,10 @@ __global__ void full_attention_decode_gqa_kernel_shared(
   for (int d = tid; d < head_dim; d += blockDim.x) {
     float acc = 0.0f;
     for (int t = 0; t < seq_len; ++t) {
-      const float * v_ptr = v_cache +
+      const CacheT * v_ptr = v_cache +
                             (static_cast<std::size_t>(t) * static_cast<std::size_t>(kv_stride)) +
                             (static_cast<std::size_t>(kvh) * static_cast<std::size_t>(head_dim));
-      acc += scores[t] * v_ptr[d];
+      acc += scores[t] * kv_cache_load(v_ptr, d);
     }
     const float g = gate_ptr[d];
     const float sig = 1.0f / (1.0f + expf(-g));
@@ -1329,11 +1686,12 @@ __global__ void full_attention_decode_gqa_kernel_shared(
   }
 }
 
-__global__ void full_attention_decode_gqa_kernel_fallback(
+template <typename CacheT>
+__global__ void full_attention_decode_gqa_kernel_fallback_t(
   const float * q,
   const float * gate,
-  const float * k_cache,
-  const float * v_cache,
+  const CacheT * k_cache,
+  const CacheT * v_cache,
   float * out,
   float * scratch_scores,
   const int n_heads,
@@ -1359,13 +1717,13 @@ __global__ void full_attention_decode_gqa_kernel_fallback(
   const float scale = rsqrtf(static_cast<float>(head_dim));
 
   for (int t = 0; t < seq_len; ++t) {
-    const float * k_ptr = k_cache +
+    const CacheT * k_ptr = k_cache +
                           (static_cast<std::size_t>(t) * static_cast<std::size_t>(kv_stride)) +
                           (static_cast<std::size_t>(kvh) * static_cast<std::size_t>(head_dim));
 
     float partial = 0.0f;
-    if (tid < head_dim) {
-      partial = q_ptr[tid] * k_ptr[tid];
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+      partial += q_ptr[d] * kv_cache_load(k_ptr, d);
     }
     reduction[tid] = partial;
     __syncthreads();
@@ -1407,10 +1765,10 @@ __global__ void full_attention_decode_gqa_kernel_fallback(
   if (tid < head_dim) {
     float acc = 0.0f;
     for (int t = 0; t < seq_len; ++t) {
-      const float * v_ptr = v_cache +
+      const CacheT * v_ptr = v_cache +
                             (static_cast<std::size_t>(t) * static_cast<std::size_t>(kv_stride)) +
                             (static_cast<std::size_t>(kvh) * static_cast<std::size_t>(head_dim));
-      acc += scores_ptr[t] * v_ptr[tid];
+      acc += scores_ptr[t] * kv_cache_load(v_ptr, tid);
     }
     const float g = gate_ptr[tid];
     const float sig = 1.0f / (1.0f + expf(-g));
@@ -1806,6 +2164,50 @@ bool run_matvec_f32_device(
   return false;
 }
 
+bool run_matvec_bf16_device_output_bf16(
+  const CudaDeviceMatrixF32 & matrix,
+  const CudaDeviceBufferF32 & input,
+  CudaDeviceBufferBF16 & output,
+  std::string & error_message) {
+  if (matrix.data_bf16 == nullptr || matrix.rows <= 0 || matrix.cols <= 0) {
+    error_message = "CUDA BF16 matrix shadow is not initialized.";
+    return false;
+  }
+  if (input.data == nullptr || input.count < static_cast<std::size_t>(matrix.cols)) {
+    error_message = "CUDA device input buffer is invalid for BF16 matvec.";
+    return false;
+  }
+  if (output.data == nullptr || output.count < static_cast<std::size_t>(matrix.rows)) {
+    error_message = "CUDA device output buffer is invalid for BF16 matvec.";
+    return false;
+  }
+
+  if (run_matvec_bf16_device_cublaslt_to_bf16(matrix, input, output, error_message)) {
+    return true;
+  }
+  return false;
+}
+
+bool run_matvec_bf16_device_input_bf16_output_bf16(
+  const CudaDeviceMatrixF32 & matrix,
+  const CudaDeviceBufferBF16 & input,
+  CudaDeviceBufferBF16 & output,
+  std::string & error_message) {
+  if (matrix.data_bf16 == nullptr || matrix.rows <= 0 || matrix.cols <= 0) {
+    error_message = "CUDA BF16 matrix shadow is not initialized.";
+    return false;
+  }
+  if (input.data == nullptr || input.count < static_cast<std::size_t>(matrix.cols)) {
+    error_message = "CUDA BF16 input buffer is invalid for matvec.";
+    return false;
+  }
+  if (output.data == nullptr || output.count < static_cast<std::size_t>(matrix.rows)) {
+    error_message = "CUDA BF16 output buffer is invalid for matvec.";
+    return false;
+  }
+  return run_matvec_bf16_device_cublaslt_bf16_input_to_bf16(matrix, input, output, error_message);
+}
+
 void set_prefer_bf16_matvec(const bool enabled) {
   g_session.prefer_bf16_matvec = enabled;
 }
@@ -1930,6 +2332,41 @@ void free_buffer_f32(CudaDeviceBufferF32 & buffer) {
   buffer.count = 0;
 }
 
+bool allocate_buffer_bf16(
+  const std::size_t count,
+  CudaDeviceBufferBF16 & out_buffer,
+  std::string & error_message) {
+  if (count == 0) {
+    out_buffer.data = nullptr;
+    out_buffer.count = 0;
+    return true;
+  }
+
+  void * device_ptr = nullptr;
+  if (!check_cuda(cudaMalloc(&device_ptr, count * sizeof(__nv_bfloat16)), "cudaMalloc(buffer_bf16)", error_message)) {
+    return false;
+  }
+  if (!check_cuda(
+        cudaMemset(device_ptr, 0, count * sizeof(__nv_bfloat16)),
+        "cudaMemset(buffer_bf16)",
+        error_message)) {
+    cudaFree(device_ptr);
+    return false;
+  }
+
+  out_buffer.data = device_ptr;
+  out_buffer.count = count;
+  return true;
+}
+
+void free_buffer_bf16(CudaDeviceBufferBF16 & buffer) {
+  if (buffer.data != nullptr) {
+    cudaFree(buffer.data);
+    buffer.data = nullptr;
+  }
+  buffer.count = 0;
+}
+
 bool upload_to_buffer_f32(
   const float * host_data,
   const std::size_t count,
@@ -2040,6 +2477,34 @@ bool run_silu_mul_f32(
   return check_cuda(cudaGetLastError(), "silu_mul_kernel", error_message);
 }
 
+bool run_silu_mul_bf16(
+  const CudaDeviceBufferBF16 & a,
+  const CudaDeviceBufferBF16 & b,
+  const std::size_t count,
+  CudaDeviceBufferBF16 & out,
+  std::string & error_message) {
+  if (count == 0) {
+    return true;
+  }
+  if (a.data == nullptr || b.data == nullptr || out.data == nullptr) {
+    error_message = "CUDA silu_mul_bf16 requires initialized buffers.";
+    return false;
+  }
+  if (a.count < count || b.count < count || out.count < count) {
+    error_message = "CUDA silu_mul_bf16 buffer range is out of bounds.";
+    return false;
+  }
+  const int block_size = 256;
+  const int grid_size = static_cast<int>((count + static_cast<std::size_t>(block_size) - 1) / static_cast<std::size_t>(block_size));
+  const cudaStream_t stream = active_stream();
+  silu_mul_bf16_kernel<<<grid_size, block_size, 0, stream>>>(
+    static_cast<const __nv_bfloat16 *>(a.data),
+    static_cast<const __nv_bfloat16 *>(b.data),
+    static_cast<__nv_bfloat16 *>(out.data),
+    count);
+  return check_cuda(cudaGetLastError(), "silu_mul_bf16_kernel", error_message);
+}
+
 bool run_add_f32(
   const CudaDeviceBufferF32 & a,
   const CudaDeviceBufferF32 & b,
@@ -2066,6 +2531,34 @@ bool run_add_f32(
     static_cast<float *>(out.data),
     count);
   return check_cuda(cudaGetLastError(), "add_kernel", error_message);
+}
+
+bool run_add_bf16(
+  const CudaDeviceBufferBF16 & a,
+  const CudaDeviceBufferBF16 & b,
+  const std::size_t count,
+  CudaDeviceBufferBF16 & out,
+  std::string & error_message) {
+  if (count == 0) {
+    return true;
+  }
+  if (a.data == nullptr || b.data == nullptr || out.data == nullptr) {
+    error_message = "CUDA add_bf16 requires initialized buffers.";
+    return false;
+  }
+  if (a.count < count || b.count < count || out.count < count) {
+    error_message = "CUDA add_bf16 buffer range is out of bounds.";
+    return false;
+  }
+  const int block_size = 256;
+  const int grid_size = static_cast<int>((count + static_cast<std::size_t>(block_size) - 1) / static_cast<std::size_t>(block_size));
+  const cudaStream_t stream = active_stream();
+  add_bf16_kernel<<<grid_size, block_size, 0, stream>>>(
+    static_cast<const __nv_bfloat16 *>(a.data),
+    static_cast<const __nv_bfloat16 *>(b.data),
+    static_cast<__nv_bfloat16 *>(out.data),
+    count);
+  return check_cuda(cudaGetLastError(), "add_bf16_kernel", error_message);
 }
 
 bool run_rms_norm_f32(
@@ -2099,6 +2592,64 @@ bool run_rms_norm_f32(
     static_cast<int>(count),
     eps);
   return check_cuda(cudaGetLastError(), "rms_norm_kernel", error_message);
+}
+
+bool run_rms_norm_bf16(
+  const CudaDeviceBufferBF16 & input,
+  const CudaDeviceBufferF32 & weight,
+  const std::size_t count,
+  const float eps,
+  CudaDeviceBufferBF16 & out,
+  std::string & error_message) {
+  if (input.data == nullptr || weight.data == nullptr || out.data == nullptr) {
+    error_message = "CUDA rms_norm_bf16 requires initialized buffers.";
+    return false;
+  }
+  if (input.count < count || out.count < count || weight.count < count) {
+    error_message = "CUDA rms_norm_bf16 buffer range is out of bounds.";
+    return false;
+  }
+  if (count > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    error_message = "CUDA rms_norm_bf16 count exceeds kernel limits.";
+    return false;
+  }
+  const cudaStream_t stream = active_stream();
+  rms_norm_bf16_kernel<<<1, 256, 0, stream>>>(
+    static_cast<const __nv_bfloat16 *>(input.data),
+    static_cast<const float *>(weight.data),
+    static_cast<__nv_bfloat16 *>(out.data),
+    static_cast<int>(count),
+    eps);
+  return check_cuda(cudaGetLastError(), "rms_norm_bf16_kernel", error_message);
+}
+
+bool run_rms_norm_bf16_to_f32(
+  const CudaDeviceBufferBF16 & input,
+  const CudaDeviceBufferF32 & weight,
+  const std::size_t count,
+  const float eps,
+  CudaDeviceBufferF32 & out,
+  std::string & error_message) {
+  if (input.data == nullptr || weight.data == nullptr || out.data == nullptr) {
+    error_message = "CUDA rms_norm_bf16_to_f32 requires initialized buffers.";
+    return false;
+  }
+  if (input.count < count || out.count < count || weight.count < count) {
+    error_message = "CUDA rms_norm_bf16_to_f32 buffer range is out of bounds.";
+    return false;
+  }
+  if (count > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    error_message = "CUDA rms_norm_bf16_to_f32 count exceeds kernel limits.";
+    return false;
+  }
+  const cudaStream_t stream = active_stream();
+  rms_norm_bf16_to_f32_kernel<<<1, 256, 0, stream>>>(
+    static_cast<const __nv_bfloat16 *>(input.data),
+    static_cast<const float *>(weight.data),
+    static_cast<float *>(out.data),
+    static_cast<int>(count),
+    eps);
+  return check_cuda(cudaGetLastError(), "rms_norm_bf16_to_f32_kernel", error_message);
 }
 
 bool run_split_q_gate_f32(
@@ -2141,6 +2692,44 @@ bool run_split_q_gate_f32(
     n_heads,
     head_dim);
   return check_cuda(cudaGetLastError(), "split_q_gate_kernel", error_message);
+}
+
+bool run_split_q_gate_bf16_to_f32(
+  const CudaDeviceBufferBF16 & q_gate_packed,
+  const int n_heads,
+  const int head_dim,
+  CudaDeviceBufferF32 & out_q,
+  CudaDeviceBufferF32 & out_gate,
+  std::string & error_message) {
+  if (n_heads <= 0 || head_dim <= 0) {
+    error_message = "Invalid dimensions for split_q_gate_bf16_to_f32.";
+    return false;
+  }
+  const std::size_t packed_count = static_cast<std::size_t>(n_heads) * static_cast<std::size_t>(head_dim) * 2u;
+  const std::size_t single_count = static_cast<std::size_t>(n_heads) * static_cast<std::size_t>(head_dim);
+  if (q_gate_packed.data == nullptr || out_q.data == nullptr || out_gate.data == nullptr) {
+    error_message = "CUDA split_q_gate_bf16_to_f32 requires initialized buffers.";
+    return false;
+  }
+  if (q_gate_packed.count < packed_count || out_q.count < single_count || out_gate.count < single_count) {
+    error_message = "CUDA split_q_gate_bf16_to_f32 buffer range is out of bounds.";
+    return false;
+  }
+  int block_size = 1;
+  while (block_size < head_dim) {
+    block_size <<= 1;
+  }
+  if (block_size > 256) {
+    block_size = 256;
+  }
+  const cudaStream_t stream = active_stream();
+  split_q_gate_bf16_to_f32_kernel<<<n_heads, block_size, 0, stream>>>(
+    static_cast<const __nv_bfloat16 *>(q_gate_packed.data),
+    static_cast<float *>(out_q.data),
+    static_cast<float *>(out_gate.data),
+    n_heads,
+    head_dim);
+  return check_cuda(cudaGetLastError(), "split_q_gate_bf16_to_f32_kernel", error_message);
 }
 
 bool run_rms_norm_per_head_f32(
@@ -2186,6 +2775,45 @@ bool run_rms_norm_per_head_f32(
   return check_cuda(cudaGetLastError(), "rms_norm_per_head_kernel", error_message);
 }
 
+bool run_rms_norm_per_head_bf16(
+  const CudaDeviceBufferBF16 & input,
+  const CudaDeviceBufferF32 & weight,
+  const int n_heads,
+  const int head_dim,
+  const float eps,
+  CudaDeviceBufferBF16 & out,
+  std::string & error_message) {
+  if (n_heads <= 0 || head_dim <= 0) {
+    error_message = "Invalid dimensions for rms_norm_per_head_bf16.";
+    return false;
+  }
+  const std::size_t count = static_cast<std::size_t>(n_heads) * static_cast<std::size_t>(head_dim);
+  if (input.data == nullptr || weight.data == nullptr || out.data == nullptr) {
+    error_message = "CUDA rms_norm_per_head_bf16 requires initialized buffers.";
+    return false;
+  }
+  if (input.count < count || out.count < count || weight.count < static_cast<std::size_t>(head_dim)) {
+    error_message = "CUDA rms_norm_per_head_bf16 buffer range is out of bounds.";
+    return false;
+  }
+  int block_size = 1;
+  while (block_size < head_dim) {
+    block_size <<= 1;
+  }
+  if (block_size > 256) {
+    block_size = 256;
+  }
+  const cudaStream_t stream = active_stream();
+  rms_norm_per_head_bf16_kernel<<<n_heads, block_size, 0, stream>>>(
+    static_cast<const __nv_bfloat16 *>(input.data),
+    static_cast<const float *>(weight.data),
+    static_cast<__nv_bfloat16 *>(out.data),
+    n_heads,
+    head_dim,
+    eps);
+  return check_cuda(cudaGetLastError(), "rms_norm_per_head_bf16_kernel", error_message);
+}
+
 bool run_apply_rope_inplace_f32(
   const CudaDeviceBufferF32 & values,
   const int n_heads,
@@ -2220,6 +2848,42 @@ bool run_apply_rope_inplace_f32(
     position,
     rope_theta);
   return check_cuda(cudaGetLastError(), "rope_inplace_kernel", error_message);
+}
+
+bool run_apply_rope_inplace_bf16(
+  const CudaDeviceBufferBF16 & values,
+  const int n_heads,
+  const int head_dim,
+  const int rope_dim,
+  const int position,
+  const float rope_theta,
+  std::string & error_message) {
+  if (n_heads <= 0 || head_dim <= 0 || rope_dim <= 0) {
+    error_message = "Invalid dimensions for apply_rope_bf16.";
+    return false;
+  }
+  const int applied_rope_dim = std::min(rope_dim, head_dim);
+  const std::size_t count = static_cast<std::size_t>(n_heads) * static_cast<std::size_t>(head_dim);
+  if (values.data == nullptr || values.count < count) {
+    error_message = "CUDA apply_rope_bf16 buffer range is out of bounds.";
+    return false;
+  }
+  const int pair_count = applied_rope_dim / 2;
+  if (pair_count <= 0) {
+    return true;
+  }
+  const int block_size = 128;
+  const int grid_y = (pair_count + block_size - 1) / block_size;
+  const dim3 grid(n_heads, grid_y, 1);
+  const cudaStream_t stream = active_stream();
+  rope_inplace_bf16_kernel<<<grid, block_size, 0, stream>>>(
+    static_cast<__nv_bfloat16 *>(values.data),
+    n_heads,
+    head_dim,
+    applied_rope_dim,
+    position,
+    rope_theta);
+  return check_cuda(cudaGetLastError(), "rope_inplace_bf16_kernel", error_message);
 }
 
 bool copy_buffer_f32(
@@ -2262,11 +2926,114 @@ bool copy_buffer_f32(
     error_message);
 }
 
-bool run_full_attention_decode_gqa(
+bool copy_buffer_bf16(
+  const CudaDeviceBufferBF16 & src,
+  const std::size_t count,
+  const std::size_t src_offset,
+  const CudaDeviceBufferBF16 & dst,
+  const std::size_t dst_offset,
+  std::string & error_message) {
+  if (count == 0) {
+    return true;
+  }
+  if (src.data == nullptr || dst.data == nullptr) {
+    error_message = "CUDA copy_buffer_bf16 requires initialized buffers.";
+    return false;
+  }
+  if (src_offset > src.count || count > (src.count - src_offset) || dst_offset > dst.count || count > (dst.count - dst_offset)) {
+    error_message = "CUDA copy_buffer_bf16 range is out of bounds.";
+    return false;
+  }
+  const __nv_bfloat16 * src_ptr = static_cast<const __nv_bfloat16 *>(src.data) + src_offset;
+  __nv_bfloat16 * dst_ptr = static_cast<__nv_bfloat16 *>(dst.data) + dst_offset;
+  const cudaStream_t stream = active_stream();
+  if (stream != nullptr) {
+    return tracked_memcpy_async(
+      dst_ptr,
+      src_ptr,
+      count * sizeof(__nv_bfloat16),
+      cudaMemcpyDeviceToDevice,
+      stream,
+      "cudaMemcpyAsync(buffer_copy_bf16_d2d)",
+      error_message);
+  }
+  return tracked_memcpy(
+    dst_ptr,
+    src_ptr,
+    count * sizeof(__nv_bfloat16),
+    cudaMemcpyDeviceToDevice,
+    "cudaMemcpy(buffer_copy_bf16_d2d)",
+    error_message);
+}
+
+bool copy_buffer_bf16_to_f32(
+  const CudaDeviceBufferBF16 & src,
+  const std::size_t count,
+  const std::size_t src_offset,
+  const CudaDeviceBufferF32 & dst,
+  const std::size_t dst_offset,
+  std::string & error_message) {
+  if (count == 0) {
+    return true;
+  }
+  if (src.data == nullptr || dst.data == nullptr) {
+    error_message = "CUDA copy_buffer_bf16_to_f32 requires initialized buffers.";
+    return false;
+  }
+  if (src_offset > src.count || count > (src.count - src_offset) || dst_offset > dst.count || count > (dst.count - dst_offset)) {
+    error_message = "CUDA copy_buffer_bf16_to_f32 range is out of bounds.";
+    return false;
+  }
+
+  const __nv_bfloat16 * src_ptr = static_cast<const __nv_bfloat16 *>(src.data) + src_offset;
+  float * dst_ptr = static_cast<float *>(dst.data) + dst_offset;
+  cudaStream_t stream = active_stream();
+  if (stream == nullptr) {
+    stream = 0;
+  }
+  const int block_size = 256;
+  const int grid_size = static_cast<int>((count + static_cast<std::size_t>(block_size) - 1) / static_cast<std::size_t>(block_size));
+  bf16_to_f32_kernel<<<grid_size, block_size, 0, stream>>>(src_ptr, dst_ptr, static_cast<int>(count));
+  return check_cuda(cudaGetLastError(), "bf16_to_f32_kernel(buffer_copy)", error_message);
+}
+
+bool copy_buffer_f32_to_bf16(
+  const CudaDeviceBufferF32 & src,
+  const std::size_t count,
+  const std::size_t src_offset,
+  const CudaDeviceBufferBF16 & dst,
+  const std::size_t dst_offset,
+  std::string & error_message) {
+  if (count == 0) {
+    return true;
+  }
+  if (src.data == nullptr || dst.data == nullptr) {
+    error_message = "CUDA copy_buffer_f32_to_bf16 requires initialized buffers.";
+    return false;
+  }
+  if (src_offset > src.count || count > (src.count - src_offset) || dst_offset > dst.count || count > (dst.count - dst_offset)) {
+    error_message = "CUDA copy_buffer_f32_to_bf16 range is out of bounds.";
+    return false;
+  }
+
+  const float * src_ptr = static_cast<const float *>(src.data) + src_offset;
+  __nv_bfloat16 * dst_ptr = static_cast<__nv_bfloat16 *>(dst.data) + dst_offset;
+  cudaStream_t stream = active_stream();
+  if (stream == nullptr) {
+    stream = 0;
+  }
+  const int block_size = 256;
+  const int grid_size = static_cast<int>((count + static_cast<std::size_t>(block_size) - 1) / static_cast<std::size_t>(block_size));
+  f32_to_bf16_kernel<<<grid_size, block_size, 0, stream>>>(src_ptr, dst_ptr, static_cast<int>(count));
+  return check_cuda(cudaGetLastError(), "f32_to_bf16_kernel(buffer_copy)", error_message);
+}
+
+template <typename CacheElemT, typename CacheBufferT>
+bool run_full_attention_decode_gqa_impl(
   const CudaDeviceBufferF32 & q,
   const CudaDeviceBufferF32 & gate,
-  const CudaDeviceBufferF32 & k_cache,
-  const CudaDeviceBufferF32 & v_cache,
+  const CacheBufferT & k_cache,
+  const CacheBufferT & v_cache,
   const int n_heads,
   const int n_kv_heads,
   const int head_dim,
@@ -2315,11 +3082,11 @@ bool run_full_attention_decode_gqa(
   const std::size_t shared_bytes =
     (static_cast<std::size_t>(block_size) + static_cast<std::size_t>(seq_len)) * sizeof(float);
   if (shared_bytes <= kFullAttentionSharedSoftmaxMaxBytes) {
-    full_attention_decode_gqa_kernel_shared<<<n_heads, block_size, shared_bytes, stream>>>(
+    full_attention_decode_gqa_kernel_shared_t<CacheElemT><<<n_heads, block_size, shared_bytes, stream>>>(
       static_cast<const float *>(q.data),
       static_cast<const float *>(gate.data),
-      static_cast<const float *>(k_cache.data),
-      static_cast<const float *>(v_cache.data),
+      static_cast<const CacheElemT *>(k_cache.data),
+      static_cast<const CacheElemT *>(v_cache.data),
       static_cast<float *>(out.data),
       n_heads,
       n_kv_heads,
@@ -2332,11 +3099,11 @@ bool run_full_attention_decode_gqa(
     error_message = "full_attention_decode_gqa fallback requires valid scratch_scores buffer.";
     return false;
   }
-  full_attention_decode_gqa_kernel_fallback<<<n_heads, block_size, 0, stream>>>(
+  full_attention_decode_gqa_kernel_fallback_t<CacheElemT><<<n_heads, block_size, 0, stream>>>(
     static_cast<const float *>(q.data),
     static_cast<const float *>(gate.data),
-    static_cast<const float *>(k_cache.data),
-    static_cast<const float *>(v_cache.data),
+    static_cast<const CacheElemT *>(k_cache.data),
+    static_cast<const CacheElemT *>(v_cache.data),
     static_cast<float *>(out.data),
     static_cast<float *>(scratch_scores.data),
     n_heads,
@@ -2344,6 +3111,58 @@ bool run_full_attention_decode_gqa(
     head_dim,
     seq_len);
   return check_cuda(cudaGetLastError(), "full_attention_decode_gqa_kernel_fallback", error_message);
+}
+
+bool run_full_attention_decode_gqa(
+  const CudaDeviceBufferF32 & q,
+  const CudaDeviceBufferF32 & gate,
+  const CudaDeviceBufferF32 & k_cache,
+  const CudaDeviceBufferF32 & v_cache,
+  const int n_heads,
+  const int n_kv_heads,
+  const int head_dim,
+  const int seq_len,
+  CudaDeviceBufferF32 & out,
+  CudaDeviceBufferF32 & scratch_scores,
+  std::string & error_message) {
+  return run_full_attention_decode_gqa_impl<float>(
+    q,
+    gate,
+    k_cache,
+    v_cache,
+    n_heads,
+    n_kv_heads,
+    head_dim,
+    seq_len,
+    out,
+    scratch_scores,
+    error_message);
+}
+
+bool run_full_attention_decode_gqa_bf16_cache(
+  const CudaDeviceBufferF32 & q,
+  const CudaDeviceBufferF32 & gate,
+  const CudaDeviceBufferBF16 & k_cache,
+  const CudaDeviceBufferBF16 & v_cache,
+  const int n_heads,
+  const int n_kv_heads,
+  const int head_dim,
+  const int seq_len,
+  CudaDeviceBufferF32 & out,
+  CudaDeviceBufferF32 & scratch_scores,
+  std::string & error_message) {
+  return run_full_attention_decode_gqa_impl<__nv_bfloat16>(
+    q,
+    gate,
+    k_cache,
+    v_cache,
+    n_heads,
+    n_kv_heads,
+    head_dim,
+    seq_len,
+    out,
+    scratch_scores,
+    error_message);
 }
 
 bool run_linear_attention_decode(

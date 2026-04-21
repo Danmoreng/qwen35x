@@ -26,6 +26,11 @@ struct CudaDeviceBufferF32 {
   std::size_t count = 0;
 };
 
+struct CudaDeviceBufferBF16 {
+  void * data = nullptr;
+  std::size_t count = 0;
+};
+
 struct CudaCapturedGraph {
   void * graph = nullptr;
   void * exec = nullptr;
@@ -67,6 +72,18 @@ bool run_matvec_f32_device(
   CudaDeviceBufferF32 & output,
   std::string & error_message);
 
+bool run_matvec_bf16_device_output_bf16(
+  const CudaDeviceMatrixF32 & matrix,
+  const CudaDeviceBufferF32 & input,
+  CudaDeviceBufferBF16 & output,
+  std::string & error_message);
+
+bool run_matvec_bf16_device_input_bf16_output_bf16(
+  const CudaDeviceMatrixF32 & matrix,
+  const CudaDeviceBufferBF16 & input,
+  CudaDeviceBufferBF16 & output,
+  std::string & error_message);
+
 void set_prefer_bf16_matvec(bool enabled);
 
 bool gather_matrix_row_f32(
@@ -87,6 +104,13 @@ bool allocate_buffer_f32(
   std::string & error_message);
 
 void free_buffer_f32(CudaDeviceBufferF32 & buffer);
+
+bool allocate_buffer_bf16(
+  std::size_t count,
+  CudaDeviceBufferBF16 & out_buffer,
+  std::string & error_message);
+
+void free_buffer_bf16(CudaDeviceBufferBF16 & buffer);
 
 bool upload_to_buffer_f32(
   const float * host_data,
@@ -109,11 +133,25 @@ bool run_silu_mul_f32(
   CudaDeviceBufferF32 & out,
   std::string & error_message);
 
+bool run_silu_mul_bf16(
+  const CudaDeviceBufferBF16 & a,
+  const CudaDeviceBufferBF16 & b,
+  std::size_t count,
+  CudaDeviceBufferBF16 & out,
+  std::string & error_message);
+
 bool run_add_f32(
   const CudaDeviceBufferF32 & a,
   const CudaDeviceBufferF32 & b,
   std::size_t count,
   CudaDeviceBufferF32 & out,
+  std::string & error_message);
+
+bool run_add_bf16(
+  const CudaDeviceBufferBF16 & a,
+  const CudaDeviceBufferBF16 & b,
+  std::size_t count,
+  CudaDeviceBufferBF16 & out,
   std::string & error_message);
 
 bool run_rms_norm_f32(
@@ -124,8 +162,32 @@ bool run_rms_norm_f32(
   CudaDeviceBufferF32 & out,
   std::string & error_message);
 
+bool run_rms_norm_bf16(
+  const CudaDeviceBufferBF16 & input,
+  const CudaDeviceBufferF32 & weight,
+  std::size_t count,
+  float eps,
+  CudaDeviceBufferBF16 & out,
+  std::string & error_message);
+
+bool run_rms_norm_bf16_to_f32(
+  const CudaDeviceBufferBF16 & input,
+  const CudaDeviceBufferF32 & weight,
+  std::size_t count,
+  float eps,
+  CudaDeviceBufferF32 & out,
+  std::string & error_message);
+
 bool run_split_q_gate_f32(
   const CudaDeviceBufferF32 & q_gate_packed,
+  int n_heads,
+  int head_dim,
+  CudaDeviceBufferF32 & out_q,
+  CudaDeviceBufferF32 & out_gate,
+  std::string & error_message);
+
+bool run_split_q_gate_bf16_to_f32(
+  const CudaDeviceBufferBF16 & q_gate_packed,
   int n_heads,
   int head_dim,
   CudaDeviceBufferF32 & out_q,
@@ -141,8 +203,26 @@ bool run_rms_norm_per_head_f32(
   CudaDeviceBufferF32 & out,
   std::string & error_message);
 
+bool run_rms_norm_per_head_bf16(
+  const CudaDeviceBufferBF16 & input,
+  const CudaDeviceBufferF32 & weight,
+  int n_heads,
+  int head_dim,
+  float eps,
+  CudaDeviceBufferBF16 & out,
+  std::string & error_message);
+
 bool run_apply_rope_inplace_f32(
   const CudaDeviceBufferF32 & values,
+  int n_heads,
+  int head_dim,
+  int rope_dim,
+  int position,
+  float rope_theta,
+  std::string & error_message);
+
+bool run_apply_rope_inplace_bf16(
+  const CudaDeviceBufferBF16 & values,
   int n_heads,
   int head_dim,
   int rope_dim,
@@ -158,11 +238,48 @@ bool copy_buffer_f32(
   std::size_t dst_offset,
   std::string & error_message);
 
+bool copy_buffer_bf16(
+  const CudaDeviceBufferBF16 & src,
+  std::size_t count,
+  std::size_t src_offset,
+  const CudaDeviceBufferBF16 & dst,
+  std::size_t dst_offset,
+  std::string & error_message);
+
+bool copy_buffer_bf16_to_f32(
+  const CudaDeviceBufferBF16 & src,
+  std::size_t count,
+  std::size_t src_offset,
+  const CudaDeviceBufferF32 & dst,
+  std::size_t dst_offset,
+  std::string & error_message);
+
+bool copy_buffer_f32_to_bf16(
+  const CudaDeviceBufferF32 & src,
+  std::size_t count,
+  std::size_t src_offset,
+  const CudaDeviceBufferBF16 & dst,
+  std::size_t dst_offset,
+  std::string & error_message);
+
 bool run_full_attention_decode_gqa(
   const CudaDeviceBufferF32 & q,
   const CudaDeviceBufferF32 & gate,
   const CudaDeviceBufferF32 & k_cache,
   const CudaDeviceBufferF32 & v_cache,
+  int n_heads,
+  int n_kv_heads,
+  int head_dim,
+  int seq_len,
+  CudaDeviceBufferF32 & out,
+  CudaDeviceBufferF32 & scratch_scores,
+  std::string & error_message);
+
+bool run_full_attention_decode_gqa_bf16_cache(
+  const CudaDeviceBufferF32 & q,
+  const CudaDeviceBufferF32 & gate,
+  const CudaDeviceBufferBF16 & k_cache,
+  const CudaDeviceBufferBF16 & v_cache,
   int n_heads,
   int n_kv_heads,
   int head_dim,
