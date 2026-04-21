@@ -3,12 +3,84 @@
 #if QWEN35X_HAS_CUDA
 
 #include <cuda_runtime.h>
+#include <cublasLt.h>
 
 #include <cmath>
+#include <utility>
 
 namespace qwen35x::cuda {
 
 namespace {
+
+constexpr std::size_t kCublasLtWorkspaceBytes = 8u * 1024u * 1024u;
+
+const char * cublas_status_string(const cublasStatus_t status) {
+  switch (status) {
+    case CUBLAS_STATUS_SUCCESS:
+      return "CUBLAS_STATUS_SUCCESS";
+    case CUBLAS_STATUS_NOT_INITIALIZED:
+      return "CUBLAS_STATUS_NOT_INITIALIZED";
+    case CUBLAS_STATUS_ALLOC_FAILED:
+      return "CUBLAS_STATUS_ALLOC_FAILED";
+    case CUBLAS_STATUS_INVALID_VALUE:
+      return "CUBLAS_STATUS_INVALID_VALUE";
+    case CUBLAS_STATUS_ARCH_MISMATCH:
+      return "CUBLAS_STATUS_ARCH_MISMATCH";
+    case CUBLAS_STATUS_MAPPING_ERROR:
+      return "CUBLAS_STATUS_MAPPING_ERROR";
+    case CUBLAS_STATUS_EXECUTION_FAILED:
+      return "CUBLAS_STATUS_EXECUTION_FAILED";
+    case CUBLAS_STATUS_INTERNAL_ERROR:
+      return "CUBLAS_STATUS_INTERNAL_ERROR";
+    case CUBLAS_STATUS_NOT_SUPPORTED:
+      return "CUBLAS_STATUS_NOT_SUPPORTED";
+#ifdef CUBLAS_STATUS_LICENSE_ERROR
+    case CUBLAS_STATUS_LICENSE_ERROR:
+      return "CUBLAS_STATUS_LICENSE_ERROR";
+#endif
+    default:
+      return "CUBLAS_STATUS_UNKNOWN";
+  }
+}
+
+bool check_cublas(const cublasStatus_t status, const char * step, std::string & error_message) {
+  if (status == CUBLAS_STATUS_SUCCESS) {
+    return true;
+  }
+  error_message = std::string(step) + " failed: " + cublas_status_string(status);
+  return false;
+}
+
+struct MatvecPlan {
+  int rows = 0;
+  int cols = 0;
+  cublasLtMatmulDesc_t op_desc = nullptr;
+  cublasLtMatrixLayout_t a_desc = nullptr;
+  cublasLtMatrixLayout_t b_desc = nullptr;
+  cublasLtMatrixLayout_t c_desc = nullptr;
+  cublasLtMatmulAlgo_t algo{};
+  bool has_algo = false;
+};
+
+void destroy_matvec_plan(MatvecPlan & plan) {
+  if (plan.op_desc != nullptr) {
+    cublasLtMatmulDescDestroy(plan.op_desc);
+    plan.op_desc = nullptr;
+  }
+  if (plan.a_desc != nullptr) {
+    cublasLtMatrixLayoutDestroy(plan.a_desc);
+    plan.a_desc = nullptr;
+  }
+  if (plan.b_desc != nullptr) {
+    cublasLtMatrixLayoutDestroy(plan.b_desc);
+    plan.b_desc = nullptr;
+  }
+  if (plan.c_desc != nullptr) {
+    cublasLtMatrixLayoutDestroy(plan.c_desc);
+    plan.c_desc = nullptr;
+  }
+  plan.has_algo = false;
+}
 
 struct InferenceSessionState {
   float * workspace_input = nullptr;
@@ -16,6 +88,10 @@ struct InferenceSessionState {
   float * workspace_output = nullptr;
   std::size_t workspace_output_count = 0;
   cudaStream_t stream = nullptr;
+  cublasLtHandle_t cublas_lt = nullptr;
+  void * cublas_lt_workspace = nullptr;
+  std::size_t cublas_lt_workspace_bytes = 0;
+  std::vector<MatvecPlan> matvec_plans;
   bool active = false;
 };
 
@@ -73,6 +149,19 @@ bool tracked_memcpy_async(
 }
 
 void release_session_storage() {
+  for (auto & plan : g_session.matvec_plans) {
+    destroy_matvec_plan(plan);
+  }
+  g_session.matvec_plans.clear();
+  if (g_session.cublas_lt_workspace != nullptr) {
+    cudaFree(g_session.cublas_lt_workspace);
+    g_session.cublas_lt_workspace = nullptr;
+    g_session.cublas_lt_workspace_bytes = 0;
+  }
+  if (g_session.cublas_lt != nullptr) {
+    cublasLtDestroy(g_session.cublas_lt);
+    g_session.cublas_lt = nullptr;
+  }
   if (g_session.workspace_input != nullptr) {
     cudaFree(g_session.workspace_input);
     g_session.workspace_input = nullptr;
@@ -97,6 +186,18 @@ bool ensure_session_workspace(
     if (!check_cuda(cudaStreamCreateWithFlags(&g_session.stream, cudaStreamNonBlocking), "cudaStreamCreate", error_message)) {
       return false;
     }
+    if (!check_cublas(cublasLtCreate(&g_session.cublas_lt), "cublasLtCreate", error_message)) {
+      release_session_storage();
+      return false;
+    }
+    if (!check_cuda(
+          cudaMalloc(&g_session.cublas_lt_workspace, kCublasLtWorkspaceBytes),
+          "cudaMalloc(cublasLt_workspace)",
+          error_message)) {
+      release_session_storage();
+      return false;
+    }
+    g_session.cublas_lt_workspace_bytes = kCublasLtWorkspaceBytes;
     g_session.active = true;
   }
 
@@ -132,6 +233,204 @@ cudaStream_t active_stream() {
     return g_session.stream;
   }
   return nullptr;
+}
+
+MatvecPlan * find_matvec_plan(const int rows, const int cols) {
+  for (auto & plan : g_session.matvec_plans) {
+    if (plan.rows == rows && plan.cols == cols) {
+      return &plan;
+    }
+  }
+  return nullptr;
+}
+
+bool initialize_matvec_plan(MatvecPlan & plan, const int rows, const int cols, std::string & error_message) {
+  plan.rows = rows;
+  plan.cols = cols;
+
+  cublasOperation_t trans = CUBLAS_OP_N;
+  if (!check_cublas(
+        cublasLtMatmulDescCreate(&plan.op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F),
+        "cublasLtMatmulDescCreate",
+        error_message) ||
+      !check_cublas(
+        cublasLtMatmulDescSetAttribute(
+          plan.op_desc,
+          CUBLASLT_MATMUL_DESC_TRANSA,
+          &trans,
+          sizeof(trans)),
+        "cublasLtMatmulDescSetAttribute(TRANSA)",
+        error_message) ||
+      !check_cublas(
+        cublasLtMatmulDescSetAttribute(
+          plan.op_desc,
+          CUBLASLT_MATMUL_DESC_TRANSB,
+          &trans,
+          sizeof(trans)),
+        "cublasLtMatmulDescSetAttribute(TRANSB)",
+        error_message)) {
+    destroy_matvec_plan(plan);
+    return false;
+  }
+
+  if (!check_cublas(
+        cublasLtMatrixLayoutCreate(
+          &plan.a_desc,
+          CUDA_R_32F,
+          static_cast<std::uint64_t>(rows),
+          static_cast<std::uint64_t>(cols),
+          static_cast<std::int64_t>(cols)),
+        "cublasLtMatrixLayoutCreate(A)",
+        error_message) ||
+      !check_cublas(
+        cublasLtMatrixLayoutCreate(
+          &plan.b_desc,
+          CUDA_R_32F,
+          static_cast<std::uint64_t>(cols),
+          1,
+          1),
+        "cublasLtMatrixLayoutCreate(B)",
+        error_message) ||
+      !check_cublas(
+        cublasLtMatrixLayoutCreate(
+          &plan.c_desc,
+          CUDA_R_32F,
+          static_cast<std::uint64_t>(rows),
+          1,
+          1),
+        "cublasLtMatrixLayoutCreate(C)",
+        error_message)) {
+    destroy_matvec_plan(plan);
+    return false;
+  }
+
+  cublasLtOrder_t row_order = CUBLASLT_ORDER_ROW;
+  if (!check_cublas(
+        cublasLtMatrixLayoutSetAttribute(
+          plan.a_desc,
+          CUBLASLT_MATRIX_LAYOUT_ORDER,
+          &row_order,
+          sizeof(row_order)),
+        "cublasLtMatrixLayoutSetAttribute(A_ORDER)",
+        error_message) ||
+      !check_cublas(
+        cublasLtMatrixLayoutSetAttribute(
+          plan.b_desc,
+          CUBLASLT_MATRIX_LAYOUT_ORDER,
+          &row_order,
+          sizeof(row_order)),
+        "cublasLtMatrixLayoutSetAttribute(B_ORDER)",
+        error_message) ||
+      !check_cublas(
+        cublasLtMatrixLayoutSetAttribute(
+          plan.c_desc,
+          CUBLASLT_MATRIX_LAYOUT_ORDER,
+          &row_order,
+          sizeof(row_order)),
+        "cublasLtMatrixLayoutSetAttribute(C_ORDER)",
+        error_message)) {
+    destroy_matvec_plan(plan);
+    return false;
+  }
+
+  cublasLtMatmulPreference_t pref = nullptr;
+  if (!check_cublas(cublasLtMatmulPreferenceCreate(&pref), "cublasLtMatmulPreferenceCreate", error_message)) {
+    destroy_matvec_plan(plan);
+    return false;
+  }
+  std::size_t workspace_bytes = g_session.cublas_lt_workspace_bytes;
+  const bool pref_ok = check_cublas(
+    cublasLtMatmulPreferenceSetAttribute(
+      pref,
+      CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+      &workspace_bytes,
+      sizeof(workspace_bytes)),
+    "cublasLtMatmulPreferenceSetAttribute(MAX_WORKSPACE_BYTES)",
+    error_message);
+  if (!pref_ok) {
+    cublasLtMatmulPreferenceDestroy(pref);
+    destroy_matvec_plan(plan);
+    return false;
+  }
+
+  cublasLtMatmulHeuristicResult_t heuristic_result{};
+  int returned_results = 0;
+  const bool heuristic_ok = check_cublas(
+    cublasLtMatmulAlgoGetHeuristic(
+      g_session.cublas_lt,
+      plan.op_desc,
+      plan.a_desc,
+      plan.b_desc,
+      plan.c_desc,
+      plan.c_desc,
+      pref,
+      1,
+      &heuristic_result,
+      &returned_results),
+    "cublasLtMatmulAlgoGetHeuristic",
+    error_message);
+  cublasLtMatmulPreferenceDestroy(pref);
+  if (!heuristic_ok) {
+    destroy_matvec_plan(plan);
+    return false;
+  }
+  if (returned_results <= 0) {
+    error_message = "cublasLtMatmulAlgoGetHeuristic did not return a valid algorithm for matvec.";
+    destroy_matvec_plan(plan);
+    return false;
+  }
+
+  plan.algo = heuristic_result.algo;
+  plan.has_algo = true;
+  return true;
+}
+
+bool run_matvec_f32_device_cublaslt(
+  const CudaDeviceMatrixF32 & matrix,
+  const CudaDeviceBufferF32 & input,
+  CudaDeviceBufferF32 & output,
+  std::string & error_message) {
+  if (g_session.cublas_lt == nullptr) {
+    error_message = "cuBLASLt handle is not initialized.";
+    return false;
+  }
+
+  MatvecPlan * plan = find_matvec_plan(matrix.rows, matrix.cols);
+  if (plan == nullptr) {
+    MatvecPlan new_plan;
+    if (!initialize_matvec_plan(new_plan, matrix.rows, matrix.cols, error_message)) {
+      return false;
+    }
+    g_session.matvec_plans.push_back(std::move(new_plan));
+    plan = &g_session.matvec_plans.back();
+  }
+  if (!plan->has_algo) {
+    error_message = "cuBLASLt matvec plan has no selected algorithm.";
+    return false;
+  }
+
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  return check_cublas(
+    cublasLtMatmul(
+      g_session.cublas_lt,
+      plan->op_desc,
+      &alpha,
+      matrix.data,
+      plan->a_desc,
+      input.data,
+      plan->b_desc,
+      &beta,
+      output.data,
+      plan->c_desc,
+      output.data,
+      plan->c_desc,
+      &plan->algo,
+      g_session.cublas_lt_workspace,
+      g_session.cublas_lt_workspace_bytes,
+      active_stream()),
+    "cublasLtMatmul(matvec)",
+    error_message);
 }
 
 __global__ void f32_matvec_kernel(
@@ -563,6 +862,11 @@ bool run_matvec_f32_device(
     return false;
   }
 
+  std::string cublas_error;
+  if (run_matvec_f32_device_cublaslt(matrix, input, output, cublas_error)) {
+    return true;
+  }
+
   const int block_size = 128;
   const int grid_size = (matrix.rows + block_size - 1) / block_size;
   const cudaStream_t stream = active_stream();
@@ -572,7 +876,13 @@ bool run_matvec_f32_device(
     static_cast<float *>(output.data),
     matrix.rows,
     matrix.cols);
-  return check_cuda(cudaGetLastError(), "f32_matvec_kernel(device)", error_message);
+  if (check_cuda(cudaGetLastError(), "f32_matvec_kernel(device)", error_message)) {
+    return true;
+  }
+  if (!cublas_error.empty()) {
+    error_message += " (fallback reason: " + cublas_error + ")";
+  }
+  return false;
 }
 
 bool allocate_buffer_f32(
