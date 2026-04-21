@@ -21,6 +21,7 @@ The goal is not a generic multi-model runtime. The goal is a small, hardware-awa
 - CUDA Graph replay for steady-state decode segments (MLP + linear-attention blocks)
 - BF16 decode matvec path for CUDA inference (`--infer-gpu` defaults to BF16 matvec, override with `--gpu-f32-matvec`)
 - Packed full-attention projection path (`q+gate+k+v`) to reduce decode matvec launches in full-attention blocks
+- Streaming full-attention decode kernel with online softmax accumulation (single pass over sequence)
 - Qwen-style default sampling (`temperature=0.7`, `top_p=0.8`, `top_k=20`, `repeat_penalty=1.05`)
 - Deterministic mode with `--seed` and `--temperature 0`
 - Stop controls: `--stop-token`, `--stop-text`, `--stop-on-im-end`
@@ -74,15 +75,15 @@ Latest local sequential benchmark (April 21, 2026, same machine):
 Command:
 
 ```powershell
-.\build\qwen35x.exe --infer-gpu --hf-model-dir models\qwen3.5-0.8b --chat-user "Tell me a short joke." --max-new-tokens 128 --max-context 256 --seed 123 --temperature 0
+.\scripts\benchmark-inference-seq.ps1 -Executable build/qwen35x.exe -HFModelDir models/qwen3.5-0.8b -PromptMode chat-user -PromptText "Tell me a short joke." -Runs 3 -WarmupRuns 1 -MaxNewTokens 128 -MaxContext 256 -Temperature 0 -TopP 0.8 -TopK 20 -RepeatPenalty 1.05 -Seed 123 -CsvOut benchmarks/qwen35x-inference-seq-post-streaming-attn.csv
 ```
 
 Results:
-- BF16 matvec ON (`--infer-gpu` default): `183.34`, `180.06`, `183.52` tokens/s
-- FP32 matvec (`--gpu-f32-matvec`): typically `~115-119` tokens/s on stable runs
+- BF16 matvec ON (`--infer-gpu` default): `180.76`, `182.03`, `169.35` tokens/s (avg `177.38`)
+- FP32 matvec (`--gpu-f32-matvec`): `116.99`, `117.77`, `117.35` tokens/s (avg `117.37`)
 - Recent optimization delta:
-  - Pre packed full-attention projection checkpoint: BF16 avg `178.91` tokens/s
-  - Post packed full-attention projection checkpoint: BF16 avg `182.31` tokens/s
+  - Prior main rerun checkpoint: BF16 avg `166.90` tokens/s
+  - Post streaming full-attention kernel: BF16 avg `177.38` tokens/s (peak `182.03`)
 
 ## Useful Commands
 

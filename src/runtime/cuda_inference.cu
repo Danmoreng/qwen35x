@@ -1245,128 +1245,25 @@ __global__ void full_attention_decode_gqa_kernel_shared(
   const float * gate_ptr = gate + static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim);
   float * out_ptr = out + static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim);
 
-  extern __shared__ float shared_mem[];
-  float * reduction = shared_mem;
-  float * scores = shared_mem + blockDim.x;
-
-  const float scale = rsqrtf(static_cast<float>(head_dim));
-  for (int t = 0; t < seq_len; ++t) {
-    const float * k_ptr = k_cache +
-                          (static_cast<std::size_t>(t) * static_cast<std::size_t>(kv_stride)) +
-                          (static_cast<std::size_t>(kvh) * static_cast<std::size_t>(head_dim));
-
-    float partial = 0.0f;
-    for (int d = tid; d < head_dim; d += blockDim.x) {
-      partial += q_ptr[d] * k_ptr[d];
-    }
-    reduction[tid] = partial;
-    __syncthreads();
-
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-      if (tid < stride) {
-        reduction[tid] += reduction[tid + stride];
-      }
-      __syncthreads();
-    }
-
-    if (tid == 0) {
-      scores[t] = reduction[0] * scale;
-    }
-    __syncthreads();
-  }
-
-  float local_max = -1.0e30f;
-  for (int t = tid; t < seq_len; t += blockDim.x) {
-    local_max = fmaxf(local_max, scores[t]);
-  }
-  reduction[tid] = local_max;
-  __syncthreads();
-
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      reduction[tid] = fmaxf(reduction[tid], reduction[tid + stride]);
-    }
-    __syncthreads();
-  }
-  const float max_score = reduction[0];
-
-  float local_sum = 0.0f;
-  for (int t = tid; t < seq_len; t += blockDim.x) {
-    const float ev = expf(scores[t] - max_score);
-    scores[t] = ev;
-    local_sum += ev;
-  }
-  reduction[tid] = local_sum;
-  __syncthreads();
-
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      reduction[tid] += reduction[tid + stride];
-    }
-    __syncthreads();
-  }
-
-  float inv_denom = 1.0f;
-  if (reduction[0] > 0.0f) {
-    inv_denom = 1.0f / reduction[0];
-  }
-  for (int t = tid; t < seq_len; t += blockDim.x) {
-    scores[t] *= inv_denom;
-  }
-  __syncthreads();
-
-  for (int d = tid; d < head_dim; d += blockDim.x) {
-    float acc = 0.0f;
-    for (int t = 0; t < seq_len; ++t) {
-      const float * v_ptr = v_cache +
-                            (static_cast<std::size_t>(t) * static_cast<std::size_t>(kv_stride)) +
-                            (static_cast<std::size_t>(kvh) * static_cast<std::size_t>(head_dim));
-      acc += scores[t] * v_ptr[d];
-    }
-    const float g = gate_ptr[d];
-    const float sig = 1.0f / (1.0f + expf(-g));
-    out_ptr[d] = acc * sig;
-  }
-}
-
-__global__ void full_attention_decode_gqa_kernel_fallback(
-  const float * q,
-  const float * gate,
-  const float * k_cache,
-  const float * v_cache,
-  float * out,
-  float * scratch_scores,
-  const int n_heads,
-  const int n_kv_heads,
-  const int head_dim,
-  const int seq_len) {
-  const int head = blockIdx.x;
-  const int tid = threadIdx.x;
-  if (head >= n_heads || seq_len <= 0) {
-    return;
-  }
-
-  const int n_rep = n_heads / n_kv_heads;
-  const int kvh = head / n_rep;
-  const int kv_stride = n_kv_heads * head_dim;
-
-  const float * q_ptr = q + static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim);
-  const float * gate_ptr = gate + static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim);
-  float * out_ptr = out + static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim);
-  float * scores_ptr = scratch_scores + static_cast<std::size_t>(head) * static_cast<std::size_t>(seq_len);
-
   __shared__ float reduction[256];
+  __shared__ float sh_alpha;
+  __shared__ float sh_beta;
+  __shared__ float sh_denom;
   const float scale = rsqrtf(static_cast<float>(head_dim));
+  const float q_value = (tid < head_dim) ? q_ptr[tid] : 0.0f;
+  float acc = 0.0f;
+  float running_max = -1.0e30f;
+  float running_denom = 0.0f;
 
   for (int t = 0; t < seq_len; ++t) {
     const float * k_ptr = k_cache +
                           (static_cast<std::size_t>(t) * static_cast<std::size_t>(kv_stride)) +
                           (static_cast<std::size_t>(kvh) * static_cast<std::size_t>(head_dim));
+    const float * v_ptr = v_cache +
+                          (static_cast<std::size_t>(t) * static_cast<std::size_t>(kv_stride)) +
+                          (static_cast<std::size_t>(kvh) * static_cast<std::size_t>(head_dim));
 
-    float partial = 0.0f;
-    if (tid < head_dim) {
-      partial = q_ptr[tid] * k_ptr[tid];
-    }
+    float partial = (tid < head_dim) ? (q_value * k_ptr[tid]) : 0.0f;
     reduction[tid] = partial;
     __syncthreads();
 
@@ -1378,43 +1275,28 @@ __global__ void full_attention_decode_gqa_kernel_fallback(
     }
 
     if (tid == 0) {
-      scores_ptr[t] = reduction[0] * scale;
+      const float score = reduction[0] * scale;
+      const float next_max = fmaxf(running_max, score);
+      const float alpha = (running_max <= -1.0e29f) ? 0.0f : expf(running_max - next_max);
+      const float beta = expf(score - next_max);
+      running_denom = running_denom * alpha + beta;
+      running_max = next_max;
+      sh_alpha = alpha;
+      sh_beta = beta;
+      sh_denom = running_denom;
+    }
+    __syncthreads();
+    if (tid < head_dim) {
+      acc = acc * sh_alpha + sh_beta * v_ptr[tid];
     }
     __syncthreads();
   }
-
-  if (tid == 0) {
-    float max_score = -1.0e30f;
-    for (int t = 0; t < seq_len; ++t) {
-      max_score = fmaxf(max_score, scores_ptr[t]);
-    }
-    float denom = 0.0f;
-    for (int t = 0; t < seq_len; ++t) {
-      const float ev = expf(scores_ptr[t] - max_score);
-      scores_ptr[t] = ev;
-      denom += ev;
-    }
-    if (denom <= 0.0f) {
-      denom = 1.0f;
-    }
-    const float inv_denom = 1.0f / denom;
-    for (int t = 0; t < seq_len; ++t) {
-      scores_ptr[t] *= inv_denom;
-    }
-  }
-  __syncthreads();
 
   if (tid < head_dim) {
-    float acc = 0.0f;
-    for (int t = 0; t < seq_len; ++t) {
-      const float * v_ptr = v_cache +
-                            (static_cast<std::size_t>(t) * static_cast<std::size_t>(kv_stride)) +
-                            (static_cast<std::size_t>(kvh) * static_cast<std::size_t>(head_dim));
-      acc += scores_ptr[t] * v_ptr[tid];
-    }
+    const float denom = (sh_denom > 0.0f) ? sh_denom : 1.0f;
     const float g = gate_ptr[tid];
     const float sig = 1.0f / (1.0f + expf(-g));
-    out_ptr[tid] = acc * sig;
+    out_ptr[tid] = (acc / denom) * sig;
   }
 }
 
@@ -2274,8 +2156,6 @@ bool run_full_attention_decode_gqa(
   CudaDeviceBufferF32 & out,
   CudaDeviceBufferF32 & scratch_scores,
   std::string & error_message) {
-  constexpr std::size_t kFullAttentionSharedSoftmaxMaxBytes = 48u * 1024u;
-
   if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || seq_len <= 0) {
     error_message = "Invalid dimensions for full attention decode.";
     return false;
@@ -2288,7 +2168,6 @@ bool run_full_attention_decode_gqa(
   const std::size_t q_count = static_cast<std::size_t>(n_heads) * static_cast<std::size_t>(head_dim);
   const std::size_t kv_stride = static_cast<std::size_t>(n_kv_heads) * static_cast<std::size_t>(head_dim);
   const std::size_t kv_count = static_cast<std::size_t>(seq_len) * kv_stride;
-  const std::size_t scores_count = static_cast<std::size_t>(n_heads) * static_cast<std::size_t>(seq_len);
   if (q.data == nullptr || gate.data == nullptr || k_cache.data == nullptr || v_cache.data == nullptr ||
       out.data == nullptr) {
     error_message = "One or more CUDA buffers are not initialized for full attention decode.";
@@ -2299,6 +2178,7 @@ bool run_full_attention_decode_gqa(
     error_message = "CUDA buffer range is out of bounds for full attention decode.";
     return false;
   }
+  (void)scratch_scores;
 
   int block_size = 1;
   while (block_size < head_dim && block_size < 256) {
@@ -2312,38 +2192,17 @@ bool run_full_attention_decode_gqa(
   }
 
   const cudaStream_t stream = active_stream();
-  const std::size_t shared_bytes =
-    (static_cast<std::size_t>(block_size) + static_cast<std::size_t>(seq_len)) * sizeof(float);
-  if (shared_bytes <= kFullAttentionSharedSoftmaxMaxBytes) {
-    full_attention_decode_gqa_kernel_shared<<<n_heads, block_size, shared_bytes, stream>>>(
-      static_cast<const float *>(q.data),
-      static_cast<const float *>(gate.data),
-      static_cast<const float *>(k_cache.data),
-      static_cast<const float *>(v_cache.data),
-      static_cast<float *>(out.data),
-      n_heads,
-      n_kv_heads,
-      head_dim,
-      seq_len);
-    return check_cuda(cudaGetLastError(), "full_attention_decode_gqa_kernel_shared", error_message);
-  }
-
-  if (scratch_scores.data == nullptr || scratch_scores.count < scores_count) {
-    error_message = "full_attention_decode_gqa fallback requires valid scratch_scores buffer.";
-    return false;
-  }
-  full_attention_decode_gqa_kernel_fallback<<<n_heads, block_size, 0, stream>>>(
+  full_attention_decode_gqa_kernel_shared<<<n_heads, block_size, 0, stream>>>(
     static_cast<const float *>(q.data),
     static_cast<const float *>(gate.data),
     static_cast<const float *>(k_cache.data),
     static_cast<const float *>(v_cache.data),
     static_cast<float *>(out.data),
-    static_cast<float *>(scratch_scores.data),
     n_heads,
     n_kv_heads,
     head_dim,
     seq_len);
-  return check_cuda(cudaGetLastError(), "full_attention_decode_gqa_kernel_fallback", error_message);
+  return check_cuda(cudaGetLastError(), "full_attention_decode_gqa_kernel_shared", error_message);
 }
 
 bool run_linear_attention_decode(

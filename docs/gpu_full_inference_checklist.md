@@ -10,8 +10,9 @@ Progress snapshot (April 2026):
 - BF16 CUDA decode matvec path is implemented (default enabled for `--infer-gpu`).
 - Optional synchronized CUDA profiling mode is implemented (`--profile-sync`).
 - Full-attention packed projection (`q+gate+k+v`) is implemented to reduce decode matvec launches.
-- Full-attention kernel uses a shared-memory softmax/value path with automatic fallback.
+- Full-attention decode now uses a streaming online-softmax/value kernel (single pass over sequence).
 - Current measured transfer footprint is near control-path scale (`~3-4 bytes D2H per forward token`).
+- Current measured sequential benchmark (April 21, 2026): BF16 `180.76`, `182.03`, `169.35` tokens/s (avg `177.38`).
 - Current open bottlenecks are full-attention graph replay coverage, sampling optimization depth, and prefill specialization.
 
 Scope:
@@ -113,11 +114,11 @@ Current issue:
 
 Tasks:
 - [x] Add real kernel replacing `qwen35x_full_decode_gqa_stub`
-- [ ] Kernel responsibilities:
-  - Q/K normalization handling (or pre/post kernels if cleaner)
+- [x] Kernel responsibilities:
+  - Q/K normalization handling (via dedicated pre/post kernels in device path)
   - RoPE for query/key at current position
   - Attention score compute against KV cache
-  - Softmax and weighted value reduction
+  - Streaming online softmax + weighted value reduction
   - Head-group mapping for GQA (`n_heads / n_kv_heads`)
 - [x] Add launch wrapper API in `cuda_inference` module
 - [x] Validate numeric parity on deterministic mode

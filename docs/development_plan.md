@@ -15,7 +15,7 @@ Completed:
 - BF16 decode matvec path in CUDA runtime (default enabled for `--infer-gpu`)
 - Optional synchronized CUDA stage timing mode (`--profile-sync`)
 - Packed full-attention projection (`q+gate+k+v`) to reduce full-attention decode matvec launches
-- Shared-memory full-attention softmax/value kernel path with automatic fallback
+- Streaming full-attention decode kernel with online softmax/value accumulation
 
 Current known constraints:
 - GPU sampling path currently requires `top_k <= 64` when `temperature > 0`
@@ -24,10 +24,10 @@ Current known constraints:
 
 Latest local benchmark snapshot (Qwen3.5-0.8B, same machine):
 - Historical chat baseline (early April 2026): ~91 tokens/s
-- Current sequential chat benchmark (April 21, 2026, post graph + full-attention packed projection):
-  - BF16 matvec ON (`--infer-gpu` default): `183.34`, `180.06`, `183.52` tokens/s (avg `182.31`)
-  - FP32 matvec (`--gpu-f32-matvec`): typically `~115-119` tokens/s on stable runs
-  - Previous checkpoint (before full-attention packed projection): BF16 avg `178.91` tokens/s
+- Current sequential chat benchmark (April 21, 2026, post streaming full-attention kernel):
+  - BF16 matvec ON (`--infer-gpu` default): `180.76`, `182.03`, `169.35` tokens/s (avg `177.38`)
+  - FP32 matvec (`--gpu-f32-matvec`): `116.99`, `117.77`, `117.35` tokens/s (avg `117.37`)
+  - Prior main rerun baseline: BF16 avg `166.90` tokens/s
 
 ## Vision
 
@@ -116,7 +116,7 @@ Milestone progress:
 ## Practical Next Steps
 
 1. Extend CUDA Graph replay to include full-attention segment and larger whole-layer decode slices
-2. Optimize full-attention kernel memory path further (vectorized loads / warp reductions / cache-friendly tiling)
+2. Optimize full-attention streaming kernel memory path further (vectorized loads / warp reductions / cache-friendly tiling)
 3. Optimize GPU sampling further (lift current `top_k <= 64` limit while preserving throughput)
 4. Add dedicated prefill implementation (batched/streaming prefill separate from decode)
 5. Add parity and performance harness scripts for repeatable CPU/GPU checks
