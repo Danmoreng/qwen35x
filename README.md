@@ -107,6 +107,12 @@ Results:
 .\build\qwen35x.exe --bench-bf16 --hf-model-dir models/qwen3.5-0.8b
 ```
 
+- Sequential inference benchmark to CSV (minimal schema):
+
+```powershell
+.\scripts\benchmark-inference-seq.ps1 -RunLabel "baseline" -Runs 3 -WarmupRuns 1 -CsvOut benchmarks\qwen35x-inference-seq.csv
+```
+
 ## Project Layout
 
 - `src/`, `include/`: engine implementation

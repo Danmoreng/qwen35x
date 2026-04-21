@@ -254,7 +254,7 @@ Exit criteria:
 
 Tasks:
 - [ ] Add script for CPU vs GPU deterministic parity runs over prompt suite
-- [ ] Add script for throughput benchmarking with CSV/JSON output
+- [x] Add script for throughput benchmarking with CSV output (`scripts/benchmark-inference-seq.ps1`)
 - [ ] Add CI-friendly smoke mode (short token count, fixed seed)
 
 Files:
