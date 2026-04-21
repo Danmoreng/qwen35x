@@ -6,11 +6,13 @@ Progress snapshot (April 2026):
 - Fully device-resident per-layer decode flow is implemented.
 - Full-logits per-token D2H copies are removed.
 - Device-token GPU decode loop path is implemented (next-step token embedding gather on device).
-- CUDA Graph replay is implemented for steady-state MLP decode work.
+- CUDA Graph replay is implemented for steady-state decode segments (MLP + linear-attention blocks).
 - BF16 CUDA decode matvec path is implemented (default enabled for `--infer-gpu`).
 - Optional synchronized CUDA profiling mode is implemented (`--profile-sync`).
+- Full-attention packed projection (`q+gate+k+v`) is implemented to reduce decode matvec launches.
+- Full-attention kernel uses a shared-memory softmax/value path with automatic fallback.
 - Current measured transfer footprint is near control-path scale (`~3-4 bytes D2H per forward token`).
-- Current open bottlenecks are broader graph capture coverage, sampling optimization depth, and prefill specialization.
+- Current open bottlenecks are full-attention graph replay coverage, sampling optimization depth, and prefill specialization.
 
 Scope:
 - Model family: Qwen3.5 (current profile `qwen3_5_0_8b.profile.json`)
@@ -236,7 +238,8 @@ Tasks:
 - [ ] Introduce persistent per-request device buffers (avoid per-token alloc/free)
 - [ ] Use pinned host memory for minimal control-path transfers
 - [x] Capture steady-state decode in CUDA Graph (MLP decode segment replay)
-- [ ] Expand CUDA Graph capture coverage to larger decode step segments
+- [x] Expand CUDA Graph capture coverage to larger decode step segments (MLP + linear-attention replay)
+- [ ] Extend CUDA Graph replay to include full-attention segment / larger whole-layer replay
 - [ ] Add stream strategy (main compute stream + optional transfer stream)
 - [ ] Add warmup step and stable benchmark mode
 
@@ -269,6 +272,7 @@ Exit criteria:
 ## 11. Stretch Goals After Full GPU Parity
 
 - [x] BF16-native decode matvec data path (beyond benchmark microkernel)
+- [x] Initial decode-critical packing: full-attention `q+gate+k+v` projection matvec
 - [ ] Weight layout packing tuned for decode kernels
 - [ ] Optional fused kernels (RMSNorm+Linear, attention epilogues)
 - [ ] Quantization track as separate mode after BF16 path is stable

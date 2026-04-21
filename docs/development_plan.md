@@ -10,10 +10,12 @@ Completed:
 - Device-resident per-layer decode flow (hidden/residual/norm/attention/MLP on GPU)
 - GPU logits + GPU sampling path
 - Device-token GPU decode loop path (sampled token consumed on device for next-step embedding gather)
-- CUDA Graph replay for steady-state MLP decode work
+- CUDA Graph replay for steady-state decode segments (MLP + linear-attention blocks)
 - Decode profiling (`--profile-json`) with stage timing and transfer breakdown
 - BF16 decode matvec path in CUDA runtime (default enabled for `--infer-gpu`)
 - Optional synchronized CUDA stage timing mode (`--profile-sync`)
+- Packed full-attention projection (`q+gate+k+v`) to reduce full-attention decode matvec launches
+- Shared-memory full-attention softmax/value kernel path with automatic fallback
 
 Current known constraints:
 - GPU sampling path currently requires `top_k <= 64` when `temperature > 0`
@@ -22,10 +24,10 @@ Current known constraints:
 
 Latest local benchmark snapshot (Qwen3.5-0.8B, same machine):
 - Historical chat baseline (early April 2026): ~91 tokens/s
-- Current sequential chat benchmark (April 21, 2026):
-  - BF16 matvec ON (`--infer-gpu` default): `178.66`, `161.41`, `173.94` tokens/s
-  - FP32 matvec (`--gpu-f32-matvec`): `117.57`, `116.99`, `117.00` tokens/s
-  - Warm-run average (runs 2+3): BF16 `167.68` tokens/s, FP32 `116.99` tokens/s
+- Current sequential chat benchmark (April 21, 2026, post graph + full-attention packed projection):
+  - BF16 matvec ON (`--infer-gpu` default): `183.34`, `180.06`, `183.52` tokens/s (avg `182.31`)
+  - FP32 matvec (`--gpu-f32-matvec`): typically `~115-119` tokens/s on stable runs
+  - Previous checkpoint (before full-attention packed projection): BF16 avg `178.91` tokens/s
 
 ## Vision
 
@@ -113,8 +115,8 @@ Milestone progress:
 
 ## Practical Next Steps
 
-1. Extend CUDA Graph usage beyond MLP replay to larger steady-state decode segments
-2. Optimize GPU sampling further (lift current `top_k <= 64` limit while preserving throughput)
-3. Add dedicated prefill implementation (batched/streaming prefill separate from decode)
-4. Add parity and performance harness scripts for repeatable CPU/GPU checks
-5. Add decode-critical weight/layout packing and kernel-tuned memory layouts
+1. Extend CUDA Graph replay to include full-attention segment and larger whole-layer decode slices
+2. Optimize full-attention kernel memory path further (vectorized loads / warp reductions / cache-friendly tiling)
+3. Optimize GPU sampling further (lift current `top_k <= 64` limit while preserving throughput)
+4. Add dedicated prefill implementation (batched/streaming prefill separate from decode)
+5. Add parity and performance harness scripts for repeatable CPU/GPU checks

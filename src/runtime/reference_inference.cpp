@@ -31,6 +31,8 @@ struct FullAttentionWeights {
   TensorData o_proj;
   TensorData q_norm;
   TensorData k_norm;
+  cuda::CudaDeviceMatrixF32 qkv_proj_device;
+  bool has_device_qkv_proj = false;
   cuda::CudaDeviceMatrixF32 kv_proj_device;
   bool has_device_kv_proj = false;
   cuda::CudaDeviceBufferF32 q_norm_device;
@@ -734,6 +736,15 @@ bool upload_model_weights_to_cuda(
         return false;
       }
       if (!upload_row_concat_2d_to_cuda(
+            {&layer.full.q_proj, &layer.full.k_proj, &layer.full.v_proj},
+            prefix + "full.qkv_proj_packed",
+            layer.full.qkv_proj_device,
+            layer.full.has_device_qkv_proj,
+            upload_bf16_shadow,
+            error_message)) {
+        return false;
+      }
+      if (!upload_row_concat_2d_to_cuda(
             {&layer.full.k_proj, &layer.full.v_proj},
             prefix + "full.kv_proj_packed",
             layer.full.kv_proj_device,
@@ -766,6 +777,8 @@ void release_model_weights_cuda(ModelWeights & weights) {
     release_tensor_cuda(layer.full.k_proj);
     release_tensor_cuda(layer.full.v_proj);
     release_tensor_cuda(layer.full.o_proj);
+    cuda::free_matrix_f32(layer.full.qkv_proj_device);
+    layer.full.has_device_qkv_proj = false;
     cuda::free_matrix_f32(layer.full.kv_proj_device);
     layer.full.has_device_kv_proj = false;
     cuda::free_buffer_f32(layer.full.q_norm_device);
@@ -805,16 +818,19 @@ bool allocate_forward_workspace_cuda(
   CudaForwardWorkspace & workspace,
   std::string & error_message) {
   const std::size_t full_q_count = static_cast<std::size_t>(dims.n_heads * dims.head_dim);
+  const std::size_t full_q_packed_count = full_q_count * 2;
   const std::size_t full_scores_count = static_cast<std::size_t>(dims.n_heads) * static_cast<std::size_t>(std::max(1, max_context));
   const std::size_t full_kv_combined_count = static_cast<std::size_t>(2 * dims.n_kv_heads * dims.head_dim);
+  const std::size_t full_qkv_combined_count = full_q_packed_count + full_kv_combined_count;
   const std::size_t linear_combined_count =
     static_cast<std::size_t>(dims.linear_conv_channels + dims.linear_v_dim + 2 * dims.linear_num_v_heads);
   const std::size_t mlp_gate_up_combined_count = static_cast<std::size_t>(2 * dims.intermediate);
   const std::size_t projection_out_count = std::max<std::size_t>({
     static_cast<std::size_t>(dims.hidden),
-    static_cast<std::size_t>(dims.n_heads * dims.head_dim * 2),
+    full_q_packed_count,
     static_cast<std::size_t>(dims.n_kv_heads * dims.head_dim),
     full_kv_combined_count,
+    full_qkv_combined_count,
     static_cast<std::size_t>(dims.linear_conv_channels),
     static_cast<std::size_t>(dims.linear_v_dim),
     static_cast<std::size_t>(dims.linear_num_v_heads),
@@ -1060,8 +1076,11 @@ bool run_full_attention_step_cuda_device(
   CudaForwardWorkspace & workspace,
   cuda::CudaDeviceBufferF32 & out_hidden,
   std::string & error_message) {
-  if (!state.has_device_state || !layer.full.has_device_norm || !layer.full.has_device_kv_proj ||
-      !layer.full.q_proj.has_device_matrix || !layer.full.kv_proj_device.data || !layer.full.o_proj.has_device_matrix) {
+  const bool has_packed_qkv = layer.full.has_device_qkv_proj && layer.full.qkv_proj_device.data != nullptr;
+  const bool has_legacy_qkv =
+    layer.full.has_device_kv_proj && layer.full.q_proj.has_device_matrix && layer.full.kv_proj_device.data != nullptr;
+  if (!state.has_device_state || !layer.full.has_device_norm || !layer.full.o_proj.has_device_matrix ||
+      (!has_packed_qkv && !has_legacy_qkv)) {
     error_message = "Full-attention CUDA device path is not fully initialized.";
     return false;
   }
@@ -1069,8 +1088,10 @@ bool run_full_attention_step_cuda_device(
   const std::size_t q_packed_count = static_cast<std::size_t>(dims.n_heads * dims.head_dim * 2);
   const std::size_t kv_count = static_cast<std::size_t>(dims.n_kv_heads * dims.head_dim);
   const std::size_t kv_packed_count = kv_count * 2;
+  const std::size_t qkv_packed_count = q_packed_count + kv_packed_count;
   const std::size_t cache_offset = static_cast<std::size_t>(position) * kv_count;
-  if (workspace.logits.count < q_packed_count || workspace.projection_out.count < kv_packed_count ||
+  const std::size_t required_projection_count = has_packed_qkv ? qkv_packed_count : kv_packed_count;
+  if ((!has_packed_qkv && workspace.logits.count < q_packed_count) || workspace.projection_out.count < required_projection_count ||
       workspace.full_q.count < static_cast<std::size_t>(dims.n_heads * dims.head_dim) ||
       workspace.full_gate.count < static_cast<std::size_t>(dims.n_heads * dims.head_dim) ||
       workspace.full_attn.count < static_cast<std::size_t>(dims.n_heads * dims.head_dim)) {
@@ -1078,16 +1099,27 @@ bool run_full_attention_step_cuda_device(
     return false;
   }
 
-  const cuda::CudaDeviceBufferF32 k_raw = buffer_slice_f32(workspace.projection_out, 0, kv_count);
-  const cuda::CudaDeviceBufferF32 v_raw = buffer_slice_f32(workspace.projection_out, kv_count, kv_count);
-  if (k_raw.data == nullptr || v_raw.data == nullptr) {
+  const cuda::CudaDeviceBufferF32 q_gate_packed = has_packed_qkv
+    ? buffer_slice_f32(workspace.projection_out, 0, q_packed_count)
+    : workspace.logits;
+  const std::size_t kv_offset = has_packed_qkv ? q_packed_count : 0;
+  const cuda::CudaDeviceBufferF32 k_raw = buffer_slice_f32(workspace.projection_out, kv_offset, kv_count);
+  const cuda::CudaDeviceBufferF32 v_raw = buffer_slice_f32(workspace.projection_out, kv_offset + kv_count, kv_count);
+  if (q_gate_packed.data == nullptr || k_raw.data == nullptr || v_raw.data == nullptr) {
     error_message = "Failed to create packed KV projection slices.";
     return false;
   }
 
-  return cuda::run_matvec_f32_device(layer.full.q_proj.device_matrix, x_in, workspace.logits, error_message) &&
-         cuda::run_matvec_f32_device(layer.full.kv_proj_device, x_in, workspace.projection_out, error_message) &&
-         cuda::run_split_q_gate_f32(workspace.logits, dims.n_heads, dims.head_dim, workspace.full_q, workspace.full_gate, error_message) &&
+  const auto run_qkv_projections = [&](std::string & run_error) -> bool {
+    if (has_packed_qkv) {
+      return cuda::run_matvec_f32_device(layer.full.qkv_proj_device, x_in, workspace.projection_out, run_error);
+    }
+    return cuda::run_matvec_f32_device(layer.full.q_proj.device_matrix, x_in, workspace.logits, run_error) &&
+           cuda::run_matvec_f32_device(layer.full.kv_proj_device, x_in, workspace.projection_out, run_error);
+  };
+
+  return run_qkv_projections(error_message) &&
+         cuda::run_split_q_gate_f32(q_gate_packed, dims.n_heads, dims.head_dim, workspace.full_q, workspace.full_gate, error_message) &&
          cuda::run_rms_norm_per_head_f32(
            workspace.full_q,
            layer.full.q_norm_device,

@@ -18,8 +18,9 @@ The goal is not a generic multi-model runtime. The goal is a small, hardware-awa
 - Device-resident decode path for per-layer hidden/residual/norm/attention/MLP math in `--infer-gpu`
 - GPU logits + GPU sampling path
 - Device-token decode loop path for `--infer-gpu` (sampled token stays on GPU for next-step embedding gather)
-- CUDA Graph replay for steady-state MLP block work in decode
+- CUDA Graph replay for steady-state decode segments (MLP + linear-attention blocks)
 - BF16 decode matvec path for CUDA inference (`--infer-gpu` defaults to BF16 matvec, override with `--gpu-f32-matvec`)
+- Packed full-attention projection path (`q+gate+k+v`) to reduce decode matvec launches in full-attention blocks
 - Qwen-style default sampling (`temperature=0.7`, `top_p=0.8`, `top_k=20`, `repeat_penalty=1.05`)
 - Deterministic mode with `--seed` and `--temperature 0`
 - Stop controls: `--stop-token`, `--stop-text`, `--stop-on-im-end`
@@ -77,9 +78,11 @@ Command:
 ```
 
 Results:
-- BF16 matvec ON (`--infer-gpu` default): `178.66`, `161.41`, `173.94` tokens/s
-- FP32 matvec (`--gpu-f32-matvec`): `117.57`, `116.99`, `117.00` tokens/s
-- Warm-run average (runs 2+3): BF16 `167.68` tokens/s vs FP32 `116.99` tokens/s (`+43%`)
+- BF16 matvec ON (`--infer-gpu` default): `183.34`, `180.06`, `183.52` tokens/s
+- FP32 matvec (`--gpu-f32-matvec`): typically `~115-119` tokens/s on stable runs
+- Recent optimization delta:
+  - Pre packed full-attention projection checkpoint: BF16 avg `178.91` tokens/s
+  - Post packed full-attention projection checkpoint: BF16 avg `182.31` tokens/s
 
 ## Useful Commands
 
