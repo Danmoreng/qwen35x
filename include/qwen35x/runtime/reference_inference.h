@@ -22,6 +22,8 @@ struct ReferenceInferenceOptions {
   int max_new_tokens = 1;
   int max_context = 4096;
   bool use_cuda = false;
+  bool use_cuda_matvec_bf16 = false;
+  bool profile_cuda_sync = false;
   SamplingOptions sampling;
   std::vector<std::int32_t> stop_token_ids;
   std::vector<std::vector<std::int32_t>> stop_token_sequences;

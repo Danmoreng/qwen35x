@@ -19,11 +19,13 @@ The goal is not a generic multi-model runtime. The goal is a small, hardware-awa
 - GPU logits + GPU sampling path
 - Device-token decode loop path for `--infer-gpu` (sampled token stays on GPU for next-step embedding gather)
 - CUDA Graph replay for steady-state MLP block work in decode
+- BF16 decode matvec path for CUDA inference (`--infer-gpu` defaults to BF16 matvec, override with `--gpu-f32-matvec`)
 - Qwen-style default sampling (`temperature=0.7`, `top_p=0.8`, `top_k=20`, `repeat_penalty=1.05`)
 - Deterministic mode with `--seed` and `--temperature 0`
 - Stop controls: `--stop-token`, `--stop-text`, `--stop-on-im-end`
 - BF16 tensor benchmark path (`--bench-bf16`)
 - Profiling output via `--profile-json` (stage timings + H2D/D2H transfer stats)
+- Optional synchronized CUDA stage timing via `--profile-sync`
 
 Current GPU sampling constraint:
 - For `temperature > 0`, GPU sampling currently supports `top_k` in `[1, 64]`.
@@ -64,12 +66,39 @@ Current decode control behavior:
 .\build\qwen35x.exe --infer-gpu --hf-model-dir models/qwen3.5-0.8b --chat-user "Tell me a short joke." --max-new-tokens 64 --max-context 256 --profile-json build/last_profile.json
 ```
 
+## Performance Snapshot
+
+Latest local sequential benchmark (April 21, 2026, same machine):
+
+Command:
+
+```powershell
+.\build\qwen35x.exe --infer-gpu --hf-model-dir models\qwen3.5-0.8b --chat-user "Tell me a short joke." --max-new-tokens 128 --max-context 256 --seed 123 --temperature 0
+```
+
+Results:
+- BF16 matvec ON (`--infer-gpu` default): `178.66`, `161.41`, `173.94` tokens/s
+- FP32 matvec (`--gpu-f32-matvec`): `117.57`, `116.99`, `117.00` tokens/s
+- Warm-run average (runs 2+3): BF16 `167.68` tokens/s vs FP32 `116.99` tokens/s (`+43%`)
+
 ## Useful Commands
 
 - Deterministic run:
 
 ```powershell
 .\build\qwen35x.exe --infer-gpu --hf-model-dir models/qwen3.5-0.8b --chat-user "Summarize this project in one sentence." --max-new-tokens 64 --max-context 256 --temperature 0 --seed 1234
+```
+
+- Force FP32 CUDA matvec (disable BF16 decode matvec):
+
+```powershell
+.\build\qwen35x.exe --infer-gpu --gpu-f32-matvec --hf-model-dir models/qwen3.5-0.8b --prompt-text "Once upon a time" --max-new-tokens 32 --temperature 0 --seed 123
+```
+
+- Enable synchronized CUDA stage timing:
+
+```powershell
+.\build\qwen35x.exe --infer-gpu --profile-sync --hf-model-dir models/qwen3.5-0.8b --prompt-text "Once upon a time" --max-new-tokens 32 --temperature 0 --seed 123
 ```
 
 - BF16 benchmark:

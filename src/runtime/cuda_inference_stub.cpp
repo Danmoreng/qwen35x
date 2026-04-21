@@ -25,6 +25,16 @@ bool upload_matrix_f32(
   return false;
 }
 
+bool upload_matrix_bf16_shadow_from_f32(
+  const std::vector<float> &,
+  int,
+  int,
+  CudaDeviceMatrixF32 &,
+  std::string & error_message) {
+  error_message = "CUDA is not enabled in this build.";
+  return false;
+}
+
 void free_matrix_f32(CudaDeviceMatrixF32 &) {
 }
 
@@ -44,6 +54,9 @@ bool run_matvec_f32_device(
   std::string & error_message) {
   error_message = "CUDA is not enabled in this build.";
   return false;
+}
+
+void set_prefer_bf16_matvec(bool) {
 }
 
 bool gather_matrix_row_f32(
@@ -240,6 +253,11 @@ bool sample_token_from_logits_f32_device_to_buffer(
   float,
   const CudaDeviceBufferF32 &,
   std::string & error_message) {
+  error_message = "CUDA is not enabled in this build.";
+  return false;
+}
+
+bool synchronize_stream(std::string & error_message) {
   error_message = "CUDA is not enabled in this build.";
   return false;
 }

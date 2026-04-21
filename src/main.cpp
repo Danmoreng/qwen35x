@@ -67,6 +67,10 @@ bool write_profile_json(
   out << "    \"repeat_penalty\": " << options.sampling.repetition_penalty << ",\n";
   out << "    \"seed\": " << options.sampling.seed << "\n";
   out << "  },\n";
+  out << "  \"cuda\": {\n";
+  out << "    \"matvec_bf16\": " << (options.use_cuda_matvec_bf16 ? "true" : "false") << ",\n";
+  out << "    \"profile_sync\": " << (options.profile_cuda_sync ? "true" : "false") << "\n";
+  out << "  },\n";
   out << "  \"stages_ms\": {\n";
   out << "    \"embedding\": " << result.timing_breakdown.embedding_ms << ",\n";
   out << "    \"attention\": " << result.timing_breakdown.attention_ms << ",\n";
@@ -132,6 +136,7 @@ int main(int argc, char ** argv) {
     } else if (arg == "--infer-gpu") {
       infer_reference = true;
       infer_options.use_cuda = true;
+      infer_options.use_cuda_matvec_bf16 = true;
     } else if (arg == "--bench-tensor" && i + 1 < argc) {
       bench_options.tensor_name = argv[++i];
     } else if (arg == "--bench-warmup" && i + 1 < argc) {
@@ -158,6 +163,12 @@ int main(int argc, char ** argv) {
       infer_options.sampling.repetition_penalty = std::stof(argv[++i]);
     } else if (arg == "--seed" && i + 1 < argc) {
       infer_options.sampling.seed = std::stoll(argv[++i]);
+    } else if (arg == "--gpu-bf16") {
+      infer_options.use_cuda_matvec_bf16 = true;
+    } else if (arg == "--gpu-f32-matvec") {
+      infer_options.use_cuda_matvec_bf16 = false;
+    } else if (arg == "--profile-sync") {
+      infer_options.profile_cuda_sync = true;
     } else if (arg == "--stop-token" && i + 1 < argc) {
       stop_tokens_csv = argv[++i];
     } else if (arg == "--stop-text" && i + 1 < argc) {
@@ -179,6 +190,7 @@ int main(int argc, char ** argv) {
       std::cout << "       qwen35x --infer-reference --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "       qwen35x --infer-gpu --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "               [--temperature <float>] [--top-p <float>] [--top-k <int>] [--repeat-penalty <float>] [--seed <int64>]\n";
+      std::cout << "               [--gpu-bf16|--gpu-f32-matvec] [--profile-sync]\n";
       std::cout << "               [--stop-token <csv>] [--stop-text <text>] [--stop-on-im-end] [--profile-json <path>]\n";
       return 0;
     }
@@ -332,6 +344,8 @@ int main(int argc, char ** argv) {
               << " top_k=" << infer_options.sampling.top_k
               << " repeat_penalty=" << infer_options.sampling.repetition_penalty
               << " seed=" << infer_options.sampling.seed << "\n";
+    std::cout << "  cuda: matvec_bf16=" << (infer_options.use_cuda_matvec_bf16 ? "on" : "off")
+              << " profile_sync=" << (infer_options.profile_cuda_sync ? "on" : "off") << "\n";
     std::cout << "  stop: token_ids=" << infer_options.stop_token_ids.size()
               << " token_sequences=" << infer_options.stop_token_sequences.size() << "\n";
     std::cout << "  output_token_ids:";

@@ -16,6 +16,7 @@ struct CudaTransferStats {
 
 struct CudaDeviceMatrixF32 {
   void * data = nullptr;
+  void * data_bf16 = nullptr;
   int rows = 0;
   int cols = 0;
 };
@@ -45,6 +46,13 @@ bool upload_matrix_f32(
   CudaDeviceMatrixF32 & out_matrix,
   std::string & error_message);
 
+bool upload_matrix_bf16_shadow_from_f32(
+  const std::vector<float> & host_data,
+  int rows,
+  int cols,
+  CudaDeviceMatrixF32 & matrix,
+  std::string & error_message);
+
 void free_matrix_f32(CudaDeviceMatrixF32 & matrix);
 
 bool run_matvec_f32(
@@ -58,6 +66,8 @@ bool run_matvec_f32_device(
   const CudaDeviceBufferF32 & input,
   CudaDeviceBufferF32 & output,
   std::string & error_message);
+
+void set_prefer_bf16_matvec(bool enabled);
 
 bool gather_matrix_row_f32(
   const CudaDeviceMatrixF32 & matrix,
@@ -207,6 +217,8 @@ bool sample_token_from_logits_f32_device_to_buffer(
   float random_u01,
   const CudaDeviceBufferF32 & out_token,
   std::string & error_message);
+
+bool synchronize_stream(std::string & error_message);
 
 bool begin_stream_capture(std::string & error_message);
 

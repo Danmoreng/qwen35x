@@ -2,11 +2,14 @@
 
 #if QWEN35X_HAS_CUDA
 
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cublasLt.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <limits>
 #include <utility>
 
@@ -18,6 +21,8 @@ constexpr std::size_t kCublasLtWorkspaceBytes = 8u * 1024u * 1024u;
 constexpr int kGpuSamplingMaxTopK = 64;
 constexpr int kSamplingArgmaxBlockSize = 256;
 constexpr int kSamplingArgmaxChunkSize = 2048;
+
+__global__ void f32_to_bf16_kernel(const float * input, __nv_bfloat16 * output, int count);
 
 const char * cublas_status_string(const cublasStatus_t status) {
   switch (status) {
@@ -59,6 +64,7 @@ bool check_cublas(const cublasStatus_t status, const char * step, std::string & 
 struct MatvecPlan {
   int rows = 0;
   int cols = 0;
+  bool use_bf16 = false;
   cublasLtMatmulDesc_t op_desc = nullptr;
   cublasLtMatrixLayout_t a_desc = nullptr;
   cublasLtMatrixLayout_t b_desc = nullptr;
@@ -92,6 +98,8 @@ struct InferenceSessionState {
   std::size_t workspace_input_count = 0;
   float * workspace_output = nullptr;
   std::size_t workspace_output_count = 0;
+  __nv_bfloat16 * workspace_input_bf16 = nullptr;
+  std::size_t workspace_input_bf16_count = 0;
   cudaStream_t stream = nullptr;
   cublasLtHandle_t cublas_lt = nullptr;
   void * cublas_lt_workspace = nullptr;
@@ -102,6 +110,7 @@ struct InferenceSessionState {
   int * sampling_block_topk_indices = nullptr;
   int sampling_block_capacity = 0;
   std::vector<MatvecPlan> matvec_plans;
+  bool prefer_bf16_matvec = false;
   bool active = false;
 };
 
@@ -114,6 +123,15 @@ bool check_cuda(cudaError_t status, const char * step, std::string & error_messa
   }
   error_message = std::string(step) + " failed: " + cudaGetErrorString(status);
   return false;
+}
+
+std::uint16_t float_to_bf16_bits(const float value) {
+  std::uint32_t bits = 0;
+  static_assert(sizeof(float) == sizeof(std::uint32_t), "Unexpected float size");
+  std::memcpy(&bits, &value, sizeof(float));
+  const std::uint32_t lsb = (bits >> 16) & 1u;
+  bits += 0x7FFFu + lsb;
+  return static_cast<std::uint16_t>(bits >> 16);
 }
 
 bool record_copy(const std::size_t bytes, const cudaMemcpyKind kind) {
@@ -193,11 +211,16 @@ void release_session_storage() {
     cudaFree(g_session.workspace_input);
     g_session.workspace_input = nullptr;
   }
+  if (g_session.workspace_input_bf16 != nullptr) {
+    cudaFree(g_session.workspace_input_bf16);
+    g_session.workspace_input_bf16 = nullptr;
+  }
   if (g_session.workspace_output != nullptr) {
     cudaFree(g_session.workspace_output);
     g_session.workspace_output = nullptr;
   }
   g_session.workspace_input_count = 0;
+  g_session.workspace_input_bf16_count = 0;
   g_session.workspace_output_count = 0;
   if (g_session.stream != nullptr) {
     cudaStreamDestroy(g_session.stream);
@@ -252,6 +275,33 @@ bool ensure_session_workspace(
     g_session.workspace_output_count = output_count;
   }
 
+  return true;
+}
+
+bool ensure_session_workspace_input_bf16(
+  const std::size_t input_count,
+  std::string & error_message) {
+  if (input_count == 0) {
+    return true;
+  }
+  if (!g_session.active) {
+    error_message = "CUDA inference session is not active.";
+    return false;
+  }
+  if (input_count > g_session.workspace_input_bf16_count) {
+    if (g_session.workspace_input_bf16 != nullptr) {
+      cudaFree(g_session.workspace_input_bf16);
+      g_session.workspace_input_bf16 = nullptr;
+      g_session.workspace_input_bf16_count = 0;
+    }
+    if (!check_cuda(
+          cudaMalloc(&g_session.workspace_input_bf16, input_count * sizeof(__nv_bfloat16)),
+          "cudaMalloc(workspace_input_bf16)",
+          error_message)) {
+      return false;
+    }
+    g_session.workspace_input_bf16_count = input_count;
+  }
   return true;
 }
 
@@ -313,22 +363,33 @@ bool ensure_sampling_workspace(const int vocab_size, std::string & error_message
   return true;
 }
 
-MatvecPlan * find_matvec_plan(const int rows, const int cols) {
+MatvecPlan * find_matvec_plan(const int rows, const int cols, const bool use_bf16) {
   for (auto & plan : g_session.matvec_plans) {
-    if (plan.rows == rows && plan.cols == cols) {
+    if (plan.rows == rows && plan.cols == cols && plan.use_bf16 == use_bf16) {
       return &plan;
     }
   }
   return nullptr;
 }
 
-bool initialize_matvec_plan(MatvecPlan & plan, const int rows, const int cols, std::string & error_message) {
+bool initialize_matvec_plan(
+  MatvecPlan & plan,
+  const int rows,
+  const int cols,
+  const bool use_bf16,
+  std::string & error_message) {
   plan.rows = rows;
   plan.cols = cols;
+  plan.use_bf16 = use_bf16;
 
   cublasOperation_t trans = CUBLAS_OP_N;
+  const cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F;
+  const cudaDataType_t scale_type = CUDA_R_32F;
+  const cudaDataType_t a_type = use_bf16 ? CUDA_R_16BF : CUDA_R_32F;
+  const cudaDataType_t b_type = use_bf16 ? CUDA_R_16BF : CUDA_R_32F;
+  const cudaDataType_t c_type = CUDA_R_32F;
   if (!check_cublas(
-        cublasLtMatmulDescCreate(&plan.op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F),
+        cublasLtMatmulDescCreate(&plan.op_desc, compute_type, scale_type),
         "cublasLtMatmulDescCreate",
         error_message) ||
       !check_cublas(
@@ -354,7 +415,7 @@ bool initialize_matvec_plan(MatvecPlan & plan, const int rows, const int cols, s
   if (!check_cublas(
         cublasLtMatrixLayoutCreate(
           &plan.a_desc,
-          CUDA_R_32F,
+          a_type,
           static_cast<std::uint64_t>(rows),
           static_cast<std::uint64_t>(cols),
           static_cast<std::int64_t>(cols)),
@@ -363,7 +424,7 @@ bool initialize_matvec_plan(MatvecPlan & plan, const int rows, const int cols, s
       !check_cublas(
         cublasLtMatrixLayoutCreate(
           &plan.b_desc,
-          CUDA_R_32F,
+          b_type,
           static_cast<std::uint64_t>(cols),
           1,
           1),
@@ -372,7 +433,7 @@ bool initialize_matvec_plan(MatvecPlan & plan, const int rows, const int cols, s
       !check_cublas(
         cublasLtMatrixLayoutCreate(
           &plan.c_desc,
-          CUDA_R_32F,
+          c_type,
           static_cast<std::uint64_t>(rows),
           1,
           1),
@@ -473,10 +534,10 @@ bool run_matvec_f32_device_cublaslt(
     return false;
   }
 
-  MatvecPlan * plan = find_matvec_plan(matrix.rows, matrix.cols);
+  MatvecPlan * plan = find_matvec_plan(matrix.rows, matrix.cols, false);
   if (plan == nullptr) {
     MatvecPlan new_plan;
-    if (!initialize_matvec_plan(new_plan, matrix.rows, matrix.cols, error_message)) {
+    if (!initialize_matvec_plan(new_plan, matrix.rows, matrix.cols, false, error_message)) {
       return false;
     }
     g_session.matvec_plans.push_back(std::move(new_plan));
@@ -511,6 +572,77 @@ bool run_matvec_f32_device_cublaslt(
     error_message);
 }
 
+bool run_matvec_bf16_device_cublaslt(
+  const CudaDeviceMatrixF32 & matrix,
+  const CudaDeviceBufferF32 & input,
+  CudaDeviceBufferF32 & output,
+  std::string & error_message) {
+  if (g_session.cublas_lt == nullptr) {
+    error_message = "cuBLASLt handle is not initialized.";
+    return false;
+  }
+  if (matrix.data_bf16 == nullptr) {
+    error_message = "BF16 shadow matrix is not initialized.";
+    return false;
+  }
+  if (!ensure_session_workspace_input_bf16(static_cast<std::size_t>(matrix.cols), error_message)) {
+    return false;
+  }
+
+  const cudaStream_t stream = active_stream();
+  if (stream == nullptr) {
+    error_message = "CUDA inference session stream is not initialized.";
+    return false;
+  }
+
+  const int convert_block = 256;
+  const int convert_grid = (matrix.cols + convert_block - 1) / convert_block;
+  f32_to_bf16_kernel<<<convert_grid, convert_block, 0, stream>>>(
+    static_cast<const float *>(input.data),
+    g_session.workspace_input_bf16,
+    matrix.cols);
+  if (!check_cuda(cudaGetLastError(), "f32_to_bf16_kernel", error_message)) {
+    return false;
+  }
+
+  MatvecPlan * plan = find_matvec_plan(matrix.rows, matrix.cols, true);
+  if (plan == nullptr) {
+    MatvecPlan new_plan;
+    if (!initialize_matvec_plan(new_plan, matrix.rows, matrix.cols, true, error_message)) {
+      return false;
+    }
+    g_session.matvec_plans.push_back(std::move(new_plan));
+    plan = &g_session.matvec_plans.back();
+  }
+  if (!plan->has_algo) {
+    error_message = "cuBLASLt BF16 matvec plan has no selected algorithm.";
+    return false;
+  }
+
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  return check_cublas(
+    cublasLtMatmul(
+      g_session.cublas_lt,
+      plan->op_desc,
+      &alpha,
+      matrix.data_bf16,
+      plan->a_desc,
+      g_session.workspace_input_bf16,
+      plan->b_desc,
+      &beta,
+      output.data,
+      plan->c_desc,
+      output.data,
+      plan->c_desc,
+      &plan->algo,
+      g_session.cublas_lt_workspace,
+      g_session.cublas_lt_workspace_bytes,
+      stream),
+    "cublasLtMatmul(matvec_bf16)",
+    error_message);
+}
+
 __global__ void f32_matvec_kernel(
   const float * weights,
   const float * input,
@@ -530,6 +662,17 @@ __global__ void f32_matvec_kernel(
   output[row] = sum;
 }
 
+__global__ void f32_to_bf16_kernel(
+  const float * input,
+  __nv_bfloat16 * output,
+  const int count) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= count) {
+    return;
+  }
+  output[idx] = __float2bfloat16(input[idx]);
+}
+
 __global__ void gather_matrix_row_kernel(
   const float * matrix,
   const int cols,
@@ -542,6 +685,20 @@ __global__ void gather_matrix_row_kernel(
   const std::size_t src_offset =
     static_cast<std::size_t>(row_index) * static_cast<std::size_t>(cols) + static_cast<std::size_t>(col);
   out_row[col] = matrix[src_offset];
+}
+
+__global__ void gather_matrix_row_bf16_kernel(
+  const __nv_bfloat16 * matrix,
+  const int cols,
+  const int row_index,
+  float * out_row) {
+  const int col = blockIdx.x * blockDim.x + threadIdx.x;
+  if (col >= cols) {
+    return;
+  }
+  const std::size_t src_offset =
+    static_cast<std::size_t>(row_index) * static_cast<std::size_t>(cols) + static_cast<std::size_t>(col);
+  out_row[col] = __bfloat162float(matrix[src_offset]);
 }
 
 __global__ void gather_matrix_row_from_token_kernel(
@@ -565,6 +722,29 @@ __global__ void gather_matrix_row_from_token_kernel(
   const std::size_t src_offset =
     static_cast<std::size_t>(row_index) * static_cast<std::size_t>(cols) + static_cast<std::size_t>(col);
   out_row[col] = matrix[src_offset];
+}
+
+__global__ void gather_matrix_row_from_token_bf16_kernel(
+  const __nv_bfloat16 * matrix,
+  const int rows,
+  const int cols,
+  const float * token_id,
+  float * out_row) {
+  const int col = blockIdx.x * blockDim.x + threadIdx.x;
+  if (col >= cols) {
+    return;
+  }
+
+  int row_index = static_cast<int>(token_id[0]);
+  if (row_index < 0) {
+    row_index = 0;
+  } else if (row_index >= rows) {
+    row_index = rows - 1;
+  }
+
+  const std::size_t src_offset =
+    static_cast<std::size_t>(row_index) * static_cast<std::size_t>(cols) + static_cast<std::size_t>(col);
+  out_row[col] = __bfloat162float(matrix[src_offset]);
 }
 
 __global__ void silu_mul_kernel(
@@ -1340,8 +1520,56 @@ bool upload_matrix_f32(
   }
 
   out_matrix.data = device_ptr;
+  out_matrix.data_bf16 = nullptr;
   out_matrix.rows = rows;
   out_matrix.cols = cols;
+  return true;
+}
+
+bool upload_matrix_bf16_shadow_from_f32(
+  const std::vector<float> & host_data,
+  const int rows,
+  const int cols,
+  CudaDeviceMatrixF32 & matrix,
+  std::string & error_message) {
+  if (rows <= 0 || cols <= 0) {
+    error_message = "Invalid matrix dimensions for CUDA BF16 shadow upload.";
+    return false;
+  }
+  const std::size_t expected_count = static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols);
+  if (host_data.size() != expected_count) {
+    error_message = "Host matrix size does not match rows * cols for BF16 upload.";
+    return false;
+  }
+  if (matrix.rows != rows || matrix.cols != cols) {
+    error_message = "BF16 shadow upload dimensions do not match matrix metadata.";
+    return false;
+  }
+
+  std::vector<std::uint16_t> bf16_values(expected_count);
+  for (std::size_t i = 0; i < expected_count; ++i) {
+    bf16_values[i] = float_to_bf16_bits(host_data[i]);
+  }
+
+  void * bf16_ptr = nullptr;
+  if (!check_cuda(cudaMalloc(&bf16_ptr, expected_count * sizeof(std::uint16_t)), "cudaMalloc(matrix_bf16)", error_message)) {
+    return false;
+  }
+  if (!tracked_memcpy(
+        bf16_ptr,
+        bf16_values.data(),
+        expected_count * sizeof(std::uint16_t),
+        cudaMemcpyHostToDevice,
+        "cudaMemcpy(matrix_bf16)",
+        error_message)) {
+    cudaFree(bf16_ptr);
+    return false;
+  }
+
+  if (matrix.data_bf16 != nullptr) {
+    cudaFree(matrix.data_bf16);
+  }
+  matrix.data_bf16 = bf16_ptr;
   return true;
 }
 
@@ -1349,6 +1577,10 @@ void free_matrix_f32(CudaDeviceMatrixF32 & matrix) {
   if (matrix.data != nullptr) {
     cudaFree(matrix.data);
     matrix.data = nullptr;
+  }
+  if (matrix.data_bf16 != nullptr) {
+    cudaFree(matrix.data_bf16);
+    matrix.data_bf16 = nullptr;
   }
   matrix.rows = 0;
   matrix.cols = 0;
@@ -1436,6 +1668,13 @@ bool run_matvec_f32_device(
     return false;
   }
 
+  if (g_session.prefer_bf16_matvec && matrix.data_bf16 != nullptr) {
+    std::string bf16_error;
+    if (run_matvec_bf16_device_cublaslt(matrix, input, output, bf16_error)) {
+      return true;
+    }
+  }
+
   std::string cublas_error;
   if (run_matvec_f32_device_cublaslt(matrix, input, output, cublas_error)) {
     return true;
@@ -1457,6 +1696,10 @@ bool run_matvec_f32_device(
     error_message += " (fallback reason: " + cublas_error + ")";
   }
   return false;
+}
+
+void set_prefer_bf16_matvec(const bool enabled) {
+  g_session.prefer_bf16_matvec = enabled;
 }
 
 bool gather_matrix_row_f32(
@@ -1485,6 +1728,15 @@ bool gather_matrix_row_f32(
 
   const int block_size = 256;
   const int grid_size = (matrix.cols + block_size - 1) / block_size;
+  if (g_session.prefer_bf16_matvec && matrix.data_bf16 != nullptr) {
+    gather_matrix_row_bf16_kernel<<<grid_size, block_size, 0, stream>>>(
+      static_cast<const __nv_bfloat16 *>(matrix.data_bf16),
+      matrix.cols,
+      row_index,
+      static_cast<float *>(out.data));
+    return check_cuda(cudaGetLastError(), "gather_matrix_row_bf16_kernel", error_message);
+  }
+
   gather_matrix_row_kernel<<<grid_size, block_size, 0, stream>>>(
     static_cast<const float *>(matrix.data),
     matrix.cols,
@@ -1519,6 +1771,16 @@ bool gather_matrix_row_f32_from_token_f32(
 
   const int block_size = 256;
   const int grid_size = (matrix.cols + block_size - 1) / block_size;
+  if (g_session.prefer_bf16_matvec && matrix.data_bf16 != nullptr) {
+    gather_matrix_row_from_token_bf16_kernel<<<grid_size, block_size, 0, stream>>>(
+      static_cast<const __nv_bfloat16 *>(matrix.data_bf16),
+      matrix.rows,
+      matrix.cols,
+      static_cast<const float *>(token_id.data),
+      static_cast<float *>(out.data));
+    return check_cuda(cudaGetLastError(), "gather_matrix_row_from_token_bf16_kernel", error_message);
+  }
+
   gather_matrix_row_from_token_kernel<<<grid_size, block_size, 0, stream>>>(
     static_cast<const float *>(matrix.data),
     matrix.rows,
@@ -2290,6 +2552,15 @@ bool launch_captured_graph(
     cudaGraphLaunch(static_cast<cudaGraphExec_t>(graph.exec), stream),
     "cudaGraphLaunch",
     error_message);
+}
+
+bool synchronize_stream(std::string & error_message) {
+  const cudaStream_t stream = active_stream();
+  if (stream == nullptr) {
+    error_message = "CUDA stream is not initialized.";
+    return false;
+  }
+  return check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize", error_message);
 }
 
 void free_captured_graph(CudaCapturedGraph & graph) {

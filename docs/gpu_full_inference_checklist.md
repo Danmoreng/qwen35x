@@ -7,6 +7,8 @@ Progress snapshot (April 2026):
 - Full-logits per-token D2H copies are removed.
 - Device-token GPU decode loop path is implemented (next-step token embedding gather on device).
 - CUDA Graph replay is implemented for steady-state MLP decode work.
+- BF16 CUDA decode matvec path is implemented (default enabled for `--infer-gpu`).
+- Optional synchronized CUDA profiling mode is implemented (`--profile-sync`).
 - Current measured transfer footprint is near control-path scale (`~3-4 bytes D2H per forward token`).
 - Current open bottlenecks are broader graph capture coverage, sampling optimization depth, and prefill specialization.
 
@@ -266,7 +268,7 @@ Exit criteria:
 
 ## 11. Stretch Goals After Full GPU Parity
 
-- [ ] BF16-native inference data path (not only benchmark microkernel)
+- [x] BF16-native decode matvec data path (beyond benchmark microkernel)
 - [ ] Weight layout packing tuned for decode kernels
 - [ ] Optional fused kernels (RMSNorm+Linear, attention epilogues)
 - [ ] Quantization track as separate mode after BF16 path is stable

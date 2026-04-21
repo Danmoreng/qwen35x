@@ -12,6 +12,8 @@ Completed:
 - Device-token GPU decode loop path (sampled token consumed on device for next-step embedding gather)
 - CUDA Graph replay for steady-state MLP decode work
 - Decode profiling (`--profile-json`) with stage timing and transfer breakdown
+- BF16 decode matvec path in CUDA runtime (default enabled for `--infer-gpu`)
+- Optional synchronized CUDA stage timing mode (`--profile-sync`)
 
 Current known constraints:
 - GPU sampling path currently requires `top_k <= 64` when `temperature > 0`
@@ -19,8 +21,11 @@ Current known constraints:
 - Prefill path is still token-by-token and not yet batched/specialized
 
 Latest local benchmark snapshot (Qwen3.5-0.8B, same machine):
-- Deterministic prompt path: ~127 tokens/s
-- Chat prompt path: ~91 tokens/s
+- Historical chat baseline (early April 2026): ~91 tokens/s
+- Current sequential chat benchmark (April 21, 2026):
+  - BF16 matvec ON (`--infer-gpu` default): `178.66`, `161.41`, `173.94` tokens/s
+  - FP32 matvec (`--gpu-f32-matvec`): `117.57`, `116.99`, `117.00` tokens/s
+  - Warm-run average (runs 2+3): BF16 `167.68` tokens/s, FP32 `116.99` tokens/s
 
 ## Vision
 

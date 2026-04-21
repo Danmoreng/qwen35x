@@ -169,6 +169,16 @@ double elapsed_ms(const std::chrono::steady_clock::time_point start_time) {
 
 constexpr int kCudaSamplingMaxTopK = 64;
 
+bool maybe_sync_cuda_for_stage_timing(
+  const bool use_cuda,
+  const bool profile_cuda_sync,
+  std::string & error_message) {
+  if (!use_cuda || !profile_cuda_sync) {
+    return true;
+  }
+  return cuda::synchronize_stream(error_message);
+}
+
 bool project_from_uploaded_hidden_cuda(
   const TensorData & projection,
   CudaForwardWorkspace & workspace,
@@ -543,7 +553,11 @@ bool load_model_weights(
   return true;
 }
 
-bool upload_tensor_2d_to_cuda(TensorData & tensor, const std::string & name, std::string & error_message) {
+bool upload_tensor_2d_to_cuda(
+  TensorData & tensor,
+  const std::string & name,
+  const bool upload_bf16_shadow,
+  std::string & error_message) {
   if (tensor.shape.size() != 2) {
     return true;
   }
@@ -555,6 +569,11 @@ bool upload_tensor_2d_to_cuda(TensorData & tensor, const std::string & name, std
   const int cols = static_cast<int>(tensor.shape[1]);
   if (!cuda::upload_matrix_f32(tensor.data, rows, cols, tensor.device_matrix, error_message)) {
     error_message = "CUDA upload failed for tensor '" + name + "': " + error_message;
+    return false;
+  }
+  if (upload_bf16_shadow &&
+      !cuda::upload_matrix_bf16_shadow_from_f32(tensor.data, rows, cols, tensor.device_matrix, error_message)) {
+    error_message = "CUDA BF16 shadow upload failed for tensor '" + name + "': " + error_message;
     return false;
   }
   tensor.has_device_matrix = true;
@@ -581,6 +600,7 @@ bool upload_row_concat_2d_to_cuda(
   const std::string & name,
   cuda::CudaDeviceMatrixF32 & out_matrix,
   bool & out_has_matrix,
+  const bool upload_bf16_shadow,
   std::string & error_message) {
   if (parts.empty()) {
     error_message = "CUDA packed upload '" + name + "' has no source tensors.";
@@ -617,6 +637,16 @@ bool upload_row_concat_2d_to_cuda(
     error_message = "CUDA packed upload failed for tensor '" + name + "': " + error_message;
     return false;
   }
+  if (upload_bf16_shadow &&
+      !cuda::upload_matrix_bf16_shadow_from_f32(
+        packed,
+        static_cast<int>(total_rows),
+        static_cast<int>(cols),
+        out_matrix,
+        error_message)) {
+    error_message = "CUDA packed BF16 shadow upload failed for tensor '" + name + "': " + error_message;
+    return false;
+  }
   out_has_matrix = true;
   return true;
 }
@@ -628,8 +658,11 @@ void release_tensor_cuda(TensorData & tensor) {
   }
 }
 
-bool upload_model_weights_to_cuda(ModelWeights & weights, std::string & error_message) {
-  if (!upload_tensor_2d_to_cuda(weights.embed_tokens, "embed_tokens", error_message)) {
+bool upload_model_weights_to_cuda(
+  ModelWeights & weights,
+  const bool upload_bf16_shadow,
+  std::string & error_message) {
+  if (!upload_tensor_2d_to_cuda(weights.embed_tokens, "embed_tokens", upload_bf16_shadow, error_message)) {
     return false;
   }
   if (!upload_vector_to_cuda(weights.final_norm.data, weights.final_norm_device, error_message)) {
@@ -647,9 +680,9 @@ bool upload_model_weights_to_cuda(ModelWeights & weights, std::string & error_me
     }
     layer.has_device_norms = true;
 
-    if (!upload_tensor_2d_to_cuda(layer.mlp_gate, prefix + "mlp_gate", error_message) ||
-        !upload_tensor_2d_to_cuda(layer.mlp_up, prefix + "mlp_up", error_message) ||
-        !upload_tensor_2d_to_cuda(layer.mlp_down, prefix + "mlp_down", error_message)) {
+    if (!upload_tensor_2d_to_cuda(layer.mlp_gate, prefix + "mlp_gate", upload_bf16_shadow, error_message) ||
+        !upload_tensor_2d_to_cuda(layer.mlp_up, prefix + "mlp_up", upload_bf16_shadow, error_message) ||
+        !upload_tensor_2d_to_cuda(layer.mlp_down, prefix + "mlp_down", upload_bf16_shadow, error_message)) {
       return false;
     }
     if (!upload_row_concat_2d_to_cuda(
@@ -657,17 +690,18 @@ bool upload_model_weights_to_cuda(ModelWeights & weights, std::string & error_me
           prefix + "mlp_gate_up_packed",
           layer.mlp_gate_up_device,
           layer.has_device_mlp_gate_up,
+          upload_bf16_shadow,
           error_message)) {
       return false;
     }
 
     if (layer.is_linear) {
-      if (!upload_tensor_2d_to_cuda(layer.linear.in_proj_qkv, prefix + "linear.in_proj_qkv", error_message) ||
-          !upload_tensor_2d_to_cuda(layer.linear.in_proj_z, prefix + "linear.in_proj_z", error_message) ||
-          !upload_tensor_2d_to_cuda(layer.linear.in_proj_b, prefix + "linear.in_proj_b", error_message) ||
-          !upload_tensor_2d_to_cuda(layer.linear.in_proj_a, prefix + "linear.in_proj_a", error_message) ||
-          !upload_tensor_2d_to_cuda(layer.linear.conv1d, prefix + "linear.conv1d", error_message) ||
-          !upload_tensor_2d_to_cuda(layer.linear.out_proj, prefix + "linear.out_proj", error_message)) {
+      if (!upload_tensor_2d_to_cuda(layer.linear.in_proj_qkv, prefix + "linear.in_proj_qkv", upload_bf16_shadow, error_message) ||
+          !upload_tensor_2d_to_cuda(layer.linear.in_proj_z, prefix + "linear.in_proj_z", upload_bf16_shadow, error_message) ||
+          !upload_tensor_2d_to_cuda(layer.linear.in_proj_b, prefix + "linear.in_proj_b", upload_bf16_shadow, error_message) ||
+          !upload_tensor_2d_to_cuda(layer.linear.in_proj_a, prefix + "linear.in_proj_a", upload_bf16_shadow, error_message) ||
+          !upload_tensor_2d_to_cuda(layer.linear.conv1d, prefix + "linear.conv1d", false, error_message) ||
+          !upload_tensor_2d_to_cuda(layer.linear.out_proj, prefix + "linear.out_proj", upload_bf16_shadow, error_message)) {
         return false;
       }
       if (!upload_vector_to_cuda(layer.linear.norm.data, layer.linear.norm_device, error_message) ||
@@ -680,15 +714,16 @@ bool upload_model_weights_to_cuda(ModelWeights & weights, std::string & error_me
             prefix + "linear.in_proj_all_packed",
             layer.linear.in_proj_all_device,
             layer.linear.has_device_in_proj_all,
+            upload_bf16_shadow,
             error_message)) {
         return false;
       }
       layer.linear.has_device_params = true;
     } else {
-      if (!upload_tensor_2d_to_cuda(layer.full.q_proj, prefix + "full.q_proj", error_message) ||
-          !upload_tensor_2d_to_cuda(layer.full.k_proj, prefix + "full.k_proj", error_message) ||
-          !upload_tensor_2d_to_cuda(layer.full.v_proj, prefix + "full.v_proj", error_message) ||
-          !upload_tensor_2d_to_cuda(layer.full.o_proj, prefix + "full.o_proj", error_message)) {
+      if (!upload_tensor_2d_to_cuda(layer.full.q_proj, prefix + "full.q_proj", upload_bf16_shadow, error_message) ||
+          !upload_tensor_2d_to_cuda(layer.full.k_proj, prefix + "full.k_proj", upload_bf16_shadow, error_message) ||
+          !upload_tensor_2d_to_cuda(layer.full.v_proj, prefix + "full.v_proj", upload_bf16_shadow, error_message) ||
+          !upload_tensor_2d_to_cuda(layer.full.o_proj, prefix + "full.o_proj", upload_bf16_shadow, error_message)) {
         return false;
       }
       if (!upload_vector_to_cuda(layer.full.q_norm.data, layer.full.q_norm_device, error_message) ||
@@ -700,6 +735,7 @@ bool upload_model_weights_to_cuda(ModelWeights & weights, std::string & error_me
             prefix + "full.kv_proj_packed",
             layer.full.kv_proj_device,
             layer.full.has_device_kv_proj,
+            upload_bf16_shadow,
             error_message)) {
         return false;
       }
@@ -1677,6 +1713,7 @@ bool run_forward_single_token_cuda_device_core(
   ModelState & state,
   const int position,
   const bool use_cuda_gpu_sampling,
+  const bool profile_cuda_sync,
   CudaForwardWorkspace & workspace,
   std::vector<float> & next_logits,
   DecodeProfilingAccumulator * profiling,
@@ -1703,6 +1740,9 @@ bool run_forward_single_token_cuda_device_core(
       return false;
     }
 
+    if (!maybe_sync_cuda_for_stage_timing(true, profile_cuda_sync, error_message)) {
+      return false;
+    }
     const auto attention_start = std::chrono::steady_clock::now();
     if (layer.is_linear) {
       if (!run_linear_attention_step_cuda_device(
@@ -1730,10 +1770,16 @@ bool run_forward_single_token_cuda_device_core(
       }
       ++full_idx;
     }
+    if (!maybe_sync_cuda_for_stage_timing(true, profile_cuda_sync, error_message)) {
+      return false;
+    }
     if (profiling != nullptr) {
       profiling->attention_ms += elapsed_ms(attention_start);
     }
 
+    if (!maybe_sync_cuda_for_stage_timing(true, profile_cuda_sync, error_message)) {
+      return false;
+    }
     const auto mlp_start = std::chrono::steady_clock::now();
     if (!cuda::run_add_f32(workspace.hidden_in, workspace.hidden_out, hidden_count, workspace.full_attn, error_message) ||
         !cuda::run_rms_norm_f32(
@@ -1828,11 +1874,17 @@ bool run_forward_single_token_cuda_device_core(
       }
     }
 
+    if (!maybe_sync_cuda_for_stage_timing(true, profile_cuda_sync, error_message)) {
+      return false;
+    }
     if (profiling != nullptr) {
       profiling->mlp_ms += elapsed_ms(mlp_start);
     }
   }
 
+  if (!maybe_sync_cuda_for_stage_timing(true, profile_cuda_sync, error_message)) {
+    return false;
+  }
   const auto logits_start = std::chrono::steady_clock::now();
   bool ok = false;
   if (!cuda::run_rms_norm_f32(
@@ -1854,6 +1906,9 @@ bool run_forward_single_token_cuda_device_core(
     }
     ok = compute_next_logits_from_embedding(weights.embed_tokens, final_hidden, false, next_logits, error_message);
   }
+  if (!maybe_sync_cuda_for_stage_timing(true, profile_cuda_sync, error_message)) {
+    return false;
+  }
   if (profiling != nullptr) {
     profiling->logits_ms += elapsed_ms(logits_start);
   }
@@ -1867,6 +1922,7 @@ bool run_forward_single_token_cuda_device(
   const int token_id,
   const int position,
   const bool use_cuda_gpu_sampling,
+  const bool profile_cuda_sync,
   CudaForwardWorkspace & workspace,
   std::vector<float> & next_logits,
   DecodeProfilingAccumulator * profiling,
@@ -1881,8 +1937,14 @@ bool run_forward_single_token_cuda_device(
     return false;
   }
 
+  if (!maybe_sync_cuda_for_stage_timing(true, profile_cuda_sync, error_message)) {
+    return false;
+  }
   const auto embedding_start = std::chrono::steady_clock::now();
   if (!cuda::gather_matrix_row_f32(weights.embed_tokens.device_matrix, token_id, workspace.hidden_in, error_message)) {
+    return false;
+  }
+  if (!maybe_sync_cuda_for_stage_timing(true, profile_cuda_sync, error_message)) {
     return false;
   }
   if (profiling != nullptr) {
@@ -1895,6 +1957,7 @@ bool run_forward_single_token_cuda_device(
     state,
     position,
     use_cuda_gpu_sampling,
+    profile_cuda_sync,
     workspace,
     next_logits,
     profiling,
@@ -1908,6 +1971,7 @@ bool run_forward_single_token_cuda_device_from_token_buffer(
   const cuda::CudaDeviceBufferF32 & token_id_device,
   const int position,
   const bool use_cuda_gpu_sampling,
+  const bool profile_cuda_sync,
   CudaForwardWorkspace & workspace,
   std::vector<float> & next_logits,
   DecodeProfilingAccumulator * profiling,
@@ -1918,12 +1982,18 @@ bool run_forward_single_token_cuda_device_from_token_buffer(
     return false;
   }
 
+  if (!maybe_sync_cuda_for_stage_timing(true, profile_cuda_sync, error_message)) {
+    return false;
+  }
   const auto embedding_start = std::chrono::steady_clock::now();
   if (!cuda::gather_matrix_row_f32_from_token_f32(
         weights.embed_tokens.device_matrix,
         token_id_device,
         workspace.hidden_in,
         error_message)) {
+    return false;
+  }
+  if (!maybe_sync_cuda_for_stage_timing(true, profile_cuda_sync, error_message)) {
     return false;
   }
   if (profiling != nullptr) {
@@ -1936,6 +2006,7 @@ bool run_forward_single_token_cuda_device_from_token_buffer(
     state,
     position,
     use_cuda_gpu_sampling,
+    profile_cuda_sync,
     workspace,
     next_logits,
     profiling,
@@ -1949,6 +2020,7 @@ bool run_forward_single_token(
   const int token_id,
   const int position,
   const bool use_cuda,
+  const bool profile_cuda_sync,
   std::vector<float> & next_logits,
   const bool use_cuda_gpu_sampling,
   CudaForwardWorkspace * cuda_workspace,
@@ -1974,6 +2046,7 @@ bool run_forward_single_token(
       token_id,
       position,
       use_cuda_gpu_sampling,
+      profile_cuda_sync,
       *cuda_workspace,
       next_logits,
       profiling,
@@ -2200,12 +2273,13 @@ bool run_reference_qwen35_inference(
   }
 
   const auto load_start = std::chrono::steady_clock::now();
+  const bool use_cuda_matvec_bf16 = options.use_cuda && options.use_cuda_matvec_bf16;
 
   ModelWeights weights;
   if (!load_model_weights(options.model_dir, dims, profile, weights, error_message)) {
     return false;
   }
-  if (options.use_cuda && !upload_model_weights_to_cuda(weights, error_message)) {
+  if (options.use_cuda && !upload_model_weights_to_cuda(weights, use_cuda_matvec_bf16, error_message)) {
     release_model_weights_cuda(weights);
     return false;
   }
@@ -2287,6 +2361,7 @@ bool run_reference_qwen35_inference(
       release_model_weights_cuda(weights);
       return false;
     }
+    cuda::set_prefer_bf16_matvec(use_cuda_matvec_bf16);
     if (!allocate_forward_workspace_cuda(dims, options.max_context, cuda_forward_workspace, error_message)) {
       cuda::end_inference_session();
       release_model_state_cuda(state);
@@ -2299,6 +2374,7 @@ bool run_reference_qwen35_inference(
   auto release_cuda_resources = [&]() {
     if (options.use_cuda) {
       release_forward_workspace_cuda(cuda_forward_workspace);
+      cuda::set_prefer_bf16_matvec(false);
       cuda::end_inference_session();
       release_model_state_cuda(state);
       release_model_weights_cuda(weights);
@@ -2386,6 +2462,7 @@ bool run_reference_qwen35_inference(
           prompt_token,
           position,
           options.use_cuda,
+          options.profile_cuda_sync,
           predicted_logits,
           use_cuda_gpu_sampling,
           cuda_workspace_ptr,
@@ -2415,6 +2492,11 @@ bool run_reference_qwen35_inference(
       }
 
       for (int i = 0; i < options.max_new_tokens; ++i) {
+        if (!maybe_sync_cuda_for_stage_timing(options.use_cuda, options.profile_cuda_sync, error_message)) {
+          release_cuda_decode_buffers();
+          release_cuda_resources();
+          return false;
+        }
         const auto sampling_start = std::chrono::steady_clock::now();
         const float random_u01 = options.sampling.temperature > 0.0f ? uniform01(rng) : 0.0f;
         if (!cuda::sample_token_from_logits_f32_device_to_buffer(
@@ -2439,6 +2521,11 @@ bool run_reference_qwen35_inference(
           release_cuda_resources();
           return false;
         }
+        if (!maybe_sync_cuda_for_stage_timing(options.use_cuda, options.profile_cuda_sync, error_message)) {
+          release_cuda_decode_buffers();
+          release_cuda_resources();
+          return false;
+        }
         profiling.sampling_ms += elapsed_ms(sampling_start);
 
         if (i + 1 < options.max_new_tokens) {
@@ -2450,6 +2537,7 @@ bool run_reference_qwen35_inference(
                 sampled_token_device,
                 position,
                 true,
+                options.profile_cuda_sync,
                 *cuda_workspace_ptr,
                 predicted_logits,
                 &profiling,
@@ -2487,6 +2575,11 @@ bool run_reference_qwen35_inference(
       }
     } else {
       for (int i = 0; i < options.max_new_tokens; ++i) {
+        if (!maybe_sync_cuda_for_stage_timing(options.use_cuda, options.profile_cuda_sync, error_message)) {
+          release_cuda_decode_buffers();
+          release_cuda_resources();
+          return false;
+        }
         const auto sampling_start = std::chrono::steady_clock::now();
         int current = 0;
         const float random_u01 = options.sampling.temperature > 0.0f ? uniform01(rng) : 0.0f;
@@ -2503,6 +2596,11 @@ bool run_reference_qwen35_inference(
               cuda_workspace_ptr->topk_indices_scratch,
               current,
               error_message)) {
+          release_cuda_decode_buffers();
+          release_cuda_resources();
+          return false;
+        }
+        if (!maybe_sync_cuda_for_stage_timing(options.use_cuda, options.profile_cuda_sync, error_message)) {
           release_cuda_decode_buffers();
           release_cuda_resources();
           return false;
@@ -2539,6 +2637,7 @@ bool run_reference_qwen35_inference(
               current,
               position,
               options.use_cuda,
+              options.profile_cuda_sync,
               predicted_logits,
               true,
               cuda_workspace_ptr,
@@ -2553,6 +2652,11 @@ bool run_reference_qwen35_inference(
     }
   } else {
     for (int i = 0; i < options.max_new_tokens; ++i) {
+      if (!maybe_sync_cuda_for_stage_timing(options.use_cuda, options.profile_cuda_sync, error_message)) {
+        release_cuda_decode_buffers();
+        release_cuda_resources();
+        return false;
+      }
       const auto sampling_start = std::chrono::steady_clock::now();
       int current = 0;
       if (!sample_token_from_logits(
@@ -2562,6 +2666,11 @@ bool run_reference_qwen35_inference(
             rng,
             current,
             error_message)) {
+        release_cuda_decode_buffers();
+        release_cuda_resources();
+        return false;
+      }
+      if (!maybe_sync_cuda_for_stage_timing(options.use_cuda, options.profile_cuda_sync, error_message)) {
         release_cuda_decode_buffers();
         release_cuda_resources();
         return false;
@@ -2601,6 +2710,7 @@ bool run_reference_qwen35_inference(
             current,
             position,
             options.use_cuda,
+            options.profile_cuda_sync,
             predicted_logits,
             false,
             cuda_workspace_ptr,
