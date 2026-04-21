@@ -31,6 +31,8 @@ struct FullAttentionWeights {
   TensorData o_proj;
   TensorData q_norm;
   TensorData k_norm;
+  cuda::CudaDeviceMatrixF32 kv_proj_device;
+  bool has_device_kv_proj = false;
   cuda::CudaDeviceBufferF32 q_norm_device;
   cuda::CudaDeviceBufferF32 k_norm_device;
   bool has_device_norm = false;
@@ -47,6 +49,8 @@ struct LinearAttentionWeights {
   TensorData a_log;
   TensorData dt_bias;
   std::vector<float> ssm_a;
+  cuda::CudaDeviceMatrixF32 in_proj_all_device;
+  bool has_device_in_proj_all = false;
   cuda::CudaDeviceBufferF32 norm_device;
   cuda::CudaDeviceBufferF32 dt_bias_device;
   cuda::CudaDeviceBufferF32 ssm_a_device;
@@ -59,6 +63,8 @@ struct LayerWeights {
   TensorData mlp_gate;
   TensorData mlp_up;
   TensorData mlp_down;
+  cuda::CudaDeviceMatrixF32 mlp_gate_up_device;
+  bool has_device_mlp_gate_up = false;
   cuda::CudaDeviceBufferF32 input_layernorm_device;
   cuda::CudaDeviceBufferF32 post_attention_layernorm_device;
   bool has_device_norms = false;
@@ -567,6 +573,51 @@ bool upload_vector_to_cuda(
   return true;
 }
 
+bool upload_row_concat_2d_to_cuda(
+  const std::vector<const TensorData *> & parts,
+  const std::string & name,
+  cuda::CudaDeviceMatrixF32 & out_matrix,
+  bool & out_has_matrix,
+  std::string & error_message) {
+  if (parts.empty()) {
+    error_message = "CUDA packed upload '" + name + "' has no source tensors.";
+    return false;
+  }
+
+  std::int64_t cols = -1;
+  std::int64_t total_rows = 0;
+  for (const TensorData * part : parts) {
+    if (part == nullptr || part->shape.size() != 2) {
+      error_message = "CUDA packed upload '" + name + "' expects 2D source tensors.";
+      return false;
+    }
+    if (cols < 0) {
+      cols = part->shape[1];
+    } else if (part->shape[1] != cols) {
+      error_message = "CUDA packed upload '" + name + "' source tensors have mismatched column counts.";
+      return false;
+    }
+    total_rows += part->shape[0];
+  }
+  if (cols <= 0 || total_rows <= 0) {
+    error_message = "CUDA packed upload '" + name + "' has invalid packed dimensions.";
+    return false;
+  }
+
+  std::vector<float> packed;
+  packed.reserve(static_cast<std::size_t>(total_rows * cols));
+  for (const TensorData * part : parts) {
+    packed.insert(packed.end(), part->data.begin(), part->data.end());
+  }
+
+  if (!cuda::upload_matrix_f32(packed, static_cast<int>(total_rows), static_cast<int>(cols), out_matrix, error_message)) {
+    error_message = "CUDA packed upload failed for tensor '" + name + "': " + error_message;
+    return false;
+  }
+  out_has_matrix = true;
+  return true;
+}
+
 void release_tensor_cuda(TensorData & tensor) {
   if (tensor.has_device_matrix || tensor.device_matrix.data != nullptr) {
     cuda::free_matrix_f32(tensor.device_matrix);
@@ -598,6 +649,14 @@ bool upload_model_weights_to_cuda(ModelWeights & weights, std::string & error_me
         !upload_tensor_2d_to_cuda(layer.mlp_down, prefix + "mlp_down", error_message)) {
       return false;
     }
+    if (!upload_row_concat_2d_to_cuda(
+          {&layer.mlp_gate, &layer.mlp_up},
+          prefix + "mlp_gate_up_packed",
+          layer.mlp_gate_up_device,
+          layer.has_device_mlp_gate_up,
+          error_message)) {
+      return false;
+    }
 
     if (layer.is_linear) {
       if (!upload_tensor_2d_to_cuda(layer.linear.in_proj_qkv, prefix + "linear.in_proj_qkv", error_message) ||
@@ -613,6 +672,14 @@ bool upload_model_weights_to_cuda(ModelWeights & weights, std::string & error_me
           !upload_vector_to_cuda(layer.linear.ssm_a, layer.linear.ssm_a_device, error_message)) {
         return false;
       }
+      if (!upload_row_concat_2d_to_cuda(
+            {&layer.linear.in_proj_qkv, &layer.linear.in_proj_z, &layer.linear.in_proj_b, &layer.linear.in_proj_a},
+            prefix + "linear.in_proj_all_packed",
+            layer.linear.in_proj_all_device,
+            layer.linear.has_device_in_proj_all,
+            error_message)) {
+        return false;
+      }
       layer.linear.has_device_params = true;
     } else {
       if (!upload_tensor_2d_to_cuda(layer.full.q_proj, prefix + "full.q_proj", error_message) ||
@@ -623,6 +690,14 @@ bool upload_model_weights_to_cuda(ModelWeights & weights, std::string & error_me
       }
       if (!upload_vector_to_cuda(layer.full.q_norm.data, layer.full.q_norm_device, error_message) ||
           !upload_vector_to_cuda(layer.full.k_norm.data, layer.full.k_norm_device, error_message)) {
+        return false;
+      }
+      if (!upload_row_concat_2d_to_cuda(
+            {&layer.full.k_proj, &layer.full.v_proj},
+            prefix + "full.kv_proj_packed",
+            layer.full.kv_proj_device,
+            layer.full.has_device_kv_proj,
+            error_message)) {
         return false;
       }
       layer.full.has_device_norm = true;
@@ -643,10 +718,14 @@ void release_model_weights_cuda(ModelWeights & weights) {
     release_tensor_cuda(layer.mlp_gate);
     release_tensor_cuda(layer.mlp_up);
     release_tensor_cuda(layer.mlp_down);
+    cuda::free_matrix_f32(layer.mlp_gate_up_device);
+    layer.has_device_mlp_gate_up = false;
     release_tensor_cuda(layer.full.q_proj);
     release_tensor_cuda(layer.full.k_proj);
     release_tensor_cuda(layer.full.v_proj);
     release_tensor_cuda(layer.full.o_proj);
+    cuda::free_matrix_f32(layer.full.kv_proj_device);
+    layer.full.has_device_kv_proj = false;
     cuda::free_buffer_f32(layer.full.q_norm_device);
     cuda::free_buffer_f32(layer.full.k_norm_device);
     layer.full.has_device_norm = false;
@@ -656,6 +735,8 @@ void release_model_weights_cuda(ModelWeights & weights) {
     release_tensor_cuda(layer.linear.in_proj_a);
     release_tensor_cuda(layer.linear.conv1d);
     release_tensor_cuda(layer.linear.out_proj);
+    cuda::free_matrix_f32(layer.linear.in_proj_all_device);
+    layer.linear.has_device_in_proj_all = false;
     cuda::free_buffer_f32(layer.linear.norm_device);
     cuda::free_buffer_f32(layer.linear.dt_bias_device);
     cuda::free_buffer_f32(layer.linear.ssm_a_device);
@@ -683,14 +764,21 @@ bool allocate_forward_workspace_cuda(
   std::string & error_message) {
   const std::size_t full_q_count = static_cast<std::size_t>(dims.n_heads * dims.head_dim);
   const std::size_t full_scores_count = static_cast<std::size_t>(dims.n_heads) * static_cast<std::size_t>(std::max(1, max_context));
+  const std::size_t full_kv_combined_count = static_cast<std::size_t>(2 * dims.n_kv_heads * dims.head_dim);
+  const std::size_t linear_combined_count =
+    static_cast<std::size_t>(dims.linear_conv_channels + dims.linear_v_dim + 2 * dims.linear_num_v_heads);
+  const std::size_t mlp_gate_up_combined_count = static_cast<std::size_t>(2 * dims.intermediate);
   const std::size_t projection_out_count = std::max<std::size_t>({
     static_cast<std::size_t>(dims.hidden),
     static_cast<std::size_t>(dims.n_heads * dims.head_dim * 2),
     static_cast<std::size_t>(dims.n_kv_heads * dims.head_dim),
+    full_kv_combined_count,
     static_cast<std::size_t>(dims.linear_conv_channels),
     static_cast<std::size_t>(dims.linear_v_dim),
     static_cast<std::size_t>(dims.linear_num_v_heads),
     static_cast<std::size_t>(dims.intermediate),
+    linear_combined_count,
+    mlp_gate_up_combined_count,
     1u
   });
   const std::size_t linear_q_dim = static_cast<std::size_t>(dims.linear_num_k_heads * dims.linear_head_k_dim);
@@ -772,6 +860,19 @@ void release_forward_workspace_cuda(CudaForwardWorkspace & workspace) {
   workspace.has_device_buffers = false;
 }
 
+cuda::CudaDeviceBufferF32 buffer_slice_f32(
+  const cuda::CudaDeviceBufferF32 & buffer,
+  const std::size_t offset,
+  const std::size_t count) {
+  cuda::CudaDeviceBufferF32 out;
+  if (buffer.data == nullptr || offset > buffer.count || count > (buffer.count - offset)) {
+    return out;
+  }
+  out.data = static_cast<float *>(buffer.data) + offset;
+  out.count = count;
+  return out;
+}
+
 bool run_linear_attention_step_cuda_device(
   const LayerWeights & layer,
   const RuntimeDims & dims,
@@ -780,23 +881,38 @@ bool run_linear_attention_step_cuda_device(
   CudaForwardWorkspace & workspace,
   cuda::CudaDeviceBufferF32 & out_hidden,
   std::string & error_message) {
-  if (!state.has_device_state || !layer.linear.has_device_params || !layer.linear.in_proj_qkv.has_device_matrix ||
-      !layer.linear.in_proj_z.has_device_matrix || !layer.linear.in_proj_b.has_device_matrix ||
-      !layer.linear.in_proj_a.has_device_matrix || !layer.linear.conv1d.has_device_matrix ||
+  if (!state.has_device_state || !layer.linear.has_device_params || !layer.linear.has_device_in_proj_all ||
+      !layer.linear.in_proj_all_device.data || !layer.linear.conv1d.has_device_matrix ||
       !layer.linear.out_proj.has_device_matrix) {
     error_message = "Linear-attention CUDA device path is not fully initialized.";
     return false;
   }
 
-  return cuda::run_matvec_f32_device(layer.linear.in_proj_qkv.device_matrix, x_in, workspace.linear_mixed_qkv, error_message) &&
-         cuda::run_matvec_f32_device(layer.linear.in_proj_z.device_matrix, x_in, workspace.linear_z, error_message) &&
-         cuda::run_matvec_f32_device(layer.linear.in_proj_b.device_matrix, x_in, workspace.linear_b, error_message) &&
-         cuda::run_matvec_f32_device(layer.linear.in_proj_a.device_matrix, x_in, workspace.linear_a, error_message) &&
+  const std::size_t mixed_count = static_cast<std::size_t>(dims.linear_conv_channels);
+  const std::size_t z_count = static_cast<std::size_t>(dims.linear_v_dim);
+  const std::size_t b_count = static_cast<std::size_t>(dims.linear_num_v_heads);
+  const std::size_t a_count = static_cast<std::size_t>(dims.linear_num_v_heads);
+  const std::size_t packed_count = mixed_count + z_count + b_count + a_count;
+  if (workspace.projection_out.count < packed_count) {
+    error_message = "CUDA workspace projection buffer is too small for packed linear projections.";
+    return false;
+  }
+
+  const cuda::CudaDeviceBufferF32 mixed = buffer_slice_f32(workspace.projection_out, 0, mixed_count);
+  const cuda::CudaDeviceBufferF32 z = buffer_slice_f32(workspace.projection_out, mixed_count, z_count);
+  const cuda::CudaDeviceBufferF32 b = buffer_slice_f32(workspace.projection_out, mixed_count + z_count, b_count);
+  const cuda::CudaDeviceBufferF32 a = buffer_slice_f32(workspace.projection_out, mixed_count + z_count + b_count, a_count);
+  if (mixed.data == nullptr || z.data == nullptr || b.data == nullptr || a.data == nullptr) {
+    error_message = "Failed to create packed linear projection slices.";
+    return false;
+  }
+
+  return cuda::run_matvec_f32_device(layer.linear.in_proj_all_device, x_in, workspace.projection_out, error_message) &&
          cuda::run_linear_attention_decode(
-           workspace.linear_mixed_qkv,
-           workspace.linear_z,
-           workspace.linear_b,
-           workspace.linear_a,
+           mixed,
+           z,
+           b,
+           a,
            layer.linear.conv1d.device_matrix,
            layer.linear.norm_device,
            layer.linear.dt_bias_device,
@@ -824,26 +940,33 @@ bool run_full_attention_step_cuda_device(
   CudaForwardWorkspace & workspace,
   cuda::CudaDeviceBufferF32 & out_hidden,
   std::string & error_message) {
-  if (!state.has_device_state || !layer.full.has_device_norm || !layer.full.q_proj.has_device_matrix ||
-      !layer.full.k_proj.has_device_matrix || !layer.full.v_proj.has_device_matrix || !layer.full.o_proj.has_device_matrix) {
+  if (!state.has_device_state || !layer.full.has_device_norm || !layer.full.has_device_kv_proj ||
+      !layer.full.q_proj.has_device_matrix || !layer.full.kv_proj_device.data || !layer.full.o_proj.has_device_matrix) {
     error_message = "Full-attention CUDA device path is not fully initialized.";
     return false;
   }
 
   const std::size_t q_packed_count = static_cast<std::size_t>(dims.n_heads * dims.head_dim * 2);
   const std::size_t kv_count = static_cast<std::size_t>(dims.n_kv_heads * dims.head_dim);
+  const std::size_t kv_packed_count = kv_count * 2;
   const std::size_t cache_offset = static_cast<std::size_t>(position) * kv_count;
-  if (workspace.logits.count < q_packed_count || workspace.hidden_out.count < kv_count ||
-      workspace.intermediate_a.count < kv_count || workspace.full_q.count < static_cast<std::size_t>(dims.n_heads * dims.head_dim) ||
+  if (workspace.logits.count < q_packed_count || workspace.projection_out.count < kv_packed_count ||
+      workspace.full_q.count < static_cast<std::size_t>(dims.n_heads * dims.head_dim) ||
       workspace.full_gate.count < static_cast<std::size_t>(dims.n_heads * dims.head_dim) ||
       workspace.full_attn.count < static_cast<std::size_t>(dims.n_heads * dims.head_dim)) {
     error_message = "CUDA forward workspace is too small for full-attention device step.";
     return false;
   }
 
+  const cuda::CudaDeviceBufferF32 k_raw = buffer_slice_f32(workspace.projection_out, 0, kv_count);
+  const cuda::CudaDeviceBufferF32 v_raw = buffer_slice_f32(workspace.projection_out, kv_count, kv_count);
+  if (k_raw.data == nullptr || v_raw.data == nullptr) {
+    error_message = "Failed to create packed KV projection slices.";
+    return false;
+  }
+
   return cuda::run_matvec_f32_device(layer.full.q_proj.device_matrix, x_in, workspace.logits, error_message) &&
-         cuda::run_matvec_f32_device(layer.full.k_proj.device_matrix, x_in, workspace.hidden_out, error_message) &&
-         cuda::run_matvec_f32_device(layer.full.v_proj.device_matrix, x_in, workspace.intermediate_a, error_message) &&
+         cuda::run_matvec_f32_device(layer.full.kv_proj_device, x_in, workspace.projection_out, error_message) &&
          cuda::run_split_q_gate_f32(workspace.logits, dims.n_heads, dims.head_dim, workspace.full_q, workspace.full_gate, error_message) &&
          cuda::run_rms_norm_per_head_f32(
            workspace.full_q,
@@ -854,7 +977,7 @@ bool run_full_attention_step_cuda_device(
            workspace.full_q,
            error_message) &&
          cuda::run_rms_norm_per_head_f32(
-           workspace.hidden_out,
+           k_raw,
            layer.full.k_norm_device,
            dims.n_kv_heads,
            dims.head_dim,
@@ -878,7 +1001,7 @@ bool run_full_attention_step_cuda_device(
            dims.rope_theta,
            error_message) &&
          cuda::copy_buffer_f32(workspace.full_attn, kv_count, 0, state.k_cache_device, cache_offset, error_message) &&
-         cuda::copy_buffer_f32(workspace.intermediate_a, kv_count, 0, state.v_cache_device, cache_offset, error_message) &&
+         cuda::copy_buffer_f32(v_raw, kv_count, 0, state.v_cache_device, cache_offset, error_message) &&
          cuda::run_full_attention_decode_gqa(
            workspace.full_q,
            workspace.full_gate,
@@ -1577,7 +1700,7 @@ bool run_forward_single_token_cuda_device(
           layer.input_layernorm_device,
           hidden_count,
           dims.rms_eps,
-          workspace.projection_out,
+          workspace.full_q,
           error_message)) {
       return false;
     }
@@ -1588,7 +1711,7 @@ bool run_forward_single_token_cuda_device(
             layer,
             dims,
             state.linear_states[static_cast<std::size_t>(linear_idx)],
-            workspace.projection_out,
+            workspace.full_q,
             workspace,
             workspace.hidden_out,
             error_message)) {
@@ -1600,7 +1723,7 @@ bool run_forward_single_token_cuda_device(
             layer,
             dims,
             state.full_states[static_cast<std::size_t>(full_idx)],
-            workspace.projection_out,
+            workspace.full_q,
             position,
             workspace,
             workspace.hidden_out,
@@ -1621,15 +1744,36 @@ bool run_forward_single_token_cuda_device(
           hidden_count,
           dims.rms_eps,
           workspace.full_q,
-          error_message) ||
-        !cuda::run_matvec_f32_device(layer.mlp_gate.device_matrix, workspace.full_q, workspace.intermediate_a, error_message) ||
-        !cuda::run_matvec_f32_device(layer.mlp_up.device_matrix, workspace.full_q, workspace.intermediate_b, error_message) ||
-        !cuda::run_silu_mul_f32(
-          workspace.intermediate_a,
-          workspace.intermediate_b,
-          intermediate_count,
-          workspace.intermediate_hidden,
-          error_message) ||
+          error_message)) {
+      return false;
+    }
+
+    bool mlp_ok = false;
+    if (layer.has_device_mlp_gate_up && layer.mlp_gate_up_device.data != nullptr) {
+      const std::size_t packed_count = intermediate_count * 2;
+      if (workspace.projection_out.count < packed_count) {
+        error_message = "CUDA workspace projection buffer is too small for packed MLP projections.";
+        return false;
+      }
+      const cuda::CudaDeviceBufferF32 gate = buffer_slice_f32(workspace.projection_out, 0, intermediate_count);
+      const cuda::CudaDeviceBufferF32 up = buffer_slice_f32(workspace.projection_out, intermediate_count, intermediate_count);
+      if (gate.data == nullptr || up.data == nullptr) {
+        error_message = "Failed to create packed MLP projection slices.";
+        return false;
+      }
+      mlp_ok = cuda::run_matvec_f32_device(layer.mlp_gate_up_device, workspace.full_q, workspace.projection_out, error_message) &&
+               cuda::run_silu_mul_f32(gate, up, intermediate_count, workspace.intermediate_hidden, error_message);
+    } else {
+      mlp_ok = cuda::run_matvec_f32_device(layer.mlp_gate.device_matrix, workspace.full_q, workspace.intermediate_a, error_message) &&
+               cuda::run_matvec_f32_device(layer.mlp_up.device_matrix, workspace.full_q, workspace.intermediate_b, error_message) &&
+               cuda::run_silu_mul_f32(
+                 workspace.intermediate_a,
+                 workspace.intermediate_b,
+                 intermediate_count,
+                 workspace.intermediate_hidden,
+                 error_message);
+    }
+    if (!mlp_ok ||
         !cuda::run_matvec_f32_device(layer.mlp_down.device_matrix, workspace.intermediate_hidden, workspace.hidden_out, error_message) ||
         !cuda::run_add_f32(workspace.full_attn, workspace.hidden_out, hidden_count, workspace.hidden_in, error_message)) {
       return false;
