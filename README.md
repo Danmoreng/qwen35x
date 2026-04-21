@@ -14,11 +14,17 @@ The goal is not a generic multi-model runtime. The goal is a small, hardware-awa
 
 - Load Qwen3.5 profile/config from Hugging Face model folders
 - Native tokenizer (`vocab.json` + `merges.txt` + added tokens)
-- Reference generation via `--infer-reference` (CPU) and `--infer-gpu` (CUDA-hybrid)
+- Reference generation via `--infer-reference` (CPU) and `--infer-gpu` (CUDA)
+- Device-resident decode path for per-layer hidden/residual/norm/attention/MLP math in `--infer-gpu`
+- GPU logits + GPU sampling path (returns only sampled token id to CPU)
 - Qwen-style default sampling (`temperature=0.7`, `top_p=0.8`, `top_k=20`, `repeat_penalty=1.05`)
 - Deterministic mode with `--seed` and `--temperature 0`
 - Stop controls: `--stop-token`, `--stop-text`, `--stop-on-im-end`
 - BF16 tensor benchmark path (`--bench-bf16`)
+- Profiling output via `--profile-json` (stage timings + H2D/D2H transfer stats)
+
+Current GPU sampling constraint:
+- For `temperature > 0`, GPU sampling currently supports `top_k` in `[1, 64]`.
 
 ## Quick Start (Windows / PowerShell)
 
@@ -44,6 +50,12 @@ The goal is not a generic multi-model runtime. The goal is a small, hardware-awa
 
 ```powershell
 .\build\qwen35x.exe --infer-gpu --hf-model-dir models/qwen3.5-0.8b --chat-user "Tell me a short joke." --max-new-tokens 64 --max-context 256 --stop-on-im-end
+```
+
+5. Run with profiling JSON
+
+```powershell
+.\build\qwen35x.exe --infer-gpu --hf-model-dir models/qwen3.5-0.8b --chat-user "Tell me a short joke." --max-new-tokens 64 --max-context 256 --profile-json build/last_profile.json
 ```
 
 ## Useful Commands

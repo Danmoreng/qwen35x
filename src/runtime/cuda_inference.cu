@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <utility>
 
 namespace qwen35x::cuda {
@@ -542,6 +543,150 @@ __global__ void silu_mul_kernel(
   const float av = a[idx];
   const float sig = 1.0f / (1.0f + expf(-av));
   out[idx] = (av * sig) * b[idx];
+}
+
+__global__ void add_kernel(
+  const float * a,
+  const float * b,
+  float * out,
+  const std::size_t count) {
+  const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * static_cast<std::size_t>(blockDim.x) +
+                          static_cast<std::size_t>(threadIdx.x);
+  if (idx >= count) {
+    return;
+  }
+  out[idx] = a[idx] + b[idx];
+}
+
+__global__ void rms_norm_kernel(
+  const float * input,
+  const float * weight,
+  float * out,
+  const int count,
+  const float eps) {
+  __shared__ float reduction[256];
+  const int tid = threadIdx.x;
+
+  float sum = 0.0f;
+  for (int i = tid; i < count; i += blockDim.x) {
+    const float v = input[i];
+    sum += v * v;
+  }
+  reduction[tid] = sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduction[tid] += reduction[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  __shared__ float inv;
+  if (tid == 0) {
+    inv = rsqrtf((reduction[0] / static_cast<float>(count)) + eps);
+  }
+  __syncthreads();
+
+  for (int i = tid; i < count; i += blockDim.x) {
+    out[i] = input[i] * inv * (1.0f + weight[i]);
+  }
+}
+
+__global__ void split_q_gate_kernel(
+  const float * packed,
+  float * out_q,
+  float * out_gate,
+  const int n_heads,
+  const int head_dim) {
+  const int h = blockIdx.x;
+  const int d = threadIdx.x;
+  if (h >= n_heads || d >= head_dim) {
+    return;
+  }
+  const int q_span = head_dim * 2;
+  const std::size_t src = static_cast<std::size_t>(h) * static_cast<std::size_t>(q_span) + static_cast<std::size_t>(d);
+  const std::size_t dst = static_cast<std::size_t>(h) * static_cast<std::size_t>(head_dim) + static_cast<std::size_t>(d);
+  out_q[dst] = packed[src];
+  out_gate[dst] = packed[src + static_cast<std::size_t>(head_dim)];
+}
+
+__global__ void rms_norm_per_head_kernel(
+  const float * input,
+  const float * weight,
+  float * out,
+  const int n_heads,
+  const int head_dim,
+  const float eps) {
+  __shared__ float reduction[256];
+  const int head = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (head >= n_heads) {
+    return;
+  }
+
+  const float * in_ptr = input + static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim);
+  float * out_ptr = out + static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim);
+
+  float sum = 0.0f;
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    const float v = in_ptr[d];
+    sum += v * v;
+  }
+  reduction[tid] = sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduction[tid] += reduction[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  __shared__ float inv;
+  if (tid == 0) {
+    inv = rsqrtf((reduction[0] / static_cast<float>(head_dim)) + eps);
+  }
+  __syncthreads();
+
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    out_ptr[d] = in_ptr[d] * inv * (1.0f + weight[d]);
+  }
+}
+
+__global__ void rope_inplace_kernel(
+  float * values,
+  const int n_heads,
+  const int head_dim,
+  const int rope_dim,
+  const int position,
+  const float rope_theta) {
+  const int head = blockIdx.x;
+  const int pair_idx = blockIdx.y * blockDim.x + threadIdx.x;
+  if (head >= n_heads) {
+    return;
+  }
+  const int half = rope_dim / 2;
+  if (pair_idx >= half) {
+    return;
+  }
+
+  const std::size_t base = static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim);
+  float * ptr = values + base;
+  const int i0 = pair_idx;
+  const int i1 = pair_idx + half;
+  if (i1 >= head_dim) {
+    return;
+  }
+  const float x0 = ptr[i0];
+  const float x1 = ptr[i1];
+  const float inv_freq = expf(
+    -logf(rope_theta) * (static_cast<float>(2 * pair_idx) / static_cast<float>(rope_dim)));
+  const float angle = static_cast<float>(position) * inv_freq;
+  const float c = cosf(angle);
+  const float s = sinf(angle);
+  ptr[i0] = x0 * c - x1 * s;
+  ptr[i1] = x1 * c + x0 * s;
 }
 
 __device__ __forceinline__ float adjust_sampling_logit(
@@ -1417,6 +1562,228 @@ bool run_silu_mul_f32(
     static_cast<float *>(out.data),
     count);
   return check_cuda(cudaGetLastError(), "silu_mul_kernel", error_message);
+}
+
+bool run_add_f32(
+  const CudaDeviceBufferF32 & a,
+  const CudaDeviceBufferF32 & b,
+  const std::size_t count,
+  CudaDeviceBufferF32 & out,
+  std::string & error_message) {
+  if (count == 0) {
+    return true;
+  }
+  if (a.data == nullptr || b.data == nullptr || out.data == nullptr) {
+    error_message = "CUDA add requires initialized buffers.";
+    return false;
+  }
+  if (a.count < count || b.count < count || out.count < count) {
+    error_message = "CUDA add buffer range is out of bounds.";
+    return false;
+  }
+  const int block_size = 256;
+  const int grid_size = static_cast<int>((count + static_cast<std::size_t>(block_size) - 1) / static_cast<std::size_t>(block_size));
+  const cudaStream_t stream = active_stream();
+  add_kernel<<<grid_size, block_size, 0, stream>>>(
+    static_cast<const float *>(a.data),
+    static_cast<const float *>(b.data),
+    static_cast<float *>(out.data),
+    count);
+  return check_cuda(cudaGetLastError(), "add_kernel", error_message);
+}
+
+bool run_rms_norm_f32(
+  const CudaDeviceBufferF32 & input,
+  const CudaDeviceBufferF32 & weight,
+  const std::size_t count,
+  const float eps,
+  CudaDeviceBufferF32 & out,
+  std::string & error_message) {
+  if (count == 0) {
+    return true;
+  }
+  if (input.data == nullptr || weight.data == nullptr || out.data == nullptr) {
+    error_message = "CUDA rms_norm requires initialized buffers.";
+    return false;
+  }
+  if (input.count < count || weight.count < count || out.count < count) {
+    error_message = "CUDA rms_norm buffer range is out of bounds.";
+    return false;
+  }
+  if (count > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    error_message = "CUDA rms_norm count exceeds kernel limits.";
+    return false;
+  }
+
+  const cudaStream_t stream = active_stream();
+  rms_norm_kernel<<<1, 256, 0, stream>>>(
+    static_cast<const float *>(input.data),
+    static_cast<const float *>(weight.data),
+    static_cast<float *>(out.data),
+    static_cast<int>(count),
+    eps);
+  return check_cuda(cudaGetLastError(), "rms_norm_kernel", error_message);
+}
+
+bool run_split_q_gate_f32(
+  const CudaDeviceBufferF32 & q_gate_packed,
+  const int n_heads,
+  const int head_dim,
+  CudaDeviceBufferF32 & out_q,
+  CudaDeviceBufferF32 & out_gate,
+  std::string & error_message) {
+  if (n_heads <= 0 || head_dim <= 0) {
+    error_message = "Invalid dimensions for split_q_gate.";
+    return false;
+  }
+  const std::size_t packed_count = static_cast<std::size_t>(n_heads) * static_cast<std::size_t>(head_dim) * 2;
+  const std::size_t q_count = static_cast<std::size_t>(n_heads) * static_cast<std::size_t>(head_dim);
+  if (q_gate_packed.data == nullptr || out_q.data == nullptr || out_gate.data == nullptr) {
+    error_message = "CUDA split_q_gate requires initialized buffers.";
+    return false;
+  }
+  if (q_gate_packed.count < packed_count || out_q.count < q_count || out_gate.count < q_count) {
+    error_message = "CUDA split_q_gate buffer range is out of bounds.";
+    return false;
+  }
+
+  int block_size = 1;
+  while (block_size < head_dim && block_size < 256) {
+    block_size <<= 1;
+  }
+  if (block_size < 32) {
+    block_size = 32;
+  }
+  if (block_size > 256) {
+    block_size = 256;
+  }
+  const cudaStream_t stream = active_stream();
+  split_q_gate_kernel<<<n_heads, block_size, 0, stream>>>(
+    static_cast<const float *>(q_gate_packed.data),
+    static_cast<float *>(out_q.data),
+    static_cast<float *>(out_gate.data),
+    n_heads,
+    head_dim);
+  return check_cuda(cudaGetLastError(), "split_q_gate_kernel", error_message);
+}
+
+bool run_rms_norm_per_head_f32(
+  const CudaDeviceBufferF32 & input,
+  const CudaDeviceBufferF32 & weight,
+  const int n_heads,
+  const int head_dim,
+  const float eps,
+  CudaDeviceBufferF32 & out,
+  std::string & error_message) {
+  if (n_heads <= 0 || head_dim <= 0) {
+    error_message = "Invalid dimensions for rms_norm_per_head.";
+    return false;
+  }
+  const std::size_t count = static_cast<std::size_t>(n_heads) * static_cast<std::size_t>(head_dim);
+  if (input.data == nullptr || weight.data == nullptr || out.data == nullptr) {
+    error_message = "CUDA rms_norm_per_head requires initialized buffers.";
+    return false;
+  }
+  if (input.count < count || weight.count < static_cast<std::size_t>(head_dim) || out.count < count) {
+    error_message = "CUDA rms_norm_per_head buffer range is out of bounds.";
+    return false;
+  }
+
+  int block_size = 1;
+  while (block_size < head_dim && block_size < 256) {
+    block_size <<= 1;
+  }
+  if (block_size < 32) {
+    block_size = 32;
+  }
+  if (block_size > 256) {
+    block_size = 256;
+  }
+  const cudaStream_t stream = active_stream();
+  rms_norm_per_head_kernel<<<n_heads, block_size, 0, stream>>>(
+    static_cast<const float *>(input.data),
+    static_cast<const float *>(weight.data),
+    static_cast<float *>(out.data),
+    n_heads,
+    head_dim,
+    eps);
+  return check_cuda(cudaGetLastError(), "rms_norm_per_head_kernel", error_message);
+}
+
+bool run_apply_rope_inplace_f32(
+  const CudaDeviceBufferF32 & values,
+  const int n_heads,
+  const int head_dim,
+  const int rope_dim,
+  const int position,
+  const float rope_theta,
+  std::string & error_message) {
+  if (n_heads <= 0 || head_dim <= 0 || rope_dim <= 0) {
+    error_message = "Invalid dimensions for apply_rope.";
+    return false;
+  }
+  const int applied_rope_dim = std::min(rope_dim, head_dim);
+  const std::size_t count = static_cast<std::size_t>(n_heads) * static_cast<std::size_t>(head_dim);
+  if (values.data == nullptr || values.count < count) {
+    error_message = "CUDA apply_rope buffer range is out of bounds.";
+    return false;
+  }
+  const int pair_count = applied_rope_dim / 2;
+  if (pair_count <= 0) {
+    return true;
+  }
+  const int block_size = 128;
+  const int grid_y = (pair_count + block_size - 1) / block_size;
+  const dim3 grid(n_heads, grid_y, 1);
+  const cudaStream_t stream = active_stream();
+  rope_inplace_kernel<<<grid, block_size, 0, stream>>>(
+    static_cast<float *>(values.data),
+    n_heads,
+    head_dim,
+    applied_rope_dim,
+    position,
+    rope_theta);
+  return check_cuda(cudaGetLastError(), "rope_inplace_kernel", error_message);
+}
+
+bool copy_buffer_f32(
+  const CudaDeviceBufferF32 & src,
+  const std::size_t count,
+  const std::size_t src_offset,
+  const CudaDeviceBufferF32 & dst,
+  const std::size_t dst_offset,
+  std::string & error_message) {
+  if (count == 0) {
+    return true;
+  }
+  if (src.data == nullptr || dst.data == nullptr) {
+    error_message = "CUDA copy_buffer requires initialized buffers.";
+    return false;
+  }
+  if (src_offset > src.count || count > (src.count - src_offset) || dst_offset > dst.count || count > (dst.count - dst_offset)) {
+    error_message = "CUDA copy_buffer range is out of bounds.";
+    return false;
+  }
+  const float * src_ptr = static_cast<const float *>(src.data) + src_offset;
+  float * dst_ptr = static_cast<float *>(dst.data) + dst_offset;
+  const cudaStream_t stream = active_stream();
+  if (stream != nullptr) {
+    return tracked_memcpy_async(
+      dst_ptr,
+      src_ptr,
+      count * sizeof(float),
+      cudaMemcpyDeviceToDevice,
+      stream,
+      "cudaMemcpyAsync(buffer_copy_d2d)",
+      error_message);
+  }
+  return tracked_memcpy(
+    dst_ptr,
+    src_ptr,
+    count * sizeof(float),
+    cudaMemcpyDeviceToDevice,
+    "cudaMemcpy(buffer_copy_d2d)",
+    error_message);
 }
 
 bool run_full_attention_decode_gqa(

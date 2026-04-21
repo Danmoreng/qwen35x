@@ -81,6 +81,55 @@ bool run_silu_mul_f32(
   CudaDeviceBufferF32 & out,
   std::string & error_message);
 
+bool run_add_f32(
+  const CudaDeviceBufferF32 & a,
+  const CudaDeviceBufferF32 & b,
+  std::size_t count,
+  CudaDeviceBufferF32 & out,
+  std::string & error_message);
+
+bool run_rms_norm_f32(
+  const CudaDeviceBufferF32 & input,
+  const CudaDeviceBufferF32 & weight,
+  std::size_t count,
+  float eps,
+  CudaDeviceBufferF32 & out,
+  std::string & error_message);
+
+bool run_split_q_gate_f32(
+  const CudaDeviceBufferF32 & q_gate_packed,
+  int n_heads,
+  int head_dim,
+  CudaDeviceBufferF32 & out_q,
+  CudaDeviceBufferF32 & out_gate,
+  std::string & error_message);
+
+bool run_rms_norm_per_head_f32(
+  const CudaDeviceBufferF32 & input,
+  const CudaDeviceBufferF32 & weight,
+  int n_heads,
+  int head_dim,
+  float eps,
+  CudaDeviceBufferF32 & out,
+  std::string & error_message);
+
+bool run_apply_rope_inplace_f32(
+  const CudaDeviceBufferF32 & values,
+  int n_heads,
+  int head_dim,
+  int rope_dim,
+  int position,
+  float rope_theta,
+  std::string & error_message);
+
+bool copy_buffer_f32(
+  const CudaDeviceBufferF32 & src,
+  std::size_t count,
+  std::size_t src_offset,
+  const CudaDeviceBufferF32 & dst,
+  std::size_t dst_offset,
+  std::string & error_message);
+
 bool run_full_attention_decode_gqa(
   const CudaDeviceBufferF32 & q,
   const CudaDeviceBufferF32 & gate,

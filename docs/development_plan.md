@@ -2,6 +2,20 @@
 
 This plan summarizes the original project direction and turns it into a public, implementation-focused roadmap.
 
+## Status Snapshot (April 2026)
+
+Completed:
+- CPU reference inference pipeline for Qwen3.5-0.8B
+- CUDA inference path with full-attention decode kernel + linear-attention decode kernel
+- Device-resident per-layer decode flow (hidden/residual/norm/attention/MLP on GPU)
+- GPU logits + GPU sampling path (sampled token id returned to host)
+- Decode profiling (`--profile-json`) with stage timing and transfer breakdown
+
+Current known constraints:
+- GPU sampling path currently requires `top_k <= 64` when `temperature > 0`
+- Stop condition checks remain host-side (token-level, cheap control-path)
+- Prefill path is still token-by-token and not yet batched/specialized
+
 ## Vision
 
 Build a standalone, hardware-aware inference engine specialized for the Qwen3.5 architecture family, starting with `Qwen3.5-0.8B` and scaling to larger variants later.
@@ -15,7 +29,7 @@ Core strategy:
 
 - Initial model: `Qwen/Qwen3.5-0.8B`
 - Initial platform: NVIDIA GPU class used in this project environment
-- Initial precision path: dense reference + CUDA-hybrid bring-up
+- Initial precision path: dense reference + CUDA GPU decode path
 - Future target: larger Qwen3.5 variants with the same engine architecture
 
 ## Design Principles
@@ -69,6 +83,11 @@ Core strategy:
 - Add one clear low-precision path first (instead of many formats at once)
 - Keep fallback and correctness tests for every precision mode
 
+Milestone progress:
+- Milestones 1-4: completed
+- Milestone 5: partially completed (decode kernels implemented; still optimizing/fusing)
+- Milestones 6-7: in progress
+
 ## Validation and Benchmarking Plan
 
 - Correctness tests:
@@ -83,7 +102,8 @@ Core strategy:
 
 ## Practical Next Steps
 
-1. Complete full GPU attention math path (remove remaining CPU bottlenecks in `--infer-gpu`)
-2. Add parity test scripts for CPU/GPU with fixed seeds
-3. Add packed-tensor pipeline for decode-critical weights
-4. Profile and iterate kernel implementations by measured hotspots
+1. Optimize GPU sampling further (lift current `top_k <= 64` limit while preserving throughput)
+2. Add dedicated prefill implementation (batched/streaming prefill separate from decode)
+3. Add parity and performance harness scripts for repeatable CPU/GPU checks
+4. Add decode-critical weight/layout packing and kernel-tuned memory layouts
+5. Introduce CUDA graph capture and stream scheduling for steady-state decode

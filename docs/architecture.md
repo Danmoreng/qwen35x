@@ -2,6 +2,13 @@
 
 The scaffold follows the public project roadmap in `docs/development_plan.md`.
 
+## Current Runtime Status
+
+- CPU reference path remains the correctness oracle.
+- `--infer-gpu` uses CUDA kernels with a device-resident decode loop across layer math.
+- Per-token D2H transfer is reduced to minimal control-path data (sampled token id / bookkeeping).
+- Profiling is available via `--profile-json` for stage timing and transfer accounting.
+
 ## Design split
 
 - Compiler layer
@@ -31,6 +38,6 @@ The scaffold follows the public project roadmap in `docs/development_plan.md`.
 
 1. Parse real HF `config.json` and `model.safetensors.index.json`.
 2. Build offline packer output (`.q35xpack`) from safetensors shards.
-3. Implement `linear_attention_decode` and `full_attention_decode_gqa` CUDA kernels.
-4. Add prefill path (`causal_conv1d` + chunked linear attention).
+3. Keep decode loop fully device-resident and remove host roundtrips in hot path.
+4. Add dedicated prefill path (`causal_conv1d` + chunked linear attention).
 5. Add quantized path and architecture-specific autotuning.

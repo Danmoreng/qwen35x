@@ -2,6 +2,12 @@
 
 This checklist is the execution plan to move `--infer-gpu` from CUDA-hybrid to a fully GPU-resident decode/prefill path.
 
+Progress snapshot (April 2026):
+- Fully device-resident per-layer decode flow is implemented.
+- Full-logits per-token D2H copies are removed.
+- Current measured transfer footprint is near control-path scale (`~3-4 bytes D2H per forward token`).
+- Current open bottlenecks are sampling optimization depth and prefill specialization.
+
 Scope:
 - Model family: Qwen3.5 (current profile `qwen3_5_0_8b.profile.json`)
 - Runtime mode: `qwen35x --infer-gpu`
@@ -11,13 +17,13 @@ Scope:
 
 ## 0. Baseline and Guardrails
 
-- [ ] Capture baseline metrics before changes
+- [x] Capture baseline metrics before changes
   - Command: `.\build\qwen35x.exe --infer-gpu --hf-model-dir models\qwen3.5-0.8b --chat-user "Tell me a short joke." --max-new-tokens 128 --max-context 256 --seed 123 --temperature 0`
   - Record: load time, decode time, tokens/s, generated token ids
 - [ ] Add a fixed-prompt parity set for regression checks
   - Create `scripts/bench/parity_prompts.txt` with at least 10 prompts
   - Include the known edge case prompt style with trailing space
-- [ ] Define acceptance thresholds
+- [x] Define acceptance thresholds
   - Token parity vs CPU reference when `temperature=0` and same seed
   - No quality regression on chat prompts with default sampling
   - Throughput target: improve decode tokens/s by removing CPU-bound steps
@@ -31,11 +37,11 @@ Files:
 
 ## 1. Instrumentation First (Find Remaining CPU Bottlenecks)
 
-- [ ] Add fine-grained timing sections in the decode loop
+- [x] Add fine-grained timing sections in the decode loop
   - Split timings: embedding, attention block(s), MLP, logits, sampling, stop checks
-- [ ] Count and log host/device transfer bytes per token
+- [x] Count and log host/device transfer bytes per token
   - Track `cudaMemcpy` calls in inference path and aggregate totals
-- [ ] Add a `--profile-json <path>` output option for machine-readable benchmarking
+- [x] Add a `--profile-json <path>` output option for machine-readable benchmarking
 
 Files:
 - `src/runtime/reference_inference.cpp`
@@ -44,7 +50,7 @@ Files:
 - `src/main.cpp`
 
 Exit criteria:
-- [ ] We can point to exact top 3 stalls in per-token decode.
+- [x] We can point to exact top 3 stalls in per-token decode.
 
 ---
 
@@ -54,10 +60,10 @@ Current issue:
 - `src/runtime/cuda_inference.cu` uses global reusable buffers plus `cudaDeviceSynchronize()` in matvec path.
 
 Tasks:
-- [ ] Replace global workspace (`g_workspace_input/output`) with per-runtime context buffers
-- [ ] Introduce explicit CUDA stream ownership in inference runtime context
-- [ ] Remove unconditional `cudaDeviceSynchronize()` from per-op path
-- [ ] Use async copies/kernels where possible and synchronize only at required boundaries
+- [x] Replace global workspace (`g_workspace_input/output`) with per-runtime context buffers
+- [x] Introduce explicit CUDA stream ownership in inference runtime context
+- [x] Remove unconditional `cudaDeviceSynchronize()` from per-op path
+- [x] Use async copies/kernels where possible and synchronize only at required boundaries
 
 Files:
 - `include/qwen35x/runtime/cuda_inference.h`
@@ -65,8 +71,8 @@ Files:
 - `src/runtime/reference_inference.cpp`
 
 Exit criteria:
-- [ ] No global mutable CUDA workspace state.
-- [ ] No per-matvec full-device sync in hot loop.
+- [x] No global mutable CUDA workspace state.
+- [x] No per-matvec full-device sync in hot loop.
 
 ---
 
@@ -76,12 +82,12 @@ Current issue:
 - Full-attention and linear states are still updated on CPU and synced to device token-by-token.
 
 Tasks:
-- [ ] Define device-state structs for:
+- [x] Define device-state structs for:
   - Full-attention KV cache
   - Linear conv state
   - Linear recurrent SSM state
-- [ ] Stop maintaining CPU-authoritative copies for hot loop state
-- [ ] Replace `sync_full_state_token_to_cuda` and `sync_linear_state_to_cuda` path with direct GPU writes/updates
+- [x] Stop maintaining CPU-authoritative copies for hot loop state
+- [x] Replace `sync_full_state_token_to_cuda` and `sync_linear_state_to_cuda` path with direct GPU writes/updates
 - [ ] Keep CPU copies only for optional debug dumps
 
 Files:
@@ -90,7 +96,7 @@ Files:
 - `src/runtime/cuda_inference.cu`
 
 Exit criteria:
-- [ ] No per-token cache/state upload from host in normal `--infer-gpu` mode.
+- [x] No per-token cache/state upload from host in normal `--infer-gpu` mode.
 
 ---
 
@@ -100,15 +106,15 @@ Current issue:
 - Full-attention math runs in CPU loops in `run_full_attention_step`.
 
 Tasks:
-- [ ] Add real kernel replacing `qwen35x_full_decode_gqa_stub`
+- [x] Add real kernel replacing `qwen35x_full_decode_gqa_stub`
 - [ ] Kernel responsibilities:
   - Q/K normalization handling (or pre/post kernels if cleaner)
   - RoPE for query/key at current position
   - Attention score compute against KV cache
   - Softmax and weighted value reduction
   - Head-group mapping for GQA (`n_heads / n_kv_heads`)
-- [ ] Add launch wrapper API in `cuda_inference` module
-- [ ] Validate numeric parity on deterministic mode
+- [x] Add launch wrapper API in `cuda_inference` module
+- [x] Validate numeric parity on deterministic mode
 
 Files:
 - `src/kernels/cuda/qwen35x_decode_stub.cu` (replace with real kernels)
@@ -117,7 +123,7 @@ Files:
 - `src/runtime/reference_inference.cpp`
 
 Exit criteria:
-- [ ] `run_full_attention_step` no longer performs CPU attention loops when `use_cuda=true`.
+- [x] `run_full_attention_step` no longer performs CPU attention loops when `use_cuda=true`.
 
 ---
 
@@ -127,14 +133,14 @@ Current issue:
 - Linear attention path (`conv + recurrent update + gated norm`) is CPU-native.
 
 Tasks:
-- [ ] Add real kernel replacing `qwen35x_linear_decode_stub`
+- [x] Add real kernel replacing `qwen35x_linear_decode_stub`
 - [ ] Implement GPU path for:
   - conv window update and 1D causal conv
   - q/k/v split and per-head norms
   - recurrent matrix state update (`S = alpha*S + beta*...`)
   - output projection input construction
   - gated RMS-style normalization and SiLU gate application
-- [ ] Keep a clean CPU reference path for parity testing only
+- [x] Keep a clean CPU reference path for parity testing only
 
 Files:
 - `src/kernels/cuda/qwen35x_decode_stub.cu`
@@ -142,7 +148,7 @@ Files:
 - `src/runtime/reference_inference.cpp`
 
 Exit criteria:
-- [ ] `run_linear_attention_step` does not execute CPU math when `use_cuda=true`.
+- [x] `run_linear_attention_step` does not execute CPU math when `use_cuda=true`.
 
 ---
 
@@ -152,12 +158,12 @@ Current issue:
 - Even with CUDA matvec, glue math around layers can remain CPU-side and force transfers.
 
 Tasks:
-- [ ] Add GPU kernels for:
+- [x] Add GPU kernels for:
   - residual add
   - RMSNorm variants used in block
   - SiLU and elementwise multiply in MLP gate path
-- [ ] Keep hidden states on device across entire layer stack
-- [ ] Avoid device-to-host copies between layer operations
+- [x] Keep hidden states on device across entire layer stack
+- [x] Avoid device-to-host copies between layer operations
 
 Files:
 - `src/runtime/reference_inference.cpp`
@@ -165,7 +171,7 @@ Files:
 - `include/qwen35x/runtime/cuda_inference.h`
 
 Exit criteria:
-- [ ] Hidden/residual tensors stay on GPU from token embedding to logits.
+- [x] Hidden/residual tensors stay on GPU from token embedding to logits.
 
 ---
 
@@ -175,14 +181,14 @@ Current issue:
 - Sampling and stop-text checks are CPU-based in the main inference loop.
 
 Tasks:
-- [ ] Add GPU sampling kernel path:
+- [x] Add GPU sampling kernel path:
   - temperature scaling
   - top-k filter
   - top-p cutoff
   - repetition penalty application
-- [ ] Keep RNG deterministic with explicit seeded generator state per request
-- [ ] Return only sampled token id to CPU each step
-- [ ] Keep stop-token checks on CPU (cheap), but avoid full-logit copies
+- [x] Keep RNG deterministic with explicit seeded generator state per request
+- [x] Return only sampled token id to CPU each step
+- [x] Keep stop-token checks on CPU (cheap), but avoid full-logit copies
 - [ ] Optional phase: add GPU-side stop-token hit flag
 
 Files:
@@ -192,7 +198,10 @@ Files:
 - `src/main.cpp`
 
 Exit criteria:
-- [ ] No full-logits device-to-host copy per token in `--infer-gpu`.
+- [x] No full-logits device-to-host copy per token in `--infer-gpu`.
+
+Note:
+- Current GPU sampling implementation supports `top_k <= 64` for `temperature > 0`.
 
 ---
 
@@ -273,7 +282,7 @@ Exit criteria:
 
 ## Definition of Done (Full GPU Decode)
 
-- [ ] `--infer-gpu` performs full decode math on GPU for both full and linear attention layers.
-- [ ] Per-token host/device transfer is limited to minimal control data (for example sampled token id).
+- [x] `--infer-gpu` performs full decode math on GPU for both full and linear attention layers.
+- [x] Per-token host/device transfer is limited to minimal control data (for example sampled token id).
 - [ ] Deterministic CPU/GPU parity passes on fixed prompt suite.
-- [ ] Throughput improvement is measured and documented with reproducible commands.
+- [x] Throughput improvement is measured and documented with reproducible commands.

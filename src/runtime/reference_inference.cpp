@@ -31,6 +31,9 @@ struct FullAttentionWeights {
   TensorData o_proj;
   TensorData q_norm;
   TensorData k_norm;
+  cuda::CudaDeviceBufferF32 q_norm_device;
+  cuda::CudaDeviceBufferF32 k_norm_device;
+  bool has_device_norm = false;
 };
 
 struct LinearAttentionWeights {
@@ -56,6 +59,9 @@ struct LayerWeights {
   TensorData mlp_gate;
   TensorData mlp_up;
   TensorData mlp_down;
+  cuda::CudaDeviceBufferF32 input_layernorm_device;
+  cuda::CudaDeviceBufferF32 post_attention_layernorm_device;
+  bool has_device_norms = false;
   bool is_linear = false;
   FullAttentionWeights full;
   LinearAttentionWeights linear;
@@ -64,6 +70,8 @@ struct LayerWeights {
 struct ModelWeights {
   TensorData embed_tokens;
   TensorData final_norm;
+  cuda::CudaDeviceBufferF32 final_norm_device;
+  bool has_device_final_norm = false;
   std::vector<LayerWeights> layers;
 };
 
@@ -570,10 +578,20 @@ bool upload_model_weights_to_cuda(ModelWeights & weights, std::string & error_me
   if (!upload_tensor_2d_to_cuda(weights.embed_tokens, "embed_tokens", error_message)) {
     return false;
   }
+  if (!upload_vector_to_cuda(weights.final_norm.data, weights.final_norm_device, error_message)) {
+    return false;
+  }
+  weights.has_device_final_norm = true;
 
   for (std::size_t il = 0; il < weights.layers.size(); ++il) {
     LayerWeights & layer = weights.layers[il];
     const std::string prefix = "layer " + std::to_string(il) + " ";
+
+    if (!upload_vector_to_cuda(layer.input_layernorm.data, layer.input_layernorm_device, error_message) ||
+        !upload_vector_to_cuda(layer.post_attention_layernorm.data, layer.post_attention_layernorm_device, error_message)) {
+      return false;
+    }
+    layer.has_device_norms = true;
 
     if (!upload_tensor_2d_to_cuda(layer.mlp_gate, prefix + "mlp_gate", error_message) ||
         !upload_tensor_2d_to_cuda(layer.mlp_up, prefix + "mlp_up", error_message) ||
@@ -603,6 +621,11 @@ bool upload_model_weights_to_cuda(ModelWeights & weights, std::string & error_me
           !upload_tensor_2d_to_cuda(layer.full.o_proj, prefix + "full.o_proj", error_message)) {
         return false;
       }
+      if (!upload_vector_to_cuda(layer.full.q_norm.data, layer.full.q_norm_device, error_message) ||
+          !upload_vector_to_cuda(layer.full.k_norm.data, layer.full.k_norm_device, error_message)) {
+        return false;
+      }
+      layer.full.has_device_norm = true;
     }
   }
 
@@ -611,7 +634,12 @@ bool upload_model_weights_to_cuda(ModelWeights & weights, std::string & error_me
 
 void release_model_weights_cuda(ModelWeights & weights) {
   release_tensor_cuda(weights.embed_tokens);
+  cuda::free_buffer_f32(weights.final_norm_device);
+  weights.has_device_final_norm = false;
   for (auto & layer : weights.layers) {
+    cuda::free_buffer_f32(layer.input_layernorm_device);
+    cuda::free_buffer_f32(layer.post_attention_layernorm_device);
+    layer.has_device_norms = false;
     release_tensor_cuda(layer.mlp_gate);
     release_tensor_cuda(layer.mlp_up);
     release_tensor_cuda(layer.mlp_down);
@@ -619,6 +647,9 @@ void release_model_weights_cuda(ModelWeights & weights) {
     release_tensor_cuda(layer.full.k_proj);
     release_tensor_cuda(layer.full.v_proj);
     release_tensor_cuda(layer.full.o_proj);
+    cuda::free_buffer_f32(layer.full.q_norm_device);
+    cuda::free_buffer_f32(layer.full.k_norm_device);
+    layer.full.has_device_norm = false;
     release_tensor_cuda(layer.linear.in_proj_qkv);
     release_tensor_cuda(layer.linear.in_proj_z);
     release_tensor_cuda(layer.linear.in_proj_b);
@@ -739,6 +770,128 @@ void release_forward_workspace_cuda(CudaForwardWorkspace & workspace) {
   cuda::free_buffer_f32(workspace.topk_indices_scratch);
   workspace.has_gpu_sampling_buffers = false;
   workspace.has_device_buffers = false;
+}
+
+bool run_linear_attention_step_cuda_device(
+  const LayerWeights & layer,
+  const RuntimeDims & dims,
+  LinearAttentionState & state,
+  const cuda::CudaDeviceBufferF32 & x_in,
+  CudaForwardWorkspace & workspace,
+  cuda::CudaDeviceBufferF32 & out_hidden,
+  std::string & error_message) {
+  if (!state.has_device_state || !layer.linear.has_device_params || !layer.linear.in_proj_qkv.has_device_matrix ||
+      !layer.linear.in_proj_z.has_device_matrix || !layer.linear.in_proj_b.has_device_matrix ||
+      !layer.linear.in_proj_a.has_device_matrix || !layer.linear.conv1d.has_device_matrix ||
+      !layer.linear.out_proj.has_device_matrix) {
+    error_message = "Linear-attention CUDA device path is not fully initialized.";
+    return false;
+  }
+
+  return cuda::run_matvec_f32_device(layer.linear.in_proj_qkv.device_matrix, x_in, workspace.linear_mixed_qkv, error_message) &&
+         cuda::run_matvec_f32_device(layer.linear.in_proj_z.device_matrix, x_in, workspace.linear_z, error_message) &&
+         cuda::run_matvec_f32_device(layer.linear.in_proj_b.device_matrix, x_in, workspace.linear_b, error_message) &&
+         cuda::run_matvec_f32_device(layer.linear.in_proj_a.device_matrix, x_in, workspace.linear_a, error_message) &&
+         cuda::run_linear_attention_decode(
+           workspace.linear_mixed_qkv,
+           workspace.linear_z,
+           workspace.linear_b,
+           workspace.linear_a,
+           layer.linear.conv1d.device_matrix,
+           layer.linear.norm_device,
+           layer.linear.dt_bias_device,
+           layer.linear.ssm_a_device,
+           dims.linear_kernel,
+           dims.linear_num_k_heads,
+           dims.linear_num_v_heads,
+           dims.linear_head_k_dim,
+           dims.linear_head_v_dim,
+           dims.rms_eps,
+           state.conv_state_device,
+           state.recurrent_state_device,
+           workspace.linear_conv_out,
+           workspace.linear_gated_norm,
+           error_message) &&
+         cuda::run_matvec_f32_device(layer.linear.out_proj.device_matrix, workspace.linear_gated_norm, out_hidden, error_message);
+}
+
+bool run_full_attention_step_cuda_device(
+  const LayerWeights & layer,
+  const RuntimeDims & dims,
+  FullAttentionState & state,
+  const cuda::CudaDeviceBufferF32 & x_in,
+  const int position,
+  CudaForwardWorkspace & workspace,
+  cuda::CudaDeviceBufferF32 & out_hidden,
+  std::string & error_message) {
+  if (!state.has_device_state || !layer.full.has_device_norm || !layer.full.q_proj.has_device_matrix ||
+      !layer.full.k_proj.has_device_matrix || !layer.full.v_proj.has_device_matrix || !layer.full.o_proj.has_device_matrix) {
+    error_message = "Full-attention CUDA device path is not fully initialized.";
+    return false;
+  }
+
+  const std::size_t q_packed_count = static_cast<std::size_t>(dims.n_heads * dims.head_dim * 2);
+  const std::size_t kv_count = static_cast<std::size_t>(dims.n_kv_heads * dims.head_dim);
+  const std::size_t cache_offset = static_cast<std::size_t>(position) * kv_count;
+  if (workspace.logits.count < q_packed_count || workspace.hidden_out.count < kv_count ||
+      workspace.intermediate_a.count < kv_count || workspace.full_q.count < static_cast<std::size_t>(dims.n_heads * dims.head_dim) ||
+      workspace.full_gate.count < static_cast<std::size_t>(dims.n_heads * dims.head_dim) ||
+      workspace.full_attn.count < static_cast<std::size_t>(dims.n_heads * dims.head_dim)) {
+    error_message = "CUDA forward workspace is too small for full-attention device step.";
+    return false;
+  }
+
+  return cuda::run_matvec_f32_device(layer.full.q_proj.device_matrix, x_in, workspace.logits, error_message) &&
+         cuda::run_matvec_f32_device(layer.full.k_proj.device_matrix, x_in, workspace.hidden_out, error_message) &&
+         cuda::run_matvec_f32_device(layer.full.v_proj.device_matrix, x_in, workspace.intermediate_a, error_message) &&
+         cuda::run_split_q_gate_f32(workspace.logits, dims.n_heads, dims.head_dim, workspace.full_q, workspace.full_gate, error_message) &&
+         cuda::run_rms_norm_per_head_f32(
+           workspace.full_q,
+           layer.full.q_norm_device,
+           dims.n_heads,
+           dims.head_dim,
+           dims.rms_eps,
+           workspace.full_q,
+           error_message) &&
+         cuda::run_rms_norm_per_head_f32(
+           workspace.hidden_out,
+           layer.full.k_norm_device,
+           dims.n_kv_heads,
+           dims.head_dim,
+           dims.rms_eps,
+           workspace.full_attn,
+           error_message) &&
+         cuda::run_apply_rope_inplace_f32(
+           workspace.full_q,
+           dims.n_heads,
+           dims.head_dim,
+           dims.rope_dim,
+           position,
+           dims.rope_theta,
+           error_message) &&
+         cuda::run_apply_rope_inplace_f32(
+           workspace.full_attn,
+           dims.n_kv_heads,
+           dims.head_dim,
+           dims.rope_dim,
+           position,
+           dims.rope_theta,
+           error_message) &&
+         cuda::copy_buffer_f32(workspace.full_attn, kv_count, 0, state.k_cache_device, cache_offset, error_message) &&
+         cuda::copy_buffer_f32(workspace.intermediate_a, kv_count, 0, state.v_cache_device, cache_offset, error_message) &&
+         cuda::run_full_attention_decode_gqa(
+           workspace.full_q,
+           workspace.full_gate,
+           state.k_cache_device,
+           state.v_cache_device,
+           dims.n_heads,
+           dims.n_kv_heads,
+           dims.head_dim,
+           position + 1,
+           workspace.full_attn,
+           workspace.full_scores,
+           error_message) &&
+         cuda::run_matvec_f32_device(layer.full.o_proj.device_matrix, workspace.full_attn, out_hidden, error_message);
 }
 
 bool run_linear_attention_step(
@@ -1380,6 +1533,139 @@ bool run_mlp_block_cuda_hybrid(
   return true;
 }
 
+bool run_forward_single_token_cuda_device(
+  const ModelWeights & weights,
+  const RuntimeDims & dims,
+  ModelState & state,
+  const int token_id,
+  const int position,
+  const bool use_cuda_gpu_sampling,
+  CudaForwardWorkspace & workspace,
+  std::vector<float> & next_logits,
+  DecodeProfilingAccumulator * profiling,
+  std::string & error_message) {
+  if (!workspace.has_device_buffers || !workspace.has_gpu_sampling_buffers || !weights.has_device_final_norm ||
+      !weights.embed_tokens.has_device_matrix || weights.embed_tokens.device_matrix.data == nullptr) {
+    error_message = "CUDA forward device path is not fully initialized.";
+    return false;
+  }
+
+  const std::size_t hidden_count = static_cast<std::size_t>(dims.hidden);
+  const std::size_t intermediate_count = static_cast<std::size_t>(dims.intermediate);
+  const float * emb_row = weights.embed_tokens.data.data() +
+                         static_cast<std::size_t>(token_id) * static_cast<std::size_t>(dims.hidden);
+
+  const auto embedding_start = std::chrono::steady_clock::now();
+  if (!cuda::upload_to_buffer_f32(emb_row, hidden_count, workspace.hidden_in, 0, error_message)) {
+    return false;
+  }
+  if (profiling != nullptr) {
+    profiling->embedding_ms += elapsed_ms(embedding_start);
+  }
+
+  int full_idx = 0;
+  int linear_idx = 0;
+  for (int il = 0; il < dims.n_layers; ++il) {
+    const LayerWeights & layer = weights.layers[static_cast<std::size_t>(il)];
+    if (!layer.has_device_norms) {
+      error_message = "CUDA forward device path requires uploaded layer norm weights.";
+      return false;
+    }
+
+    if (!cuda::run_rms_norm_f32(
+          workspace.hidden_in,
+          layer.input_layernorm_device,
+          hidden_count,
+          dims.rms_eps,
+          workspace.projection_out,
+          error_message)) {
+      return false;
+    }
+
+    const auto attention_start = std::chrono::steady_clock::now();
+    if (layer.is_linear) {
+      if (!run_linear_attention_step_cuda_device(
+            layer,
+            dims,
+            state.linear_states[static_cast<std::size_t>(linear_idx)],
+            workspace.projection_out,
+            workspace,
+            workspace.hidden_out,
+            error_message)) {
+        return false;
+      }
+      ++linear_idx;
+    } else {
+      if (!run_full_attention_step_cuda_device(
+            layer,
+            dims,
+            state.full_states[static_cast<std::size_t>(full_idx)],
+            workspace.projection_out,
+            position,
+            workspace,
+            workspace.hidden_out,
+            error_message)) {
+        return false;
+      }
+      ++full_idx;
+    }
+    if (profiling != nullptr) {
+      profiling->attention_ms += elapsed_ms(attention_start);
+    }
+
+    const auto mlp_start = std::chrono::steady_clock::now();
+    if (!cuda::run_add_f32(workspace.hidden_in, workspace.hidden_out, hidden_count, workspace.full_attn, error_message) ||
+        !cuda::run_rms_norm_f32(
+          workspace.full_attn,
+          layer.post_attention_layernorm_device,
+          hidden_count,
+          dims.rms_eps,
+          workspace.full_q,
+          error_message) ||
+        !cuda::run_matvec_f32_device(layer.mlp_gate.device_matrix, workspace.full_q, workspace.intermediate_a, error_message) ||
+        !cuda::run_matvec_f32_device(layer.mlp_up.device_matrix, workspace.full_q, workspace.intermediate_b, error_message) ||
+        !cuda::run_silu_mul_f32(
+          workspace.intermediate_a,
+          workspace.intermediate_b,
+          intermediate_count,
+          workspace.intermediate_hidden,
+          error_message) ||
+        !cuda::run_matvec_f32_device(layer.mlp_down.device_matrix, workspace.intermediate_hidden, workspace.hidden_out, error_message) ||
+        !cuda::run_add_f32(workspace.full_attn, workspace.hidden_out, hidden_count, workspace.hidden_in, error_message)) {
+      return false;
+    }
+    if (profiling != nullptr) {
+      profiling->mlp_ms += elapsed_ms(mlp_start);
+    }
+  }
+
+  const auto logits_start = std::chrono::steady_clock::now();
+  bool ok = false;
+  if (!cuda::run_rms_norm_f32(
+        workspace.hidden_in,
+        weights.final_norm_device,
+        hidden_count,
+        dims.rms_eps,
+        workspace.hidden_out,
+        error_message)) {
+    return false;
+  }
+
+  if (use_cuda_gpu_sampling) {
+    ok = cuda::run_matvec_f32_device(weights.embed_tokens.device_matrix, workspace.hidden_out, workspace.logits, error_message);
+  } else {
+    std::vector<float> final_hidden;
+    if (!cuda::download_from_buffer_f32(workspace.hidden_out, hidden_count, 0, final_hidden, error_message)) {
+      return false;
+    }
+    ok = compute_next_logits_from_embedding(weights.embed_tokens, final_hidden, false, next_logits, error_message);
+  }
+  if (profiling != nullptr) {
+    profiling->logits_ms += elapsed_ms(logits_start);
+  }
+  return ok;
+}
+
 bool run_forward_single_token(
   const ModelWeights & weights,
   const RuntimeDims & dims,
@@ -1399,6 +1685,23 @@ bool run_forward_single_token(
 
   if (profiling != nullptr) {
     ++profiling->forward_pass_tokens;
+  }
+
+  const bool use_cuda_device_forward =
+    use_cuda && use_cuda_gpu_sampling && cuda_workspace != nullptr && cuda_workspace->has_device_buffers &&
+    cuda_workspace->has_gpu_sampling_buffers;
+  if (use_cuda_device_forward) {
+    return run_forward_single_token_cuda_device(
+      weights,
+      dims,
+      state,
+      token_id,
+      position,
+      use_cuda_gpu_sampling,
+      *cuda_workspace,
+      next_logits,
+      profiling,
+      error_message);
   }
 
   const auto embedding_start = std::chrono::steady_clock::now();

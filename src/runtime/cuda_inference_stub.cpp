@@ -87,6 +87,73 @@ bool run_silu_mul_f32(
   return false;
 }
 
+bool run_add_f32(
+  const CudaDeviceBufferF32 &,
+  const CudaDeviceBufferF32 &,
+  std::size_t,
+  CudaDeviceBufferF32 &,
+  std::string & error_message) {
+  error_message = "CUDA is not enabled in this build.";
+  return false;
+}
+
+bool run_rms_norm_f32(
+  const CudaDeviceBufferF32 &,
+  const CudaDeviceBufferF32 &,
+  std::size_t,
+  float,
+  CudaDeviceBufferF32 &,
+  std::string & error_message) {
+  error_message = "CUDA is not enabled in this build.";
+  return false;
+}
+
+bool run_split_q_gate_f32(
+  const CudaDeviceBufferF32 &,
+  int,
+  int,
+  CudaDeviceBufferF32 &,
+  CudaDeviceBufferF32 &,
+  std::string & error_message) {
+  error_message = "CUDA is not enabled in this build.";
+  return false;
+}
+
+bool run_rms_norm_per_head_f32(
+  const CudaDeviceBufferF32 &,
+  const CudaDeviceBufferF32 &,
+  int,
+  int,
+  float,
+  CudaDeviceBufferF32 &,
+  std::string & error_message) {
+  error_message = "CUDA is not enabled in this build.";
+  return false;
+}
+
+bool run_apply_rope_inplace_f32(
+  const CudaDeviceBufferF32 &,
+  int,
+  int,
+  int,
+  int,
+  float,
+  std::string & error_message) {
+  error_message = "CUDA is not enabled in this build.";
+  return false;
+}
+
+bool copy_buffer_f32(
+  const CudaDeviceBufferF32 &,
+  std::size_t,
+  std::size_t,
+  const CudaDeviceBufferF32 &,
+  std::size_t,
+  std::string & error_message) {
+  error_message = "CUDA is not enabled in this build.";
+  return false;
+}
+
 bool run_full_attention_decode_gqa(
   const CudaDeviceBufferF32 &,
   const CudaDeviceBufferF32 &,
