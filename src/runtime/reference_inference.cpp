@@ -146,6 +146,9 @@ struct CudaForwardWorkspace {
   cuda::CudaDeviceBufferF32 seen_token_mask;
   cuda::CudaDeviceBufferF32 topk_values_scratch;
   cuda::CudaDeviceBufferF32 topk_indices_scratch;
+  std::vector<cuda::CudaCapturedGraph> mlp_graphs;
+  std::vector<bool> mlp_graph_warmup_done;
+  std::vector<bool> mlp_graph_disabled;
   bool has_gpu_sampling_buffers = false;
   bool has_device_buffers = false;
 };
@@ -829,6 +832,12 @@ bool allocate_forward_workspace_cuda(
 
   workspace.has_gpu_sampling_buffers = true;
   workspace.has_device_buffers = true;
+  workspace.mlp_graphs.clear();
+  workspace.mlp_graph_warmup_done.clear();
+  workspace.mlp_graph_disabled.clear();
+  workspace.mlp_graphs.resize(static_cast<std::size_t>(dims.n_layers));
+  workspace.mlp_graph_warmup_done.resize(static_cast<std::size_t>(dims.n_layers), false);
+  workspace.mlp_graph_disabled.resize(static_cast<std::size_t>(dims.n_layers), false);
   return true;
 }
 
@@ -856,6 +865,12 @@ void release_forward_workspace_cuda(CudaForwardWorkspace & workspace) {
   cuda::free_buffer_f32(workspace.seen_token_mask);
   cuda::free_buffer_f32(workspace.topk_values_scratch);
   cuda::free_buffer_f32(workspace.topk_indices_scratch);
+  for (auto & graph : workspace.mlp_graphs) {
+    cuda::free_captured_graph(graph);
+  }
+  workspace.mlp_graphs.clear();
+  workspace.mlp_graph_warmup_done.clear();
+  workspace.mlp_graph_disabled.clear();
   workspace.has_gpu_sampling_buffers = false;
   workspace.has_device_buffers = false;
 }
@@ -1656,35 +1671,18 @@ bool run_mlp_block_cuda_hybrid(
   return true;
 }
 
-bool run_forward_single_token_cuda_device(
+bool run_forward_single_token_cuda_device_core(
   const ModelWeights & weights,
   const RuntimeDims & dims,
   ModelState & state,
-  const int token_id,
   const int position,
   const bool use_cuda_gpu_sampling,
   CudaForwardWorkspace & workspace,
   std::vector<float> & next_logits,
   DecodeProfilingAccumulator * profiling,
   std::string & error_message) {
-  if (!workspace.has_device_buffers || !workspace.has_gpu_sampling_buffers || !weights.has_device_final_norm ||
-      !weights.embed_tokens.has_device_matrix || weights.embed_tokens.device_matrix.data == nullptr) {
-    error_message = "CUDA forward device path is not fully initialized.";
-    return false;
-  }
-
   const std::size_t hidden_count = static_cast<std::size_t>(dims.hidden);
   const std::size_t intermediate_count = static_cast<std::size_t>(dims.intermediate);
-  const float * emb_row = weights.embed_tokens.data.data() +
-                         static_cast<std::size_t>(token_id) * static_cast<std::size_t>(dims.hidden);
-
-  const auto embedding_start = std::chrono::steady_clock::now();
-  if (!cuda::upload_to_buffer_f32(emb_row, hidden_count, workspace.hidden_in, 0, error_message)) {
-    return false;
-  }
-  if (profiling != nullptr) {
-    profiling->embedding_ms += elapsed_ms(embedding_start);
-  }
 
   int full_idx = 0;
   int linear_idx = 0;
@@ -1748,36 +1746,88 @@ bool run_forward_single_token_cuda_device(
       return false;
     }
 
-    bool mlp_ok = false;
-    if (layer.has_device_mlp_gate_up && layer.mlp_gate_up_device.data != nullptr) {
-      const std::size_t packed_count = intermediate_count * 2;
-      if (workspace.projection_out.count < packed_count) {
-        error_message = "CUDA workspace projection buffer is too small for packed MLP projections.";
+    const auto run_mlp_direct = [&](std::string & run_error) -> bool {
+      bool mlp_ok = false;
+      if (layer.has_device_mlp_gate_up && layer.mlp_gate_up_device.data != nullptr) {
+        const std::size_t packed_count = intermediate_count * 2;
+        if (workspace.projection_out.count < packed_count) {
+          run_error = "CUDA workspace projection buffer is too small for packed MLP projections.";
+          return false;
+        }
+        const cuda::CudaDeviceBufferF32 gate = buffer_slice_f32(workspace.projection_out, 0, intermediate_count);
+        const cuda::CudaDeviceBufferF32 up = buffer_slice_f32(workspace.projection_out, intermediate_count, intermediate_count);
+        if (gate.data == nullptr || up.data == nullptr) {
+          run_error = "Failed to create packed MLP projection slices.";
+          return false;
+        }
+        mlp_ok = cuda::run_matvec_f32_device(layer.mlp_gate_up_device, workspace.full_q, workspace.projection_out, run_error) &&
+                 cuda::run_silu_mul_f32(gate, up, intermediate_count, workspace.intermediate_hidden, run_error);
+      } else {
+        mlp_ok = cuda::run_matvec_f32_device(layer.mlp_gate.device_matrix, workspace.full_q, workspace.intermediate_a, run_error) &&
+                 cuda::run_matvec_f32_device(layer.mlp_up.device_matrix, workspace.full_q, workspace.intermediate_b, run_error) &&
+                 cuda::run_silu_mul_f32(
+                   workspace.intermediate_a,
+                   workspace.intermediate_b,
+                   intermediate_count,
+                   workspace.intermediate_hidden,
+                   run_error);
+      }
+      return mlp_ok &&
+             cuda::run_matvec_f32_device(layer.mlp_down.device_matrix, workspace.intermediate_hidden, workspace.hidden_out, run_error) &&
+             cuda::run_add_f32(workspace.full_attn, workspace.hidden_out, hidden_count, workspace.hidden_in, run_error);
+    };
+
+    bool mlp_done = false;
+    const std::size_t layer_slot = static_cast<std::size_t>(il);
+    if (layer_slot < workspace.mlp_graphs.size()) {
+      if (workspace.mlp_graphs[layer_slot].ready) {
+        mlp_done = cuda::launch_captured_graph(workspace.mlp_graphs[layer_slot], error_message);
+        if (!mlp_done) {
+          workspace.mlp_graph_disabled[layer_slot] = true;
+          cuda::free_captured_graph(workspace.mlp_graphs[layer_slot]);
+        }
+      }
+
+      if (!mlp_done && !workspace.mlp_graph_disabled[layer_slot] && workspace.mlp_graph_warmup_done[layer_slot]) {
+        std::string capture_error;
+        const bool capture_started = cuda::begin_stream_capture(capture_error);
+        bool capture_ok = false;
+        if (capture_started) {
+          std::string captured_run_error;
+          const bool captured_run_ok = run_mlp_direct(captured_run_error);
+          std::string capture_end_error;
+          const bool capture_end_ok = cuda::end_stream_capture(workspace.mlp_graphs[layer_slot], capture_end_error);
+          if (captured_run_ok && capture_end_ok) {
+            capture_ok = cuda::launch_captured_graph(workspace.mlp_graphs[layer_slot], capture_error);
+          }
+        }
+        if (!capture_ok) {
+          workspace.mlp_graph_disabled[layer_slot] = true;
+          cuda::free_captured_graph(workspace.mlp_graphs[layer_slot]);
+        } else {
+          mlp_done = true;
+        }
+      }
+
+      if (!mlp_done && !workspace.mlp_graph_disabled[layer_slot] && !workspace.mlp_graph_warmup_done[layer_slot]) {
+        std::string warmup_error;
+        if (!run_mlp_direct(warmup_error)) {
+          error_message = warmup_error;
+          return false;
+        }
+        workspace.mlp_graph_warmup_done[layer_slot] = true;
+        mlp_done = true;
+      }
+    }
+
+    if (!mlp_done) {
+      std::string direct_error;
+      if (!run_mlp_direct(direct_error)) {
+        error_message = direct_error;
         return false;
       }
-      const cuda::CudaDeviceBufferF32 gate = buffer_slice_f32(workspace.projection_out, 0, intermediate_count);
-      const cuda::CudaDeviceBufferF32 up = buffer_slice_f32(workspace.projection_out, intermediate_count, intermediate_count);
-      if (gate.data == nullptr || up.data == nullptr) {
-        error_message = "Failed to create packed MLP projection slices.";
-        return false;
-      }
-      mlp_ok = cuda::run_matvec_f32_device(layer.mlp_gate_up_device, workspace.full_q, workspace.projection_out, error_message) &&
-               cuda::run_silu_mul_f32(gate, up, intermediate_count, workspace.intermediate_hidden, error_message);
-    } else {
-      mlp_ok = cuda::run_matvec_f32_device(layer.mlp_gate.device_matrix, workspace.full_q, workspace.intermediate_a, error_message) &&
-               cuda::run_matvec_f32_device(layer.mlp_up.device_matrix, workspace.full_q, workspace.intermediate_b, error_message) &&
-               cuda::run_silu_mul_f32(
-                 workspace.intermediate_a,
-                 workspace.intermediate_b,
-                 intermediate_count,
-                 workspace.intermediate_hidden,
-                 error_message);
     }
-    if (!mlp_ok ||
-        !cuda::run_matvec_f32_device(layer.mlp_down.device_matrix, workspace.intermediate_hidden, workspace.hidden_out, error_message) ||
-        !cuda::run_add_f32(workspace.full_attn, workspace.hidden_out, hidden_count, workspace.hidden_in, error_message)) {
-      return false;
-    }
+
     if (profiling != nullptr) {
       profiling->mlp_ms += elapsed_ms(mlp_start);
     }
@@ -1808,6 +1858,88 @@ bool run_forward_single_token_cuda_device(
     profiling->logits_ms += elapsed_ms(logits_start);
   }
   return ok;
+}
+
+bool run_forward_single_token_cuda_device(
+  const ModelWeights & weights,
+  const RuntimeDims & dims,
+  ModelState & state,
+  const int token_id,
+  const int position,
+  const bool use_cuda_gpu_sampling,
+  CudaForwardWorkspace & workspace,
+  std::vector<float> & next_logits,
+  DecodeProfilingAccumulator * profiling,
+  std::string & error_message) {
+  if (!workspace.has_device_buffers || !workspace.has_gpu_sampling_buffers || !weights.has_device_final_norm ||
+      !weights.embed_tokens.has_device_matrix || weights.embed_tokens.device_matrix.data == nullptr) {
+    error_message = "CUDA forward device path is not fully initialized.";
+    return false;
+  }
+  if (token_id < 0 || token_id >= dims.vocab_size) {
+    error_message = "Token id out of vocabulary range.";
+    return false;
+  }
+
+  const auto embedding_start = std::chrono::steady_clock::now();
+  if (!cuda::gather_matrix_row_f32(weights.embed_tokens.device_matrix, token_id, workspace.hidden_in, error_message)) {
+    return false;
+  }
+  if (profiling != nullptr) {
+    profiling->embedding_ms += elapsed_ms(embedding_start);
+  }
+
+  return run_forward_single_token_cuda_device_core(
+    weights,
+    dims,
+    state,
+    position,
+    use_cuda_gpu_sampling,
+    workspace,
+    next_logits,
+    profiling,
+    error_message);
+}
+
+bool run_forward_single_token_cuda_device_from_token_buffer(
+  const ModelWeights & weights,
+  const RuntimeDims & dims,
+  ModelState & state,
+  const cuda::CudaDeviceBufferF32 & token_id_device,
+  const int position,
+  const bool use_cuda_gpu_sampling,
+  CudaForwardWorkspace & workspace,
+  std::vector<float> & next_logits,
+  DecodeProfilingAccumulator * profiling,
+  std::string & error_message) {
+  if (!workspace.has_device_buffers || !workspace.has_gpu_sampling_buffers || !weights.has_device_final_norm ||
+      !weights.embed_tokens.has_device_matrix || weights.embed_tokens.device_matrix.data == nullptr) {
+    error_message = "CUDA forward device path is not fully initialized.";
+    return false;
+  }
+
+  const auto embedding_start = std::chrono::steady_clock::now();
+  if (!cuda::gather_matrix_row_f32_from_token_f32(
+        weights.embed_tokens.device_matrix,
+        token_id_device,
+        workspace.hidden_in,
+        error_message)) {
+    return false;
+  }
+  if (profiling != nullptr) {
+    profiling->embedding_ms += elapsed_ms(embedding_start);
+  }
+
+  return run_forward_single_token_cuda_device_core(
+    weights,
+    dims,
+    state,
+    position,
+    use_cuda_gpu_sampling,
+    workspace,
+    next_logits,
+    profiling,
+    error_message);
 }
 
 bool run_forward_single_token(
@@ -2234,6 +2366,13 @@ bool run_reference_qwen35_inference(
     }
   }
 
+  cuda::CudaDeviceBufferF32 sampled_token_device;
+  cuda::CudaDeviceBufferF32 generated_tokens_device;
+  auto release_cuda_decode_buffers = [&]() {
+    cuda::free_buffer_f32(sampled_token_device);
+    cuda::free_buffer_f32(generated_tokens_device);
+  };
+
   DecodeProfilingAccumulator profiling;
   std::uniform_real_distribution<float> uniform01(0.0f, 1.0f);
 
@@ -2260,28 +2399,162 @@ bool run_reference_qwen35_inference(
 
   result.generated_tokens.clear();
   result.generated_tokens.reserve(static_cast<std::size_t>(options.max_new_tokens));
-  for (int i = 0; i < options.max_new_tokens; ++i) {
-    const auto sampling_start = std::chrono::steady_clock::now();
-    int current = 0;
-    if (use_cuda_gpu_sampling) {
-      const float random_u01 = options.sampling.temperature > 0.0f ? uniform01(rng) : 0.0f;
-      if (!cuda::sample_token_from_logits_f32_device(
-            cuda_workspace_ptr->logits,
-            cuda_workspace_ptr->seen_token_mask,
-            dims.vocab_size,
-            options.sampling.temperature,
-            options.sampling.top_p,
-            options.sampling.top_k,
-            options.sampling.repetition_penalty,
-            random_u01,
-            cuda_workspace_ptr->topk_values_scratch,
-            cuda_workspace_ptr->topk_indices_scratch,
-            current,
+  if (use_cuda_gpu_sampling) {
+    const bool defer_stop_checks = stop_token_set.empty() && options.stop_token_sequences.empty();
+    if (defer_stop_checks) {
+      if (options.max_new_tokens > 0) {
+        if (!cuda::allocate_buffer_f32(1, sampled_token_device, error_message) ||
+            !cuda::allocate_buffer_f32(
+              static_cast<std::size_t>(options.max_new_tokens),
+              generated_tokens_device,
+              error_message)) {
+          release_cuda_decode_buffers();
+          release_cuda_resources();
+          return false;
+        }
+      }
+
+      for (int i = 0; i < options.max_new_tokens; ++i) {
+        const auto sampling_start = std::chrono::steady_clock::now();
+        const float random_u01 = options.sampling.temperature > 0.0f ? uniform01(rng) : 0.0f;
+        if (!cuda::sample_token_from_logits_f32_device_to_buffer(
+              cuda_workspace_ptr->logits,
+              cuda_workspace_ptr->seen_token_mask,
+              dims.vocab_size,
+              options.sampling.temperature,
+              options.sampling.top_p,
+              options.sampling.top_k,
+              options.sampling.repetition_penalty,
+              random_u01,
+              sampled_token_device,
+              error_message) ||
+            !cuda::copy_buffer_f32(
+              sampled_token_device,
+              1,
+              0,
+              generated_tokens_device,
+              static_cast<std::size_t>(i),
+              error_message)) {
+          release_cuda_decode_buffers();
+          release_cuda_resources();
+          return false;
+        }
+        profiling.sampling_ms += elapsed_ms(sampling_start);
+
+        if (i + 1 < options.max_new_tokens) {
+          ++profiling.forward_pass_tokens;
+          if (!run_forward_single_token_cuda_device_from_token_buffer(
+                weights,
+                dims,
+                state,
+                sampled_token_device,
+                position,
+                true,
+                *cuda_workspace_ptr,
+                predicted_logits,
+                &profiling,
+                error_message)) {
+            release_cuda_decode_buffers();
+            release_cuda_resources();
+            return false;
+          }
+          ++position;
+        }
+      }
+
+      std::vector<float> generated_token_values;
+      if (options.max_new_tokens > 0 &&
+          !cuda::download_from_buffer_f32(
+            generated_tokens_device,
+            static_cast<std::size_t>(options.max_new_tokens),
+            0,
+            generated_token_values,
             error_message)) {
+        release_cuda_decode_buffers();
         release_cuda_resources();
         return false;
       }
+
+      for (int i = 0; i < options.max_new_tokens; ++i) {
+        const int current = static_cast<int>(generated_token_values[static_cast<std::size_t>(i)]);
+        if (current < 0 || current >= dims.vocab_size) {
+          error_message = "CUDA sampling produced an out-of-range token id.";
+          release_cuda_decode_buffers();
+          release_cuda_resources();
+          return false;
+        }
+        result.generated_tokens.push_back(current);
+      }
     } else {
+      for (int i = 0; i < options.max_new_tokens; ++i) {
+        const auto sampling_start = std::chrono::steady_clock::now();
+        int current = 0;
+        const float random_u01 = options.sampling.temperature > 0.0f ? uniform01(rng) : 0.0f;
+        if (!cuda::sample_token_from_logits_f32_device(
+              cuda_workspace_ptr->logits,
+              cuda_workspace_ptr->seen_token_mask,
+              dims.vocab_size,
+              options.sampling.temperature,
+              options.sampling.top_p,
+              options.sampling.top_k,
+              options.sampling.repetition_penalty,
+              random_u01,
+              cuda_workspace_ptr->topk_values_scratch,
+              cuda_workspace_ptr->topk_indices_scratch,
+              current,
+              error_message)) {
+          release_cuda_decode_buffers();
+          release_cuda_resources();
+          return false;
+        }
+        profiling.sampling_ms += elapsed_ms(sampling_start);
+
+        result.generated_tokens.push_back(current);
+
+        const auto stop_checks_start = std::chrono::steady_clock::now();
+        bool should_stop = false;
+        std::size_t trim_count = 0;
+        if (stop_token_set.find(current) != stop_token_set.end()) {
+          should_stop = true;
+          trim_count = std::max<std::size_t>(trim_count, 1);
+        }
+        for (const auto & stop_sequence : options.stop_token_sequences) {
+          if (generated_ends_with_sequence(result.generated_tokens, stop_sequence)) {
+            should_stop = true;
+            trim_count = std::max(trim_count, stop_sequence.size());
+          }
+        }
+        profiling.stop_checks_ms += elapsed_ms(stop_checks_start);
+        if (should_stop) {
+          if (trim_count > 0 && trim_count <= result.generated_tokens.size()) {
+            result.generated_tokens.resize(result.generated_tokens.size() - trim_count);
+          }
+          break;
+        }
+
+        if (!run_forward_single_token(
+              weights,
+              dims,
+              state,
+              current,
+              position,
+              options.use_cuda,
+              predicted_logits,
+              true,
+              cuda_workspace_ptr,
+              &profiling,
+              error_message)) {
+          release_cuda_decode_buffers();
+          release_cuda_resources();
+          return false;
+        }
+        ++position;
+      }
+    }
+  } else {
+    for (int i = 0; i < options.max_new_tokens; ++i) {
+      const auto sampling_start = std::chrono::steady_clock::now();
+      int current = 0;
       if (!sample_token_from_logits(
             predicted_logits,
             options.sampling,
@@ -2289,54 +2562,56 @@ bool run_reference_qwen35_inference(
             rng,
             current,
             error_message)) {
+        release_cuda_decode_buffers();
         release_cuda_resources();
         return false;
       }
-    }
-    profiling.sampling_ms += elapsed_ms(sampling_start);
+      profiling.sampling_ms += elapsed_ms(sampling_start);
 
-    result.generated_tokens.push_back(current);
-    if (current >= 0 && current < dims.vocab_size) {
-      token_counts[static_cast<std::size_t>(current)] += 1;
-    }
+      result.generated_tokens.push_back(current);
+      if (current >= 0 && current < dims.vocab_size) {
+        token_counts[static_cast<std::size_t>(current)] += 1;
+      }
 
-    const auto stop_checks_start = std::chrono::steady_clock::now();
-    bool should_stop = false;
-    std::size_t trim_count = 0;
-    if (stop_token_set.find(current) != stop_token_set.end()) {
-      should_stop = true;
-      trim_count = std::max<std::size_t>(trim_count, 1);
-    }
-    for (const auto & stop_sequence : options.stop_token_sequences) {
-      if (generated_ends_with_sequence(result.generated_tokens, stop_sequence)) {
+      const auto stop_checks_start = std::chrono::steady_clock::now();
+      bool should_stop = false;
+      std::size_t trim_count = 0;
+      if (stop_token_set.find(current) != stop_token_set.end()) {
         should_stop = true;
-        trim_count = std::max(trim_count, stop_sequence.size());
+        trim_count = std::max<std::size_t>(trim_count, 1);
       }
-    }
-    profiling.stop_checks_ms += elapsed_ms(stop_checks_start);
-    if (should_stop) {
-      if (trim_count > 0 && trim_count <= result.generated_tokens.size()) {
-        result.generated_tokens.resize(result.generated_tokens.size() - trim_count);
+      for (const auto & stop_sequence : options.stop_token_sequences) {
+        if (generated_ends_with_sequence(result.generated_tokens, stop_sequence)) {
+          should_stop = true;
+          trim_count = std::max(trim_count, stop_sequence.size());
+        }
       }
-      break;
-    }
+      profiling.stop_checks_ms += elapsed_ms(stop_checks_start);
+      if (should_stop) {
+        if (trim_count > 0 && trim_count <= result.generated_tokens.size()) {
+          result.generated_tokens.resize(result.generated_tokens.size() - trim_count);
+        }
+        break;
+      }
 
-    if (!run_forward_single_token(
-          weights,
-          dims,
-          state,
-          current,
-          position,
-          options.use_cuda,
-          predicted_logits,
-          use_cuda_gpu_sampling,
-          cuda_workspace_ptr,
-          &profiling,
-          error_message)) {
-      release_cuda_resources();
-      return false;
+      if (!run_forward_single_token(
+            weights,
+            dims,
+            state,
+            current,
+            position,
+            options.use_cuda,
+            predicted_logits,
+            false,
+            cuda_workspace_ptr,
+            &profiling,
+            error_message)) {
+        release_cuda_decode_buffers();
+        release_cuda_resources();
+        return false;
+      }
+      ++position;
     }
-    ++position;
   }
 
   const auto decode_end = std::chrono::steady_clock::now();
@@ -2368,6 +2643,7 @@ bool run_reference_qwen35_inference(
       static_cast<double>(result.transfer_breakdown.device_to_host_bytes) / forward_tokens;
   }
 
+  release_cuda_decode_buffers();
   release_cuda_resources();
   return true;
 }

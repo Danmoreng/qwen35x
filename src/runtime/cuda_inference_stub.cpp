@@ -46,6 +46,24 @@ bool run_matvec_f32_device(
   return false;
 }
 
+bool gather_matrix_row_f32(
+  const CudaDeviceMatrixF32 &,
+  int,
+  CudaDeviceBufferF32 &,
+  std::string & error_message) {
+  error_message = "CUDA is not enabled in this build.";
+  return false;
+}
+
+bool gather_matrix_row_f32_from_token_f32(
+  const CudaDeviceMatrixF32 &,
+  const CudaDeviceBufferF32 &,
+  CudaDeviceBufferF32 &,
+  std::string & error_message) {
+  error_message = "CUDA is not enabled in this build.";
+  return false;
+}
+
 bool allocate_buffer_f32(
   std::size_t,
   CudaDeviceBufferF32 &,
@@ -209,6 +227,43 @@ bool sample_token_from_logits_f32_device(
   std::string & error_message) {
   error_message = "CUDA is not enabled in this build.";
   return false;
+}
+
+bool sample_token_from_logits_f32_device_to_buffer(
+  const CudaDeviceBufferF32 &,
+  const CudaDeviceBufferF32 &,
+  int,
+  float,
+  float,
+  int,
+  float,
+  float,
+  const CudaDeviceBufferF32 &,
+  std::string & error_message) {
+  error_message = "CUDA is not enabled in this build.";
+  return false;
+}
+
+bool begin_stream_capture(std::string & error_message) {
+  error_message = "CUDA is not enabled in this build.";
+  return false;
+}
+
+bool end_stream_capture(
+  CudaCapturedGraph &,
+  std::string & error_message) {
+  error_message = "CUDA is not enabled in this build.";
+  return false;
+}
+
+bool launch_captured_graph(
+  const CudaCapturedGraph &,
+  std::string & error_message) {
+  error_message = "CUDA is not enabled in this build.";
+  return false;
+}
+
+void free_captured_graph(CudaCapturedGraph &) {
 }
 
 void reset_transfer_stats() {

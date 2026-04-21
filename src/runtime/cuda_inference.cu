@@ -530,6 +530,43 @@ __global__ void f32_matvec_kernel(
   output[row] = sum;
 }
 
+__global__ void gather_matrix_row_kernel(
+  const float * matrix,
+  const int cols,
+  const int row_index,
+  float * out_row) {
+  const int col = blockIdx.x * blockDim.x + threadIdx.x;
+  if (col >= cols) {
+    return;
+  }
+  const std::size_t src_offset =
+    static_cast<std::size_t>(row_index) * static_cast<std::size_t>(cols) + static_cast<std::size_t>(col);
+  out_row[col] = matrix[src_offset];
+}
+
+__global__ void gather_matrix_row_from_token_kernel(
+  const float * matrix,
+  const int rows,
+  const int cols,
+  const float * token_id,
+  float * out_row) {
+  const int col = blockIdx.x * blockDim.x + threadIdx.x;
+  if (col >= cols) {
+    return;
+  }
+
+  int row_index = static_cast<int>(token_id[0]);
+  if (row_index < 0) {
+    row_index = 0;
+  } else if (row_index >= rows) {
+    row_index = rows - 1;
+  }
+
+  const std::size_t src_offset =
+    static_cast<std::size_t>(row_index) * static_cast<std::size_t>(cols) + static_cast<std::size_t>(col);
+  out_row[col] = matrix[src_offset];
+}
+
 __global__ void silu_mul_kernel(
   const float * a,
   const float * b,
@@ -1422,6 +1459,75 @@ bool run_matvec_f32_device(
   return false;
 }
 
+bool gather_matrix_row_f32(
+  const CudaDeviceMatrixF32 & matrix,
+  const int row_index,
+  CudaDeviceBufferF32 & out,
+  std::string & error_message) {
+  if (matrix.data == nullptr || matrix.rows <= 0 || matrix.cols <= 0) {
+    error_message = "CUDA matrix is not initialized.";
+    return false;
+  }
+  if (row_index < 0 || row_index >= matrix.rows) {
+    error_message = "CUDA matrix row index is out of range.";
+    return false;
+  }
+  if (out.data == nullptr || out.count < static_cast<std::size_t>(matrix.cols)) {
+    error_message = "CUDA output buffer is invalid for gather_matrix_row_f32.";
+    return false;
+  }
+
+  const cudaStream_t stream = active_stream();
+  if (stream == nullptr) {
+    error_message = "CUDA inference session stream is not initialized.";
+    return false;
+  }
+
+  const int block_size = 256;
+  const int grid_size = (matrix.cols + block_size - 1) / block_size;
+  gather_matrix_row_kernel<<<grid_size, block_size, 0, stream>>>(
+    static_cast<const float *>(matrix.data),
+    matrix.cols,
+    row_index,
+    static_cast<float *>(out.data));
+  return check_cuda(cudaGetLastError(), "gather_matrix_row_kernel", error_message);
+}
+
+bool gather_matrix_row_f32_from_token_f32(
+  const CudaDeviceMatrixF32 & matrix,
+  const CudaDeviceBufferF32 & token_id,
+  CudaDeviceBufferF32 & out,
+  std::string & error_message) {
+  if (matrix.data == nullptr || matrix.rows <= 0 || matrix.cols <= 0) {
+    error_message = "CUDA matrix is not initialized.";
+    return false;
+  }
+  if (token_id.data == nullptr || token_id.count < 1) {
+    error_message = "CUDA token buffer is invalid for gather_matrix_row_f32_from_token_f32.";
+    return false;
+  }
+  if (out.data == nullptr || out.count < static_cast<std::size_t>(matrix.cols)) {
+    error_message = "CUDA output buffer is invalid for gather_matrix_row_f32_from_token_f32.";
+    return false;
+  }
+
+  const cudaStream_t stream = active_stream();
+  if (stream == nullptr) {
+    error_message = "CUDA inference session stream is not initialized.";
+    return false;
+  }
+
+  const int block_size = 256;
+  const int grid_size = (matrix.cols + block_size - 1) / block_size;
+  gather_matrix_row_from_token_kernel<<<grid_size, block_size, 0, stream>>>(
+    static_cast<const float *>(matrix.data),
+    matrix.rows,
+    matrix.cols,
+    static_cast<const float *>(token_id.data),
+    static_cast<float *>(out.data));
+  return check_cuda(cudaGetLastError(), "gather_matrix_row_from_token_kernel", error_message);
+}
+
 bool allocate_buffer_f32(
   const std::size_t count,
   CudaDeviceBufferF32 & out_buffer,
@@ -1951,7 +2057,7 @@ bool run_linear_attention_decode(
   return check_cuda(cudaGetLastError(), "linear_recurrent_decode_kernel", error_message);
 }
 
-bool sample_token_from_logits_f32_device(
+bool sample_token_from_logits_f32_device_to_buffer(
   const CudaDeviceBufferF32 & logits,
   const CudaDeviceBufferF32 & seen_token_mask,
   const int vocab_size,
@@ -1960,13 +2066,8 @@ bool sample_token_from_logits_f32_device(
   const int top_k,
   const float repetition_penalty,
   const float random_u01,
-  const CudaDeviceBufferF32 & topk_values_scratch,
-  const CudaDeviceBufferF32 & topk_indices_scratch,
-  int & out_token,
+  const CudaDeviceBufferF32 & out_token,
   std::string & error_message) {
-  (void)topk_values_scratch;
-  (void)topk_indices_scratch;
-
   if (logits.data == nullptr || seen_token_mask.data == nullptr) {
     error_message = "CUDA sampling requires initialized device buffers.";
     return false;
@@ -1994,8 +2095,8 @@ bool sample_token_from_logits_f32_device(
       return false;
     }
   }
-  if (g_session.workspace_output == nullptr || g_session.workspace_output_count < 1) {
-    error_message = "CUDA sampling output workspace is not initialized.";
+  if (out_token.data == nullptr || out_token.count < 1) {
+    error_message = "CUDA sampling output token buffer is not initialized.";
     return false;
   }
   const cudaStream_t stream = active_stream();
@@ -2027,7 +2128,7 @@ bool sample_token_from_logits_f32_device(
       block_count,
       static_cast<float *>(seen_token_mask.data),
       vocab_size,
-      g_session.workspace_output);
+      static_cast<float *>(out_token.data));
     if (!check_cuda(cudaGetLastError(), "finalize_argmax_token_kernel", error_message)) {
       return false;
     }
@@ -2053,16 +2154,63 @@ bool sample_token_from_logits_f32_device(
       top_k,
       random_u01,
       static_cast<float *>(seen_token_mask.data),
-      g_session.workspace_output);
+      static_cast<float *>(out_token.data));
     if (!check_cuda(cudaGetLastError(), "sample_token_from_block_topk_kernel", error_message)) {
       return false;
     }
   }
 
+  return true;
+}
+
+bool sample_token_from_logits_f32_device(
+  const CudaDeviceBufferF32 & logits,
+  const CudaDeviceBufferF32 & seen_token_mask,
+  const int vocab_size,
+  const float temperature,
+  const float top_p,
+  const int top_k,
+  const float repetition_penalty,
+  const float random_u01,
+  const CudaDeviceBufferF32 & topk_values_scratch,
+  const CudaDeviceBufferF32 & topk_indices_scratch,
+  int & out_token,
+  std::string & error_message) {
+  (void)topk_values_scratch;
+  (void)topk_indices_scratch;
+
+  if (g_session.workspace_output == nullptr || g_session.workspace_output_count < 1) {
+    error_message = "CUDA sampling output workspace is not initialized.";
+    return false;
+  }
+  CudaDeviceBufferF32 sampled_token_device;
+  sampled_token_device.data = g_session.workspace_output;
+  sampled_token_device.count = 1;
+
+  if (!sample_token_from_logits_f32_device_to_buffer(
+        logits,
+        seen_token_mask,
+        vocab_size,
+        temperature,
+        top_p,
+        top_k,
+        repetition_penalty,
+        random_u01,
+        sampled_token_device,
+        error_message)) {
+    return false;
+  }
+
+  const cudaStream_t stream = active_stream();
+  if (stream == nullptr) {
+    error_message = "CUDA sampling stream is not initialized.";
+    return false;
+  }
+
   float token_value = -1.0f;
   if (!tracked_memcpy_async(
         &token_value,
-        g_session.workspace_output,
+        sampled_token_device.data,
         sizeof(float),
         cudaMemcpyDeviceToHost,
         stream,
@@ -2080,6 +2228,80 @@ bool sample_token_from_logits_f32_device(
     return false;
   }
   return true;
+}
+
+bool begin_stream_capture(std::string & error_message) {
+  const cudaStream_t stream = active_stream();
+  if (stream == nullptr) {
+    error_message = "CUDA stream capture requires an active inference session stream.";
+    return false;
+  }
+  return check_cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), "cudaStreamBeginCapture", error_message);
+}
+
+bool end_stream_capture(
+  CudaCapturedGraph & out_graph,
+  std::string & error_message) {
+  const cudaStream_t stream = active_stream();
+  if (stream == nullptr) {
+    error_message = "CUDA stream capture requires an active inference session stream.";
+    return false;
+  }
+
+  cudaGraph_t captured_graph = nullptr;
+  if (!check_cuda(cudaStreamEndCapture(stream, &captured_graph), "cudaStreamEndCapture", error_message)) {
+    return false;
+  }
+  if (captured_graph == nullptr) {
+    error_message = "CUDA stream capture returned a null graph.";
+    return false;
+  }
+
+  cudaGraphExec_t graph_exec = nullptr;
+  if (!check_cuda(
+        cudaGraphInstantiate(&graph_exec, captured_graph, nullptr, nullptr, 0),
+        "cudaGraphInstantiate",
+        error_message)) {
+    cudaGraphDestroy(captured_graph);
+    return false;
+  }
+
+  free_captured_graph(out_graph);
+  out_graph.graph = captured_graph;
+  out_graph.exec = graph_exec;
+  out_graph.ready = true;
+  return true;
+}
+
+bool launch_captured_graph(
+  const CudaCapturedGraph & graph,
+  std::string & error_message) {
+  if (!graph.ready || graph.exec == nullptr) {
+    error_message = "CUDA captured graph is not initialized.";
+    return false;
+  }
+
+  const cudaStream_t stream = active_stream();
+  if (stream == nullptr) {
+    error_message = "CUDA stream capture requires an active inference session stream.";
+    return false;
+  }
+  return check_cuda(
+    cudaGraphLaunch(static_cast<cudaGraphExec_t>(graph.exec), stream),
+    "cudaGraphLaunch",
+    error_message);
+}
+
+void free_captured_graph(CudaCapturedGraph & graph) {
+  if (graph.exec != nullptr) {
+    cudaGraphExecDestroy(static_cast<cudaGraphExec_t>(graph.exec));
+    graph.exec = nullptr;
+  }
+  if (graph.graph != nullptr) {
+    cudaGraphDestroy(static_cast<cudaGraph_t>(graph.graph));
+    graph.graph = nullptr;
+  }
+  graph.ready = false;
 }
 
 void reset_transfer_stats() {

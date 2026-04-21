@@ -25,6 +25,12 @@ struct CudaDeviceBufferF32 {
   std::size_t count = 0;
 };
 
+struct CudaCapturedGraph {
+  void * graph = nullptr;
+  void * exec = nullptr;
+  bool ready = false;
+};
+
 bool begin_inference_session(
   std::size_t max_input_count,
   std::size_t max_output_count,
@@ -51,6 +57,18 @@ bool run_matvec_f32_device(
   const CudaDeviceMatrixF32 & matrix,
   const CudaDeviceBufferF32 & input,
   CudaDeviceBufferF32 & output,
+  std::string & error_message);
+
+bool gather_matrix_row_f32(
+  const CudaDeviceMatrixF32 & matrix,
+  int row_index,
+  CudaDeviceBufferF32 & out,
+  std::string & error_message);
+
+bool gather_matrix_row_f32_from_token_f32(
+  const CudaDeviceMatrixF32 & matrix,
+  const CudaDeviceBufferF32 & token_id,
+  CudaDeviceBufferF32 & out,
   std::string & error_message);
 
 bool allocate_buffer_f32(
@@ -177,6 +195,30 @@ bool sample_token_from_logits_f32_device(
   const CudaDeviceBufferF32 & topk_indices_scratch,
   int & out_token,
   std::string & error_message);
+
+bool sample_token_from_logits_f32_device_to_buffer(
+  const CudaDeviceBufferF32 & logits,
+  const CudaDeviceBufferF32 & seen_token_mask,
+  int vocab_size,
+  float temperature,
+  float top_p,
+  int top_k,
+  float repetition_penalty,
+  float random_u01,
+  const CudaDeviceBufferF32 & out_token,
+  std::string & error_message);
+
+bool begin_stream_capture(std::string & error_message);
+
+bool end_stream_capture(
+  CudaCapturedGraph & out_graph,
+  std::string & error_message);
+
+bool launch_captured_graph(
+  const CudaCapturedGraph & graph,
+  std::string & error_message);
+
+void free_captured_graph(CudaCapturedGraph & graph);
 
 void reset_transfer_stats();
 
