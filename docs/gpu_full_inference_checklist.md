@@ -5,8 +5,10 @@ This checklist is the execution plan to move `--infer-gpu` from CUDA-hybrid to a
 Progress snapshot (April 2026):
 - Fully device-resident per-layer decode flow is implemented.
 - Full-logits per-token D2H copies are removed.
+- Device-token GPU decode loop path is implemented (next-step token embedding gather on device).
+- CUDA Graph replay is implemented for steady-state MLP decode work.
 - Current measured transfer footprint is near control-path scale (`~3-4 bytes D2H per forward token`).
-- Current open bottlenecks are sampling optimization depth and prefill specialization.
+- Current open bottlenecks are broader graph capture coverage, sampling optimization depth, and prefill specialization.
 
 Scope:
 - Model family: Qwen3.5 (current profile `qwen3_5_0_8b.profile.json`)
@@ -187,7 +189,7 @@ Tasks:
   - top-p cutoff
   - repetition penalty application
 - [x] Keep RNG deterministic with explicit seeded generator state per request
-- [x] Return only sampled token id to CPU each step
+- [x] Keep sampled token on device for next-step forward path when immediate stop checks are not required
 - [x] Keep stop-token checks on CPU (cheap), but avoid full-logit copies
 - [ ] Optional phase: add GPU-side stop-token hit flag
 
@@ -199,6 +201,7 @@ Files:
 
 Exit criteria:
 - [x] No full-logits device-to-host copy per token in `--infer-gpu`.
+- [x] Device-token decode loop path exists for runs without stop-token/stop-sequence controls.
 
 Note:
 - Current GPU sampling implementation supports `top_k <= 64` for `temperature > 0`.
@@ -230,7 +233,8 @@ Exit criteria:
 Tasks:
 - [ ] Introduce persistent per-request device buffers (avoid per-token alloc/free)
 - [ ] Use pinned host memory for minimal control-path transfers
-- [ ] Capture steady-state decode in CUDA Graph
+- [x] Capture steady-state decode in CUDA Graph (MLP decode segment replay)
+- [ ] Expand CUDA Graph capture coverage to larger decode step segments
 - [ ] Add stream strategy (main compute stream + optional transfer stream)
 - [ ] Add warmup step and stable benchmark mode
 

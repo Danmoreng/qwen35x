@@ -8,13 +8,19 @@ Completed:
 - CPU reference inference pipeline for Qwen3.5-0.8B
 - CUDA inference path with full-attention decode kernel + linear-attention decode kernel
 - Device-resident per-layer decode flow (hidden/residual/norm/attention/MLP on GPU)
-- GPU logits + GPU sampling path (sampled token id returned to host)
+- GPU logits + GPU sampling path
+- Device-token GPU decode loop path (sampled token consumed on device for next-step embedding gather)
+- CUDA Graph replay for steady-state MLP decode work
 - Decode profiling (`--profile-json`) with stage timing and transfer breakdown
 
 Current known constraints:
 - GPU sampling path currently requires `top_k <= 64` when `temperature > 0`
-- Stop condition checks remain host-side (token-level, cheap control-path)
+- Stop condition checks remain host-side when stop tokens/sequences are configured
 - Prefill path is still token-by-token and not yet batched/specialized
+
+Latest local benchmark snapshot (Qwen3.5-0.8B, same machine):
+- Deterministic prompt path: ~127 tokens/s
+- Chat prompt path: ~91 tokens/s
 
 ## Vision
 
@@ -85,7 +91,7 @@ Core strategy:
 
 Milestone progress:
 - Milestones 1-4: completed
-- Milestone 5: partially completed (decode kernels implemented; still optimizing/fusing)
+- Milestone 5: in progress (decode kernels implemented, packed projections added, CUDA Graph MLP replay added)
 - Milestones 6-7: in progress
 
 ## Validation and Benchmarking Plan
@@ -102,8 +108,8 @@ Milestone progress:
 
 ## Practical Next Steps
 
-1. Optimize GPU sampling further (lift current `top_k <= 64` limit while preserving throughput)
-2. Add dedicated prefill implementation (batched/streaming prefill separate from decode)
-3. Add parity and performance harness scripts for repeatable CPU/GPU checks
-4. Add decode-critical weight/layout packing and kernel-tuned memory layouts
-5. Introduce CUDA graph capture and stream scheduling for steady-state decode
+1. Extend CUDA Graph usage beyond MLP replay to larger steady-state decode segments
+2. Optimize GPU sampling further (lift current `top_k <= 64` limit while preserving throughput)
+3. Add dedicated prefill implementation (batched/streaming prefill separate from decode)
+4. Add parity and performance harness scripts for repeatable CPU/GPU checks
+5. Add decode-critical weight/layout packing and kernel-tuned memory layouts

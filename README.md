@@ -16,7 +16,9 @@ The goal is not a generic multi-model runtime. The goal is a small, hardware-awa
 - Native tokenizer (`vocab.json` + `merges.txt` + added tokens)
 - Reference generation via `--infer-reference` (CPU) and `--infer-gpu` (CUDA)
 - Device-resident decode path for per-layer hidden/residual/norm/attention/MLP math in `--infer-gpu`
-- GPU logits + GPU sampling path (returns only sampled token id to CPU)
+- GPU logits + GPU sampling path
+- Device-token decode loop path for `--infer-gpu` (sampled token stays on GPU for next-step embedding gather)
+- CUDA Graph replay for steady-state MLP block work in decode
 - Qwen-style default sampling (`temperature=0.7`, `top_p=0.8`, `top_k=20`, `repeat_penalty=1.05`)
 - Deterministic mode with `--seed` and `--temperature 0`
 - Stop controls: `--stop-token`, `--stop-text`, `--stop-on-im-end`
@@ -25,6 +27,10 @@ The goal is not a generic multi-model runtime. The goal is a small, hardware-awa
 
 Current GPU sampling constraint:
 - For `temperature > 0`, GPU sampling currently supports `top_k` in `[1, 64]`.
+
+Current decode control behavior:
+- If no stop tokens/sequences are configured, generated token ids are buffered on device and copied back in bulk after generation.
+- If stop tokens/sequences are configured, decoding uses per-token host-visible sampling to preserve immediate stop behavior.
 
 ## Quick Start (Windows / PowerShell)
 
