@@ -149,6 +149,9 @@ struct CudaForwardWorkspace {
   std::vector<cuda::CudaCapturedGraph> mlp_graphs;
   std::vector<bool> mlp_graph_warmup_done;
   std::vector<bool> mlp_graph_disabled;
+  std::vector<cuda::CudaCapturedGraph> linear_attention_graphs;
+  std::vector<bool> linear_attention_graph_warmup_done;
+  std::vector<bool> linear_attention_graph_disabled;
   bool has_gpu_sampling_buffers = false;
   bool has_device_buffers = false;
 };
@@ -871,9 +874,15 @@ bool allocate_forward_workspace_cuda(
   workspace.mlp_graphs.clear();
   workspace.mlp_graph_warmup_done.clear();
   workspace.mlp_graph_disabled.clear();
+  workspace.linear_attention_graphs.clear();
+  workspace.linear_attention_graph_warmup_done.clear();
+  workspace.linear_attention_graph_disabled.clear();
   workspace.mlp_graphs.resize(static_cast<std::size_t>(dims.n_layers));
   workspace.mlp_graph_warmup_done.resize(static_cast<std::size_t>(dims.n_layers), false);
   workspace.mlp_graph_disabled.resize(static_cast<std::size_t>(dims.n_layers), false);
+  workspace.linear_attention_graphs.resize(static_cast<std::size_t>(dims.n_layers));
+  workspace.linear_attention_graph_warmup_done.resize(static_cast<std::size_t>(dims.n_layers), false);
+  workspace.linear_attention_graph_disabled.resize(static_cast<std::size_t>(dims.n_layers), false);
   return true;
 }
 
@@ -904,9 +913,15 @@ void release_forward_workspace_cuda(CudaForwardWorkspace & workspace) {
   for (auto & graph : workspace.mlp_graphs) {
     cuda::free_captured_graph(graph);
   }
+  for (auto & graph : workspace.linear_attention_graphs) {
+    cuda::free_captured_graph(graph);
+  }
   workspace.mlp_graphs.clear();
   workspace.mlp_graph_warmup_done.clear();
   workspace.mlp_graph_disabled.clear();
+  workspace.linear_attention_graphs.clear();
+  workspace.linear_attention_graph_warmup_done.clear();
+  workspace.linear_attention_graph_disabled.clear();
   workspace.has_gpu_sampling_buffers = false;
   workspace.has_device_buffers = false;
 }
@@ -927,6 +942,7 @@ cuda::CudaDeviceBufferF32 buffer_slice_f32(
 bool run_linear_attention_step_cuda_device(
   const LayerWeights & layer,
   const RuntimeDims & dims,
+  const std::size_t layer_slot,
   LinearAttentionState & state,
   const cuda::CudaDeviceBufferF32 & x_in,
   CudaForwardWorkspace & workspace,
@@ -958,28 +974,81 @@ bool run_linear_attention_step_cuda_device(
     return false;
   }
 
-  return cuda::run_matvec_f32_device(layer.linear.in_proj_all_device, x_in, workspace.projection_out, error_message) &&
-         cuda::run_linear_attention_decode(
-           mixed,
-           z,
-           b,
-           a,
-           layer.linear.conv1d.device_matrix,
-           layer.linear.norm_device,
-           layer.linear.dt_bias_device,
-           layer.linear.ssm_a_device,
-           dims.linear_kernel,
-           dims.linear_num_k_heads,
-           dims.linear_num_v_heads,
-           dims.linear_head_k_dim,
-           dims.linear_head_v_dim,
-           dims.rms_eps,
-           state.conv_state_device,
-           state.recurrent_state_device,
-           workspace.linear_conv_out,
-           workspace.linear_gated_norm,
-           error_message) &&
-         cuda::run_matvec_f32_device(layer.linear.out_proj.device_matrix, workspace.linear_gated_norm, out_hidden, error_message);
+  const auto run_linear_direct = [&](std::string & run_error) -> bool {
+    return cuda::run_matvec_f32_device(layer.linear.in_proj_all_device, x_in, workspace.projection_out, run_error) &&
+           cuda::run_linear_attention_decode(
+             mixed,
+             z,
+             b,
+             a,
+             layer.linear.conv1d.device_matrix,
+             layer.linear.norm_device,
+             layer.linear.dt_bias_device,
+             layer.linear.ssm_a_device,
+             dims.linear_kernel,
+             dims.linear_num_k_heads,
+             dims.linear_num_v_heads,
+             dims.linear_head_k_dim,
+             dims.linear_head_v_dim,
+             dims.rms_eps,
+             state.conv_state_device,
+             state.recurrent_state_device,
+             workspace.linear_conv_out,
+             workspace.linear_gated_norm,
+             run_error) &&
+           cuda::run_matvec_f32_device(layer.linear.out_proj.device_matrix, workspace.linear_gated_norm, out_hidden, run_error);
+  };
+
+  bool linear_done = false;
+  if (layer_slot < workspace.linear_attention_graphs.size()) {
+    if (workspace.linear_attention_graphs[layer_slot].ready) {
+      linear_done = cuda::launch_captured_graph(workspace.linear_attention_graphs[layer_slot], error_message);
+      if (!linear_done) {
+        workspace.linear_attention_graph_disabled[layer_slot] = true;
+        cuda::free_captured_graph(workspace.linear_attention_graphs[layer_slot]);
+      }
+    }
+
+    if (!linear_done && !workspace.linear_attention_graph_disabled[layer_slot] &&
+        workspace.linear_attention_graph_warmup_done[layer_slot]) {
+      std::string capture_error;
+      const bool capture_started = cuda::begin_stream_capture(capture_error);
+      bool capture_ok = false;
+      if (capture_started) {
+        std::string captured_run_error;
+        const bool captured_run_ok = run_linear_direct(captured_run_error);
+        std::string capture_end_error;
+        const bool capture_end_ok = cuda::end_stream_capture(
+          workspace.linear_attention_graphs[layer_slot],
+          capture_end_error);
+        if (captured_run_ok && capture_end_ok) {
+          capture_ok = cuda::launch_captured_graph(workspace.linear_attention_graphs[layer_slot], capture_error);
+        }
+      }
+      if (!capture_ok) {
+        workspace.linear_attention_graph_disabled[layer_slot] = true;
+        cuda::free_captured_graph(workspace.linear_attention_graphs[layer_slot]);
+      } else {
+        linear_done = true;
+      }
+    }
+
+    if (!linear_done && !workspace.linear_attention_graph_disabled[layer_slot] &&
+        !workspace.linear_attention_graph_warmup_done[layer_slot]) {
+      std::string warmup_error;
+      if (!run_linear_direct(warmup_error)) {
+        error_message = warmup_error;
+        return false;
+      }
+      workspace.linear_attention_graph_warmup_done[layer_slot] = true;
+      linear_done = true;
+    }
+  }
+
+  if (linear_done) {
+    return true;
+  }
+  return run_linear_direct(error_message);
 }
 
 bool run_full_attention_step_cuda_device(
@@ -1748,6 +1817,7 @@ bool run_forward_single_token_cuda_device_core(
       if (!run_linear_attention_step_cuda_device(
             layer,
             dims,
+            static_cast<std::size_t>(il),
             state.linear_states[static_cast<std::size_t>(linear_idx)],
             workspace.full_q,
             workspace,
