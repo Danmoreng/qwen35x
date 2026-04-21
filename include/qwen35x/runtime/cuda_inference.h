@@ -115,6 +115,20 @@ bool run_linear_attention_decode(
   CudaDeviceBufferF32 & out_gated_norm,
   std::string & error_message);
 
+bool sample_token_from_logits_f32_device(
+  const CudaDeviceBufferF32 & logits,
+  const CudaDeviceBufferF32 & seen_token_mask,
+  int vocab_size,
+  float temperature,
+  float top_p,
+  int top_k,
+  float repetition_penalty,
+  float random_u01,
+  const CudaDeviceBufferF32 & topk_values_scratch,
+  const CudaDeviceBufferF32 & topk_indices_scratch,
+  int & out_token,
+  std::string & error_message);
+
 void reset_transfer_stats();
 
 void get_transfer_stats(CudaTransferStats & out_stats);

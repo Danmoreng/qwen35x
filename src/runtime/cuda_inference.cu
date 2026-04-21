@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 #include <cublasLt.h>
 
+#include <algorithm>
 #include <cmath>
 #include <utility>
 
@@ -13,6 +14,9 @@ namespace qwen35x::cuda {
 namespace {
 
 constexpr std::size_t kCublasLtWorkspaceBytes = 8u * 1024u * 1024u;
+constexpr int kGpuSamplingMaxTopK = 64;
+constexpr int kSamplingArgmaxBlockSize = 256;
+constexpr int kSamplingArgmaxChunkSize = 2048;
 
 const char * cublas_status_string(const cublasStatus_t status) {
   switch (status) {
@@ -91,6 +95,11 @@ struct InferenceSessionState {
   cublasLtHandle_t cublas_lt = nullptr;
   void * cublas_lt_workspace = nullptr;
   std::size_t cublas_lt_workspace_bytes = 0;
+  float * sampling_block_values = nullptr;
+  int * sampling_block_indices = nullptr;
+  float * sampling_block_topk_values = nullptr;
+  int * sampling_block_topk_indices = nullptr;
+  int sampling_block_capacity = 0;
   std::vector<MatvecPlan> matvec_plans;
   bool active = false;
 };
@@ -153,6 +162,23 @@ void release_session_storage() {
     destroy_matvec_plan(plan);
   }
   g_session.matvec_plans.clear();
+  if (g_session.sampling_block_values != nullptr) {
+    cudaFree(g_session.sampling_block_values);
+    g_session.sampling_block_values = nullptr;
+  }
+  if (g_session.sampling_block_indices != nullptr) {
+    cudaFree(g_session.sampling_block_indices);
+    g_session.sampling_block_indices = nullptr;
+  }
+  if (g_session.sampling_block_topk_values != nullptr) {
+    cudaFree(g_session.sampling_block_topk_values);
+    g_session.sampling_block_topk_values = nullptr;
+  }
+  if (g_session.sampling_block_topk_indices != nullptr) {
+    cudaFree(g_session.sampling_block_topk_indices);
+    g_session.sampling_block_topk_indices = nullptr;
+  }
+  g_session.sampling_block_capacity = 0;
   if (g_session.cublas_lt_workspace != nullptr) {
     cudaFree(g_session.cublas_lt_workspace);
     g_session.cublas_lt_workspace = nullptr;
@@ -233,6 +259,57 @@ cudaStream_t active_stream() {
     return g_session.stream;
   }
   return nullptr;
+}
+
+bool ensure_sampling_workspace(const int vocab_size, std::string & error_message) {
+  if (vocab_size <= 0) {
+    error_message = "CUDA sampling requires vocab_size > 0.";
+    return false;
+  }
+  const int block_count = std::max(1, (vocab_size + kSamplingArgmaxChunkSize - 1) / kSamplingArgmaxChunkSize);
+  if (g_session.sampling_block_capacity < block_count) {
+    if (g_session.sampling_block_values != nullptr) {
+      cudaFree(g_session.sampling_block_values);
+      g_session.sampling_block_values = nullptr;
+    }
+    if (g_session.sampling_block_indices != nullptr) {
+      cudaFree(g_session.sampling_block_indices);
+      g_session.sampling_block_indices = nullptr;
+    }
+    if (!check_cuda(
+          cudaMalloc(&g_session.sampling_block_values, static_cast<std::size_t>(block_count) * sizeof(float)),
+          "cudaMalloc(sampling_block_values)",
+          error_message) ||
+        !check_cuda(
+          cudaMalloc(&g_session.sampling_block_indices, static_cast<std::size_t>(block_count) * sizeof(int)),
+          "cudaMalloc(sampling_block_indices)",
+          error_message)) {
+      return false;
+    }
+
+    if (g_session.sampling_block_topk_values != nullptr) {
+      cudaFree(g_session.sampling_block_topk_values);
+      g_session.sampling_block_topk_values = nullptr;
+    }
+    if (g_session.sampling_block_topk_indices != nullptr) {
+      cudaFree(g_session.sampling_block_topk_indices);
+      g_session.sampling_block_topk_indices = nullptr;
+    }
+    const std::size_t topk_entries = static_cast<std::size_t>(block_count) * static_cast<std::size_t>(kGpuSamplingMaxTopK);
+    if (!check_cuda(
+          cudaMalloc(&g_session.sampling_block_topk_values, topk_entries * sizeof(float)),
+          "cudaMalloc(sampling_block_topk_values)",
+          error_message) ||
+        !check_cuda(
+          cudaMalloc(&g_session.sampling_block_topk_indices, topk_entries * sizeof(int)),
+          "cudaMalloc(sampling_block_topk_indices)",
+          error_message)) {
+      return false;
+    }
+    g_session.sampling_block_capacity = block_count;
+  }
+
+  return true;
 }
 
 MatvecPlan * find_matvec_plan(const int rows, const int cols) {
@@ -465,6 +542,321 @@ __global__ void silu_mul_kernel(
   const float av = a[idx];
   const float sig = 1.0f / (1.0f + expf(-av));
   out[idx] = (av * sig) * b[idx];
+}
+
+__device__ __forceinline__ float adjust_sampling_logit(
+  const float raw,
+  const float seen_mask,
+  const float repetition_penalty,
+  const float temperature) {
+  float value = raw;
+  if (repetition_penalty > 1.0f && seen_mask > 0.0f) {
+    if (value > 0.0f) {
+      value /= repetition_penalty;
+    } else {
+      value *= repetition_penalty;
+    }
+  }
+  if (temperature > 0.0f) {
+    value /= temperature;
+  }
+  return value;
+}
+
+__global__ void argmax_blocks_kernel(
+  const float * logits,
+  const float * seen_token_mask,
+  const int vocab_size,
+  const float repetition_penalty,
+  float * block_values,
+  int * block_indices) {
+  __shared__ float sh_values[kSamplingArgmaxBlockSize];
+  __shared__ int sh_indices[kSamplingArgmaxBlockSize];
+
+  const int tid = threadIdx.x;
+  const int block_start = blockIdx.x * kSamplingArgmaxChunkSize;
+  const int block_end = min(vocab_size, block_start + kSamplingArgmaxChunkSize);
+
+  float best_value = -1.0e30f;
+  int best_index = -1;
+  for (int idx = block_start + tid; idx < block_end; idx += blockDim.x) {
+    const float value = adjust_sampling_logit(logits[idx], seen_token_mask[idx], repetition_penalty, 0.0f);
+    if (value > best_value || (value == best_value && (best_index < 0 || idx < best_index))) {
+      best_value = value;
+      best_index = idx;
+    }
+  }
+
+  sh_values[tid] = best_value;
+  sh_indices[tid] = best_index;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      const float other_value = sh_values[tid + stride];
+      const int other_index = sh_indices[tid + stride];
+      if (other_value > sh_values[tid] ||
+          (other_value == sh_values[tid] && (sh_indices[tid] < 0 || (other_index >= 0 && other_index < sh_indices[tid])))) {
+        sh_values[tid] = other_value;
+        sh_indices[tid] = other_index;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    block_values[blockIdx.x] = sh_values[0];
+    block_indices[blockIdx.x] = sh_indices[0];
+  }
+}
+
+__global__ void finalize_argmax_token_kernel(
+  const float * block_values,
+  const int * block_indices,
+  const int block_count,
+  float * seen_token_mask,
+  const int vocab_size,
+  float * out_token) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+
+  float best_value = -1.0e30f;
+  int best_index = -1;
+  for (int i = 0; i < block_count; ++i) {
+    const float value = block_values[i];
+    const int idx = block_indices[i];
+    if (idx < 0) {
+      continue;
+    }
+    if (value > best_value || (value == best_value && (best_index < 0 || idx < best_index))) {
+      best_value = value;
+      best_index = idx;
+    }
+  }
+
+  if (best_index < 0 || best_index >= vocab_size) {
+    out_token[0] = -1.0f;
+    return;
+  }
+  seen_token_mask[best_index] = 1.0f;
+  out_token[0] = static_cast<float>(best_index);
+}
+
+__global__ void topk_blocks_kernel(
+  const float * logits,
+  const float * seen_token_mask,
+  const int vocab_size,
+  const float temperature,
+  const float repetition_penalty,
+  const int top_k,
+  float * block_top_values,
+  int * block_top_indices) {
+  if (threadIdx.x != 0) {
+    return;
+  }
+
+  const int block_start = blockIdx.x * kSamplingArgmaxChunkSize;
+  const int block_end = min(vocab_size, block_start + kSamplingArgmaxChunkSize);
+  const int base = blockIdx.x * kGpuSamplingMaxTopK;
+
+  float local_values[kGpuSamplingMaxTopK];
+  int local_indices[kGpuSamplingMaxTopK];
+  for (int i = 0; i < top_k; ++i) {
+    local_values[i] = -1.0e30f;
+    local_indices[i] = -1;
+  }
+
+  for (int idx = block_start; idx < block_end; ++idx) {
+    const float value =
+      adjust_sampling_logit(logits[idx], seen_token_mask[idx], repetition_penalty, temperature);
+    int min_slot = 0;
+    float min_value = local_values[0];
+    for (int i = 1; i < top_k; ++i) {
+      if (local_values[i] < min_value) {
+        min_value = local_values[i];
+        min_slot = i;
+      }
+    }
+    if (value > min_value) {
+      local_values[min_slot] = value;
+      local_indices[min_slot] = idx;
+    }
+  }
+
+  for (int i = 0; i + 1 < top_k; ++i) {
+    int best = i;
+    for (int j = i + 1; j < top_k; ++j) {
+      if (local_values[j] > local_values[best]) {
+        best = j;
+      }
+    }
+    if (best != i) {
+      const float tmp_v = local_values[i];
+      local_values[i] = local_values[best];
+      local_values[best] = tmp_v;
+      const int tmp_i = local_indices[i];
+      local_indices[i] = local_indices[best];
+      local_indices[best] = tmp_i;
+    }
+  }
+
+  for (int i = 0; i < top_k; ++i) {
+    block_top_values[base + i] = local_values[i];
+    block_top_indices[base + i] = local_indices[i];
+  }
+}
+
+__global__ void sample_token_from_block_topk_kernel(
+  const float * block_top_values,
+  const int * block_top_indices,
+  const int block_count,
+  const int vocab_size,
+  const float top_p,
+  const int top_k,
+  const float random_u01,
+  float * seen_token_mask,
+  float * out_token) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+
+  float global_values[kGpuSamplingMaxTopK];
+  int global_indices[kGpuSamplingMaxTopK];
+  for (int i = 0; i < top_k; ++i) {
+    global_values[i] = -1.0e30f;
+    global_indices[i] = -1;
+  }
+
+  const int candidate_count = block_count * top_k;
+  for (int c = 0; c < candidate_count; ++c) {
+    const int idx = block_top_indices[c];
+    if (idx < 0 || idx >= vocab_size) {
+      continue;
+    }
+    const float value = block_top_values[c];
+    int min_slot = 0;
+    float min_value = global_values[0];
+    for (int i = 1; i < top_k; ++i) {
+      if (global_values[i] < min_value) {
+        min_value = global_values[i];
+        min_slot = i;
+      }
+    }
+    if (value > min_value) {
+      global_values[min_slot] = value;
+      global_indices[min_slot] = idx;
+    }
+  }
+
+  for (int i = 0; i + 1 < top_k; ++i) {
+    int best = i;
+    for (int j = i + 1; j < top_k; ++j) {
+      if (global_values[j] > global_values[best]) {
+        best = j;
+      }
+    }
+    if (best != i) {
+      const float tmp_v = global_values[i];
+      global_values[i] = global_values[best];
+      global_values[best] = tmp_v;
+      const int tmp_i = global_indices[i];
+      global_indices[i] = global_indices[best];
+      global_indices[best] = tmp_i;
+    }
+  }
+
+  int valid_count = 0;
+  float max_logit = -1.0e30f;
+  for (int i = 0; i < top_k; ++i) {
+    if (global_indices[i] < 0) {
+      continue;
+    }
+    ++valid_count;
+    if (global_values[i] > max_logit) {
+      max_logit = global_values[i];
+    }
+  }
+  if (valid_count <= 0) {
+    out_token[0] = -1.0f;
+    return;
+  }
+
+  float probs[kGpuSamplingMaxTopK];
+  float prob_sum = 0.0f;
+  for (int i = 0; i < valid_count; ++i) {
+    probs[i] = expf(global_values[i] - max_logit);
+    prob_sum += probs[i];
+  }
+  if (prob_sum <= 0.0f) {
+    const int fallback = global_indices[0];
+    if (fallback < 0 || fallback >= vocab_size) {
+      out_token[0] = -1.0f;
+      return;
+    }
+    seen_token_mask[fallback] = 1.0f;
+    out_token[0] = static_cast<float>(fallback);
+    return;
+  }
+  for (int i = 0; i < valid_count; ++i) {
+    probs[i] /= prob_sum;
+  }
+
+  int keep = valid_count;
+  if (top_p < 1.0f) {
+    float cumulative = 0.0f;
+    keep = 0;
+    for (int i = 0; i < valid_count; ++i) {
+      cumulative += probs[i];
+      ++keep;
+      if (cumulative >= top_p && keep >= 1) {
+        break;
+      }
+    }
+    if (keep <= 0) {
+      keep = 1;
+    }
+  }
+
+  float keep_sum = 0.0f;
+  for (int i = 0; i < keep; ++i) {
+    keep_sum += probs[i];
+  }
+  if (keep_sum <= 0.0f) {
+    const int fallback = global_indices[0];
+    if (fallback < 0 || fallback >= vocab_size) {
+      out_token[0] = -1.0f;
+      return;
+    }
+    seen_token_mask[fallback] = 1.0f;
+    out_token[0] = static_cast<float>(fallback);
+    return;
+  }
+
+  float clamped_u = random_u01;
+  if (clamped_u < 0.0f) {
+    clamped_u = 0.0f;
+  }
+  if (clamped_u >= 1.0f) {
+    clamped_u = 0.99999994f;
+  }
+  const float threshold = clamped_u * keep_sum;
+  float cumulative = 0.0f;
+  int sampled = global_indices[keep - 1];
+  for (int i = 0; i < keep; ++i) {
+    cumulative += probs[i];
+    if (threshold <= cumulative) {
+      sampled = global_indices[i];
+      break;
+    }
+  }
+
+  if (sampled < 0 || sampled >= vocab_size) {
+    out_token[0] = -1.0f;
+    return;
+  }
+  seen_token_mask[sampled] = 1.0f;
+  out_token[0] = static_cast<float>(sampled);
 }
 
 __global__ void full_attention_decode_gqa_kernel(
@@ -1190,6 +1582,137 @@ bool run_linear_attention_decode(
     linear_head_v_dim,
     rms_eps);
   return check_cuda(cudaGetLastError(), "linear_recurrent_decode_kernel", error_message);
+}
+
+bool sample_token_from_logits_f32_device(
+  const CudaDeviceBufferF32 & logits,
+  const CudaDeviceBufferF32 & seen_token_mask,
+  const int vocab_size,
+  const float temperature,
+  const float top_p,
+  const int top_k,
+  const float repetition_penalty,
+  const float random_u01,
+  const CudaDeviceBufferF32 & topk_values_scratch,
+  const CudaDeviceBufferF32 & topk_indices_scratch,
+  int & out_token,
+  std::string & error_message) {
+  (void)topk_values_scratch;
+  (void)topk_indices_scratch;
+
+  if (logits.data == nullptr || seen_token_mask.data == nullptr) {
+    error_message = "CUDA sampling requires initialized device buffers.";
+    return false;
+  }
+  if (vocab_size <= 0 || logits.count < static_cast<std::size_t>(vocab_size) ||
+      seen_token_mask.count < static_cast<std::size_t>(vocab_size)) {
+    error_message = "CUDA sampling buffer size is out of bounds.";
+    return false;
+  }
+  if (top_p <= 0.0f || top_p > 1.0f) {
+    error_message = "CUDA sampling requires top_p in (0, 1].";
+    return false;
+  }
+  if (repetition_penalty <= 0.0f) {
+    error_message = "CUDA sampling requires repetition_penalty > 0.";
+    return false;
+  }
+  if (temperature < 0.0f) {
+    error_message = "CUDA sampling requires temperature >= 0.";
+    return false;
+  }
+  if (temperature > 0.0f) {
+    if (top_k <= 0 || top_k > kGpuSamplingMaxTopK) {
+      error_message = "CUDA sampling requires top_k in [1, 64] when temperature > 0.";
+      return false;
+    }
+  }
+  if (g_session.workspace_output == nullptr || g_session.workspace_output_count < 1) {
+    error_message = "CUDA sampling output workspace is not initialized.";
+    return false;
+  }
+  const cudaStream_t stream = active_stream();
+  if (stream == nullptr) {
+    error_message = "CUDA sampling stream is not initialized.";
+    return false;
+  }
+
+  if (!ensure_sampling_workspace(vocab_size, error_message)) {
+    return false;
+  }
+
+  const int block_count = std::max(1, (vocab_size + kSamplingArgmaxChunkSize - 1) / kSamplingArgmaxChunkSize);
+
+  if (temperature <= 0.0f) {
+    argmax_blocks_kernel<<<block_count, kSamplingArgmaxBlockSize, 0, stream>>>(
+      static_cast<const float *>(logits.data),
+      static_cast<const float *>(seen_token_mask.data),
+      vocab_size,
+      repetition_penalty,
+      g_session.sampling_block_values,
+      g_session.sampling_block_indices);
+    if (!check_cuda(cudaGetLastError(), "argmax_blocks_kernel", error_message)) {
+      return false;
+    }
+    finalize_argmax_token_kernel<<<1, 1, 0, stream>>>(
+      g_session.sampling_block_values,
+      g_session.sampling_block_indices,
+      block_count,
+      static_cast<float *>(seen_token_mask.data),
+      vocab_size,
+      g_session.workspace_output);
+    if (!check_cuda(cudaGetLastError(), "finalize_argmax_token_kernel", error_message)) {
+      return false;
+    }
+  } else {
+    topk_blocks_kernel<<<block_count, 1, 0, stream>>>(
+      static_cast<const float *>(logits.data),
+      static_cast<const float *>(seen_token_mask.data),
+      vocab_size,
+      temperature,
+      repetition_penalty,
+      top_k,
+      g_session.sampling_block_topk_values,
+      g_session.sampling_block_topk_indices);
+    if (!check_cuda(cudaGetLastError(), "topk_blocks_kernel", error_message)) {
+      return false;
+    }
+    sample_token_from_block_topk_kernel<<<1, 1, 0, stream>>>(
+      g_session.sampling_block_topk_values,
+      g_session.sampling_block_topk_indices,
+      block_count,
+      vocab_size,
+      top_p,
+      top_k,
+      random_u01,
+      static_cast<float *>(seen_token_mask.data),
+      g_session.workspace_output);
+    if (!check_cuda(cudaGetLastError(), "sample_token_from_block_topk_kernel", error_message)) {
+      return false;
+    }
+  }
+
+  float token_value = -1.0f;
+  if (!tracked_memcpy_async(
+        &token_value,
+        g_session.workspace_output,
+        sizeof(float),
+        cudaMemcpyDeviceToHost,
+        stream,
+        "cudaMemcpyAsync(sampled_token)",
+        error_message)) {
+    return false;
+  }
+  if (!check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize(sampled_token)", error_message)) {
+    return false;
+  }
+
+  out_token = static_cast<int>(token_value);
+  if (out_token < 0 || out_token >= vocab_size) {
+    error_message = "CUDA sampling failed to produce a valid token id.";
+    return false;
+  }
+  return true;
 }
 
 void reset_transfer_stats() {

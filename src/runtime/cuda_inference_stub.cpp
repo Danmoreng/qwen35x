@@ -127,6 +127,23 @@ bool run_linear_attention_decode(
   return false;
 }
 
+bool sample_token_from_logits_f32_device(
+  const CudaDeviceBufferF32 &,
+  const CudaDeviceBufferF32 &,
+  int,
+  float,
+  float,
+  int,
+  float,
+  float,
+  const CudaDeviceBufferF32 &,
+  const CudaDeviceBufferF32 &,
+  int &,
+  std::string & error_message) {
+  error_message = "CUDA is not enabled in this build.";
+  return false;
+}
+
 void reset_transfer_stats() {
 }
 

@@ -128,6 +128,11 @@ struct CudaForwardWorkspace {
   cuda::CudaDeviceBufferF32 linear_a;
   cuda::CudaDeviceBufferF32 linear_conv_out;
   cuda::CudaDeviceBufferF32 linear_gated_norm;
+  cuda::CudaDeviceBufferF32 logits;
+  cuda::CudaDeviceBufferF32 seen_token_mask;
+  cuda::CudaDeviceBufferF32 topk_values_scratch;
+  cuda::CudaDeviceBufferF32 topk_indices_scratch;
+  bool has_gpu_sampling_buffers = false;
   bool has_device_buffers = false;
 };
 
@@ -144,6 +149,8 @@ struct DecodeProfilingAccumulator {
 double elapsed_ms(const std::chrono::steady_clock::time_point start_time) {
   return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start_time).count();
 }
+
+constexpr int kCudaSamplingMaxTopK = 64;
 
 bool project_from_uploaded_hidden_cuda(
   const TensorData & projection,
@@ -673,7 +680,11 @@ bool allocate_forward_workspace_cuda(
       !cuda::allocate_buffer_f32(static_cast<std::size_t>(dims.linear_num_v_heads), workspace.linear_b, error_message) ||
       !cuda::allocate_buffer_f32(static_cast<std::size_t>(dims.linear_num_v_heads), workspace.linear_a, error_message) ||
       !cuda::allocate_buffer_f32(linear_conv_channels, workspace.linear_conv_out, error_message) ||
-      !cuda::allocate_buffer_f32(linear_v_dim, workspace.linear_gated_norm, error_message)) {
+      !cuda::allocate_buffer_f32(linear_v_dim, workspace.linear_gated_norm, error_message) ||
+      !cuda::allocate_buffer_f32(static_cast<std::size_t>(dims.vocab_size), workspace.logits, error_message) ||
+      !cuda::allocate_buffer_f32(static_cast<std::size_t>(dims.vocab_size), workspace.seen_token_mask, error_message) ||
+      !cuda::allocate_buffer_f32(static_cast<std::size_t>(kCudaSamplingMaxTopK), workspace.topk_values_scratch, error_message) ||
+      !cuda::allocate_buffer_f32(static_cast<std::size_t>(kCudaSamplingMaxTopK), workspace.topk_indices_scratch, error_message)) {
     cuda::free_buffer_f32(workspace.hidden_in);
     cuda::free_buffer_f32(workspace.intermediate_a);
     cuda::free_buffer_f32(workspace.intermediate_b);
@@ -690,9 +701,14 @@ bool allocate_forward_workspace_cuda(
     cuda::free_buffer_f32(workspace.linear_a);
     cuda::free_buffer_f32(workspace.linear_conv_out);
     cuda::free_buffer_f32(workspace.linear_gated_norm);
+    cuda::free_buffer_f32(workspace.logits);
+    cuda::free_buffer_f32(workspace.seen_token_mask);
+    cuda::free_buffer_f32(workspace.topk_values_scratch);
+    cuda::free_buffer_f32(workspace.topk_indices_scratch);
     return false;
   }
 
+  workspace.has_gpu_sampling_buffers = true;
   workspace.has_device_buffers = true;
   return true;
 }
@@ -717,6 +733,11 @@ void release_forward_workspace_cuda(CudaForwardWorkspace & workspace) {
   cuda::free_buffer_f32(workspace.linear_a);
   cuda::free_buffer_f32(workspace.linear_conv_out);
   cuda::free_buffer_f32(workspace.linear_gated_norm);
+  cuda::free_buffer_f32(workspace.logits);
+  cuda::free_buffer_f32(workspace.seen_token_mask);
+  cuda::free_buffer_f32(workspace.topk_values_scratch);
+  cuda::free_buffer_f32(workspace.topk_indices_scratch);
+  workspace.has_gpu_sampling_buffers = false;
   workspace.has_device_buffers = false;
 }
 
@@ -1367,6 +1388,7 @@ bool run_forward_single_token(
   const int position,
   const bool use_cuda,
   std::vector<float> & next_logits,
+  const bool use_cuda_gpu_sampling,
   CudaForwardWorkspace * cuda_workspace,
   DecodeProfilingAccumulator * profiling,
   std::string & error_message) {
@@ -1473,8 +1495,22 @@ bool run_forward_single_token(
   const auto logits_start = std::chrono::steady_clock::now();
   std::vector<float> final_hidden;
   rms_norm_qwen3next(x, weights.final_norm, dims.rms_eps, final_hidden);
-  const bool ok =
-    compute_next_logits_from_embedding(weights.embed_tokens, final_hidden, use_cuda, next_logits, error_message);
+  bool ok = false;
+  if (use_cuda_gpu_sampling && use_cuda && cuda_workspace != nullptr && cuda_workspace->has_gpu_sampling_buffers) {
+    if (!weights.embed_tokens.has_device_matrix || weights.embed_tokens.device_matrix.data == nullptr) {
+      error_message = "CUDA GPU sampling path requested but embedding matrix is not uploaded.";
+      ok = false;
+    } else {
+      ok = cuda::upload_to_buffer_f32(final_hidden.data(), final_hidden.size(), cuda_workspace->hidden_in, 0, error_message) &&
+           cuda::run_matvec_f32_device(
+             weights.embed_tokens.device_matrix,
+             cuda_workspace->hidden_in,
+             cuda_workspace->logits,
+             error_message);
+    }
+  } else {
+    ok = compute_next_logits_from_embedding(weights.embed_tokens, final_hidden, use_cuda, next_logits, error_message);
+  }
   if (profiling != nullptr) {
     profiling->logits_ms += elapsed_ms(logits_start);
   }
@@ -1720,7 +1756,39 @@ bool run_reference_qwen35_inference(
     }
   }
 
+  const bool gpu_sampling_supported_by_config =
+    options.sampling.temperature >= 0.0f && options.sampling.top_p > 0.0f && options.sampling.top_p <= 1.0f &&
+    options.sampling.repetition_penalty > 0.0f &&
+    ((options.sampling.temperature <= 0.0f) ||
+     (options.sampling.top_k > 0 && options.sampling.top_k <= kCudaSamplingMaxTopK));
+  const bool use_cuda_gpu_sampling =
+    options.use_cuda && cuda_workspace_ptr != nullptr && cuda_workspace_ptr->has_gpu_sampling_buffers &&
+    gpu_sampling_supported_by_config;
+  if (options.use_cuda && !use_cuda_gpu_sampling) {
+    error_message = "GPU sampling requires temperature >= 0, top_p in (0,1], repetition_penalty > 0, and top_k in [1, 64] when temperature > 0.";
+    release_cuda_resources();
+    return false;
+  }
+  if (use_cuda_gpu_sampling) {
+    std::vector<float> seen_mask(static_cast<std::size_t>(dims.vocab_size), 0.0f);
+    for (int token = 0; token < dims.vocab_size; ++token) {
+      if (token_counts[static_cast<std::size_t>(token)] > 0) {
+        seen_mask[static_cast<std::size_t>(token)] = 1.0f;
+      }
+    }
+    if (!cuda::upload_to_buffer_f32(
+          seen_mask.data(),
+          seen_mask.size(),
+          cuda_workspace_ptr->seen_token_mask,
+          0,
+          error_message)) {
+      release_cuda_resources();
+      return false;
+    }
+  }
+
   DecodeProfilingAccumulator profiling;
+  std::uniform_real_distribution<float> uniform01(0.0f, 1.0f);
 
   int position = 0;
   std::vector<float> predicted_logits;
@@ -1733,6 +1801,7 @@ bool run_reference_qwen35_inference(
           position,
           options.use_cuda,
           predicted_logits,
+          use_cuda_gpu_sampling,
           cuda_workspace_ptr,
           &profiling,
           error_message)) {
@@ -1747,15 +1816,35 @@ bool run_reference_qwen35_inference(
   for (int i = 0; i < options.max_new_tokens; ++i) {
     const auto sampling_start = std::chrono::steady_clock::now();
     int current = 0;
-    if (!sample_token_from_logits(
-          predicted_logits,
-          options.sampling,
-          token_counts,
-          rng,
-          current,
-          error_message)) {
-      release_cuda_resources();
-      return false;
+    if (use_cuda_gpu_sampling) {
+      const float random_u01 = options.sampling.temperature > 0.0f ? uniform01(rng) : 0.0f;
+      if (!cuda::sample_token_from_logits_f32_device(
+            cuda_workspace_ptr->logits,
+            cuda_workspace_ptr->seen_token_mask,
+            dims.vocab_size,
+            options.sampling.temperature,
+            options.sampling.top_p,
+            options.sampling.top_k,
+            options.sampling.repetition_penalty,
+            random_u01,
+            cuda_workspace_ptr->topk_values_scratch,
+            cuda_workspace_ptr->topk_indices_scratch,
+            current,
+            error_message)) {
+        release_cuda_resources();
+        return false;
+      }
+    } else {
+      if (!sample_token_from_logits(
+            predicted_logits,
+            options.sampling,
+            token_counts,
+            rng,
+            current,
+            error_message)) {
+        release_cuda_resources();
+        return false;
+      }
     }
     profiling.sampling_ms += elapsed_ms(sampling_start);
 
@@ -1793,6 +1882,7 @@ bool run_reference_qwen35_inference(
           position,
           options.use_cuda,
           predicted_logits,
+          use_cuda_gpu_sampling,
           cuda_workspace_ptr,
           &profiling,
           error_message)) {
