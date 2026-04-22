@@ -10,7 +10,9 @@ param (
     [string]$BuildDir = "build",
     [string]$Target = "qwen35x",
     [string]$Profile = "configs/qwen3_5_0_8b.profile.json",
-    [int]$SmVersion = 120
+    [int]$SmVersion = 120,
+    [int]$LuceBlockSize = 256,
+    [int]$LuceNumBlocks = 82
 )
 
 Set-StrictMode -Version Latest
@@ -119,7 +121,9 @@ $configureArgs = @(
     "-B", $resolvedBuildDir
 ) + $GeneratorArgs + @(
     "-DCMAKE_CXX_STANDARD=20",
-    "-DQWEN35X_ENABLE_CUDA=$cudaFlag"
+    "-DQWEN35X_ENABLE_CUDA=$cudaFlag",
+    "-DQWEN35X_LUCE_BENCH_BLOCK_SIZE=$LuceBlockSize",
+    "-DQWEN35X_LUCE_BENCH_NUM_BLOCKS=$LuceNumBlocks"
 )
 
 if ($isNinja) {
@@ -177,4 +181,3 @@ if ($RunSmokeTest) {
     }
     Write-Host "Smoke test passed." -ForegroundColor Green
 }
-

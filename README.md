@@ -70,7 +70,24 @@ Current decode control behavior:
 
 ## Performance Snapshot
 
-Latest local sequential benchmark (April 21, 2026, same machine):
+Latest published benchmark comparison is documented here:
+
+- [docs/benchmark-comparison-2026-04-22.md](docs/benchmark-comparison-2026-04-22.md)
+
+It includes:
+
+- qwen35x vs Luce vs llama.cpp (with/without FlashAttention)
+- decode + prefill numbers
+- Luce block-size/decode-block tuning results
+- CSV source file references for reproducibility
+
+Quick headline numbers from that report:
+
+- Luce decode: `267.45 tok/s`
+- llama.cpp BF16 + FA decode: `222.62 tok/s`
+- qwen35x custom decode: `199.17 tok/s`
+
+Historical local sequential benchmark command (kept for reference):
 
 Command:
 

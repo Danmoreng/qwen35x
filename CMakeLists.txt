@@ -7,6 +7,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(QWEN35X_ENABLE_CUDA "Enable CUDA kernels when a CUDA compiler is available" ON)
 set(QWEN35X_CUDA_ARCHITECTURES "native" CACHE STRING "CUDA architectures passed to CMAKE_CUDA_ARCHITECTURES")
+set(QWEN35X_LUCE_BENCH_BLOCK_SIZE "256" CACHE STRING "Compile-time BLOCK_SIZE for luce megakernel bench kernel")
+set(QWEN35X_LUCE_BENCH_NUM_BLOCKS "82" CACHE STRING "Compile-time NUM_BLOCKS default for luce megakernel bench kernel")
 
 include(CheckLanguage)
 if (QWEN35X_ENABLE_CUDA)
@@ -48,3 +50,30 @@ endif ()
 
 add_executable(qwen35x src/main.cpp)
 target_link_libraries(qwen35x PRIVATE qwen35x_core)
+
+if (CMAKE_CUDA_COMPILER)
+  add_executable(
+    qwen35x_lucebench
+    src/luce_bench_main.cpp
+    third_party/vendor/luce_megakernel/kernel.cu
+    third_party/reference/lucebox-hub/megakernel/prefill.cu
+  )
+  target_include_directories(
+    qwen35x_lucebench
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  target_compile_options(
+    qwen35x_lucebench
+    PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
+  )
+  target_compile_definitions(
+    qwen35x_lucebench
+    PRIVATE
+      BLOCK_SIZE=${QWEN35X_LUCE_BENCH_BLOCK_SIZE}
+      NUM_BLOCKS=${QWEN35X_LUCE_BENCH_NUM_BLOCKS}
+  )
+  target_link_libraries(qwen35x_lucebench PRIVATE qwen35x_core CUDA::cublas)
+  set_target_properties(qwen35x_lucebench PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+endif ()

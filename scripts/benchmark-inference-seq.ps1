@@ -6,10 +6,11 @@ param(
     [string]$RunLabel = "",
     [ValidateSet("gpu-bf16", "gpu-f32", "cpu-reference")]
     [string[]]$Modes = @("gpu-bf16", "gpu-f32"),
-    [ValidateSet("chat-user", "prompt-text")]
+    [ValidateSet("chat-user", "prompt-text", "prompt-tokens")]
     [string]$PromptMode = "chat-user",
     [string]$PromptName = "chat_short_joke",
     [string]$PromptText = "Tell me a short joke.",
+    [string]$PromptTokensCsv = "",
     [int]$Runs = 3,
     [int]$WarmupRuns = 1,
     [int]$MaxNewTokens = 128,
@@ -49,6 +50,7 @@ function Invoke-BenchmarkRun {
         [Parameter(Mandatory = $true)][string]$ModelDir,
         [Parameter(Mandatory = $true)][string]$PromptMode,
         [Parameter(Mandatory = $true)][string]$PromptText,
+        [Parameter(Mandatory = $false)][string]$PromptTokensCsv,
         [Parameter(Mandatory = $true)][int]$MaxNewTokens,
         [Parameter(Mandatory = $true)][int]$MaxContext,
         [Parameter(Mandatory = $true)][double]$Temperature,
@@ -90,8 +92,10 @@ function Invoke-BenchmarkRun {
 
     if ($PromptMode -eq "chat-user") {
         $args += @("--chat-user", $PromptText)
-    } else {
+    } elseif ($PromptMode -eq "prompt-text") {
         $args += @("--prompt-text", $PromptText)
+    } else {
+        $args += @("--prompt-tokens", $PromptTokensCsv)
     }
 
     if ($ProfileSyncEnabled -and $Mode -ne "cpu-reference") {
@@ -134,6 +138,12 @@ if ($Runs -lt 1) {
 if ($WarmupRuns -lt 0) {
     throw "WarmupRuns must be >= 0."
 }
+if (($PromptMode -eq "chat-user" -or $PromptMode -eq "prompt-text") -and [string]::IsNullOrWhiteSpace($PromptText)) {
+    throw "PromptText must be non-empty for prompt mode '$PromptMode'."
+}
+if ($PromptMode -eq "prompt-tokens" -and [string]::IsNullOrWhiteSpace($PromptTokensCsv)) {
+    throw "PromptTokensCsv must be non-empty when PromptMode is 'prompt-tokens'."
+}
 
 New-Item -ItemType Directory -Path (Split-Path -Parent $resolvedCsvOut) -Force | Out-Null
 New-Item -ItemType Directory -Path $profileTmpDir -Force | Out-Null
@@ -151,6 +161,7 @@ foreach ($mode in $Modes) {
                 -ModelDir $resolvedModelDir `
                 -PromptMode $PromptMode `
                 -PromptText $PromptText `
+                -PromptTokensCsv $PromptTokensCsv `
                 -MaxNewTokens $MaxNewTokens `
                 -MaxContext $MaxContext `
                 -Temperature $Temperature `
@@ -177,6 +188,7 @@ foreach ($mode in $Modes) {
                 -ModelDir $resolvedModelDir `
                 -PromptMode $PromptMode `
                 -PromptText $PromptText `
+                -PromptTokensCsv $PromptTokensCsv `
                 -MaxNewTokens $MaxNewTokens `
                 -MaxContext $MaxContext `
                 -Temperature $Temperature `
@@ -196,6 +208,8 @@ foreach ($mode in $Modes) {
                 prompt_tokens    = [int]$profile.prompt_tokens
                 generated_tokens = [int]$profile.generated_tokens
                 load_time_ms     = To-InvariantString $profile.load_time_ms
+                prefill_time_ms  = To-InvariantString $profile.prefill_time_ms
+                prefill_tokens_per_second = To-InvariantString $profile.prefill_tokens_per_second
                 decode_time_ms   = To-InvariantString $profile.decode_time_ms
                 tokens_per_second = To-InvariantString $profile.tokens_per_second
             }

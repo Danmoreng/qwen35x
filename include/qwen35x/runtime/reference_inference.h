@@ -48,6 +48,8 @@ struct ReferenceTransferBreakdown {
 struct ReferenceInferenceResult {
   std::vector<std::int32_t> generated_tokens;
   double load_time_ms = 0.0;
+  double prefill_time_ms = 0.0;
+  double prefill_tokens_per_second = 0.0;
   double decode_time_ms = 0.0;
   double tokens_per_second = 0.0;
   int forward_pass_tokens = 0;

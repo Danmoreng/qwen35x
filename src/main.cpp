@@ -58,6 +58,8 @@ bool write_profile_json(
   out << "  \"generated_tokens\": " << result.generated_tokens.size() << ",\n";
   out << "  \"forward_pass_tokens\": " << result.forward_pass_tokens << ",\n";
   out << "  \"load_time_ms\": " << result.load_time_ms << ",\n";
+  out << "  \"prefill_time_ms\": " << result.prefill_time_ms << ",\n";
+  out << "  \"prefill_tokens_per_second\": " << result.prefill_tokens_per_second << ",\n";
   out << "  \"decode_time_ms\": " << result.decode_time_ms << ",\n";
   out << "  \"tokens_per_second\": " << result.tokens_per_second << ",\n";
   out << "  \"sampling\": {\n";
@@ -326,6 +328,8 @@ int main(int argc, char ** argv) {
     std::cout << "  prompt_tokens: " << infer_options.prompt_tokens.size() << "\n";
     std::cout << "  generated_tokens: " << infer_result.generated_tokens.size() << "\n";
     std::cout << "  load_time_ms: " << infer_result.load_time_ms << "\n";
+    std::cout << "  prefill_time_ms: " << infer_result.prefill_time_ms << "\n";
+    std::cout << "  prefill_tokens_per_second: " << infer_result.prefill_tokens_per_second << "\n";
     std::cout << "  decode_time_ms: " << infer_result.decode_time_ms << "\n";
     std::cout << "  tokens_per_second: " << infer_result.tokens_per_second << "\n";
     std::cout << "  stage_ms: embedding=" << infer_result.timing_breakdown.embedding_ms

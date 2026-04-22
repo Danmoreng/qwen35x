@@ -2541,6 +2541,7 @@ bool run_reference_qwen35_inference(
 
   int position = 0;
   std::vector<float> predicted_logits;
+  const auto prefill_start = std::chrono::steady_clock::now();
   for (const std::int32_t prompt_token : options.prompt_tokens) {
     if (!run_forward_single_token(
           weights,
@@ -2560,6 +2561,12 @@ bool run_reference_qwen35_inference(
     }
     ++position;
   }
+  const auto prefill_end = std::chrono::steady_clock::now();
+  result.prefill_time_ms = std::chrono::duration<double, std::milli>(prefill_end - prefill_start).count();
+  result.prefill_tokens_per_second =
+    (result.prefill_time_ms > 0.0)
+      ? (static_cast<double>(options.prompt_tokens.size()) * 1000.0 / result.prefill_time_ms)
+      : 0.0;
 
   result.generated_tokens.clear();
   result.generated_tokens.reserve(static_cast<std::size_t>(options.max_new_tokens));
