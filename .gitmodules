@@ -4,3 +4,6 @@
 [submodule "third_party/reference/tinygrad"]
 	path = third_party/reference/tinygrad
 	url = https://github.com/tinygrad/tinygrad.git
+[submodule "third_party/reference/lucebox-hub"]
+	path = third_party/reference/lucebox-hub
+	url = git@github.com:Luce-Org/lucebox-hub.git
