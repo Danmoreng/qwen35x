@@ -150,6 +150,27 @@ bool run_apply_rope_inplace_f32(
   float rope_theta,
   std::string & error_message);
 
+bool run_prepare_full_attention_qkv_f32(
+  const CudaDeviceBufferF32 & q_gate_packed,
+  const CudaDeviceBufferF32 & k_raw,
+  const CudaDeviceBufferF32 & v_raw,
+  const CudaDeviceBufferF32 & q_norm_weight,
+  const CudaDeviceBufferF32 & k_norm_weight,
+  int n_heads,
+  int n_kv_heads,
+  int head_dim,
+  int rope_dim,
+  int position,
+  float rope_theta,
+  float eps,
+  CudaDeviceBufferF32 & out_q,
+  CudaDeviceBufferF32 & out_gate,
+  CudaDeviceBufferF32 & k_cache,
+  std::size_t k_cache_offset,
+  CudaDeviceBufferF32 & v_cache,
+  std::size_t v_cache_offset,
+  std::string & error_message);
+
 bool copy_buffer_f32(
   const CudaDeviceBufferF32 & src,
   std::size_t count,

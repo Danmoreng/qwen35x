@@ -906,6 +906,145 @@ __global__ void rope_inplace_kernel(
   ptr[i1] = x1 * c + x0 * s;
 }
 
+__global__ void prepare_full_attention_qkv_kernel(
+  const float * q_gate_packed,
+  const float * k_raw,
+  const float * v_raw,
+  const float * q_norm_weight,
+  const float * k_norm_weight,
+  float * out_q,
+  float * out_gate,
+  float * k_cache,
+  float * v_cache,
+  const int n_heads,
+  const int n_kv_heads,
+  const int head_dim,
+  const int applied_rope_dim,
+  const int position,
+  const float rope_theta,
+  const float eps,
+  const unsigned long long k_cache_offset,
+  const unsigned long long v_cache_offset) {
+  __shared__ float reduction[256];
+  __shared__ float inv_norm;
+
+  const int head = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (head >= n_heads) {
+    return;
+  }
+
+  const int pair_count = applied_rope_dim / 2;
+  const std::size_t q_head_base = static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim);
+  const std::size_t packed_base = q_head_base * 2;
+
+  // Split Q/G, apply per-head RMSNorm on Q, then RoPE on Q.
+  float q_sq_sum = 0.0f;
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    const float qv = q_gate_packed[packed_base + static_cast<std::size_t>(d)];
+    q_sq_sum += qv * qv;
+  }
+  reduction[tid] = q_sq_sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduction[tid] += reduction[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    inv_norm = rsqrtf((reduction[0] / static_cast<float>(head_dim)) + eps);
+  }
+  __syncthreads();
+
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    const std::size_t idx = q_head_base + static_cast<std::size_t>(d);
+    const float qv = q_gate_packed[packed_base + static_cast<std::size_t>(d)];
+    const float gv = q_gate_packed[packed_base + static_cast<std::size_t>(head_dim) + static_cast<std::size_t>(d)];
+    out_q[idx] = qv * inv_norm * (1.0f + q_norm_weight[d]);
+    out_gate[idx] = gv;
+  }
+  __syncthreads();
+
+  for (int pair_idx = tid; pair_idx < pair_count; pair_idx += blockDim.x) {
+    const int i0 = pair_idx;
+    const int i1 = pair_idx + pair_count;
+    if (i1 >= head_dim) {
+      continue;
+    }
+    const float inv_freq = expf(
+      -logf(rope_theta) * (static_cast<float>(2 * pair_idx) / static_cast<float>(applied_rope_dim)));
+    const float angle = static_cast<float>(position) * inv_freq;
+    const float c = cosf(angle);
+    const float s = sinf(angle);
+    const std::size_t q0_idx = q_head_base + static_cast<std::size_t>(i0);
+    const std::size_t q1_idx = q_head_base + static_cast<std::size_t>(i1);
+    const float x0 = out_q[q0_idx];
+    const float x1 = out_q[q1_idx];
+    out_q[q0_idx] = x0 * c - x1 * s;
+    out_q[q1_idx] = x1 * c + x0 * s;
+  }
+  __syncthreads();
+
+  // For KV heads, apply RMSNorm+RoPE on K and write K/V directly into caches.
+  if (head >= n_kv_heads) {
+    return;
+  }
+
+  const std::size_t kv_head_base = static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim);
+
+  float k_sq_sum = 0.0f;
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    const float kv = k_raw[kv_head_base + static_cast<std::size_t>(d)];
+    k_sq_sum += kv * kv;
+  }
+  reduction[tid] = k_sq_sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduction[tid] += reduction[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    inv_norm = rsqrtf((reduction[0] / static_cast<float>(head_dim)) + eps);
+  }
+  __syncthreads();
+
+  const std::size_t k_cache_base = static_cast<std::size_t>(k_cache_offset) + kv_head_base;
+  const std::size_t v_cache_base = static_cast<std::size_t>(v_cache_offset) + kv_head_base;
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    const std::size_t local_idx = kv_head_base + static_cast<std::size_t>(d);
+    k_cache[k_cache_base + static_cast<std::size_t>(d)] =
+      k_raw[local_idx] * inv_norm * (1.0f + k_norm_weight[d]);
+    v_cache[v_cache_base + static_cast<std::size_t>(d)] = v_raw[local_idx];
+  }
+  __syncthreads();
+
+  for (int pair_idx = tid; pair_idx < pair_count; pair_idx += blockDim.x) {
+    const int i0 = pair_idx;
+    const int i1 = pair_idx + pair_count;
+    if (i1 >= head_dim) {
+      continue;
+    }
+    const float inv_freq = expf(
+      -logf(rope_theta) * (static_cast<float>(2 * pair_idx) / static_cast<float>(applied_rope_dim)));
+    const float angle = static_cast<float>(position) * inv_freq;
+    const float c = cosf(angle);
+    const float s = sinf(angle);
+    const std::size_t k0_idx = k_cache_base + static_cast<std::size_t>(i0);
+    const std::size_t k1_idx = k_cache_base + static_cast<std::size_t>(i1);
+    const float x0 = k_cache[k0_idx];
+    const float x1 = k_cache[k1_idx];
+    k_cache[k0_idx] = x0 * c - x1 * s;
+    k_cache[k1_idx] = x1 * c + x0 * s;
+  }
+}
+
 __device__ __forceinline__ float adjust_sampling_logit(
   const float raw,
   const float seen_mask,
@@ -2102,6 +2241,80 @@ bool run_apply_rope_inplace_f32(
     position,
     rope_theta);
   return check_cuda(cudaGetLastError(), "rope_inplace_kernel", error_message);
+}
+
+bool run_prepare_full_attention_qkv_f32(
+  const CudaDeviceBufferF32 & q_gate_packed,
+  const CudaDeviceBufferF32 & k_raw,
+  const CudaDeviceBufferF32 & v_raw,
+  const CudaDeviceBufferF32 & q_norm_weight,
+  const CudaDeviceBufferF32 & k_norm_weight,
+  const int n_heads,
+  const int n_kv_heads,
+  const int head_dim,
+  const int rope_dim,
+  const int position,
+  const float rope_theta,
+  const float eps,
+  CudaDeviceBufferF32 & out_q,
+  CudaDeviceBufferF32 & out_gate,
+  CudaDeviceBufferF32 & k_cache,
+  const std::size_t k_cache_offset,
+  CudaDeviceBufferF32 & v_cache,
+  const std::size_t v_cache_offset,
+  std::string & error_message) {
+  if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0) {
+    error_message = "Invalid dimensions for full-attention QKV prepare.";
+    return false;
+  }
+  if (n_heads % n_kv_heads != 0) {
+    error_message = "n_heads must be divisible by n_kv_heads for GQA.";
+    return false;
+  }
+  const int applied_rope_dim = std::min(rope_dim, head_dim);
+  const std::size_t q_count = static_cast<std::size_t>(n_heads) * static_cast<std::size_t>(head_dim);
+  const std::size_t q_packed_count = q_count * 2;
+  const std::size_t kv_count = static_cast<std::size_t>(n_kv_heads) * static_cast<std::size_t>(head_dim);
+  if (q_gate_packed.data == nullptr || k_raw.data == nullptr || v_raw.data == nullptr || q_norm_weight.data == nullptr ||
+      k_norm_weight.data == nullptr || out_q.data == nullptr || out_gate.data == nullptr || k_cache.data == nullptr ||
+      v_cache.data == nullptr) {
+    error_message = "CUDA full-attention QKV prepare requires initialized buffers.";
+    return false;
+  }
+  if (q_gate_packed.count < q_packed_count || k_raw.count < kv_count || v_raw.count < kv_count || out_q.count < q_count ||
+      out_gate.count < q_count || q_norm_weight.count < static_cast<std::size_t>(head_dim) ||
+      k_norm_weight.count < static_cast<std::size_t>(head_dim)) {
+    error_message = "CUDA full-attention QKV prepare buffer range is out of bounds.";
+    return false;
+  }
+  if (k_cache_offset > k_cache.count || kv_count > (k_cache.count - k_cache_offset) ||
+      v_cache_offset > v_cache.count || kv_count > (v_cache.count - v_cache_offset)) {
+    error_message = "CUDA full-attention QKV prepare cache range is out of bounds.";
+    return false;
+  }
+
+  constexpr int block_size = 256;
+  const cudaStream_t stream = active_stream();
+  prepare_full_attention_qkv_kernel<<<n_heads, block_size, 0, stream>>>(
+    static_cast<const float *>(q_gate_packed.data),
+    static_cast<const float *>(k_raw.data),
+    static_cast<const float *>(v_raw.data),
+    static_cast<const float *>(q_norm_weight.data),
+    static_cast<const float *>(k_norm_weight.data),
+    static_cast<float *>(out_q.data),
+    static_cast<float *>(out_gate.data),
+    static_cast<float *>(k_cache.data),
+    static_cast<float *>(v_cache.data),
+    n_heads,
+    n_kv_heads,
+    head_dim,
+    applied_rope_dim,
+    position,
+    rope_theta,
+    eps,
+    static_cast<unsigned long long>(k_cache_offset),
+    static_cast<unsigned long long>(v_cache_offset));
+  return check_cuda(cudaGetLastError(), "prepare_full_attention_qkv_kernel", error_message);
 }
 
 bool copy_buffer_f32(

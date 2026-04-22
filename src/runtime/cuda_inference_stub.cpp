@@ -174,6 +174,30 @@ bool run_apply_rope_inplace_f32(
   return false;
 }
 
+bool run_prepare_full_attention_qkv_f32(
+  const CudaDeviceBufferF32 &,
+  const CudaDeviceBufferF32 &,
+  const CudaDeviceBufferF32 &,
+  const CudaDeviceBufferF32 &,
+  const CudaDeviceBufferF32 &,
+  int,
+  int,
+  int,
+  int,
+  int,
+  float,
+  float,
+  CudaDeviceBufferF32 &,
+  CudaDeviceBufferF32 &,
+  CudaDeviceBufferF32 &,
+  std::size_t,
+  CudaDeviceBufferF32 &,
+  std::size_t,
+  std::string & error_message) {
+  error_message = "CUDA is not enabled in this build.";
+  return false;
+}
+
 bool copy_buffer_f32(
   const CudaDeviceBufferF32 &,
   std::size_t,

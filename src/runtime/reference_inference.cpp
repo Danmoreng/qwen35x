@@ -1119,41 +1119,26 @@ bool run_full_attention_step_cuda_device(
   };
 
   return run_qkv_projections(error_message) &&
-         cuda::run_split_q_gate_f32(q_gate_packed, dims.n_heads, dims.head_dim, workspace.full_q, workspace.full_gate, error_message) &&
-         cuda::run_rms_norm_per_head_f32(
-           workspace.full_q,
-           layer.full.q_norm_device,
-           dims.n_heads,
-           dims.head_dim,
-           dims.rms_eps,
-           workspace.full_q,
-           error_message) &&
-         cuda::run_rms_norm_per_head_f32(
+         cuda::run_prepare_full_attention_qkv_f32(
+           q_gate_packed,
            k_raw,
+           v_raw,
+           layer.full.q_norm_device,
            layer.full.k_norm_device,
-           dims.n_kv_heads,
-           dims.head_dim,
-           dims.rms_eps,
-           workspace.full_attn,
-           error_message) &&
-         cuda::run_apply_rope_inplace_f32(
-           workspace.full_q,
            dims.n_heads,
-           dims.head_dim,
-           dims.rope_dim,
-           position,
-           dims.rope_theta,
-           error_message) &&
-         cuda::run_apply_rope_inplace_f32(
-           workspace.full_attn,
            dims.n_kv_heads,
            dims.head_dim,
            dims.rope_dim,
            position,
            dims.rope_theta,
+           dims.rms_eps,
+           workspace.full_q,
+           workspace.full_gate,
+           state.k_cache_device,
+           cache_offset,
+           state.v_cache_device,
+           cache_offset,
            error_message) &&
-         cuda::copy_buffer_f32(workspace.full_attn, kv_count, 0, state.k_cache_device, cache_offset, error_message) &&
-         cuda::copy_buffer_f32(v_raw, kv_count, 0, state.v_cache_device, cache_offset, error_message) &&
          cuda::run_full_attention_decode_gqa(
            workspace.full_q,
            workspace.full_gate,
