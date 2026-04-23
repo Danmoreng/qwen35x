@@ -18,6 +18,7 @@ bool init_runtime_decode_backend(
     config.model_dir = options.model_dir;
     config.max_context = options.max_context;
     config.decode_blocks = options.gpu_decode_blocks;
+    config.repetition_penalty = options.sampling.repetition_penalty;
     if (!backend.luce_backend.initialize(config, error_message)) {
       return false;
     }

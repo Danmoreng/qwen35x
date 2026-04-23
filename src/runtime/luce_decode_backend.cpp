@@ -106,6 +106,9 @@ extern "C" void launch_prefill_bf16(
   void * hidden_bf16_out,
   void * lm_bmv,
   void * lm_bmi,
+  float * seen_token_mask,
+  float repetition_penalty,
+  int max_seq_len,
   cudaStream_t stream);
 
 struct DeviceArena {
@@ -466,7 +469,7 @@ bool initialize_backend_state(
       !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * kDnVSize * bf16_bytes, state.pf_dn_out_buf, error_message) ||
       !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * kDnNumHeads * sizeof(float), reinterpret_cast<void *&>(state.pf_beta_buf), error_message) ||
       !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * kDnNumHeads * sizeof(float), reinterpret_cast<void *&>(state.pf_alpha_buf), error_message) ||
-      !arena.alloc_bytes(kHiddenSize * bf16_bytes, state.pf_final_normed, error_message) ||
+      !arena.alloc_bytes(kHiddenSize * f32_bytes, state.pf_final_normed, error_message) ||
       !arena.alloc_bytes(kHiddenSize * bf16_bytes, state.pf_hidden_bf16_out, error_message) ||
       !arena.alloc_bytes(1024 * sizeof(float), reinterpret_cast<void *&>(state.pf_lm_bmv), error_message) ||
       !arena.alloc_bytes(1024 * sizeof(int), reinterpret_cast<void *&>(state.pf_lm_bmi), error_message)) {
@@ -501,11 +504,16 @@ bool reset_state(const BackendState & state, std::string & error_message) {
 
 bool run_prefill_impl(
   const BackendState & state,
+  const LuceDecodeBackendConfig & config,
   const std::vector<std::int32_t> & tokens,
   int & out_first_token,
   std::string & error_message) {
   if (tokens.empty()) {
     error_message = "Prefill tokens are empty.";
+    return false;
+  }
+  if (tokens.size() > static_cast<std::size_t>(config.max_context)) {
+    error_message = "Prefill token count exceeds max_context.";
     return false;
   }
 
@@ -546,6 +554,9 @@ bool run_prefill_impl(
     state.pf_hidden_bf16_out,
     state.pf_lm_bmv,
     state.pf_lm_bmi,
+    state.seen_token_mask,
+    config.repetition_penalty,
+    config.max_context,
     nullptr);
 
   if (!check_cuda(cudaGetLastError(), "launch_prefill_bf16", error_message)) {
@@ -701,7 +712,7 @@ bool LuceDecodeBackend::run_prefill(
     error_message = "Prefill token count exceeds configured max_context.";
     return false;
   }
-  return run_prefill_impl(impl_->state, tokens, out_first_token, error_message);
+  return run_prefill_impl(impl_->state, impl_->config, tokens, out_first_token, error_message);
 }
 
 bool LuceDecodeBackend::run_decode_step(

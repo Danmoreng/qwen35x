@@ -15,7 +15,7 @@ Progress snapshot (April 2026):
 - The Luce backend passes deterministic CPU parity on both minimal and extended prompt suites.
 - Legacy runtime measured transfer footprint is near control-path scale (`~3-4 bytes D2H per forward token`); Luce backend transfer accounting is currently outside the shared CUDA stats path.
 - Current measured sequential benchmark (April 23, 2026, integrated Luce default): `gpu-bf16` avg `289.43 tok/s`, `gpu-f32` avg `287.88 tok/s`.
-- Current open bottlenecks are greedy-only Luce sampling support, prompt prefill replay, and batched/specialized prefill.
+- Current open bottlenecks are greedy-only Luce sampling support, prompt prefill replay, and batched/specialized prefill parity.
 
 Scope:
 - Model family: Qwen3.5 (current profile `qwen3_5_0_8b.profile.json`)
@@ -268,6 +268,7 @@ Latest parity status (April 23, 2026):
 - Minimal parity smoke (`scripts/bench/parity_prompts_minimal.txt`, `max_new_tokens=4`, `gpu-f32`): pass `5/5`.
 - Extended parity suite (`scripts/bench/parity_prompts.txt`, `max_new_tokens=4`, `gpu-f32`): pass `12/12`.
 - Post source-move minimal parity (`benchmarks/qwen35x-parity-moved-luce.csv`): pass `5/5`.
+- Default Luce prefill mode remains `replay`; experimental `batched` mode is not parity-clean yet.
 
 Files:
 - `scripts/` (new scripts)

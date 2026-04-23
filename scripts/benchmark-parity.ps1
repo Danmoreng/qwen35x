@@ -14,6 +14,8 @@ param(
     [int64]$Seed = 123,
     [ValidateSet("gpu-bf16", "gpu-f32")]
     [string]$GpuMode = "gpu-f32",
+    [ValidateSet("default", "replay", "batched")]
+    [string]$LucePrefillMode = "default",
     [switch]$ProfileSync,
     [bool]$FailOnMismatch = $true,
     [switch]$KeepProfiles
@@ -101,6 +103,7 @@ function Invoke-InferenceProfile {
         [Parameter(Mandatory = $true)][int]$TopK,
         [Parameter(Mandatory = $true)][double]$RepeatPenalty,
         [Parameter(Mandatory = $true)][int64]$Seed,
+        [Parameter(Mandatory = $true)][string]$LucePrefillMode,
         [Parameter(Mandatory = $true)][bool]$ProfileSyncEnabled,
         [Parameter(Mandatory = $true)][string]$ProfileJsonPath
     )
@@ -143,6 +146,9 @@ function Invoke-InferenceProfile {
 
     if ($ProfileSyncEnabled -and $Mode -ne "cpu-reference") {
         $args += @("--profile-sync")
+    }
+    if ($Mode -ne "cpu-reference" -and $LucePrefillMode -ne "default") {
+        $args += @("--luce-prefill-mode", $LucePrefillMode)
     }
 
     $runOutput = & $ExePath @args 2>&1
@@ -256,6 +262,7 @@ foreach ($prompt in $prompts) {
             -TopK $TopK `
             -RepeatPenalty $RepeatPenalty `
             -Seed $Seed `
+            -LucePrefillMode "default" `
             -ProfileSyncEnabled $false `
             -ProfileJsonPath $cpuProfilePath
 
@@ -272,6 +279,7 @@ foreach ($prompt in $prompts) {
             -TopK $TopK `
             -RepeatPenalty $RepeatPenalty `
             -Seed $Seed `
+            -LucePrefillMode $LucePrefillMode `
             -ProfileSyncEnabled $ProfileSync.IsPresent `
             -ProfileJsonPath $gpuProfilePath
 
@@ -309,6 +317,7 @@ foreach ($prompt in $prompts) {
             top_k = $TopK
             repeat_penalty = To-InvariantString $RepeatPenalty
             seed = $Seed
+            luce_prefill_mode = $LucePrefillMode
             token_parity_pass = if ($parityPass) { "true" } else { "false" }
             first_mismatch_index = $comparison.first_mismatch_index
             cpu_mismatch_token = $comparison.cpu_mismatch_token

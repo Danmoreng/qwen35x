@@ -50,6 +50,17 @@ const char * gpu_decode_backend_name(const qwen35x::GpuDecodeBackend backend) {
   }
 }
 
+const char * luce_prefill_mode_name(const qwen35x::LucePrefillMode mode) {
+  switch (mode) {
+    case qwen35x::LucePrefillMode::replay:
+      return "replay";
+    case qwen35x::LucePrefillMode::batched:
+      return "batched";
+    default:
+      return "unknown";
+  }
+}
+
 bool write_profile_json(
   const std::string & output_path,
   const qwen35x::ReferenceInferenceOptions & options,
@@ -67,6 +78,7 @@ bool write_profile_json(
   out << "{\n";
   out << "  \"backend\": \"" << json_escape(backend) << "\",\n";
   out << "  \"decode_backend\": \"" << json_escape(decode_backend) << "\",\n";
+  out << "  \"luce_prefill_mode\": \"" << json_escape(luce_prefill_mode_name(options.luce_prefill_mode)) << "\",\n";
   out << "  \"prompt_tokens\": " << options.prompt_tokens.size() << ",\n";
   out << "  \"generated_tokens\": " << result.generated_tokens.size() << ",\n";
   out << "  \"forward_pass_tokens\": " << result.forward_pass_tokens << ",\n";
@@ -198,6 +210,16 @@ int main(int argc, char ** argv) {
       }
     } else if (arg == "--gpu-decode-blocks" && i + 1 < argc) {
       infer_options.gpu_decode_blocks = std::stoi(argv[++i]);
+    } else if (arg == "--luce-prefill-mode" && i + 1 < argc) {
+      const std::string mode = argv[++i];
+      if (mode == "replay") {
+        infer_options.luce_prefill_mode = qwen35x::LucePrefillMode::replay;
+      } else if (mode == "batched") {
+        infer_options.luce_prefill_mode = qwen35x::LucePrefillMode::batched;
+      } else {
+        std::cerr << "unknown --luce-prefill-mode value: " << mode << " (expected: replay|batched)\n";
+        return 11;
+      }
     } else if (arg == "--profile-sync") {
       infer_options.profile_cuda_sync = true;
     } else if (arg == "--stop-token" && i + 1 < argc) {
@@ -221,7 +243,7 @@ int main(int argc, char ** argv) {
       std::cout << "       qwen35x --infer-reference --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "       qwen35x --infer-gpu --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "               [--temperature <float>] [--top-p <float>] [--top-k <int>] [--repeat-penalty <float>] [--seed <int64>]\n";
-      std::cout << "               [--gpu-bf16|--gpu-f32-matvec] [--gpu-decode-backend <default|luce>] [--gpu-decode-blocks <n>] [--profile-sync]\n";
+      std::cout << "               [--gpu-bf16|--gpu-f32-matvec] [--gpu-decode-backend <default|luce>] [--gpu-decode-blocks <n>] [--luce-prefill-mode <replay|batched>] [--profile-sync]\n";
       std::cout << "               [--stop-token <csv>] [--stop-text <text>] [--stop-on-im-end] [--profile-json <path>]\n";
       return 0;
     }
@@ -359,6 +381,7 @@ int main(int argc, char ** argv) {
     std::cout << "reference inference\n";
     std::cout << "  backend: " << (infer_options.use_cuda ? "cuda-hybrid" : "cpu-reference") << "\n";
     std::cout << "  decode_backend: " << gpu_decode_backend_name(infer_options.gpu_decode_backend) << "\n";
+    std::cout << "  luce_prefill_mode: " << luce_prefill_mode_name(infer_options.luce_prefill_mode) << "\n";
     std::cout << "  prompt_tokens: " << infer_options.prompt_tokens.size() << "\n";
     std::cout << "  generated_tokens: " << infer_result.generated_tokens.size() << "\n";
     std::cout << "  load_time_ms: " << infer_result.load_time_ms << "\n";

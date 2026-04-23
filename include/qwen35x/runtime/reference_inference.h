@@ -21,6 +21,11 @@ enum class GpuDecodeBackend {
   luce = 1
 };
 
+enum class LucePrefillMode {
+  replay = 0,
+  batched = 1
+};
+
 struct ReferenceInferenceOptions {
   std::string model_dir;
   std::vector<std::int32_t> prompt_tokens;
@@ -29,6 +34,7 @@ struct ReferenceInferenceOptions {
   bool use_cuda = false;
   bool use_cuda_matvec_bf16 = false;
   GpuDecodeBackend gpu_decode_backend = GpuDecodeBackend::runtime_default;
+  LucePrefillMode luce_prefill_mode = LucePrefillMode::replay;
   int gpu_decode_blocks = 0;
   bool profile_cuda_sync = false;
   SamplingOptions sampling;

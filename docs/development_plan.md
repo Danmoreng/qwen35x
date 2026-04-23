@@ -25,6 +25,7 @@ Current known constraints:
 - Legacy runtime GPU sampling path currently requires `top_k <= 64` when `temperature > 0`
 - Stop condition checks remain host-side
 - Main Luce inference path currently replays prompt tokens through single-token decode for correctness; batched/specialized prefill is still open
+- Experimental Luce batched prefill is selectable with `--luce-prefill-mode batched`; it is kept off by default until it reaches full CPU parity.
 
 Latest local benchmark snapshot (Qwen3.5-0.8B, same machine):
 - Historical chat baseline (early April 2026): ~91 tokens/s
@@ -193,6 +194,7 @@ Validation policy for each new size:
 - [x] Apply local Luce correctness fixes needed for CPU parity: DeltaNet decode decay, host-side barrier reset, repetition-penalty-aware greedy argmax.
 - [ ] Unify prefill/decode around one canonical cache/state layout without prompt replay or conversion.
 - [ ] Replace correctness-first token replay prefill with batched GEMM + flash-style full-attention prefill kernels.
+  Current status: `--luce-prefill-mode batched` is wired for diagnostics and has sampler/cache-stride fixes, but still has a known token-parity mismatch.
 - [ ] Remove token-wise projection/copy overhead in prefill and move to true batched projection execution.
 - [ ] Parameterize kernel/runtime descriptors by model metadata to support `Qwen3.5-0.8B`, `4B`, `9B`, and `27B`.
 - [ ] Add per-model/per-GPU autotune profiles (decode blocks, tile sizes, chunk sizes, graph boundaries).

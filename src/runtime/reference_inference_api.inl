@@ -76,12 +76,18 @@ bool run_luce_qwen35_inference(
 
   int first_token = 0;
   const auto prefill_start = std::chrono::steady_clock::now();
-  int prefill_position = 0;
-  for (const std::int32_t prompt_token : options.prompt_tokens) {
-    if (!backend.run_decode_step(prompt_token, prefill_position, first_token, error_message)) {
+  if (options.luce_prefill_mode == LucePrefillMode::batched) {
+    if (!backend.run_prefill(options.prompt_tokens, first_token, error_message)) {
       return false;
     }
-    ++prefill_position;
+  } else {
+    int prefill_position = 0;
+    for (const std::int32_t prompt_token : options.prompt_tokens) {
+      if (!backend.run_decode_step(prompt_token, prefill_position, first_token, error_message)) {
+        return false;
+      }
+      ++prefill_position;
+    }
   }
   const auto prefill_end = std::chrono::steady_clock::now();
   result.prefill_time_ms = std::chrono::duration<double, std::milli>(prefill_end - prefill_start).count();

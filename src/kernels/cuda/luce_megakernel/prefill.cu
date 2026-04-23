@@ -50,6 +50,15 @@ __global__ void pf_embed(const int *ids, const __nv_bfloat16 *embed, __nv_bfloat
     out[idx] = embed[ids[idx / HIDDEN] * HIDDEN + idx % HIDDEN];
 }
 
+__global__ void pf_mark_seen_tokens(const int *ids, int S, float *seen_token_mask) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= S) return;
+    int token_id = ids[idx];
+    if (token_id >= 0 && token_id < VOCAB) {
+        seen_token_mask[token_id] = 1.0f;
+    }
+}
+
 // Batched RMSNorm: bf16 in → bf16 out, saves bf16 residual
 __global__ void pf_rmsnorm(const __nv_bfloat16 *in, const __nv_bfloat16 *w,
     __nv_bfloat16 *out, __nv_bfloat16 *res, int S, int D) {
@@ -80,13 +89,13 @@ __global__ void pf_bf16_matvec(const __nv_bfloat16 *in, const __nv_bfloat16 *w, 
     if (lid == 0) out[idx] = sum;
 }
 
-// bf16 result + bf16 residual → bf16 output
+// bf16 result + bf16 residual -> bf16 output
 __global__ void pf_add_residual_bf16(const __nv_bfloat16 *a, const __nv_bfloat16 *b, __nv_bfloat16 *out, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < N) out[i] = __float2bfloat16(__bfloat162float(a[i]) + __bfloat162float(b[i]));
 }
 
-// SiLU(gate) * up — bf16 inputs → bf16 output
+// SiLU(gate) * up, bf16 inputs/output
 __global__ void pf_silu_mul_bf16(const __nv_bfloat16 *gate, const __nv_bfloat16 *up, __nv_bfloat16 *out, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < N) { float g = __bfloat162float(gate[i]); out[i] = __float2bfloat16(pf_silu(g) * __bfloat162float(up[i])); }
@@ -214,7 +223,7 @@ __global__ void pf_qk_norm_rope(
     if (idx < total_q) {
         int pos = idx / FA_Q_HEADS, head = idx % FA_Q_HEADS;
         __nv_bfloat16 *qh = q + pos * FA_QPROJ_SIZE + head * FA_HEAD_DIM * 2;
-        float ss = 0; for (int i = lid; i < FA_HEAD_DIM; i += 32) { float v = __bfloat162float(qh[i]); ss += v*v; }
+        float ss = 0; for (int i = lid; i < FA_HEAD_DIM; i += 32) { float vq = __bfloat162float(qh[i]); ss += vq*vq; }
         ss = pf_warp_sum(ss); float sc = rsqrtf(ss/FA_HEAD_DIM+RMS_EPS); sc = __shfl_sync(0xffffffff,sc,0);
         for (int i = lid; i < FA_HEAD_DIM; i += 32) {
             float normed = __bfloat162float(qh[i])*sc*(1.f+__bfloat162float(qnw[i]));
@@ -233,7 +242,7 @@ __global__ void pf_qk_norm_rope(
         const __nv_bfloat16 *vh = v + pos*FA_KV_SIZE + head*FA_HEAD_DIM;
         __nv_bfloat16 *kc = k_cache + head*max_seq*FA_HEAD_DIM + pos*FA_HEAD_DIM;
         __nv_bfloat16 *vc = v_cache + head*max_seq*FA_HEAD_DIM + pos*FA_HEAD_DIM;
-        float ss = 0; for (int i = lid; i < FA_HEAD_DIM; i += 32) { float v = __bfloat162float(kh[i]); ss += v*v; }
+        float ss = 0; for (int i = lid; i < FA_HEAD_DIM; i += 32) { float vk = __bfloat162float(kh[i]); ss += vk*vk; }
         ss = pf_warp_sum(ss); float sc = rsqrtf(ss/FA_HEAD_DIM+RMS_EPS); sc = __shfl_sync(0xffffffff,sc,0);
         for (int i = lid; i < FA_HEAD_DIM; i += 32) {
             float normed = __bfloat162float(kh[i])*sc*(1.f+__bfloat162float(knw[i])); float fk;
@@ -277,7 +286,7 @@ __global__ void pf_causal_attn(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
 
 // Final norm
 __global__ void pf_final_norm(const __nv_bfloat16 *hidden, const __nv_bfloat16 *w,
-    __nv_bfloat16 *normed, __nv_bfloat16 *hidden_out, int S) {
+    float *normed, __nv_bfloat16 *hidden_out, int S) {
     int tid=threadIdx.x, wid=tid/32, lid=tid%32;
     __shared__ float smem[16];
     const __nv_bfloat16 *row = hidden + (S-1)*HIDDEN;
@@ -287,23 +296,27 @@ __global__ void pf_final_norm(const __nv_bfloat16 *hidden, const __nv_bfloat16 *
     __syncthreads();float rstd=smem[0];
     for(int i=tid;i<HIDDEN;i+=blockDim.x){
         float v=__bfloat162float(row[i]);
-        normed[i]=__float2bfloat16(v*rstd*(1.f+__bfloat162float(w[i])));
+        normed[i]=v*rstd*(1.f+__bfloat162float(w[i]));
         hidden_out[i]=row[i];
     }
 }
 
-// LM head: bf16 weight × bf16 hidden
-__global__ void pf_lm_head(const __nv_bfloat16 *hidden, const __nv_bfloat16 *w,
-    float *bmv, int *bmi, int N) {
-    __shared__ __nv_bfloat16 s_h[HIDDEN];
+// LM head: bf16 weight x f32 hidden
+__global__ void pf_lm_head(const float *hidden, const __nv_bfloat16 *w,
+    float *bmv, int *bmi, int N, const float *seen_token_mask, float repetition_penalty) {
+    __shared__ float s_h[HIDDEN];
     for(int i=threadIdx.x;i<HIDDEN;i+=blockDim.x) s_h[i]=hidden[i];
     __syncthreads();
     int wid=threadIdx.x/32, lid=threadIdx.x%32, nw=blockDim.x/32;
     int rpb=(N+gridDim.x-1)/gridDim.x, rs=blockIdx.x*rpb, re=min(rs+rpb,N);
     float lm=-1e30f; int li=-1;
     for(int m=rs+wid;m<re;m+=nw){const __nv_bfloat16 *wr=w+m*HIDDEN;float s=0;
-        for(int k=lid*8;k<HIDDEN;k+=32*8){for(int i=0;i<8;i++)s+=__bfloat162float(wr[k+i])*__bfloat162float(s_h[k+i]);}
-        s=pf_warp_sum(s);if(lid==0&&s>lm){lm=s;li=m;}}
+        for(int k=lid*8;k<HIDDEN;k+=32*8){for(int i=0;i<8;i++)s+=__bfloat162float(wr[k+i])*s_h[k+i];}
+        s=pf_warp_sum(s);
+        if(lid==0&&repetition_penalty>1.0f&&seen_token_mask&&seen_token_mask[m]>0.0f){
+            s=(s>0.0f)?(s/repetition_penalty):(s*repetition_penalty);
+        }
+        if(lid==0&&s>lm){lm=s;li=m;}}
     lm=__shfl_sync(0xffffffff,lm,0);li=__shfl_sync(0xffffffff,li,0);
     __shared__ float wm[32]; __shared__ int wi[32];
     if(lid==0){wm[wid]=lm;wi[wid]=li;}__syncthreads();
@@ -338,14 +351,16 @@ extern "C" void launch_prefill_bf16(
     const __nv_bfloat16 *final_norm_w, const __nv_bfloat16 *lm_head_w,
     __nv_bfloat16 *fa_k_cache, __nv_bfloat16 *fa_v_cache,
     float *dn_states, float *conv_bufs,
-    // Scratch (ALL bf16 except state/conv which are f32)
+    // Scratch: hidden/norm/residual/projection buffers bf16; state/conv/beta/alpha are f32.
     __nv_bfloat16 *hidden, __nv_bfloat16 *residual, __nv_bfloat16 *normalized,
     __nv_bfloat16 *proj_buf, __nv_bfloat16 *proj_buf2,
     __nv_bfloat16 *attn_buf, __nv_bfloat16 *mlp_buf,
     __nv_bfloat16 *dn_out_buf,
     float *beta_buf, float *alpha_buf,
-    __nv_bfloat16 *final_normed, __nv_bfloat16 *hidden_bf16_out,
+    float *final_normed, __nv_bfloat16 *hidden_bf16_out,
     float *lm_bmv, int *lm_bmi,
+    float *seen_token_mask, float repetition_penalty,
+    int max_seq_len,
     cudaStream_t stream)
 {
     static cublasHandle_t cublas = nullptr;
@@ -360,8 +375,11 @@ extern "C" void launch_prefill_bf16(
     int bk = (S*HIDDEN+255)/256;
 
     pf_embed<<<bk, 256, 0, stream>>>(token_ids, embed_weight, hidden, S);
+    if (seen_token_mask && repetition_penalty > 1.0f) {
+        pf_mark_seen_tokens<<<(S+255)/256, 256, 0, stream>>>(token_ids, S, seen_token_mask);
+    }
 
-    int fa_stride = FA_KV_HEADS * 2048 * FA_HEAD_DIM;
+    int fa_stride = FA_KV_HEADS * max_seq_len * FA_HEAD_DIM;
     int dn_stride = DN_HEADS * DN_KEY * DN_VAL;
     int fa_idx = 0, dn_idx = 0;
 
@@ -436,7 +454,7 @@ extern "C" void launch_prefill_bf16(
             int total_heads = S*(FA_Q_HEADS+FA_KV_HEADS);
             pf_qk_norm_rope<<<(total_heads+15)/16, 512, 0, stream>>>(
                 proj_buf, proj_buf2, attn_buf, q_nw, k_nw,
-                fa_k_cache + fa_idx*fa_stride, fa_v_cache + fa_idx*fa_stride, S, 2048);
+                fa_k_cache + fa_idx*fa_stride, fa_v_cache + fa_idx*fa_stride, S, max_seq_len);
 
             pf_causal_attn<<<(S*FA_Q_HEADS+15)/16, 512, 0, stream>>>(
                 proj_buf, proj_buf2, attn_buf, dn_out_buf, S);
@@ -460,6 +478,6 @@ extern "C" void launch_prefill_bf16(
     pf_final_norm<<<1, 512, 0, stream>>>(hidden, final_norm_w, final_normed, hidden_bf16_out, S);
 
     int lm_blocks = 512;
-    pf_lm_head<<<lm_blocks, 256, 0, stream>>>(final_normed, lm_head_w, lm_bmv, lm_bmi, VOCAB);
+    pf_lm_head<<<lm_blocks, 256, 0, stream>>>(final_normed, lm_head_w, lm_bmv, lm_bmi, VOCAB, seen_token_mask, repetition_penalty);
     pf_lm_reduce<<<1, 256, 0, stream>>>(lm_bmv, lm_bmi, output_token, lm_blocks);
 }

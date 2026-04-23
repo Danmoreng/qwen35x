@@ -35,6 +35,10 @@ Current GPU sampling constraint:
 - The default Luce backend currently supports greedy decode only (`--temperature 0`) and applies repetition penalty during argmax.
 - For `temperature > 0`, use `--gpu-decode-backend default`; that GPU sampling path currently supports `top_k` in `[1, 64]`.
 
+Current Luce prefill behavior:
+- `--luce-prefill-mode replay` is the default parity path.
+- `--luce-prefill-mode batched` is available for investigation, but it is not the default until it passes the CPU parity suite.
+
 Current decode control behavior:
 - The default Luce path returns the selected token id each step and performs stop checks on the host.
 - The legacy runtime backend buffers generated token ids on device when no stop tokens/sequences are configured.
