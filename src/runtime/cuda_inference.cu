@@ -1045,6 +1045,157 @@ __global__ void prepare_full_attention_qkv_kernel(
   }
 }
 
+__global__ void prepare_full_attention_qkv_prefill_chunk_kernel(
+  const float * q_gate_packed,
+  const float * k_raw,
+  const float * v_raw,
+  const float * q_norm_weight,
+  const float * k_norm_weight,
+  float * out_q,
+  float * out_gate,
+  float * k_cache,
+  float * v_cache,
+  const int token_count,
+  const int n_heads,
+  const int n_kv_heads,
+  const int head_dim,
+  const int applied_rope_dim,
+  const int position_base,
+  const float rope_theta,
+  const float eps,
+  const unsigned long long k_cache_offset_base,
+  const unsigned long long v_cache_offset_base) {
+  __shared__ float reduction[256];
+  __shared__ float inv_norm;
+
+  const int head = blockIdx.x;
+  const int token = blockIdx.y;
+  const int tid = threadIdx.x;
+  if (head >= n_heads || token >= token_count) {
+    return;
+  }
+
+  const int pair_count = applied_rope_dim / 2;
+  const std::size_t q_count = static_cast<std::size_t>(n_heads) * static_cast<std::size_t>(head_dim);
+  const std::size_t q_packed_count = q_count * 2;
+  const std::size_t kv_count = static_cast<std::size_t>(n_kv_heads) * static_cast<std::size_t>(head_dim);
+
+  const std::size_t q_token_base = static_cast<std::size_t>(token) * q_count;
+  const std::size_t packed_token_base = static_cast<std::size_t>(token) * q_packed_count;
+  const std::size_t kv_token_base = static_cast<std::size_t>(token) * kv_count;
+
+  const std::size_t q_head_base = q_token_base + static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim);
+  const std::size_t packed_head_base = packed_token_base + static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim) * 2;
+
+  float q_sq_sum = 0.0f;
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    const float qv = q_gate_packed[packed_head_base + static_cast<std::size_t>(d)];
+    q_sq_sum += qv * qv;
+  }
+  reduction[tid] = q_sq_sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduction[tid] += reduction[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    inv_norm = rsqrtf((reduction[0] / static_cast<float>(head_dim)) + eps);
+  }
+  __syncthreads();
+
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    const std::size_t out_idx = q_head_base + static_cast<std::size_t>(d);
+    const float qv = q_gate_packed[packed_head_base + static_cast<std::size_t>(d)];
+    const float gv = q_gate_packed[packed_head_base + static_cast<std::size_t>(head_dim) + static_cast<std::size_t>(d)];
+    out_q[out_idx] = qv * inv_norm * (1.0f + q_norm_weight[d]);
+    out_gate[out_idx] = gv;
+  }
+  __syncthreads();
+
+  const int position = position_base + token;
+  for (int pair_idx = tid; pair_idx < pair_count; pair_idx += blockDim.x) {
+    const int i0 = pair_idx;
+    const int i1 = pair_idx + pair_count;
+    if (i1 >= head_dim) {
+      continue;
+    }
+    const float inv_freq = expf(
+      -logf(rope_theta) * (static_cast<float>(2 * pair_idx) / static_cast<float>(applied_rope_dim)));
+    const float angle = static_cast<float>(position) * inv_freq;
+    const float c = cosf(angle);
+    const float s = sinf(angle);
+    const std::size_t q0_idx = q_head_base + static_cast<std::size_t>(i0);
+    const std::size_t q1_idx = q_head_base + static_cast<std::size_t>(i1);
+    const float x0 = out_q[q0_idx];
+    const float x1 = out_q[q1_idx];
+    out_q[q0_idx] = x0 * c - x1 * s;
+    out_q[q1_idx] = x1 * c + x0 * s;
+  }
+  __syncthreads();
+
+  if (head >= n_kv_heads) {
+    return;
+  }
+
+  const std::size_t kv_head_base = kv_token_base + static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim);
+
+  float k_sq_sum = 0.0f;
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    const float kv = k_raw[kv_head_base + static_cast<std::size_t>(d)];
+    k_sq_sum += kv * kv;
+  }
+  reduction[tid] = k_sq_sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduction[tid] += reduction[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    inv_norm = rsqrtf((reduction[0] / static_cast<float>(head_dim)) + eps);
+  }
+  __syncthreads();
+
+  const std::size_t cache_token_offset = static_cast<std::size_t>(token) * kv_count;
+  const std::size_t k_cache_base = static_cast<std::size_t>(k_cache_offset_base) + cache_token_offset +
+                                   static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim);
+  const std::size_t v_cache_base = static_cast<std::size_t>(v_cache_offset_base) + cache_token_offset +
+                                   static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim);
+
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    const std::size_t src_idx = kv_head_base + static_cast<std::size_t>(d);
+    k_cache[k_cache_base + static_cast<std::size_t>(d)] = k_raw[src_idx] * inv_norm * (1.0f + k_norm_weight[d]);
+    v_cache[v_cache_base + static_cast<std::size_t>(d)] = v_raw[src_idx];
+  }
+  __syncthreads();
+
+  for (int pair_idx = tid; pair_idx < pair_count; pair_idx += blockDim.x) {
+    const int i0 = pair_idx;
+    const int i1 = pair_idx + pair_count;
+    if (i1 >= head_dim) {
+      continue;
+    }
+    const float inv_freq = expf(
+      -logf(rope_theta) * (static_cast<float>(2 * pair_idx) / static_cast<float>(applied_rope_dim)));
+    const float angle = static_cast<float>(position) * inv_freq;
+    const float c = cosf(angle);
+    const float s = sinf(angle);
+    const std::size_t k0_idx = k_cache_base + static_cast<std::size_t>(i0);
+    const std::size_t k1_idx = k_cache_base + static_cast<std::size_t>(i1);
+    const float x0 = k_cache[k0_idx];
+    const float x1 = k_cache[k1_idx];
+    k_cache[k0_idx] = x0 * c - x1 * s;
+    k_cache[k1_idx] = x1 * c + x0 * s;
+  }
+}
+
 __device__ __forceinline__ float adjust_sampling_logit(
   const float raw,
   const float seen_mask,
@@ -1439,6 +1590,91 @@ __global__ void full_attention_decode_gqa_kernel_shared(
   }
 }
 
+__global__ void full_attention_prefill_gqa_chunk_kernel_shared(
+  const float * q,
+  const float * gate,
+  const float * k_cache,
+  const float * v_cache,
+  float * out,
+  const int token_count,
+  const int n_heads,
+  const int n_kv_heads,
+  const int head_dim,
+  const int position_base) {
+  const int head = blockIdx.x;
+  const int token = blockIdx.y;
+  const int tid = threadIdx.x;
+  if (head >= n_heads || token >= token_count) {
+    return;
+  }
+
+  const int n_rep = n_heads / n_kv_heads;
+  const int kvh = head / n_rep;
+  const int kv_stride = n_kv_heads * head_dim;
+  const std::size_t q_stride = static_cast<std::size_t>(n_heads) * static_cast<std::size_t>(head_dim);
+
+  const std::size_t token_base = static_cast<std::size_t>(token) * q_stride;
+  const float * q_ptr = q + token_base + static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim);
+  const float * gate_ptr = gate + token_base + static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim);
+  float * out_ptr = out + token_base + static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim);
+
+  __shared__ float reduction[256];
+  __shared__ float sh_alpha;
+  __shared__ float sh_beta;
+  __shared__ float sh_denom;
+  const float scale = rsqrtf(static_cast<float>(head_dim));
+  const float q_value = (tid < head_dim) ? q_ptr[tid] : 0.0f;
+  float acc = 0.0f;
+  float running_max = -1.0e30f;
+  float running_denom = 0.0f;
+
+  const int seq_len = position_base + token + 1;
+  for (int t = 0; t < seq_len; ++t) {
+    const float * k_ptr = k_cache +
+                          (static_cast<std::size_t>(t) * static_cast<std::size_t>(kv_stride)) +
+                          (static_cast<std::size_t>(kvh) * static_cast<std::size_t>(head_dim));
+    const float * v_ptr = v_cache +
+                          (static_cast<std::size_t>(t) * static_cast<std::size_t>(kv_stride)) +
+                          (static_cast<std::size_t>(kvh) * static_cast<std::size_t>(head_dim));
+
+    float partial = (tid < head_dim) ? (q_value * k_ptr[tid]) : 0.0f;
+    reduction[tid] = partial;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        reduction[tid] += reduction[tid + stride];
+      }
+      __syncthreads();
+    }
+
+    if (tid == 0) {
+      const float score = reduction[0] * scale;
+      const float next_max = fmaxf(running_max, score);
+      const float alpha = (running_max <= -1.0e29f) ? 0.0f : expf(running_max - next_max);
+      const float beta = expf(score - next_max);
+      running_denom = running_denom * alpha + beta;
+      running_max = next_max;
+      sh_alpha = alpha;
+      sh_beta = beta;
+      sh_denom = running_denom;
+    }
+    __syncthreads();
+
+    if (tid < head_dim) {
+      acc = acc * sh_alpha + sh_beta * v_ptr[tid];
+    }
+    __syncthreads();
+  }
+
+  if (tid < head_dim) {
+    const float denom = (sh_denom > 0.0f) ? sh_denom : 1.0f;
+    const float g = gate_ptr[tid];
+    const float sig = 1.0f / (1.0f + expf(-g));
+    out_ptr[tid] = (acc / denom) * sig;
+  }
+}
+
 __device__ float sigmoidf_device(const float x) {
   return 1.0f / (1.0f + expf(-x));
 }
@@ -1592,6 +1828,171 @@ __global__ void linear_recurrent_decode_kernel(
   for (int i = tid; i < head_v_dim; i += blockDim.x) {
     const float zv = z_ptr[i];
     out_ptr[i] = sh_core[i] * sh_inv_norm * norm[i] * (zv * sigmoidf_device(zv));
+  }
+}
+
+__global__ void linear_conv_prefill_chunk_kernel(
+  const float * mixed_qkv,
+  const float * conv_weights,
+  float * conv_state,
+  float * conv_out,
+  const int token_count,
+  const int channels,
+  const int kernel_size) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= channels) {
+    return;
+  }
+
+  constexpr int kMaxSupportedKernel = 16;
+  if (kernel_size > kMaxSupportedKernel) {
+    return;
+  }
+
+  const int history = kernel_size - 1;
+  const float * w_ptr = conv_weights + static_cast<std::size_t>(c) * static_cast<std::size_t>(kernel_size);
+  float hist[kMaxSupportedKernel];
+  for (int k = 0; k < history; ++k) {
+    hist[k] = conv_state[static_cast<std::size_t>(k) * static_cast<std::size_t>(channels) + static_cast<std::size_t>(c)];
+  }
+
+  for (int t = 0; t < token_count; ++t) {
+    const float cur = mixed_qkv[static_cast<std::size_t>(t) * static_cast<std::size_t>(channels) + static_cast<std::size_t>(c)];
+    float sum = cur * w_ptr[history];
+    for (int k = 0; k < history; ++k) {
+      sum += hist[k] * w_ptr[k];
+    }
+    conv_out[static_cast<std::size_t>(t) * static_cast<std::size_t>(channels) + static_cast<std::size_t>(c)] =
+      sum * sigmoidf_device(sum);
+    for (int k = 0; k + 1 < history; ++k) {
+      hist[k] = hist[k + 1];
+    }
+    if (history > 0) {
+      hist[history - 1] = cur;
+    }
+  }
+
+  for (int k = 0; k < history; ++k) {
+    conv_state[static_cast<std::size_t>(k) * static_cast<std::size_t>(channels) + static_cast<std::size_t>(c)] = hist[k];
+  }
+}
+
+__global__ void linear_recurrent_prefill_chunk_kernel(
+  const float * conv_out,
+  const float * z,
+  const float * b,
+  const float * a,
+  const float * norm,
+  const float * dt_bias,
+  const float * ssm_a,
+  float * recurrent_state,
+  float * out_gated_norm,
+  const int token_count,
+  const int linear_num_k_heads,
+  const int linear_num_v_heads,
+  const int head_k_dim,
+  const int head_v_dim,
+  const float rms_eps) {
+  const int h = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (h >= linear_num_v_heads) {
+    return;
+  }
+
+  const int q_dim = linear_num_k_heads * head_k_dim;
+  const int v_dim = linear_num_v_heads * head_v_dim;
+  const int channels = q_dim * 2 + v_dim;
+  const int q_base = h * head_k_dim;
+  const int v_base = h * head_v_dim;
+  if (q_base + head_k_dim > q_dim || v_base + head_v_dim > v_dim) {
+    return;
+  }
+
+  float * s = recurrent_state +
+              static_cast<std::size_t>(h) * static_cast<std::size_t>(head_v_dim) * static_cast<std::size_t>(head_v_dim);
+
+  __shared__ float sh_inv_q;
+  __shared__ float sh_inv_k;
+  __shared__ float sh_alpha;
+  __shared__ float sh_beta;
+  __shared__ float sh_inv_norm;
+  extern __shared__ float shared[];
+  float * sh_sk = shared;
+  float * sh_core = shared + head_v_dim;
+
+  const int state_count = head_v_dim * head_v_dim;
+  for (int t = 0; t < token_count; ++t) {
+    const float * conv_t = conv_out + static_cast<std::size_t>(t) * static_cast<std::size_t>(channels);
+    const float * q_ptr = conv_t + q_base;
+    const float * k_ptr = conv_t + q_dim + q_base;
+    const float * v_ptr = conv_t + 2 * q_dim + v_base;
+    const float * z_ptr = z + static_cast<std::size_t>(t) * static_cast<std::size_t>(v_dim) + v_base;
+    float * out_ptr = out_gated_norm + static_cast<std::size_t>(t) * static_cast<std::size_t>(v_dim) + v_base;
+
+    if (tid == 0) {
+      float sq_q = 0.0f;
+      float sq_k = 0.0f;
+      for (int d = 0; d < head_k_dim; ++d) {
+        sq_q += q_ptr[d] * q_ptr[d];
+        sq_k += k_ptr[d] * k_ptr[d];
+      }
+      sh_inv_q = rsqrtf(sq_q + 1.0e-6f) * rsqrtf(static_cast<float>(head_k_dim));
+      sh_inv_k = rsqrtf(sq_k + 1.0e-6f);
+      sh_beta = sigmoidf_device(b[static_cast<std::size_t>(t) * static_cast<std::size_t>(linear_num_v_heads) + static_cast<std::size_t>(h)]);
+      const float pre_gate = softplusf_device(
+        a[static_cast<std::size_t>(t) * static_cast<std::size_t>(linear_num_v_heads) + static_cast<std::size_t>(h)] + dt_bias[h]);
+      sh_alpha = expf(pre_gate * ssm_a[h]);
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < state_count; idx += blockDim.x) {
+      s[idx] *= sh_alpha;
+    }
+    __syncthreads();
+
+    for (int i = tid; i < head_v_dim; i += blockDim.x) {
+      float sk = 0.0f;
+      const float * row = s + static_cast<std::size_t>(i) * static_cast<std::size_t>(head_v_dim);
+      for (int j = 0; j < head_v_dim; ++j) {
+        sk += row[j] * (k_ptr[j] * sh_inv_k);
+      }
+      sh_sk[i] = sk;
+    }
+    __syncthreads();
+
+    for (int i = tid; i < head_v_dim; i += blockDim.x) {
+      const float delta = (v_ptr[i] - sh_sk[i]) * sh_beta;
+      float * row = s + static_cast<std::size_t>(i) * static_cast<std::size_t>(head_v_dim);
+      for (int j = 0; j < head_v_dim; ++j) {
+        row[j] += delta * (k_ptr[j] * sh_inv_k);
+      }
+    }
+    __syncthreads();
+
+    for (int i = tid; i < head_v_dim; i += blockDim.x) {
+      float core = 0.0f;
+      const float * row = s + static_cast<std::size_t>(i) * static_cast<std::size_t>(head_v_dim);
+      for (int j = 0; j < head_v_dim; ++j) {
+        core += row[j] * (q_ptr[j] * sh_inv_q);
+      }
+      sh_core[i] = core;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+      float sq_sum = 0.0f;
+      for (int i = 0; i < head_v_dim; ++i) {
+        sq_sum += sh_core[i] * sh_core[i];
+      }
+      sh_inv_norm = rsqrtf(sq_sum / static_cast<float>(head_v_dim) + rms_eps);
+    }
+    __syncthreads();
+
+    for (int i = tid; i < head_v_dim; i += blockDim.x) {
+      const float zv = z_ptr[i];
+      out_ptr[i] = sh_core[i] * sh_inv_norm * norm[i] * (zv * sigmoidf_device(zv));
+    }
+    __syncthreads();
   }
 }
 
@@ -2317,6 +2718,88 @@ bool run_prepare_full_attention_qkv_f32(
   return check_cuda(cudaGetLastError(), "prepare_full_attention_qkv_kernel", error_message);
 }
 
+bool run_prepare_full_attention_qkv_prefill_chunk_f32(
+  const CudaDeviceBufferF32 & q_gate_packed,
+  const CudaDeviceBufferF32 & k_raw,
+  const CudaDeviceBufferF32 & v_raw,
+  const CudaDeviceBufferF32 & q_norm_weight,
+  const CudaDeviceBufferF32 & k_norm_weight,
+  const int token_count,
+  const int n_heads,
+  const int n_kv_heads,
+  const int head_dim,
+  const int rope_dim,
+  const int position_base,
+  const float rope_theta,
+  const float eps,
+  CudaDeviceBufferF32 & out_q,
+  CudaDeviceBufferF32 & out_gate,
+  CudaDeviceBufferF32 & k_cache,
+  const std::size_t k_cache_offset_base,
+  CudaDeviceBufferF32 & v_cache,
+  const std::size_t v_cache_offset_base,
+  std::string & error_message) {
+  if (token_count <= 0 || n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0) {
+    error_message = "Invalid dimensions for full-attention prefill QKV prepare.";
+    return false;
+  }
+  if (n_heads % n_kv_heads != 0) {
+    error_message = "n_heads must be divisible by n_kv_heads for GQA.";
+    return false;
+  }
+
+  const int applied_rope_dim = std::min(rope_dim, head_dim);
+  const std::size_t q_count = static_cast<std::size_t>(n_heads) * static_cast<std::size_t>(head_dim);
+  const std::size_t q_packed_count = q_count * 2;
+  const std::size_t kv_count = static_cast<std::size_t>(n_kv_heads) * static_cast<std::size_t>(head_dim);
+  const std::size_t q_total = static_cast<std::size_t>(token_count) * q_count;
+  const std::size_t q_packed_total = static_cast<std::size_t>(token_count) * q_packed_count;
+  const std::size_t kv_total = static_cast<std::size_t>(token_count) * kv_count;
+
+  if (q_gate_packed.data == nullptr || k_raw.data == nullptr || v_raw.data == nullptr || q_norm_weight.data == nullptr ||
+      k_norm_weight.data == nullptr || out_q.data == nullptr || out_gate.data == nullptr || k_cache.data == nullptr ||
+      v_cache.data == nullptr) {
+    error_message = "CUDA full-attention prefill QKV prepare requires initialized buffers.";
+    return false;
+  }
+  if (q_gate_packed.count < q_packed_total || k_raw.count < kv_total || v_raw.count < kv_total || out_q.count < q_total ||
+      out_gate.count < q_total || q_norm_weight.count < static_cast<std::size_t>(head_dim) ||
+      k_norm_weight.count < static_cast<std::size_t>(head_dim)) {
+    error_message = "CUDA full-attention prefill QKV prepare buffer range is out of bounds.";
+    return false;
+  }
+  if (k_cache_offset_base > k_cache.count || kv_total > (k_cache.count - k_cache_offset_base) ||
+      v_cache_offset_base > v_cache.count || kv_total > (v_cache.count - v_cache_offset_base)) {
+    error_message = "CUDA full-attention prefill QKV prepare cache range is out of bounds.";
+    return false;
+  }
+
+  constexpr int block_size = 256;
+  const cudaStream_t stream = active_stream();
+  const dim3 grid(static_cast<unsigned int>(n_heads), static_cast<unsigned int>(token_count), 1);
+  prepare_full_attention_qkv_prefill_chunk_kernel<<<grid, block_size, 0, stream>>>(
+    static_cast<const float *>(q_gate_packed.data),
+    static_cast<const float *>(k_raw.data),
+    static_cast<const float *>(v_raw.data),
+    static_cast<const float *>(q_norm_weight.data),
+    static_cast<const float *>(k_norm_weight.data),
+    static_cast<float *>(out_q.data),
+    static_cast<float *>(out_gate.data),
+    static_cast<float *>(k_cache.data),
+    static_cast<float *>(v_cache.data),
+    token_count,
+    n_heads,
+    n_kv_heads,
+    head_dim,
+    applied_rope_dim,
+    position_base,
+    rope_theta,
+    eps,
+    static_cast<unsigned long long>(k_cache_offset_base),
+    static_cast<unsigned long long>(v_cache_offset_base));
+  return check_cuda(cudaGetLastError(), "prepare_full_attention_qkv_prefill_chunk_kernel", error_message);
+}
+
 bool copy_buffer_f32(
   const CudaDeviceBufferF32 & src,
   const std::size_t count,
@@ -2416,6 +2899,68 @@ bool run_full_attention_decode_gqa(
     head_dim,
     seq_len);
   return check_cuda(cudaGetLastError(), "full_attention_decode_gqa_kernel_shared", error_message);
+}
+
+bool run_full_attention_prefill_gqa_chunk(
+  const CudaDeviceBufferF32 & q,
+  const CudaDeviceBufferF32 & gate,
+  const CudaDeviceBufferF32 & k_cache,
+  const CudaDeviceBufferF32 & v_cache,
+  const int token_count,
+  const int n_heads,
+  const int n_kv_heads,
+  const int head_dim,
+  const int position_base,
+  CudaDeviceBufferF32 & out,
+  std::string & error_message) {
+  if (token_count <= 0 || n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || position_base < 0) {
+    error_message = "Invalid dimensions for full attention prefill chunk.";
+    return false;
+  }
+  if ((n_heads % n_kv_heads) != 0) {
+    error_message = "Invalid GQA ratio for full attention prefill chunk.";
+    return false;
+  }
+
+  const std::size_t q_count = static_cast<std::size_t>(n_heads) * static_cast<std::size_t>(head_dim);
+  const std::size_t q_total = static_cast<std::size_t>(token_count) * q_count;
+  const std::size_t kv_stride = static_cast<std::size_t>(n_kv_heads) * static_cast<std::size_t>(head_dim);
+  const std::size_t kv_required =
+    static_cast<std::size_t>(position_base + token_count) * static_cast<std::size_t>(kv_stride);
+  if (q.data == nullptr || gate.data == nullptr || k_cache.data == nullptr || v_cache.data == nullptr || out.data == nullptr) {
+    error_message = "One or more CUDA buffers are not initialized for full attention prefill chunk.";
+    return false;
+  }
+  if (q.count < q_total || gate.count < q_total || out.count < q_total || k_cache.count < kv_required || v_cache.count < kv_required) {
+    error_message = "CUDA buffer range is out of bounds for full attention prefill chunk.";
+    return false;
+  }
+
+  int block_size = 1;
+  while (block_size < head_dim && block_size < 256) {
+    block_size <<= 1;
+  }
+  if (block_size < 32) {
+    block_size = 32;
+  }
+  if (block_size > 256) {
+    block_size = 256;
+  }
+
+  const cudaStream_t stream = active_stream();
+  const dim3 grid(static_cast<unsigned int>(n_heads), static_cast<unsigned int>(token_count), 1);
+  full_attention_prefill_gqa_chunk_kernel_shared<<<grid, block_size, 0, stream>>>(
+    static_cast<const float *>(q.data),
+    static_cast<const float *>(gate.data),
+    static_cast<const float *>(k_cache.data),
+    static_cast<const float *>(v_cache.data),
+    static_cast<float *>(out.data),
+    token_count,
+    n_heads,
+    n_kv_heads,
+    head_dim,
+    position_base);
+  return check_cuda(cudaGetLastError(), "full_attention_prefill_gqa_chunk_kernel_shared", error_message);
 }
 
 bool run_linear_attention_decode(
@@ -2519,6 +3064,117 @@ bool run_linear_attention_decode(
     linear_head_v_dim,
     rms_eps);
   return check_cuda(cudaGetLastError(), "linear_recurrent_decode_kernel", error_message);
+}
+
+bool run_linear_attention_prefill_chunk(
+  const CudaDeviceBufferF32 & mixed_qkv,
+  const CudaDeviceBufferF32 & z,
+  const CudaDeviceBufferF32 & b,
+  const CudaDeviceBufferF32 & a,
+  const CudaDeviceMatrixF32 & conv1d,
+  const CudaDeviceBufferF32 & norm,
+  const CudaDeviceBufferF32 & dt_bias,
+  const CudaDeviceBufferF32 & ssm_a,
+  const int token_count,
+  const int linear_kernel,
+  const int linear_num_k_heads,
+  const int linear_num_v_heads,
+  const int linear_head_k_dim,
+  const int linear_head_v_dim,
+  const float rms_eps,
+  CudaDeviceBufferF32 & conv_state,
+  CudaDeviceBufferF32 & recurrent_state,
+  CudaDeviceBufferF32 & scratch_conv_out,
+  CudaDeviceBufferF32 & out_gated_norm,
+  std::string & error_message) {
+  if (token_count <= 0 || linear_kernel <= 1 || linear_num_k_heads <= 0 || linear_num_v_heads <= 0 ||
+      linear_head_k_dim <= 0 || linear_head_v_dim <= 0) {
+    error_message = "Invalid dimensions for linear attention prefill chunk.";
+    return false;
+  }
+  if (linear_head_k_dim != linear_head_v_dim) {
+    error_message = "Linear attention prefill chunk expects head_k_dim == head_v_dim.";
+    return false;
+  }
+
+  const int linear_q_dim = linear_num_k_heads * linear_head_k_dim;
+  const int linear_v_dim = linear_num_v_heads * linear_head_v_dim;
+  const int linear_conv_channels = linear_q_dim * 2 + linear_v_dim;
+  const int conv_hist = linear_kernel - 1;
+  constexpr int kMaxSupportedKernel = 16;
+  if (linear_kernel > kMaxSupportedKernel) {
+    error_message = "Linear attention prefill chunk currently supports kernel_size <= 16.";
+    return false;
+  }
+
+  const std::size_t mixed_total = static_cast<std::size_t>(token_count) * static_cast<std::size_t>(linear_conv_channels);
+  const std::size_t z_total = static_cast<std::size_t>(token_count) * static_cast<std::size_t>(linear_v_dim);
+  const std::size_t head_total = static_cast<std::size_t>(token_count) * static_cast<std::size_t>(linear_num_v_heads);
+  if (mixed_qkv.data == nullptr || z.data == nullptr || b.data == nullptr || a.data == nullptr || conv1d.data == nullptr ||
+      norm.data == nullptr || dt_bias.data == nullptr || ssm_a.data == nullptr || conv_state.data == nullptr ||
+      recurrent_state.data == nullptr || scratch_conv_out.data == nullptr || out_gated_norm.data == nullptr) {
+    error_message = "One or more CUDA buffers are not initialized for linear attention prefill chunk.";
+    return false;
+  }
+  if (mixed_qkv.count < mixed_total || z.count < z_total || b.count < head_total || a.count < head_total ||
+      norm.count < static_cast<std::size_t>(linear_head_v_dim) || dt_bias.count < static_cast<std::size_t>(linear_num_v_heads) ||
+      ssm_a.count < static_cast<std::size_t>(linear_num_v_heads) ||
+      conv_state.count < static_cast<std::size_t>(conv_hist * linear_conv_channels) ||
+      recurrent_state.count <
+        static_cast<std::size_t>(linear_num_v_heads) * static_cast<std::size_t>(linear_head_v_dim) *
+          static_cast<std::size_t>(linear_head_v_dim) ||
+      scratch_conv_out.count < mixed_total || out_gated_norm.count < z_total) {
+    error_message = "CUDA buffer range is out of bounds for linear attention prefill chunk.";
+    return false;
+  }
+  if (conv1d.rows != linear_conv_channels || conv1d.cols != linear_kernel) {
+    error_message = "conv1d device matrix dimensions do not match linear attention prefill chunk dimensions.";
+    return false;
+  }
+
+  const cudaStream_t stream = active_stream();
+  const int conv_block = 256;
+  const int conv_grid = (linear_conv_channels + conv_block - 1) / conv_block;
+  linear_conv_prefill_chunk_kernel<<<conv_grid, conv_block, 0, stream>>>(
+    static_cast<const float *>(mixed_qkv.data),
+    static_cast<const float *>(conv1d.data),
+    static_cast<float *>(conv_state.data),
+    static_cast<float *>(scratch_conv_out.data),
+    token_count,
+    linear_conv_channels,
+    linear_kernel);
+  if (!check_cuda(cudaGetLastError(), "linear_conv_prefill_chunk_kernel", error_message)) {
+    return false;
+  }
+
+  int block_size = 1;
+  while (block_size < linear_head_v_dim && block_size < 256) {
+    block_size <<= 1;
+  }
+  if (block_size < 32) {
+    block_size = 32;
+  }
+  if (block_size > 256) {
+    block_size = 256;
+  }
+  const std::size_t shared_bytes = static_cast<std::size_t>(2 * linear_head_v_dim) * sizeof(float);
+  linear_recurrent_prefill_chunk_kernel<<<linear_num_v_heads, block_size, shared_bytes, stream>>>(
+    static_cast<const float *>(scratch_conv_out.data),
+    static_cast<const float *>(z.data),
+    static_cast<const float *>(b.data),
+    static_cast<const float *>(a.data),
+    static_cast<const float *>(norm.data),
+    static_cast<const float *>(dt_bias.data),
+    static_cast<const float *>(ssm_a.data),
+    static_cast<float *>(recurrent_state.data),
+    static_cast<float *>(out_gated_norm.data),
+    token_count,
+    linear_num_k_heads,
+    linear_num_v_heads,
+    linear_head_k_dim,
+    linear_head_v_dim,
+    rms_eps);
+  return check_cuda(cudaGetLastError(), "linear_recurrent_prefill_chunk_kernel", error_message);
 }
 
 bool sample_token_from_logits_f32_device_to_buffer(

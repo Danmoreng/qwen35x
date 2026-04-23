@@ -171,6 +171,28 @@ bool run_prepare_full_attention_qkv_f32(
   std::size_t v_cache_offset,
   std::string & error_message);
 
+bool run_prepare_full_attention_qkv_prefill_chunk_f32(
+  const CudaDeviceBufferF32 & q_gate_packed,
+  const CudaDeviceBufferF32 & k_raw,
+  const CudaDeviceBufferF32 & v_raw,
+  const CudaDeviceBufferF32 & q_norm_weight,
+  const CudaDeviceBufferF32 & k_norm_weight,
+  int token_count,
+  int n_heads,
+  int n_kv_heads,
+  int head_dim,
+  int rope_dim,
+  int position_base,
+  float rope_theta,
+  float eps,
+  CudaDeviceBufferF32 & out_q,
+  CudaDeviceBufferF32 & out_gate,
+  CudaDeviceBufferF32 & k_cache,
+  std::size_t k_cache_offset_base,
+  CudaDeviceBufferF32 & v_cache,
+  std::size_t v_cache_offset_base,
+  std::string & error_message);
+
 bool copy_buffer_f32(
   const CudaDeviceBufferF32 & src,
   std::size_t count,
@@ -192,6 +214,19 @@ bool run_full_attention_decode_gqa(
   CudaDeviceBufferF32 & scratch_scores,
   std::string & error_message);
 
+bool run_full_attention_prefill_gqa_chunk(
+  const CudaDeviceBufferF32 & q,
+  const CudaDeviceBufferF32 & gate,
+  const CudaDeviceBufferF32 & k_cache,
+  const CudaDeviceBufferF32 & v_cache,
+  int token_count,
+  int n_heads,
+  int n_kv_heads,
+  int head_dim,
+  int position_base,
+  CudaDeviceBufferF32 & out,
+  std::string & error_message);
+
 bool run_linear_attention_decode(
   const CudaDeviceBufferF32 & mixed_qkv,
   const CudaDeviceBufferF32 & z,
@@ -201,6 +236,28 @@ bool run_linear_attention_decode(
   const CudaDeviceBufferF32 & norm,
   const CudaDeviceBufferF32 & dt_bias,
   const CudaDeviceBufferF32 & ssm_a,
+  int linear_kernel,
+  int linear_num_k_heads,
+  int linear_num_v_heads,
+  int linear_head_k_dim,
+  int linear_head_v_dim,
+  float rms_eps,
+  CudaDeviceBufferF32 & conv_state,
+  CudaDeviceBufferF32 & recurrent_state,
+  CudaDeviceBufferF32 & scratch_conv_out,
+  CudaDeviceBufferF32 & out_gated_norm,
+  std::string & error_message);
+
+bool run_linear_attention_prefill_chunk(
+  const CudaDeviceBufferF32 & mixed_qkv,
+  const CudaDeviceBufferF32 & z,
+  const CudaDeviceBufferF32 & b,
+  const CudaDeviceBufferF32 & a,
+  const CudaDeviceMatrixF32 & conv1d,
+  const CudaDeviceBufferF32 & norm,
+  const CudaDeviceBufferF32 & dt_bias,
+  const CudaDeviceBufferF32 & ssm_a,
+  int token_count,
   int linear_kernel,
   int linear_num_k_heads,
   int linear_num_v_heads,

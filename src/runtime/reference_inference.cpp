@@ -158,6 +158,29 @@ struct CudaForwardWorkspace {
   bool has_device_buffers = false;
 };
 
+struct CudaPrefillChunkWorkspace {
+  int max_tokens = 0;
+  cuda::CudaDeviceBufferF32 hidden_a;
+  cuda::CudaDeviceBufferF32 hidden_b;
+  cuda::CudaDeviceBufferF32 normed;
+  cuda::CudaDeviceBufferF32 attn_out;
+  cuda::CudaDeviceBufferF32 residual;
+  cuda::CudaDeviceBufferF32 full_qkv_combined;
+  cuda::CudaDeviceBufferF32 full_q_gate_packed;
+  cuda::CudaDeviceBufferF32 full_k_raw;
+  cuda::CudaDeviceBufferF32 full_v_raw;
+  cuda::CudaDeviceBufferF32 full_q;
+  cuda::CudaDeviceBufferF32 full_gate;
+  cuda::CudaDeviceBufferF32 full_attn;
+  cuda::CudaDeviceBufferF32 linear_proj_combined;
+  cuda::CudaDeviceBufferF32 linear_mixed;
+  cuda::CudaDeviceBufferF32 linear_z;
+  cuda::CudaDeviceBufferF32 linear_b;
+  cuda::CudaDeviceBufferF32 linear_a;
+  cuda::CudaDeviceBufferF32 linear_conv_out;
+  cuda::CudaDeviceBufferF32 linear_gated_norm;
+};
+
 struct DecodeProfilingAccumulator {
   double embedding_ms = 0.0;
   double attention_ms = 0.0;
@@ -173,6 +196,7 @@ double elapsed_ms(const std::chrono::steady_clock::time_point start_time) {
 }
 
 constexpr int kCudaSamplingMaxTopK = 64;
+constexpr int kCudaPrefillChunkTokens = 32;
 
 bool maybe_sync_cuda_for_stage_timing(
   const bool use_cuda,
@@ -902,6 +926,75 @@ bool allocate_forward_workspace_cuda(
   return true;
 }
 
+bool allocate_prefill_chunk_workspace_cuda(
+  const RuntimeDims & dims,
+  const int max_tokens,
+  CudaPrefillChunkWorkspace & workspace,
+  std::string & error_message) {
+  if (max_tokens <= 0) {
+    error_message = "CUDA prefill chunk workspace requires max_tokens > 0.";
+    return false;
+  }
+
+  const std::size_t token_count = static_cast<std::size_t>(max_tokens);
+  const std::size_t hidden_count = static_cast<std::size_t>(dims.hidden);
+  const std::size_t full_q_count = static_cast<std::size_t>(dims.n_heads * dims.head_dim);
+  const std::size_t full_q_packed_count = full_q_count * 2;
+  const std::size_t full_kv_count = static_cast<std::size_t>(dims.n_kv_heads * dims.head_dim);
+  const std::size_t linear_mixed_count = static_cast<std::size_t>(dims.linear_conv_channels);
+  const std::size_t linear_z_count = static_cast<std::size_t>(dims.linear_v_dim);
+  const std::size_t linear_ba_count = static_cast<std::size_t>(dims.linear_num_v_heads);
+
+  const std::size_t hidden_total = token_count * hidden_count;
+  const std::size_t full_q_total = token_count * full_q_count;
+  const std::size_t full_q_packed_total = token_count * full_q_packed_count;
+  const std::size_t full_kv_total = token_count * full_kv_count;
+  const std::size_t linear_mixed_total = token_count * linear_mixed_count;
+  const std::size_t linear_z_total = token_count * linear_z_count;
+  const std::size_t linear_ba_total = token_count * linear_ba_count;
+
+  if (!cuda::allocate_buffer_f32(hidden_total, workspace.hidden_a, error_message) ||
+      !cuda::allocate_buffer_f32(hidden_total, workspace.hidden_b, error_message) ||
+      !cuda::allocate_buffer_f32(hidden_total, workspace.normed, error_message) ||
+      !cuda::allocate_buffer_f32(hidden_total, workspace.attn_out, error_message) ||
+      !cuda::allocate_buffer_f32(hidden_total, workspace.residual, error_message) ||
+      !cuda::allocate_buffer_f32(full_q_packed_total, workspace.full_q_gate_packed, error_message) ||
+      !cuda::allocate_buffer_f32(full_kv_total, workspace.full_k_raw, error_message) ||
+      !cuda::allocate_buffer_f32(full_kv_total, workspace.full_v_raw, error_message) ||
+      !cuda::allocate_buffer_f32(full_q_total, workspace.full_q, error_message) ||
+      !cuda::allocate_buffer_f32(full_q_total, workspace.full_gate, error_message) ||
+      !cuda::allocate_buffer_f32(full_q_total, workspace.full_attn, error_message) ||
+      !cuda::allocate_buffer_f32(linear_mixed_total, workspace.linear_mixed, error_message) ||
+      !cuda::allocate_buffer_f32(linear_z_total, workspace.linear_z, error_message) ||
+      !cuda::allocate_buffer_f32(linear_ba_total, workspace.linear_b, error_message) ||
+      !cuda::allocate_buffer_f32(linear_ba_total, workspace.linear_a, error_message) ||
+      !cuda::allocate_buffer_f32(linear_mixed_total, workspace.linear_conv_out, error_message) ||
+      !cuda::allocate_buffer_f32(linear_z_total, workspace.linear_gated_norm, error_message)) {
+    cuda::free_buffer_f32(workspace.hidden_a);
+    cuda::free_buffer_f32(workspace.hidden_b);
+    cuda::free_buffer_f32(workspace.normed);
+    cuda::free_buffer_f32(workspace.attn_out);
+    cuda::free_buffer_f32(workspace.residual);
+    cuda::free_buffer_f32(workspace.full_q_gate_packed);
+    cuda::free_buffer_f32(workspace.full_k_raw);
+    cuda::free_buffer_f32(workspace.full_v_raw);
+    cuda::free_buffer_f32(workspace.full_q);
+    cuda::free_buffer_f32(workspace.full_gate);
+    cuda::free_buffer_f32(workspace.full_attn);
+    cuda::free_buffer_f32(workspace.linear_mixed);
+    cuda::free_buffer_f32(workspace.linear_z);
+    cuda::free_buffer_f32(workspace.linear_b);
+    cuda::free_buffer_f32(workspace.linear_a);
+    cuda::free_buffer_f32(workspace.linear_conv_out);
+    cuda::free_buffer_f32(workspace.linear_gated_norm);
+    workspace.max_tokens = 0;
+    return false;
+  }
+
+  workspace.max_tokens = max_tokens;
+  return true;
+}
+
 void release_forward_workspace_cuda(CudaForwardWorkspace & workspace) {
   if (!workspace.has_device_buffers) {
     return;
@@ -942,6 +1035,29 @@ void release_forward_workspace_cuda(CudaForwardWorkspace & workspace) {
   workspace.has_device_buffers = false;
 }
 
+void release_prefill_chunk_workspace_cuda(CudaPrefillChunkWorkspace & workspace) {
+  cuda::free_buffer_f32(workspace.hidden_a);
+  cuda::free_buffer_f32(workspace.hidden_b);
+  cuda::free_buffer_f32(workspace.normed);
+  cuda::free_buffer_f32(workspace.attn_out);
+  cuda::free_buffer_f32(workspace.residual);
+  cuda::free_buffer_f32(workspace.full_qkv_combined);
+  cuda::free_buffer_f32(workspace.full_q_gate_packed);
+  cuda::free_buffer_f32(workspace.full_k_raw);
+  cuda::free_buffer_f32(workspace.full_v_raw);
+  cuda::free_buffer_f32(workspace.full_q);
+  cuda::free_buffer_f32(workspace.full_gate);
+  cuda::free_buffer_f32(workspace.full_attn);
+  cuda::free_buffer_f32(workspace.linear_proj_combined);
+  cuda::free_buffer_f32(workspace.linear_mixed);
+  cuda::free_buffer_f32(workspace.linear_z);
+  cuda::free_buffer_f32(workspace.linear_b);
+  cuda::free_buffer_f32(workspace.linear_a);
+  cuda::free_buffer_f32(workspace.linear_conv_out);
+  cuda::free_buffer_f32(workspace.linear_gated_norm);
+  workspace.max_tokens = 0;
+}
+
 cuda::CudaDeviceBufferF32 buffer_slice_f32(
   const cuda::CudaDeviceBufferF32 & buffer,
   const std::size_t offset,
@@ -953,6 +1069,17 @@ cuda::CudaDeviceBufferF32 buffer_slice_f32(
   out.data = static_cast<float *>(buffer.data) + offset;
   out.count = count;
   return out;
+}
+
+cuda::CudaDeviceBufferF32 buffer_row_slice_f32(
+  const cuda::CudaDeviceBufferF32 & buffer,
+  const int row,
+  const std::size_t row_width) {
+  if (row < 0) {
+    return {};
+  }
+  const std::size_t offset = static_cast<std::size_t>(row) * row_width;
+  return buffer_slice_f32(buffer, offset, row_width);
 }
 
 bool run_linear_attention_step_cuda_device(
@@ -1793,6 +1920,484 @@ bool run_mlp_block_cuda_hybrid(
   return true;
 }
 
+bool run_prefill_prompt_cuda_chunked(
+  const ModelWeights & weights,
+  const RuntimeDims & dims,
+  ModelState & state,
+  const std::vector<std::int32_t> & prompt_tokens,
+  const bool use_cuda_gpu_sampling,
+  const bool profile_cuda_sync,
+  CudaForwardWorkspace & forward_workspace,
+  CudaPrefillChunkWorkspace & prefill_workspace,
+  int & position,
+  std::vector<float> & predicted_logits,
+  DecodeProfilingAccumulator * profiling,
+  std::string & error_message) {
+  if (prompt_tokens.empty()) {
+    return true;
+  }
+  if (!forward_workspace.has_device_buffers || !forward_workspace.has_gpu_sampling_buffers || !weights.has_device_final_norm ||
+      !weights.embed_tokens.has_device_matrix || weights.embed_tokens.device_matrix.data == nullptr) {
+    error_message = "CUDA chunked prefill requires initialized device workspace and uploaded embeddings.";
+    return false;
+  }
+  if (prefill_workspace.max_tokens <= 0) {
+    error_message = "CUDA chunked prefill workspace is not initialized.";
+    return false;
+  }
+
+  const std::size_t hidden_count = static_cast<std::size_t>(dims.hidden);
+  const std::size_t intermediate_count = static_cast<std::size_t>(dims.intermediate);
+  const std::size_t full_q_count = static_cast<std::size_t>(dims.n_heads * dims.head_dim);
+  const std::size_t full_q_packed_count = full_q_count * 2;
+  const std::size_t full_kv_count = static_cast<std::size_t>(dims.n_kv_heads * dims.head_dim);
+  const std::size_t linear_mixed_count = static_cast<std::size_t>(dims.linear_conv_channels);
+  const std::size_t linear_z_count = static_cast<std::size_t>(dims.linear_v_dim);
+  const std::size_t linear_ba_count = static_cast<std::size_t>(dims.linear_num_v_heads);
+  const std::size_t linear_proj_packed_count = linear_mixed_count + linear_z_count + 2 * linear_ba_count;
+  if (forward_workspace.projection_out.count < linear_proj_packed_count) {
+    error_message = "CUDA projection workspace is too small for chunked linear projections.";
+    return false;
+  }
+
+  std::vector<float> embedding_chunk_host;
+  embedding_chunk_host.reserve(static_cast<std::size_t>(prefill_workspace.max_tokens) * hidden_count);
+  predicted_logits.clear();
+
+  for (std::size_t chunk_start = 0; chunk_start < prompt_tokens.size();
+       chunk_start += static_cast<std::size_t>(prefill_workspace.max_tokens)) {
+    const int token_count = static_cast<int>(std::min<std::size_t>(
+      static_cast<std::size_t>(prefill_workspace.max_tokens),
+      prompt_tokens.size() - chunk_start));
+    const std::size_t token_count_sz = static_cast<std::size_t>(token_count);
+    const std::size_t hidden_total = token_count_sz * hidden_count;
+    const int chunk_position_base = position;
+
+    if (!maybe_sync_cuda_for_stage_timing(true, profile_cuda_sync, error_message)) {
+      return false;
+    }
+    const auto embedding_start = std::chrono::steady_clock::now();
+    embedding_chunk_host.resize(hidden_total);
+    for (int t = 0; t < token_count; ++t) {
+      const std::int32_t token = prompt_tokens[chunk_start + static_cast<std::size_t>(t)];
+      if (token < 0 || token >= dims.vocab_size) {
+        error_message = "Prompt token id out of vocabulary range.";
+        return false;
+      }
+      const float * emb_row = weights.embed_tokens.data.data() +
+                              static_cast<std::size_t>(token) * hidden_count;
+      std::memcpy(
+        embedding_chunk_host.data() + static_cast<std::size_t>(t) * hidden_count,
+        emb_row,
+        hidden_count * sizeof(float));
+    }
+    if (!cuda::upload_to_buffer_f32(embedding_chunk_host.data(), hidden_total, prefill_workspace.hidden_a, 0, error_message)) {
+      return false;
+    }
+    if (!maybe_sync_cuda_for_stage_timing(true, profile_cuda_sync, error_message)) {
+      return false;
+    }
+    if (profiling != nullptr) {
+      profiling->embedding_ms += elapsed_ms(embedding_start);
+      profiling->forward_pass_tokens += token_count;
+    }
+
+    int full_idx = 0;
+    int linear_idx = 0;
+    for (int il = 0; il < dims.n_layers; ++il) {
+      const LayerWeights & layer = weights.layers[static_cast<std::size_t>(il)];
+      if (!layer.has_device_norms) {
+        error_message = "CUDA chunked prefill requires uploaded layer norm weights.";
+        return false;
+      }
+
+      for (int t = 0; t < token_count; ++t) {
+        const cuda::CudaDeviceBufferF32 hidden_in_t =
+          buffer_row_slice_f32(prefill_workspace.hidden_a, t, hidden_count);
+        cuda::CudaDeviceBufferF32 normed_t =
+          buffer_row_slice_f32(prefill_workspace.normed, t, hidden_count);
+        if (hidden_in_t.data == nullptr || normed_t.data == nullptr ||
+            !cuda::run_rms_norm_f32(
+              hidden_in_t,
+              layer.input_layernorm_device,
+              hidden_count,
+              dims.rms_eps,
+              normed_t,
+              error_message)) {
+          return false;
+        }
+      }
+
+      if (!maybe_sync_cuda_for_stage_timing(true, profile_cuda_sync, error_message)) {
+        return false;
+      }
+      const auto attention_start = std::chrono::steady_clock::now();
+      if (layer.is_linear) {
+        if (linear_idx >= static_cast<int>(state.linear_states.size())) {
+          error_message = "Linear attention state index out of range.";
+          return false;
+        }
+        if (!state.linear_states[static_cast<std::size_t>(linear_idx)].has_device_state ||
+            !layer.linear.has_device_params || !layer.linear.has_device_in_proj_all || !layer.linear.in_proj_all_device.data ||
+            !layer.linear.conv1d.has_device_matrix || !layer.linear.out_proj.has_device_matrix) {
+          error_message = "Linear-attention CUDA chunked prefill path is not fully initialized.";
+          return false;
+        }
+
+        for (int t = 0; t < token_count; ++t) {
+          const cuda::CudaDeviceBufferF32 normed_t =
+            buffer_row_slice_f32(prefill_workspace.normed, t, hidden_count);
+          if (normed_t.data == nullptr ||
+              !cuda::run_matvec_f32_device(
+                layer.linear.in_proj_all_device,
+                normed_t,
+                forward_workspace.projection_out,
+                error_message)) {
+            return false;
+          }
+
+          const cuda::CudaDeviceBufferF32 mixed_src =
+            buffer_slice_f32(forward_workspace.projection_out, 0, linear_mixed_count);
+          const cuda::CudaDeviceBufferF32 z_src =
+            buffer_slice_f32(forward_workspace.projection_out, linear_mixed_count, linear_z_count);
+          const cuda::CudaDeviceBufferF32 b_src =
+            buffer_slice_f32(forward_workspace.projection_out, linear_mixed_count + linear_z_count, linear_ba_count);
+          const cuda::CudaDeviceBufferF32 a_src = buffer_slice_f32(
+            forward_workspace.projection_out,
+            linear_mixed_count + linear_z_count + linear_ba_count,
+            linear_ba_count);
+          const cuda::CudaDeviceBufferF32 mixed_dst =
+            buffer_row_slice_f32(prefill_workspace.linear_mixed, t, linear_mixed_count);
+          const cuda::CudaDeviceBufferF32 z_dst =
+            buffer_row_slice_f32(prefill_workspace.linear_z, t, linear_z_count);
+          const cuda::CudaDeviceBufferF32 b_dst =
+            buffer_row_slice_f32(prefill_workspace.linear_b, t, linear_ba_count);
+          const cuda::CudaDeviceBufferF32 a_dst =
+            buffer_row_slice_f32(prefill_workspace.linear_a, t, linear_ba_count);
+          if (mixed_src.data == nullptr || z_src.data == nullptr || b_src.data == nullptr || a_src.data == nullptr ||
+              mixed_dst.data == nullptr || z_dst.data == nullptr || b_dst.data == nullptr || a_dst.data == nullptr ||
+              !cuda::copy_buffer_f32(mixed_src, linear_mixed_count, 0, mixed_dst, 0, error_message) ||
+              !cuda::copy_buffer_f32(z_src, linear_z_count, 0, z_dst, 0, error_message) ||
+              !cuda::copy_buffer_f32(b_src, linear_ba_count, 0, b_dst, 0, error_message) ||
+              !cuda::copy_buffer_f32(a_src, linear_ba_count, 0, a_dst, 0, error_message)) {
+            return false;
+          }
+        }
+
+        if (!cuda::run_linear_attention_prefill_chunk(
+              prefill_workspace.linear_mixed,
+              prefill_workspace.linear_z,
+              prefill_workspace.linear_b,
+              prefill_workspace.linear_a,
+              layer.linear.conv1d.device_matrix,
+              layer.linear.norm_device,
+              layer.linear.dt_bias_device,
+              layer.linear.ssm_a_device,
+              token_count,
+              dims.linear_kernel,
+              dims.linear_num_k_heads,
+              dims.linear_num_v_heads,
+              dims.linear_head_k_dim,
+              dims.linear_head_v_dim,
+              dims.rms_eps,
+              state.linear_states[static_cast<std::size_t>(linear_idx)].conv_state_device,
+              state.linear_states[static_cast<std::size_t>(linear_idx)].recurrent_state_device,
+              prefill_workspace.linear_conv_out,
+              prefill_workspace.linear_gated_norm,
+              error_message)) {
+          return false;
+        }
+
+        for (int t = 0; t < token_count; ++t) {
+          const cuda::CudaDeviceBufferF32 gated_t =
+            buffer_row_slice_f32(prefill_workspace.linear_gated_norm, t, linear_z_count);
+          cuda::CudaDeviceBufferF32 attn_out_t =
+            buffer_row_slice_f32(prefill_workspace.attn_out, t, hidden_count);
+          if (gated_t.data == nullptr || attn_out_t.data == nullptr ||
+              !cuda::run_matvec_f32_device(layer.linear.out_proj.device_matrix, gated_t, attn_out_t, error_message)) {
+            return false;
+          }
+        }
+        ++linear_idx;
+      } else {
+        if (full_idx >= static_cast<int>(state.full_states.size())) {
+          error_message = "Full attention state index out of range.";
+          return false;
+        }
+        const bool has_packed_qkv = layer.full.has_device_qkv_proj && layer.full.qkv_proj_device.data != nullptr;
+        const bool has_legacy_qkv =
+          layer.full.has_device_kv_proj && layer.full.q_proj.has_device_matrix && layer.full.kv_proj_device.data != nullptr;
+        if (!state.full_states[static_cast<std::size_t>(full_idx)].has_device_state || !layer.full.has_device_norm ||
+            !layer.full.o_proj.has_device_matrix || (!has_packed_qkv && !has_legacy_qkv)) {
+          error_message = "Full-attention CUDA chunked prefill path is not fully initialized.";
+          return false;
+        }
+        if (!has_packed_qkv && forward_workspace.logits.count < full_q_packed_count) {
+          error_message = "CUDA workspace logits buffer is too small for legacy packed Q projection.";
+          return false;
+        }
+
+        for (int t = 0; t < token_count; ++t) {
+          const cuda::CudaDeviceBufferF32 normed_t =
+            buffer_row_slice_f32(prefill_workspace.normed, t, hidden_count);
+          if (normed_t.data == nullptr) {
+            error_message = "Failed to create normalized token slice for full-attention prefill.";
+            return false;
+          }
+
+          cuda::CudaDeviceBufferF32 q_src;
+          cuda::CudaDeviceBufferF32 k_src;
+          cuda::CudaDeviceBufferF32 v_src;
+          if (has_packed_qkv) {
+            if (!cuda::run_matvec_f32_device(
+                  layer.full.qkv_proj_device,
+                  normed_t,
+                  forward_workspace.projection_out,
+                  error_message)) {
+              return false;
+            }
+            q_src = buffer_slice_f32(forward_workspace.projection_out, 0, full_q_packed_count);
+            k_src = buffer_slice_f32(forward_workspace.projection_out, full_q_packed_count, full_kv_count);
+            v_src = buffer_slice_f32(forward_workspace.projection_out, full_q_packed_count + full_kv_count, full_kv_count);
+          } else {
+            if (!cuda::run_matvec_f32_device(
+                  layer.full.q_proj.device_matrix,
+                  normed_t,
+                  forward_workspace.logits,
+                  error_message) ||
+                !cuda::run_matvec_f32_device(
+                  layer.full.kv_proj_device,
+                  normed_t,
+                  forward_workspace.projection_out,
+                  error_message)) {
+              return false;
+            }
+            q_src = buffer_slice_f32(forward_workspace.logits, 0, full_q_packed_count);
+            k_src = buffer_slice_f32(forward_workspace.projection_out, 0, full_kv_count);
+            v_src = buffer_slice_f32(forward_workspace.projection_out, full_kv_count, full_kv_count);
+          }
+
+          const cuda::CudaDeviceBufferF32 q_dst =
+            buffer_row_slice_f32(prefill_workspace.full_q_gate_packed, t, full_q_packed_count);
+          const cuda::CudaDeviceBufferF32 k_dst =
+            buffer_row_slice_f32(prefill_workspace.full_k_raw, t, full_kv_count);
+          const cuda::CudaDeviceBufferF32 v_dst =
+            buffer_row_slice_f32(prefill_workspace.full_v_raw, t, full_kv_count);
+          if (q_src.data == nullptr || k_src.data == nullptr || v_src.data == nullptr ||
+              q_dst.data == nullptr || k_dst.data == nullptr || v_dst.data == nullptr ||
+              !cuda::copy_buffer_f32(q_src, full_q_packed_count, 0, q_dst, 0, error_message) ||
+              !cuda::copy_buffer_f32(k_src, full_kv_count, 0, k_dst, 0, error_message) ||
+              !cuda::copy_buffer_f32(v_src, full_kv_count, 0, v_dst, 0, error_message)) {
+            return false;
+          }
+        }
+
+        const std::size_t cache_offset_base = static_cast<std::size_t>(chunk_position_base) * full_kv_count;
+        if (!cuda::run_prepare_full_attention_qkv_prefill_chunk_f32(
+              prefill_workspace.full_q_gate_packed,
+              prefill_workspace.full_k_raw,
+              prefill_workspace.full_v_raw,
+              layer.full.q_norm_device,
+              layer.full.k_norm_device,
+              token_count,
+              dims.n_heads,
+              dims.n_kv_heads,
+              dims.head_dim,
+              dims.rope_dim,
+              chunk_position_base,
+              dims.rope_theta,
+              dims.rms_eps,
+              prefill_workspace.full_q,
+              prefill_workspace.full_gate,
+              state.full_states[static_cast<std::size_t>(full_idx)].k_cache_device,
+              cache_offset_base,
+              state.full_states[static_cast<std::size_t>(full_idx)].v_cache_device,
+              cache_offset_base,
+              error_message) ||
+            !cuda::run_full_attention_prefill_gqa_chunk(
+              prefill_workspace.full_q,
+              prefill_workspace.full_gate,
+              state.full_states[static_cast<std::size_t>(full_idx)].k_cache_device,
+              state.full_states[static_cast<std::size_t>(full_idx)].v_cache_device,
+              token_count,
+              dims.n_heads,
+              dims.n_kv_heads,
+              dims.head_dim,
+              chunk_position_base,
+              prefill_workspace.full_attn,
+              error_message)) {
+          return false;
+        }
+
+        for (int t = 0; t < token_count; ++t) {
+          const cuda::CudaDeviceBufferF32 full_attn_t =
+            buffer_row_slice_f32(prefill_workspace.full_attn, t, full_q_count);
+          cuda::CudaDeviceBufferF32 attn_out_t =
+            buffer_row_slice_f32(prefill_workspace.attn_out, t, hidden_count);
+          if (full_attn_t.data == nullptr || attn_out_t.data == nullptr ||
+              !cuda::run_matvec_f32_device(layer.full.o_proj.device_matrix, full_attn_t, attn_out_t, error_message)) {
+            return false;
+          }
+        }
+        ++full_idx;
+      }
+      if (!maybe_sync_cuda_for_stage_timing(true, profile_cuda_sync, error_message)) {
+        return false;
+      }
+      if (profiling != nullptr) {
+        profiling->attention_ms += elapsed_ms(attention_start);
+      }
+
+      if (!maybe_sync_cuda_for_stage_timing(true, profile_cuda_sync, error_message)) {
+        return false;
+      }
+      const auto mlp_start = std::chrono::steady_clock::now();
+      for (int t = 0; t < token_count; ++t) {
+        const cuda::CudaDeviceBufferF32 hidden_in_t =
+          buffer_row_slice_f32(prefill_workspace.hidden_a, t, hidden_count);
+        const cuda::CudaDeviceBufferF32 attn_out_t =
+          buffer_row_slice_f32(prefill_workspace.attn_out, t, hidden_count);
+        cuda::CudaDeviceBufferF32 residual_t =
+          buffer_row_slice_f32(prefill_workspace.residual, t, hidden_count);
+        if (hidden_in_t.data == nullptr || attn_out_t.data == nullptr || residual_t.data == nullptr ||
+            !cuda::run_add_f32(hidden_in_t, attn_out_t, hidden_count, residual_t, error_message)) {
+          return false;
+        }
+
+        cuda::CudaDeviceBufferF32 post_norm_t =
+          buffer_row_slice_f32(prefill_workspace.normed, t, hidden_count);
+        if (post_norm_t.data == nullptr ||
+            !cuda::run_rms_norm_f32(
+              residual_t,
+              layer.post_attention_layernorm_device,
+              hidden_count,
+              dims.rms_eps,
+              post_norm_t,
+              error_message)) {
+          return false;
+        }
+
+        bool mlp_ok = false;
+        if (layer.has_device_mlp_gate_up && layer.mlp_gate_up_device.data != nullptr) {
+          if (forward_workspace.projection_out.count < (2 * intermediate_count)) {
+            error_message = "CUDA workspace projection buffer is too small for packed MLP projections.";
+            return false;
+          }
+          const cuda::CudaDeviceBufferF32 gate = buffer_slice_f32(forward_workspace.projection_out, 0, intermediate_count);
+          const cuda::CudaDeviceBufferF32 up =
+            buffer_slice_f32(forward_workspace.projection_out, intermediate_count, intermediate_count);
+          if (gate.data == nullptr || up.data == nullptr) {
+            error_message = "Failed to create packed MLP projection slices.";
+            return false;
+          }
+          mlp_ok = cuda::run_matvec_f32_device(
+                     layer.mlp_gate_up_device,
+                     post_norm_t,
+                     forward_workspace.projection_out,
+                     error_message) &&
+                   cuda::run_silu_mul_f32(gate, up, intermediate_count, forward_workspace.intermediate_hidden, error_message);
+        } else {
+          mlp_ok = cuda::run_matvec_f32_device(
+                     layer.mlp_gate.device_matrix,
+                     post_norm_t,
+                     forward_workspace.intermediate_a,
+                     error_message) &&
+                   cuda::run_matvec_f32_device(
+                     layer.mlp_up.device_matrix,
+                     post_norm_t,
+                     forward_workspace.intermediate_b,
+                     error_message) &&
+                   cuda::run_silu_mul_f32(
+                     forward_workspace.intermediate_a,
+                     forward_workspace.intermediate_b,
+                     intermediate_count,
+                     forward_workspace.intermediate_hidden,
+                     error_message);
+        }
+        if (!mlp_ok ||
+            !cuda::run_matvec_f32_device(
+              layer.mlp_down.device_matrix,
+              forward_workspace.intermediate_hidden,
+              forward_workspace.hidden_out,
+              error_message)) {
+          return false;
+        }
+
+        cuda::CudaDeviceBufferF32 hidden_out_t =
+          buffer_row_slice_f32(prefill_workspace.hidden_b, t, hidden_count);
+        if (hidden_out_t.data == nullptr ||
+            !cuda::run_add_f32(residual_t, forward_workspace.hidden_out, hidden_count, hidden_out_t, error_message)) {
+          return false;
+        }
+      }
+      if (!maybe_sync_cuda_for_stage_timing(true, profile_cuda_sync, error_message)) {
+        return false;
+      }
+      if (profiling != nullptr) {
+        profiling->mlp_ms += elapsed_ms(mlp_start);
+      }
+
+      std::swap(prefill_workspace.hidden_a, prefill_workspace.hidden_b);
+    }
+
+    const bool chunk_has_final_prompt_token = (chunk_start + token_count_sz) == prompt_tokens.size();
+    if (chunk_has_final_prompt_token) {
+      if (!maybe_sync_cuda_for_stage_timing(true, profile_cuda_sync, error_message)) {
+        return false;
+      }
+      const auto logits_start = std::chrono::steady_clock::now();
+      const cuda::CudaDeviceBufferF32 final_hidden_t =
+        buffer_row_slice_f32(prefill_workspace.hidden_a, token_count - 1, hidden_count);
+      if (final_hidden_t.data == nullptr ||
+          !cuda::run_rms_norm_f32(
+            final_hidden_t,
+            weights.final_norm_device,
+            hidden_count,
+            dims.rms_eps,
+            forward_workspace.hidden_out,
+            error_message)) {
+        return false;
+      }
+
+      bool logits_ok = false;
+      if (use_cuda_gpu_sampling) {
+        logits_ok = cuda::run_matvec_f32_device(
+          weights.embed_tokens.device_matrix,
+          forward_workspace.hidden_out,
+          forward_workspace.logits,
+          error_message);
+      } else {
+        std::vector<float> final_hidden;
+        logits_ok = cuda::download_from_buffer_f32(
+                      forward_workspace.hidden_out,
+                      hidden_count,
+                      0,
+                      final_hidden,
+                      error_message) &&
+                    compute_next_logits_from_embedding(
+                      weights.embed_tokens,
+                      final_hidden,
+                      false,
+                      predicted_logits,
+                      error_message);
+      }
+      if (!logits_ok) {
+        return false;
+      }
+      if (!maybe_sync_cuda_for_stage_timing(true, profile_cuda_sync, error_message)) {
+        return false;
+      }
+      if (profiling != nullptr) {
+        profiling->logits_ms += elapsed_ms(logits_start);
+      }
+    }
+
+    position += token_count;
+  }
+
+  return true;
+}
+
 bool run_forward_single_token_cuda_device_core(
   const ModelWeights & weights,
   const RuntimeDims & dims,
@@ -2436,6 +3041,7 @@ bool run_reference_qwen35_inference(
   }
 
   CudaForwardWorkspace cuda_forward_workspace;
+  CudaPrefillChunkWorkspace cuda_prefill_workspace;
   CudaForwardWorkspace * cuda_workspace_ptr = nullptr;
   if (options.use_cuda) {
     const std::size_t max_input_count = std::max<std::size_t>({
@@ -2470,11 +3076,19 @@ bool run_reference_qwen35_inference(
       release_model_weights_cuda(weights);
       return false;
     }
+    if (!allocate_prefill_chunk_workspace_cuda(dims, kCudaPrefillChunkTokens, cuda_prefill_workspace, error_message)) {
+      release_forward_workspace_cuda(cuda_forward_workspace);
+      cuda::end_inference_session();
+      release_model_state_cuda(state);
+      release_model_weights_cuda(weights);
+      return false;
+    }
     cuda_workspace_ptr = &cuda_forward_workspace;
   }
 
   auto release_cuda_resources = [&]() {
     if (options.use_cuda) {
+      release_prefill_chunk_workspace_cuda(cuda_prefill_workspace);
       release_forward_workspace_cuda(cuda_forward_workspace);
       cuda::set_prefer_bf16_matvec(false);
       cuda::end_inference_session();
@@ -2557,27 +3171,46 @@ bool run_reference_qwen35_inference(
   int position = 0;
   std::vector<float> predicted_logits;
   const auto prefill_start = std::chrono::steady_clock::now();
-  for (std::size_t prompt_index = 0; prompt_index < options.prompt_tokens.size(); ++prompt_index) {
-    const std::int32_t prompt_token = options.prompt_tokens[prompt_index];
-    const bool compute_next_logits = (prompt_index + 1 == options.prompt_tokens.size());
-    if (!run_forward_single_token(
+  if (options.use_cuda && cuda_workspace_ptr != nullptr) {
+    if (!run_prefill_prompt_cuda_chunked(
           weights,
           dims,
           state,
-          prompt_token,
-          position,
-          options.use_cuda,
-          options.profile_cuda_sync,
-          predicted_logits,
+          options.prompt_tokens,
           use_cuda_gpu_sampling,
-          compute_next_logits,
-          cuda_workspace_ptr,
+          options.profile_cuda_sync,
+          *cuda_workspace_ptr,
+          cuda_prefill_workspace,
+          position,
+          predicted_logits,
           &profiling,
           error_message)) {
       release_cuda_resources();
       return false;
     }
-    ++position;
+  } else {
+    for (std::size_t prompt_index = 0; prompt_index < options.prompt_tokens.size(); ++prompt_index) {
+      const std::int32_t prompt_token = options.prompt_tokens[prompt_index];
+      const bool compute_next_logits = (prompt_index + 1 == options.prompt_tokens.size());
+      if (!run_forward_single_token(
+            weights,
+            dims,
+            state,
+            prompt_token,
+            position,
+            options.use_cuda,
+            options.profile_cuda_sync,
+            predicted_logits,
+            use_cuda_gpu_sampling,
+            compute_next_logits,
+            cuda_workspace_ptr,
+            &profiling,
+            error_message)) {
+        release_cuda_resources();
+        return false;
+      }
+      ++position;
+    }
   }
   const auto prefill_end = std::chrono::steady_clock::now();
   result.prefill_time_ms = std::chrono::duration<double, std::milli>(prefill_end - prefill_start).count();
