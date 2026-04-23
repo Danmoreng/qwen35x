@@ -198,7 +198,9 @@ bool run_reference_qwen35_inference(
     cuda_workspace_ptr = &cuda_forward_workspace;
   }
 
+  RuntimeDecodeBackend decode_backend;
   auto release_cuda_resources = [&]() {
+    release_runtime_decode_backend(decode_backend);
     if (options.use_cuda) {
       release_forward_workspace_cuda(cuda_forward_workspace);
       cuda::set_prefer_bf16_matvec(false);
@@ -251,6 +253,11 @@ bool run_reference_qwen35_inference(
     release_cuda_resources();
     return false;
   }
+  if (!init_runtime_decode_backend(decode_backend, error_message) ||
+      !reset_runtime_decode_backend(decode_backend, error_message)) {
+    release_cuda_resources();
+    return false;
+  }
   if (use_cuda_gpu_sampling) {
     std::vector<float> seen_mask(static_cast<std::size_t>(dims.vocab_size), 0.0f);
     for (int token = 0; token < dims.vocab_size; ++token) {
@@ -285,7 +292,8 @@ bool run_reference_qwen35_inference(
   for (std::size_t prompt_index = 0; prompt_index < options.prompt_tokens.size(); ++prompt_index) {
     const std::int32_t prompt_token = options.prompt_tokens[prompt_index];
     const bool compute_next_logits = (prompt_index + 1 == options.prompt_tokens.size());
-    if (!run_forward_single_token(
+    if (!decode_step_with_runtime_backend(
+          decode_backend,
           weights,
           dims,
           state,
@@ -367,7 +375,8 @@ bool run_reference_qwen35_inference(
 
         if (i + 1 < options.max_new_tokens) {
           ++profiling.forward_pass_tokens;
-          if (!run_forward_single_token_cuda_device_from_token_buffer(
+          if (!decode_step_with_runtime_backend_from_device_token(
+                decode_backend,
                 weights,
                 dims,
                 state,
@@ -468,7 +477,8 @@ bool run_reference_qwen35_inference(
           break;
         }
 
-        if (!run_forward_single_token(
+        if (!decode_step_with_runtime_backend(
+              decode_backend,
               weights,
               dims,
               state,
@@ -542,7 +552,8 @@ bool run_reference_qwen35_inference(
         break;
       }
 
-      if (!run_forward_single_token(
+      if (!decode_step_with_runtime_backend(
+            decode_backend,
             weights,
             dims,
             state,

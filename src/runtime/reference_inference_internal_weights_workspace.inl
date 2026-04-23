@@ -151,6 +151,15 @@ struct DecodeProfilingAccumulator {
   int forward_pass_tokens = 0;
 };
 
+enum class RuntimeDecodeBackendKind {
+  runtime_default = 0
+};
+
+struct RuntimeDecodeBackend {
+  RuntimeDecodeBackendKind kind = RuntimeDecodeBackendKind::runtime_default;
+  bool initialized = false;
+};
+
 double elapsed_ms(const std::chrono::steady_clock::time_point start_time) {
   return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start_time).count();
 }
