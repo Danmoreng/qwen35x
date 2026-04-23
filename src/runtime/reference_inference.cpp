@@ -1799,6 +1799,7 @@ bool run_forward_single_token_cuda_device_core(
   ModelState & state,
   const int position,
   const bool use_cuda_gpu_sampling,
+  const bool compute_next_logits,
   const bool profile_cuda_sync,
   CudaForwardWorkspace & workspace,
   std::vector<float> & next_logits,
@@ -1969,6 +1970,10 @@ bool run_forward_single_token_cuda_device_core(
     }
   }
 
+  if (!compute_next_logits) {
+    return true;
+  }
+
   if (!maybe_sync_cuda_for_stage_timing(true, profile_cuda_sync, error_message)) {
     return false;
   }
@@ -2009,6 +2014,7 @@ bool run_forward_single_token_cuda_device(
   const int token_id,
   const int position,
   const bool use_cuda_gpu_sampling,
+  const bool compute_next_logits,
   const bool profile_cuda_sync,
   CudaForwardWorkspace & workspace,
   std::vector<float> & next_logits,
@@ -2044,6 +2050,7 @@ bool run_forward_single_token_cuda_device(
     state,
     position,
     use_cuda_gpu_sampling,
+    compute_next_logits,
     profile_cuda_sync,
     workspace,
     next_logits,
@@ -2058,6 +2065,7 @@ bool run_forward_single_token_cuda_device_from_token_buffer(
   const cuda::CudaDeviceBufferF32 & token_id_device,
   const int position,
   const bool use_cuda_gpu_sampling,
+  const bool compute_next_logits,
   const bool profile_cuda_sync,
   CudaForwardWorkspace & workspace,
   std::vector<float> & next_logits,
@@ -2093,6 +2101,7 @@ bool run_forward_single_token_cuda_device_from_token_buffer(
     state,
     position,
     use_cuda_gpu_sampling,
+    compute_next_logits,
     profile_cuda_sync,
     workspace,
     next_logits,
@@ -2110,6 +2119,7 @@ bool run_forward_single_token(
   const bool profile_cuda_sync,
   std::vector<float> & next_logits,
   const bool use_cuda_gpu_sampling,
+  const bool compute_next_logits,
   CudaForwardWorkspace * cuda_workspace,
   DecodeProfilingAccumulator * profiling,
   std::string & error_message) {
@@ -2133,6 +2143,7 @@ bool run_forward_single_token(
       token_id,
       position,
       use_cuda_gpu_sampling,
+      compute_next_logits,
       profile_cuda_sync,
       *cuda_workspace,
       next_logits,
@@ -2229,6 +2240,10 @@ bool run_forward_single_token(
     if (profiling != nullptr) {
       profiling->mlp_ms += elapsed_ms(mlp_start);
     }
+  }
+
+  if (!compute_next_logits) {
+    return true;
   }
 
   const auto logits_start = std::chrono::steady_clock::now();
@@ -2542,7 +2557,9 @@ bool run_reference_qwen35_inference(
   int position = 0;
   std::vector<float> predicted_logits;
   const auto prefill_start = std::chrono::steady_clock::now();
-  for (const std::int32_t prompt_token : options.prompt_tokens) {
+  for (std::size_t prompt_index = 0; prompt_index < options.prompt_tokens.size(); ++prompt_index) {
+    const std::int32_t prompt_token = options.prompt_tokens[prompt_index];
+    const bool compute_next_logits = (prompt_index + 1 == options.prompt_tokens.size());
     if (!run_forward_single_token(
           weights,
           dims,
@@ -2553,6 +2570,7 @@ bool run_reference_qwen35_inference(
           options.profile_cuda_sync,
           predicted_logits,
           use_cuda_gpu_sampling,
+          compute_next_logits,
           cuda_workspace_ptr,
           &profiling,
           error_message)) {
@@ -2630,6 +2648,7 @@ bool run_reference_qwen35_inference(
                 state,
                 sampled_token_device,
                 position,
+                true,
                 true,
                 options.profile_cuda_sync,
                 *cuda_workspace_ptr,
@@ -2734,6 +2753,7 @@ bool run_reference_qwen35_inference(
               options.profile_cuda_sync,
               predicted_logits,
               true,
+              true,
               cuda_workspace_ptr,
               &profiling,
               error_message)) {
@@ -2807,6 +2827,7 @@ bool run_reference_qwen35_inference(
             options.profile_cuda_sync,
             predicted_logits,
             false,
+            true,
             cuda_workspace_ptr,
             &profiling,
             error_message)) {
