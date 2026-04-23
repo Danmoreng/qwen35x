@@ -113,10 +113,63 @@ Milestone progress:
 - Regression gates:
 - Keep simple prompts and expected token outputs as smoke checks
 
-## Practical Next Steps
+## Current Performance Plan (April 2026 Update)
 
-1. Extend CUDA Graph replay to include full-attention segment and larger whole-layer decode slices
-2. Optimize full-attention streaming kernel memory path further (vectorized loads / warp reductions / cache-friendly tiling)
-3. Optimize GPU sampling further (lift current `top_k <= 64` limit while preserving throughput)
-4. Add dedicated prefill implementation (batched/streaming prefill separate from decode)
-5. Add parity and performance harness scripts for repeatable CPU/GPU checks
+Primary objective:
+- Reach Luce-level decode throughput and llama.cpp-level prefill throughput on the same hardware class.
+
+Technical direction:
+- Use Luce-style decode as the baseline runtime architecture.
+- Improve prefill inside the same engine, using llama.cpp-inspired methods (large batched GEMM + flash-style attention), without splitting into two incompatible runtime stacks.
+- Keep one canonical cache/state layout so prefill can hand off directly to decode without conversion or reorder steps.
+
+Execution phases:
+1. Stabilize runtime baseline
+- Keep persistent, device-resident decode flow as the default path.
+- Preserve deterministic correctness against CPU reference for fixed prompts/seeds.
+
+2. Decode optimization track (Luce target)
+- Prioritize persistent/megakernel-style decode execution and reduce per-token launch overhead.
+- Tune decode occupancy controls (`decode_blocks`, launch geometry) per GPU profile.
+- Keep sampling fully device-resident and remove avoidable host-side sync points.
+
+3. Prefill optimization track (llama.cpp target)
+- Replace token-by-token prefill projections with true batched GEMM paths for QKV and MLP projections.
+- Add specialized full-attention prefill kernels with flash-style block processing.
+- Add chunked linear-attention prefill with sequence-level kernels instead of per-token micro-dispatch.
+- Minimize copy traffic and kernel launch count in prefill (eliminate token-wise buffer shuffles).
+
+4. Unified scheduler and fallback policy
+- Use one scheduler that chooses optimized paths by workload shape (prompt length, batch shape, model size, GPU profile).
+- Keep safe fallback paths for short prompts and unsupported configurations.
+
+Benchmark gates:
+- Track prefill and decode separately in sequential harness runs with fixed settings.
+- Require no regression on short-prompt decode while improving long-prompt prefill.
+- Maintain comparable A/B runs versus old commits, Luce benchmark harness, and llama.cpp benchmark output.
+
+## Scaling Plan for Larger Qwen3.5 Models
+
+Model progression:
+- Start from `Qwen3.5-0.8B`, then adapt to `4B`, `9B`, and `27B`.
+
+Adaptation approach:
+1. Parameterize kernel/runtime descriptors
+- Drive dimensions (hidden size, head counts, KV heads, layer count, schedule) from model metadata.
+- Keep model-specific compile-time specializations only where they provide measurable speedups.
+
+2. Retune per model size
+- Generate per-model tuning profiles (tile sizes, decode blocks, chunk sizes, graph capture boundaries).
+- Store and reuse tuned profiles per GPU class.
+
+3. Enforce layout compatibility
+- Keep cache/state ABI stable across model variants to reuse the same runtime orchestration.
+- Avoid model-specific conversion steps between prefill and decode.
+
+4. Expand memory strategy for larger models
+- For larger variants, plan for stricter VRAM budgeting, cache paging strategy, and potential multi-GPU/tensor-parallel extensions.
+
+Validation policy for each new size:
+- CPU/GPU token-level parity checks.
+- Long-prompt prefill and decode throughput benchmarks.
+- Regression comparison against the previous model tier before promotion.
