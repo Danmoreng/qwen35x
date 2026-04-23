@@ -28,6 +28,7 @@ add_library(qwen35x_core
   src/kernels/kernel_registry.cpp
   src/runtime/cuda_bench_stub.cpp
   src/runtime/cuda_inference_stub.cpp
+  src/runtime/luce_decode_backend.cpp
   src/runtime/reference_inference.cpp
   src/runtime/runtime.cpp
   src/tokenizer/tokenizer.cpp
@@ -40,8 +41,22 @@ target_include_directories(qwen35x_core
 )
 
 if (CMAKE_CUDA_COMPILER)
-  target_sources(qwen35x_core PRIVATE src/kernels/cuda/qwen35x_decode_stub.cu src/runtime/cuda_bench.cu src/runtime/cuda_inference.cu)
-  target_link_libraries(qwen35x_core PRIVATE CUDA::cublasLt)
+  target_sources(
+    qwen35x_core
+    PRIVATE
+      src/kernels/cuda/qwen35x_decode_stub.cu
+      src/runtime/cuda_bench.cu
+      src/runtime/cuda_inference.cu
+      third_party/vendor/luce_megakernel/kernel.cu
+      third_party/reference/lucebox-hub/megakernel/prefill.cu
+  )
+  target_compile_definitions(
+    qwen35x_core
+    PRIVATE
+      BLOCK_SIZE=${QWEN35X_LUCE_BENCH_BLOCK_SIZE}
+      NUM_BLOCKS=${QWEN35X_LUCE_BENCH_NUM_BLOCKS}
+  )
+  target_link_libraries(qwen35x_core PRIVATE CUDA::cublasLt CUDA::cublas)
   target_compile_definitions(qwen35x_core PUBLIC QWEN35X_HAS_CUDA=1)
   set_target_properties(qwen35x_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 else ()
@@ -55,8 +70,6 @@ if (CMAKE_CUDA_COMPILER)
   add_executable(
     qwen35x_lucebench
     src/luce_bench_main.cpp
-    third_party/vendor/luce_megakernel/kernel.cu
-    third_party/reference/lucebox-hub/megakernel/prefill.cu
   )
   target_include_directories(
     qwen35x_lucebench
@@ -74,6 +87,6 @@ if (CMAKE_CUDA_COMPILER)
       BLOCK_SIZE=${QWEN35X_LUCE_BENCH_BLOCK_SIZE}
       NUM_BLOCKS=${QWEN35X_LUCE_BENCH_NUM_BLOCKS}
   )
-  target_link_libraries(qwen35x_lucebench PRIVATE qwen35x_core CUDA::cublas)
+  target_link_libraries(qwen35x_lucebench PRIVATE qwen35x_core)
   set_target_properties(qwen35x_lucebench PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif ()
