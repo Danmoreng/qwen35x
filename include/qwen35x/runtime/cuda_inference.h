@@ -67,6 +67,13 @@ bool run_matvec_f32_device(
   CudaDeviceBufferF32 & output,
   std::string & error_message);
 
+bool run_matmul_f32_device(
+  const CudaDeviceMatrixF32 & matrix,
+  const CudaDeviceBufferF32 & input,
+  int input_cols,
+  CudaDeviceBufferF32 & output,
+  std::string & error_message);
+
 void set_prefer_bf16_matvec(bool enabled);
 
 bool gather_matrix_row_f32(
