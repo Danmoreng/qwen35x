@@ -1,0 +1,15 @@
+# JSONL format: one prompt object per line.
+# Fields: name, mode ("chat-user"|"prompt-text"), text
+# Extended parity corpus. Prefer `parity_prompts_minimal.txt` for fast CPU gate runs.
+{"name":"chat_short_joke","mode":"chat-user","text":"Tell me a short joke."}
+{"name":"chat_one_sentence_summary","mode":"chat-user","text":"Summarize this project in one sentence."}
+{"name":"chat_three_bullets","mode":"chat-user","text":"Give me three short bullet points about GPU inference."}
+{"name":"chat_math_reasoning","mode":"chat-user","text":"What is 17 * 23? Show the final answer only."}
+{"name":"chat_translation","mode":"chat-user","text":"Translate this to German: The build finished successfully."}
+{"name":"chat_trailing_space_edge","mode":"chat-user","text":"Continue this phrase with one more word: hello\u0020"}
+{"name":"chat_newline_prompt","mode":"chat-user","text":"Write two lines.\nLine one should be \"alpha\".\nLine two should be \"beta\"."}
+{"name":"chat_code_style","mode":"chat-user","text":"Write a tiny C++ function that returns the maximum of two integers."}
+{"name":"chat_stopword_check","mode":"chat-user","text":"Reply with exactly one word: ready"}
+{"name":"chat_json_shape","mode":"chat-user","text":"Return a JSON object with keys name and status."}
+{"name":"prompt_text_plain","mode":"prompt-text","text":"The capital of France is"}
+{"name":"prompt_text_numbers","mode":"prompt-text","text":"Sequence: 2, 4, 6, 8,"}

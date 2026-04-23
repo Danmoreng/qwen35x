@@ -1,0 +1,7 @@
+# JSONL format: one prompt object per line.
+# Minimal deterministic parity suite for CPU-vs-GPU token checks.
+{"name":"chat_short_joke","mode":"chat-user","text":"Tell me a short joke."}
+{"name":"chat_trailing_space_edge","mode":"chat-user","text":"Continue this phrase with one more word: hello\u0020"}
+{"name":"chat_stopword_check","mode":"chat-user","text":"Reply with exactly one word: ready"}
+{"name":"prompt_text_plain","mode":"prompt-text","text":"The capital of France is"}
+{"name":"prompt_text_numbers","mode":"prompt-text","text":"Sequence: 2, 4, 6, 8,"}

@@ -87,6 +87,10 @@ Quick headline numbers from that report:
 - llama.cpp BF16 + FA decode: `222.62 tok/s`
 - qwen35x custom decode: `199.17 tok/s`
 
+Parity status (April 23, 2026):
+- Minimal deterministic parity smoke (`gpu-f32`, `max_new_tokens=4`): `5/5` prompts pass.
+- Extended deterministic parity suite (`gpu-f32`, `max_new_tokens=4`): `12/12` prompts pass.
+
 Historical local sequential benchmark command (kept for reference):
 
 Command:
@@ -126,6 +130,18 @@ Results:
 
 ```powershell
 .\build\qwen35x.exe --bench-bf16 --hf-model-dir models/qwen3.5-0.8b
+```
+
+- Deterministic CPU vs GPU parity smoke (short prompts, minimal generated tokens):
+
+```powershell
+.\scripts\benchmark-parity.ps1 -CsvOut benchmarks\qwen35x-parity.csv
+```
+
+- Deterministic CPU vs GPU parity (extended prompt suite):
+
+```powershell
+.\scripts\benchmark-parity.ps1 -PromptsFile scripts\bench\parity_prompts.txt -CsvOut benchmarks\qwen35x-parity-extended.csv
 ```
 
 - Sequential inference benchmark to CSV (minimal schema):

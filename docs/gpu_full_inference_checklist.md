@@ -27,9 +27,10 @@ Scope:
 - [x] Capture baseline metrics before changes
   - Command: `.\build\qwen35x.exe --infer-gpu --hf-model-dir models\qwen3.5-0.8b --chat-user "Tell me a short joke." --max-new-tokens 128 --max-context 256 --seed 123 --temperature 0`
   - Record: load time, decode time, tokens/s, generated token ids
-- [ ] Add a fixed-prompt parity set for regression checks
-  - Create `scripts/bench/parity_prompts.txt` with at least 10 prompts
-  - Include the known edge case prompt style with trailing space
+- [x] Add a fixed-prompt parity set for regression checks
+  - Added fast smoke suite: `scripts/bench/parity_prompts_minimal.txt`
+  - Added extended suite: `scripts/bench/parity_prompts.txt`
+  - Includes trailing-space edge case prompt style
 - [x] Define acceptance thresholds
   - Token parity vs CPU reference when `temperature=0` and same seed
   - No quality regression on chat prompts with default sampling
@@ -257,9 +258,13 @@ Exit criteria:
 ## 10. Correctness and Regression Harness
 
 Tasks:
-- [ ] Add script for CPU vs GPU deterministic parity runs over prompt suite
+- [x] Add script for CPU vs GPU deterministic parity runs over prompt suite (`scripts/benchmark-parity.ps1`)
 - [x] Add script for throughput benchmarking with CSV output (`scripts/benchmark-inference-seq.ps1`)
 - [ ] Add CI-friendly smoke mode (short token count, fixed seed)
+
+Latest parity status (April 23, 2026):
+- Minimal parity smoke (`scripts/bench/parity_prompts_minimal.txt`, `max_new_tokens=4`, `gpu-f32`): pass `5/5`.
+- Extended parity suite (`scripts/bench/parity_prompts.txt`, `max_new_tokens=4`, `gpu-f32`): pass `12/12`.
 
 Files:
 - `scripts/` (new scripts)
@@ -295,5 +300,5 @@ Exit criteria:
 
 - [x] `--infer-gpu` performs full decode math on GPU for both full and linear attention layers.
 - [x] Per-token host/device transfer is limited to minimal control data (for example sampled token id).
-- [ ] Deterministic CPU/GPU parity passes on fixed prompt suite.
+- [x] Deterministic CPU/GPU parity passes on fixed prompt suite.
 - [x] Throughput improvement is measured and documented with reproducible commands.
