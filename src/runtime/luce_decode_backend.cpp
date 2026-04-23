@@ -22,6 +22,7 @@ namespace {
 constexpr int kNumLayers = 24;
 constexpr int kHiddenSize = 1024;
 constexpr int kIntermediateSize = 3584;
+constexpr int kVocabSize = 248320;
 constexpr int kMaxSeqLen = 2048;
 constexpr int kFaNumQHeads = 8;
 constexpr int kFaNumKvHeads = 2;
@@ -73,6 +74,8 @@ extern "C" void launch_decode(
   float * block_max_vals,
   int * block_max_idxs,
   unsigned int * lm_sync_counter,
+  float * seen_token_mask,
+  float repetition_penalty,
   int position,
   int max_seq_len,
   cudaStream_t stream);
@@ -155,6 +158,7 @@ struct BackendState {
   float * block_max_vals = nullptr;
   int * block_max_idxs = nullptr;
   unsigned int * lm_sync_counter = nullptr;
+  float * seen_token_mask = nullptr;
   int * output_token = nullptr;
 
   int * token_ids = nullptr;
@@ -435,6 +439,12 @@ bool initialize_backend_state(
       !arena.alloc_bytes(1024 * sizeof(float), reinterpret_cast<void *&>(state.block_max_vals), error_message) ||
       !arena.alloc_bytes(1024 * sizeof(int), reinterpret_cast<void *&>(state.block_max_idxs), error_message) ||
       !arena.alloc_bytes(sizeof(unsigned int), reinterpret_cast<void *&>(state.lm_sync_counter), error_message) ||
+      !alloc_and_zero(
+        arena,
+        static_cast<std::size_t>(kVocabSize) * f32_bytes,
+        reinterpret_cast<void *&>(state.seen_token_mask),
+        "seen_token_mask",
+        error_message) ||
       !arena.alloc_bytes(sizeof(int), reinterpret_cast<void *&>(state.output_token), error_message)) {
     return false;
   }
@@ -480,11 +490,13 @@ bool reset_state(const BackendState & state, std::string & error_message) {
   const std::size_t fa_bytes = static_cast<std::size_t>(n_full_layers) * kFaNumKvHeads * kMaxSeqLen * kFaHeadDim * sizeof(std::uint16_t);
   const std::size_t dn_bytes = static_cast<std::size_t>(n_delta_layers) * kDnNumHeads * kDnKeyDim * kDnValueDim * sizeof(float);
   const std::size_t conv_bytes = static_cast<std::size_t>(n_delta_layers) * kDnConvChannels * kDnConvKernel * sizeof(float);
+  const std::size_t seen_bytes = static_cast<std::size_t>(kVocabSize) * sizeof(float);
 
   return check_cuda(cudaMemset(state.fa_k_cache, 0, fa_bytes), "cudaMemset(fa_k_cache)", error_message) &&
          check_cuda(cudaMemset(state.fa_v_cache, 0, fa_bytes), "cudaMemset(fa_v_cache)", error_message) &&
          check_cuda(cudaMemset(state.dn_states, 0, dn_bytes), "cudaMemset(dn_states)", error_message) &&
-         check_cuda(cudaMemset(state.conv_bufs, 0, conv_bytes), "cudaMemset(conv_bufs)", error_message);
+         check_cuda(cudaMemset(state.conv_bufs, 0, conv_bytes), "cudaMemset(conv_bufs)", error_message) &&
+         check_cuda(cudaMemset(state.seen_token_mask, 0, seen_bytes), "cudaMemset(seen_token_mask)", error_message);
 }
 
 bool run_prefill_impl(
@@ -561,8 +573,23 @@ bool run_decode_step_impl(
   const BackendState & state,
   int input_token,
   int position,
+  float repetition_penalty,
   int & out_next_token,
   std::string & error_message) {
+  if (repetition_penalty > 1.0f && input_token >= 0 && input_token < kVocabSize) {
+    const float seen = 1.0f;
+    if (!check_cuda(
+          cudaMemcpy(
+            state.seen_token_mask + input_token,
+            &seen,
+            sizeof(float),
+            cudaMemcpyHostToDevice),
+          "cudaMemcpy(H2D seen_token_mask)",
+          error_message)) {
+      return false;
+    }
+  }
+
   launch_decode(
     input_token,
     state.output_token,
@@ -590,6 +617,8 @@ bool run_decode_step_impl(
     state.block_max_vals,
     state.block_max_idxs,
     state.lm_sync_counter,
+    state.seen_token_mask,
+    repetition_penalty,
     position,
     kMaxSeqLen,
     nullptr);
@@ -631,6 +660,10 @@ bool LuceDecodeBackend::initialize(const LuceDecodeBackendConfig & config, std::
   }
   if (config.decode_blocks < 0) {
     error_message = "decode_blocks must be >= 0.";
+    return false;
+  }
+  if (config.repetition_penalty < 1.0f) {
+    error_message = "repetition_penalty must be >= 1.0.";
     return false;
   }
 
@@ -680,7 +713,13 @@ bool LuceDecodeBackend::run_decode_step(
     error_message = "Luce backend decode_step requested before initialize.";
     return false;
   }
-  return run_decode_step_impl(impl_->state, input_token, position, out_next_token, error_message);
+  return run_decode_step_impl(
+    impl_->state,
+    input_token,
+    position,
+    impl_->config.repetition_penalty,
+    out_next_token,
+    error_message);
 }
 
 bool LuceDecodeBackend::synchronize(std::string & error_message) {

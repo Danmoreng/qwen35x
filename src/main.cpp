@@ -39,11 +39,23 @@ std::string json_escape(const std::string & input) {
   return out;
 }
 
+const char * gpu_decode_backend_name(const qwen35x::GpuDecodeBackend backend) {
+  switch (backend) {
+    case qwen35x::GpuDecodeBackend::runtime_default:
+      return "runtime_default";
+    case qwen35x::GpuDecodeBackend::luce:
+      return "luce";
+    default:
+      return "unknown";
+  }
+}
+
 bool write_profile_json(
   const std::string & output_path,
   const qwen35x::ReferenceInferenceOptions & options,
   const qwen35x::ReferenceInferenceResult & result,
   const std::string & backend,
+  const std::string & decode_backend,
   std::string & error_message) {
   std::ofstream out(output_path, std::ios::binary | std::ios::trunc);
   if (!out.is_open()) {
@@ -54,6 +66,7 @@ bool write_profile_json(
   out << std::fixed << std::setprecision(6);
   out << "{\n";
   out << "  \"backend\": \"" << json_escape(backend) << "\",\n";
+  out << "  \"decode_backend\": \"" << json_escape(decode_backend) << "\",\n";
   out << "  \"prompt_tokens\": " << options.prompt_tokens.size() << ",\n";
   out << "  \"generated_tokens\": " << result.generated_tokens.size() << ",\n";
   out << "  \"forward_pass_tokens\": " << result.forward_pass_tokens << ",\n";
@@ -121,6 +134,8 @@ int main(int argc, char ** argv) {
   qwen35x::RuntimeTarget target;
   bool bench_bf16 = false;
   bool infer_reference = false;
+  bool infer_gpu = false;
+  bool gpu_decode_backend_explicit = false;
   qwen35x::Bf16TensorBenchOptions bench_options;
   qwen35x::ReferenceInferenceOptions infer_options;
 
@@ -137,6 +152,7 @@ int main(int argc, char ** argv) {
       infer_reference = true;
     } else if (arg == "--infer-gpu") {
       infer_reference = true;
+      infer_gpu = true;
       infer_options.use_cuda = true;
       infer_options.use_cuda_matvec_bf16 = true;
     } else if (arg == "--bench-tensor" && i + 1 < argc) {
@@ -169,6 +185,19 @@ int main(int argc, char ** argv) {
       infer_options.use_cuda_matvec_bf16 = true;
     } else if (arg == "--gpu-f32-matvec") {
       infer_options.use_cuda_matvec_bf16 = false;
+    } else if (arg == "--gpu-decode-backend" && i + 1 < argc) {
+      const std::string backend = argv[++i];
+      gpu_decode_backend_explicit = true;
+      if (backend == "default") {
+        infer_options.gpu_decode_backend = qwen35x::GpuDecodeBackend::runtime_default;
+      } else if (backend == "luce") {
+        infer_options.gpu_decode_backend = qwen35x::GpuDecodeBackend::luce;
+      } else {
+        std::cerr << "unknown --gpu-decode-backend value: " << backend << " (expected: default|luce)\n";
+        return 11;
+      }
+    } else if (arg == "--gpu-decode-blocks" && i + 1 < argc) {
+      infer_options.gpu_decode_blocks = std::stoi(argv[++i]);
     } else if (arg == "--profile-sync") {
       infer_options.profile_cuda_sync = true;
     } else if (arg == "--stop-token" && i + 1 < argc) {
@@ -192,10 +221,14 @@ int main(int argc, char ** argv) {
       std::cout << "       qwen35x --infer-reference --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "       qwen35x --infer-gpu --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "               [--temperature <float>] [--top-p <float>] [--top-k <int>] [--repeat-penalty <float>] [--seed <int64>]\n";
-      std::cout << "               [--gpu-bf16|--gpu-f32-matvec] [--profile-sync]\n";
+      std::cout << "               [--gpu-bf16|--gpu-f32-matvec] [--gpu-decode-backend <default|luce>] [--gpu-decode-blocks <n>] [--profile-sync]\n";
       std::cout << "               [--stop-token <csv>] [--stop-text <text>] [--stop-on-im-end] [--profile-json <path>]\n";
       return 0;
     }
+  }
+
+  if (infer_gpu && !gpu_decode_backend_explicit) {
+    infer_options.gpu_decode_backend = qwen35x::GpuDecodeBackend::luce;
   }
 
   if (bench_bf16) {
@@ -325,6 +358,7 @@ int main(int argc, char ** argv) {
 
     std::cout << "reference inference\n";
     std::cout << "  backend: " << (infer_options.use_cuda ? "cuda-hybrid" : "cpu-reference") << "\n";
+    std::cout << "  decode_backend: " << gpu_decode_backend_name(infer_options.gpu_decode_backend) << "\n";
     std::cout << "  prompt_tokens: " << infer_options.prompt_tokens.size() << "\n";
     std::cout << "  generated_tokens: " << infer_result.generated_tokens.size() << "\n";
     std::cout << "  load_time_ms: " << infer_result.load_time_ms << "\n";
@@ -372,6 +406,7 @@ int main(int argc, char ** argv) {
             infer_options,
             infer_result,
             infer_options.use_cuda ? "cuda-hybrid" : "cpu-reference",
+            gpu_decode_backend_name(infer_options.gpu_decode_backend),
             error_message)) {
         std::cerr << "profile json write failed: " << error_message << "\n";
         return 14;

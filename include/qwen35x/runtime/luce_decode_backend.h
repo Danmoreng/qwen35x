@@ -11,6 +11,7 @@ struct LuceDecodeBackendConfig {
   std::string model_dir = "models/qwen3.5-0.8b";
   int max_context = 256;
   int decode_blocks = 0;
+  float repetition_penalty = 1.0f;
 };
 
 class LuceDecodeBackend {

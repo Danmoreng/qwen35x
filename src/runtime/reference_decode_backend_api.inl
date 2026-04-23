@@ -1,10 +1,28 @@
 bool init_runtime_decode_backend(
   RuntimeDecodeBackend & backend,
+  const ReferenceInferenceOptions & options,
   std::string & error_message) {
   backend = RuntimeDecodeBackend{};
   backend.kind = RuntimeDecodeBackendKind::runtime_default;
+  if (options.use_cuda && options.gpu_decode_backend == GpuDecodeBackend::luce) {
+    backend.kind = RuntimeDecodeBackendKind::luce;
+    if (options.sampling.temperature > 0.0f) {
+      error_message = "Luce decode backend currently supports only greedy decode (temperature <= 0).";
+      return false;
+    }
+    if (options.gpu_decode_blocks < 0) {
+      error_message = "gpu_decode_blocks must be >= 0.";
+      return false;
+    }
+    luce::LuceDecodeBackendConfig config;
+    config.model_dir = options.model_dir;
+    config.max_context = options.max_context;
+    config.decode_blocks = options.gpu_decode_blocks;
+    if (!backend.luce_backend.initialize(config, error_message)) {
+      return false;
+    }
+  }
   backend.initialized = true;
-  (void)error_message;
   return true;
 }
 
@@ -15,7 +33,15 @@ bool reset_runtime_decode_backend(
     error_message = "Decode backend reset requested before init.";
     return false;
   }
-  return true;
+  switch (backend.kind) {
+    case RuntimeDecodeBackendKind::runtime_default:
+      return true;
+    case RuntimeDecodeBackendKind::luce:
+      return backend.luce_backend.reset(error_message);
+    default:
+      error_message = "Unsupported runtime decode backend kind.";
+      return false;
+  }
 }
 
 void release_runtime_decode_backend(RuntimeDecodeBackend & backend) {
@@ -58,6 +84,26 @@ bool decode_step_with_runtime_backend(
         cuda_workspace,
         profiling,
         error_message);
+    case RuntimeDecodeBackendKind::luce: {
+      int next_token = 0;
+      if (!backend.luce_backend.run_decode_step(token_id, position, next_token, error_message)) {
+        return false;
+      }
+      if (compute_next_logits) {
+        if (next_token < 0 || next_token >= dims.vocab_size) {
+          error_message = "Luce decode backend produced an out-of-range token id.";
+          return false;
+        }
+        next_logits.assign(static_cast<std::size_t>(dims.vocab_size), 0.0f);
+        next_logits[static_cast<std::size_t>(next_token)] = 1.0f;
+      } else {
+        next_logits.clear();
+      }
+      if (profiling != nullptr) {
+        ++profiling->forward_pass_tokens;
+      }
+      return true;
+    }
     default:
       error_message = "Unsupported runtime decode backend kind.";
       return false;
@@ -98,6 +144,9 @@ bool decode_step_with_runtime_backend_from_device_token(
         next_logits,
         profiling,
         error_message);
+    case RuntimeDecodeBackendKind::luce:
+      error_message = "Luce decode backend does not support device-token decode path.";
+      return false;
     default:
       error_message = "Unsupported runtime decode backend kind.";
       return false;

@@ -45,10 +45,10 @@ if (CMAKE_CUDA_COMPILER)
     qwen35x_core
     PRIVATE
       src/kernels/cuda/qwen35x_decode_stub.cu
+      src/kernels/cuda/luce_megakernel/kernel.cu
+      src/kernels/cuda/luce_megakernel/prefill.cu
       src/runtime/cuda_bench.cu
       src/runtime/cuda_inference.cu
-      third_party/vendor/luce_megakernel/kernel.cu
-      third_party/reference/lucebox-hub/megakernel/prefill.cu
   )
   target_compile_definitions(
     qwen35x_core

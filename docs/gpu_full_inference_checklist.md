@@ -1,19 +1,21 @@
 # Full GPU Inference Checklist (Qwen3.5)
 
-This checklist is the execution plan to move `--infer-gpu` from CUDA-hybrid to a fully GPU-resident decode/prefill path.
+This checklist is the execution plan to move `--infer-gpu` from the early CUDA-hybrid path to a fully GPU-resident decode/prefill path.
 
 Progress snapshot (April 2026):
 - Fully device-resident per-layer decode flow is implemented.
 - Full-logits per-token D2H copies are removed.
-- Device-token GPU decode loop path is implemented (next-step token embedding gather on device).
-- CUDA Graph replay is implemented for steady-state decode segments (MLP + linear-attention blocks).
-- BF16 CUDA decode matvec path is implemented (default enabled for `--infer-gpu`).
+- Legacy runtime device-token GPU decode loop path is implemented (next-step token embedding gather on device).
+- Legacy runtime CUDA Graph replay is implemented for steady-state decode segments (MLP + linear-attention blocks).
+- Legacy runtime BF16 CUDA decode matvec path is implemented.
 - Optional synchronized CUDA profiling mode is implemented (`--profile-sync`).
 - Full-attention packed projection (`q+gate+k+v`) is implemented to reduce decode matvec launches.
 - Full-attention decode now uses a streaming online-softmax/value kernel (single pass over sequence).
-- Current measured transfer footprint is near control-path scale (`~3-4 bytes D2H per forward token`).
-- Current measured sequential benchmark (April 21, 2026): BF16 `180.76`, `182.03`, `169.35` tokens/s (avg `177.38`).
-- Current open bottlenecks are full-attention graph replay coverage, sampling optimization depth, and prefill specialization.
+- `--infer-gpu` now defaults to the in-tree Luce megakernel decode backend for Qwen3.5-0.8B.
+- The Luce backend passes deterministic CPU parity on both minimal and extended prompt suites.
+- Legacy runtime measured transfer footprint is near control-path scale (`~3-4 bytes D2H per forward token`); Luce backend transfer accounting is currently outside the shared CUDA stats path.
+- Current measured sequential benchmark (April 23, 2026, integrated Luce default): `gpu-bf16` avg `289.43 tok/s`, `gpu-f32` avg `287.88 tok/s`.
+- Current open bottlenecks are greedy-only Luce sampling support, prompt prefill replay, and batched/specialized prefill.
 
 Scope:
 - Model family: Qwen3.5 (current profile `qwen3_5_0_8b.profile.json`)
@@ -265,6 +267,7 @@ Tasks:
 Latest parity status (April 23, 2026):
 - Minimal parity smoke (`scripts/bench/parity_prompts_minimal.txt`, `max_new_tokens=4`, `gpu-f32`): pass `5/5`.
 - Extended parity suite (`scripts/bench/parity_prompts.txt`, `max_new_tokens=4`, `gpu-f32`): pass `12/12`.
+- Post source-move minimal parity (`benchmarks/qwen35x-parity-moved-luce.csv`): pass `5/5`.
 
 Files:
 - `scripts/` (new scripts)

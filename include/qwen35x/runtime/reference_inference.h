@@ -16,6 +16,11 @@ struct SamplingOptions {
   std::int64_t seed = -1;
 };
 
+enum class GpuDecodeBackend {
+  runtime_default = 0,
+  luce = 1
+};
+
 struct ReferenceInferenceOptions {
   std::string model_dir;
   std::vector<std::int32_t> prompt_tokens;
@@ -23,6 +28,8 @@ struct ReferenceInferenceOptions {
   int max_context = 4096;
   bool use_cuda = false;
   bool use_cuda_matvec_bf16 = false;
+  GpuDecodeBackend gpu_decode_backend = GpuDecodeBackend::runtime_default;
+  int gpu_decode_blocks = 0;
   bool profile_cuda_sync = false;
   SamplingOptions sampling;
   std::vector<std::int32_t> stop_token_ids;

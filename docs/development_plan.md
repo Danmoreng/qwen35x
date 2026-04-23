@@ -8,24 +8,32 @@ Completed:
 - CPU reference inference pipeline for Qwen3.5-0.8B
 - CUDA inference path with full-attention decode kernel + linear-attention decode kernel
 - Device-resident per-layer decode flow (hidden/residual/norm/attention/MLP on GPU)
-- GPU logits + GPU sampling path
-- Device-token GPU decode loop path (sampled token consumed on device for next-step embedding gather)
+- Legacy CUDA runtime GPU logits + GPU sampling path
+- Legacy CUDA runtime device-token decode loop path (sampled token consumed on device for next-step embedding gather)
 - CUDA Graph replay for steady-state decode segments (MLP + linear-attention blocks)
 - Decode profiling (`--profile-json`) with stage timing and transfer breakdown
-- BF16 decode matvec path in CUDA runtime (default enabled for `--infer-gpu`)
+- BF16 decode matvec path in the legacy CUDA runtime backend
 - Optional synchronized CUDA stage timing mode (`--profile-sync`)
 - Packed full-attention projection (`q+gate+k+v`) to reduce full-attention decode matvec launches
 - Streaming full-attention decode kernel with online softmax/value accumulation
+- Luce megakernel decode backend integrated into `--infer-gpu` as the default Qwen3.5-0.8B decode path
+- Luce CUDA sources used by the build moved into `src/kernels/cuda/luce_megakernel/` with local correctness fixes and MIT attribution
+- Deterministic CPU/GPU parity harness with minimal and extended prompt suites
 
 Current known constraints:
-- GPU sampling path currently requires `top_k <= 64` when `temperature > 0`
-- Stop condition checks remain host-side when stop tokens/sequences are configured
-- Prefill path is still token-by-token and not yet batched/specialized
+- Default Luce backend currently supports greedy decode only (`temperature <= 0`)
+- Legacy runtime GPU sampling path currently requires `top_k <= 64` when `temperature > 0`
+- Stop condition checks remain host-side
+- Main Luce inference path currently replays prompt tokens through single-token decode for correctness; batched/specialized prefill is still open
 
 Latest local benchmark snapshot (Qwen3.5-0.8B, same machine):
 - Historical chat baseline (early April 2026): ~91 tokens/s
-- Current sequential chat benchmark (April 21, 2026, post streaming full-attention kernel):
-  - BF16 matvec ON (`--infer-gpu` default): `180.76`, `182.03`, `169.35` tokens/s (avg `177.38`)
+- Current integrated Luce sequential chat benchmark (April 23, 2026, `Runs=3`, `WarmupRuns=1`, `MaxNewTokens=128`, `MaxContext=256`):
+  - `gpu-bf16` label: avg `289.43 tok/s` (`289.02` min, `290.15` max)
+  - `gpu-f32` label: avg `287.88 tok/s` (`287.43` min, `288.31` max)
+  - CSV: `benchmarks/qwen35x-inference-seq-luce-current.csv`
+- Historical sequential chat benchmark (April 21, 2026, post streaming full-attention kernel):
+  - BF16 matvec ON (historical `--infer-gpu` default at the time): `180.76`, `182.03`, `169.35` tokens/s (avg `177.38`)
   - FP32 matvec (`--gpu-f32-matvec`): `116.99`, `117.77`, `117.35` tokens/s (avg `117.37`)
   - Prior main rerun baseline: BF16 avg `166.90` tokens/s
 
@@ -98,7 +106,7 @@ Core strategy:
 
 Milestone progress:
 - Milestones 1-4: completed
-- Milestone 5: in progress (decode kernels implemented, packed projections added, CUDA Graph MLP replay added)
+- Milestone 5: completed for the Qwen3.5-0.8B default decode path (legacy kernels + integrated Luce megakernel backend)
 - Milestones 6-7: in progress
 
 ## Validation and Benchmarking Plan
@@ -176,17 +184,19 @@ Validation policy for each new size:
 
 ## Implementation TODO (Megakernel Adaptation)
 
-- [ ] Extract a reusable Luce decode backend from the current benchmark harness.
-- [ ] Define a runtime-facing decode backend API (`init`, `reset`, `decode_step`, `release`) independent of benchmarking code.
-- [ ] Map current model weights/states into Luce-style packed decode layout at model-load time.
-- [ ] Integrate the reusable decode backend into the main GPU inference loop (replace current decode step path, keep CLI/profile outputs unchanged).
-- [ ] Keep one canonical cache/state layout shared by prefill and decode (no conversion step between phases).
-- [ ] Keep a one-size-fits-all runtime path (no prompt-size gating in execution logic).
-- [ ] Keep Luce prefill code out of runtime integration; implement prefill in our runtime using batched GEMM + flash-style full-attention prefill kernels.
+- [x] Extract a reusable Luce decode backend from the current benchmark harness.
+- [x] Define a runtime-facing decode backend API (`init`, `reset`, `decode_step`, `release`) independent of benchmarking code.
+- [x] Map current model weights/states into Luce-style packed decode layout at model-load time.
+- [x] Integrate the reusable decode backend into the main GPU inference loop (default for `--infer-gpu`; legacy runtime backend remains selectable).
+- [x] Keep a one-size-fits-all runtime path (no prompt-size gating in execution logic).
+- [x] Move the Luce CUDA sources used by the build into `src/kernels/cuda/luce_megakernel/` with MIT license attribution.
+- [x] Apply local Luce correctness fixes needed for CPU parity: DeltaNet decode decay, host-side barrier reset, repetition-penalty-aware greedy argmax.
+- [ ] Unify prefill/decode around one canonical cache/state layout without prompt replay or conversion.
+- [ ] Replace correctness-first token replay prefill with batched GEMM + flash-style full-attention prefill kernels.
 - [ ] Remove token-wise projection/copy overhead in prefill and move to true batched projection execution.
 - [ ] Parameterize kernel/runtime descriptors by model metadata to support `Qwen3.5-0.8B`, `4B`, `9B`, and `27B`.
 - [ ] Add per-model/per-GPU autotune profiles (decode blocks, tile sizes, chunk sizes, graph boundaries).
 - [x] Establish deterministic CPU vs GPU parity harness + fixed prompt suites (`scripts/benchmark-parity.ps1`, minimal + extended prompt sets). Latest baseline (April 23, 2026): minimal `5/5` pass, extended `12/12` pass.
-- [ ] Run CPU vs GPU token-parity validation on every major step.
+- [x] Run CPU vs GPU token-parity validation for the Luce default integration and source move.
 - [ ] Run prompt-length sweep benchmarks (short/medium/long) after each major optimization batch.
-- [ ] Compare every milestone against Luce decode and llama.cpp prefill baselines.
+- [x] Compare the integrated Luce default decode milestone against prior qwen35x and Luce decode baselines.

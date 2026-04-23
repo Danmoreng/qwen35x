@@ -5,7 +5,9 @@ The scaffold follows the public project roadmap in `docs/development_plan.md`.
 ## Current Runtime Status
 
 - CPU reference path remains the correctness oracle.
-- `--infer-gpu` uses CUDA kernels with a device-resident decode loop across layer math.
+- `--infer-gpu` defaults to the in-tree Luce megakernel decode backend for Qwen3.5-0.8B.
+- The legacy CUDA runtime decode backend remains selectable with `--gpu-decode-backend default`.
+- CUDA decode paths use device-resident layer math across hidden/residual/norm/attention/MLP work.
 - Device-token GPU decode loop is implemented for the no-stop-controls path.
 - CUDA Graph replay is implemented for steady-state MLP decode work.
 - Per-token D2H transfer is reduced to minimal control-path data.
@@ -27,6 +29,7 @@ The scaffold follows the public project roadmap in `docs/development_plan.md`.
   - Input: key `(op, mode, dtype, layout, sm)`
   - Output: callable kernel symbol
   - Responsibility: architecture-specific CUDA fast paths and reference fallbacks
+  - In-tree Luce CUDA sources live under `src/kernels/cuda/luce_megakernel/`
 
 ## Initial scope
 
@@ -40,6 +43,6 @@ The scaffold follows the public project roadmap in `docs/development_plan.md`.
 
 1. Parse real HF `config.json` and `model.safetensors.index.json`.
 2. Build offline packer output (`.q35xpack`) from safetensors shards.
-3. Expand CUDA Graph coverage from MLP replay to broader steady-state decode segments.
-4. Add dedicated prefill path (`causal_conv1d` + chunked linear attention).
+3. Replace correctness-first prompt replay with dedicated batched/specialized prefill.
+4. Expand CUDA Graph or persistent-kernel coverage where it still benefits the legacy runtime path.
 5. Add quantized path and architecture-specific autotuning.

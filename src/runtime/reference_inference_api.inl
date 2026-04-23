@@ -34,6 +34,115 @@ bool parse_token_list_csv(
   return true;
 }
 
+bool run_luce_qwen35_inference(
+  const ReferenceInferenceOptions & options,
+  ReferenceInferenceResult & result,
+  std::string & error_message) {
+  if (options.sampling.temperature > 0.0f) {
+    error_message = "Luce decode backend currently supports only greedy decode (temperature <= 0).";
+    return false;
+  }
+  if (options.gpu_decode_blocks < 0) {
+    error_message = "gpu_decode_blocks must be >= 0.";
+    return false;
+  }
+
+  const auto load_start = std::chrono::steady_clock::now();
+  luce::LuceDecodeBackend backend;
+  luce::LuceDecodeBackendConfig config;
+  config.model_dir = options.model_dir;
+  config.max_context = options.max_context;
+  config.decode_blocks = options.gpu_decode_blocks;
+  config.repetition_penalty = options.sampling.repetition_penalty;
+  if (!backend.initialize(config, error_message)) {
+    return false;
+  }
+  if (!backend.reset(error_message)) {
+    return false;
+  }
+  const auto load_end = std::chrono::steady_clock::now();
+  result.load_time_ms = std::chrono::duration<double, std::milli>(load_end - load_start).count();
+
+  std::unordered_set<std::int32_t> stop_token_set;
+  stop_token_set.reserve(options.stop_token_ids.size());
+  for (const std::int32_t token : options.stop_token_ids) {
+    stop_token_set.insert(token);
+  }
+
+  DecodeProfilingAccumulator profiling;
+  profiling.forward_pass_tokens = static_cast<int>(options.prompt_tokens.size());
+
+  const auto decode_start = std::chrono::steady_clock::now();
+
+  int first_token = 0;
+  const auto prefill_start = std::chrono::steady_clock::now();
+  int prefill_position = 0;
+  for (const std::int32_t prompt_token : options.prompt_tokens) {
+    if (!backend.run_decode_step(prompt_token, prefill_position, first_token, error_message)) {
+      return false;
+    }
+    ++prefill_position;
+  }
+  const auto prefill_end = std::chrono::steady_clock::now();
+  result.prefill_time_ms = std::chrono::duration<double, std::milli>(prefill_end - prefill_start).count();
+  result.prefill_tokens_per_second =
+    (result.prefill_time_ms > 0.0)
+      ? (static_cast<double>(options.prompt_tokens.size()) * 1000.0 / result.prefill_time_ms)
+      : 0.0;
+
+  result.generated_tokens.clear();
+  result.generated_tokens.reserve(static_cast<std::size_t>(options.max_new_tokens));
+
+  int current = first_token;
+  int position = static_cast<int>(options.prompt_tokens.size());
+  for (int i = 0; i < options.max_new_tokens; ++i) {
+    result.generated_tokens.push_back(current);
+
+    const auto stop_checks_start = std::chrono::steady_clock::now();
+    bool should_stop = false;
+    std::size_t trim_count = 0;
+    if (stop_token_set.find(current) != stop_token_set.end()) {
+      should_stop = true;
+      trim_count = std::max<std::size_t>(trim_count, 1);
+    }
+    for (const auto & stop_sequence : options.stop_token_sequences) {
+      if (generated_ends_with_sequence(result.generated_tokens, stop_sequence)) {
+        should_stop = true;
+        trim_count = std::max(trim_count, stop_sequence.size());
+      }
+    }
+    profiling.stop_checks_ms += elapsed_ms(stop_checks_start);
+    if (should_stop) {
+      if (trim_count > 0 && trim_count <= result.generated_tokens.size()) {
+        result.generated_tokens.resize(result.generated_tokens.size() - trim_count);
+      }
+      break;
+    }
+
+    if (i + 1 >= options.max_new_tokens) {
+      break;
+    }
+
+    int next = 0;
+    if (!backend.run_decode_step(current, position, next, error_message)) {
+      return false;
+    }
+    ++profiling.forward_pass_tokens;
+    current = next;
+    ++position;
+  }
+
+  const auto decode_end = std::chrono::steady_clock::now();
+  result.decode_time_ms = std::chrono::duration<double, std::milli>(decode_end - decode_start).count();
+  result.tokens_per_second =
+    (result.decode_time_ms > 0.0)
+      ? (static_cast<double>(result.generated_tokens.size()) * 1000.0 / result.decode_time_ms)
+      : 0.0;
+  result.forward_pass_tokens = profiling.forward_pass_tokens;
+  result.timing_breakdown.stop_checks_ms = profiling.stop_checks_ms;
+  return true;
+}
+
 bool run_reference_qwen35_inference(
   const ModelProfile & profile,
   const ReferenceInferenceOptions & options,
@@ -97,6 +206,10 @@ bool run_reference_qwen35_inference(
   if (static_cast<int>(options.prompt_tokens.size()) + options.max_new_tokens > options.max_context) {
     error_message = "prompt length + max_new_tokens exceeds max_context.";
     return false;
+  }
+
+  if (options.use_cuda && options.gpu_decode_backend == GpuDecodeBackend::luce) {
+    return run_luce_qwen35_inference(options, result, error_message);
   }
 
   const auto load_start = std::chrono::steady_clock::now();
@@ -253,7 +366,7 @@ bool run_reference_qwen35_inference(
     release_cuda_resources();
     return false;
   }
-  if (!init_runtime_decode_backend(decode_backend, error_message) ||
+  if (!init_runtime_decode_backend(decode_backend, options, error_message) ||
       !reset_runtime_decode_backend(decode_backend, error_message)) {
     release_cuda_resources();
     return false;
