@@ -80,6 +80,14 @@ bool write_profile_json(
   out << "  \"decode_backend\": \"" << json_escape(decode_backend) << "\",\n";
   out << "  \"luce_prefill_mode\": \"" << json_escape(luce_prefill_mode_name(options.luce_prefill_mode)) << "\",\n";
   out << "  \"prompt_tokens\": " << options.prompt_tokens.size() << ",\n";
+  out << "  \"prompt_token_ids\": [";
+  for (std::size_t i = 0; i < options.prompt_tokens.size(); ++i) {
+    if (i > 0) {
+      out << ", ";
+    }
+    out << options.prompt_tokens[i];
+  }
+  out << "],\n";
   out << "  \"generated_tokens\": " << result.generated_tokens.size() << ",\n";
   out << "  \"forward_pass_tokens\": " << result.forward_pass_tokens << ",\n";
   out << "  \"load_time_ms\": " << result.load_time_ms << ",\n";

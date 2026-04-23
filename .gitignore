@@ -2,6 +2,7 @@ build/
 out/
 models/
 benchmarks/
+.venv-hf-parity/
 
 .vscode/
 .idea/

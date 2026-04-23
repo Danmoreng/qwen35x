@@ -264,10 +264,10 @@ Tasks:
 - [x] Add script for throughput benchmarking with CSV output (`scripts/benchmark-inference-seq.ps1`)
 - [ ] Add CI-friendly smoke mode (short token count, fixed seed)
 
-Latest parity status (April 23, 2026):
-- Minimal parity smoke (`scripts/bench/parity_prompts_minimal.txt`, `max_new_tokens=4`, `gpu-f32`): pass `5/5`.
-- Extended parity suite (`scripts/bench/parity_prompts.txt`, `max_new_tokens=4`, `gpu-f32`): pass `12/12`.
-- Post source-move minimal parity (`benchmarks/qwen35x-parity-moved-luce.csv`): pass `5/5`.
+Latest parity status (April 24, 2026):
+- CPU reference vs PyTorch/Transformers external oracle (`scripts/benchmark-transformers-parity.ps1`, minimal prompt suite, `max_new_tokens=4`): pass `5/5` for prompt-token and generated-token parity.
+- Current default GPU path vs CPU reference (`scripts/benchmark-parity.ps1`, minimal prompt suite, `gpu-f32`, Luce `replay`, `max_new_tokens=4`): pass `5/5`.
+- Extended CPU/GPU parity suite (`scripts/bench/parity_prompts.txt`, `max_new_tokens=4`, `gpu-f32`, April 23, 2026): pass `12/12`.
 - Default Luce prefill mode remains `replay`; experimental `batched` mode is not parity-clean yet.
 
 Files:

@@ -19,6 +19,7 @@ Completed:
 - Luce megakernel decode backend integrated into `--infer-gpu` as the default Qwen3.5-0.8B decode path
 - Luce CUDA sources used by the build moved into `src/kernels/cuda/luce_megakernel/` with local correctness fixes and MIT attribution
 - Deterministic CPU/GPU parity harness with minimal and extended prompt suites
+- Optional PyTorch/Transformers parity harness for checking the CPU reference against an external implementation
 
 Current known constraints:
 - Default Luce backend currently supports greedy decode only (`temperature <= 0`)
@@ -26,6 +27,7 @@ Current known constraints:
 - Stop condition checks remain host-side
 - Main Luce inference path currently replays prompt tokens through single-token decode for correctness; batched/specialized prefill is still open
 - Experimental Luce batched prefill is selectable with `--luce-prefill-mode batched`; it is kept off by default until it reaches full CPU parity.
+- The PyTorch/Transformers comparison environment is optional and kept outside the C++ build in `.venv-hf-parity`; it is a correctness oracle, not a performance benchmark.
 
 Latest local benchmark snapshot (Qwen3.5-0.8B, same machine):
 - Historical chat baseline (early April 2026): ~91 tokens/s
@@ -37,6 +39,11 @@ Latest local benchmark snapshot (Qwen3.5-0.8B, same machine):
   - BF16 matvec ON (historical `--infer-gpu` default at the time): `180.76`, `182.03`, `169.35` tokens/s (avg `177.38`)
   - FP32 matvec (`--gpu-f32-matvec`): `116.99`, `117.77`, `117.35` tokens/s (avg `117.37`)
   - Prior main rerun baseline: BF16 avg `166.90` tokens/s
+
+Latest validation snapshot (April 24, 2026):
+- CPU reference vs PyTorch/Transformers external oracle (`scripts/benchmark-transformers-parity.ps1`, minimal prompt suite, `max_new_tokens=4`): pass `5/5` with prompt-token and generated-token parity.
+- Default GPU path vs CPU reference (`scripts/benchmark-parity.ps1`, minimal prompt suite, `gpu-f32`, Luce `replay`, `max_new_tokens=4`): pass `5/5`.
+- Extended CPU/GPU parity baseline from April 23, 2026 remains pass `12/12`.
 
 ## Vision
 
@@ -60,7 +67,8 @@ Core strategy:
 - Compiler: parse model metadata, build static execution plan, prepare packed tensors
 - Runtime: execute prefill/decode and manage caches, dispatch, and memory
 - Keep correctness and speed work separate:
-- CPU reference path is the oracle
+- CPU reference path is the local oracle
+- Periodically validate the CPU reference against an external implementation such as PyTorch/Transformers
 - GPU path must match token-by-token before heavy optimization
 - Optimize measured bottlenecks first:
 - Decode path and cache updates before broad refactors
@@ -114,6 +122,7 @@ Milestone progress:
 
 - Correctness tests:
 - CPU vs GPU token-level parity for fixed prompts
+- CPU reference vs PyTorch/Transformers token-level parity for fixed prompts
 - Deterministic sampling with known seeds
 - Benchmark suite:
 - Decode tokens/sec
@@ -198,7 +207,8 @@ Validation policy for each new size:
 - [ ] Remove token-wise projection/copy overhead in prefill and move to true batched projection execution.
 - [ ] Parameterize kernel/runtime descriptors by model metadata to support `Qwen3.5-0.8B`, `4B`, `9B`, and `27B`.
 - [ ] Add per-model/per-GPU autotune profiles (decode blocks, tile sizes, chunk sizes, graph boundaries).
-- [x] Establish deterministic CPU vs GPU parity harness + fixed prompt suites (`scripts/benchmark-parity.ps1`, minimal + extended prompt sets). Latest baseline (April 23, 2026): minimal `5/5` pass, extended `12/12` pass.
+- [x] Establish deterministic CPU vs GPU parity harness + fixed prompt suites (`scripts/benchmark-parity.ps1`, minimal + extended prompt sets). Latest baseline (April 24, 2026): minimal `5/5` pass on default Luce `replay`; extended `12/12` pass from April 23, 2026.
+- [x] Add optional PyTorch/Transformers parity harness (`scripts/benchmark-transformers-parity.ps1`) to validate tokenizer, prompt formatting, and greedy CPU-reference output against an external implementation. Latest baseline (April 24, 2026): minimal `5/5` pass.
 - [x] Run CPU vs GPU token-parity validation for the Luce default integration and source move.
 - [ ] Run prompt-length sweep benchmarks (short/medium/long) after each major optimization batch.
 - [x] Compare the integrated Luce default decode milestone against prior qwen35x and Luce decode baselines.

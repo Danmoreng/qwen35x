@@ -30,6 +30,7 @@ The goal is not a generic multi-model runtime. The goal is a small, hardware-awa
 - BF16 tensor benchmark path (`--bench-bf16`)
 - Profiling output via `--profile-json` (stage timings + H2D/D2H transfer stats)
 - Optional synchronized CUDA stage timing via `--profile-sync`
+- Optional PyTorch/Transformers parity oracle for checking the local CPU reference against an external implementation
 
 Current GPU sampling constraint:
 - The default Luce backend currently supports greedy decode only (`--temperature 0`) and applies repetition penalty during argmax.
@@ -109,9 +110,11 @@ Quick headline numbers from that historical report:
 - llama.cpp BF16 + FA decode: `222.62 tok/s`
 - qwen35x pre-Luce custom decode: `199.17 tok/s`
 
-Parity status (April 23, 2026):
-- Minimal deterministic parity smoke (`gpu-f32`, `max_new_tokens=4`): `5/5` prompts pass.
-- Extended deterministic parity suite (`gpu-f32`, `max_new_tokens=4`): `12/12` prompts pass.
+Parity status (April 24, 2026):
+- CPU reference vs PyTorch/Transformers external oracle (`max_new_tokens=4`): `5/5` minimal prompts pass for both prompt token IDs and generated token IDs.
+- Default GPU path vs CPU reference (`--infer-gpu`, Luce `replay`, `gpu-f32`, `max_new_tokens=4`): `5/5` minimal prompts pass.
+- Extended deterministic CPU/GPU suite (`gpu-f32`, `max_new_tokens=4`, April 23, 2026): `12/12` prompts pass.
+- The CPU reference remains the primary local oracle for GPU work. `scripts/benchmark-transformers-parity.ps1` cross-checks that oracle against PyTorch/Transformers.
 
 Historical pre-Luce local sequential benchmark command (kept for reference):
 
@@ -166,6 +169,22 @@ Results:
 .\scripts\benchmark-parity.ps1 -PromptsFile scripts\bench\parity_prompts.txt -CsvOut benchmarks\qwen35x-parity-extended.csv
 ```
 
+- Install optional PyTorch/Transformers parity dependencies:
+
+```powershell
+.\scripts\setup-transformers-parity.ps1
+```
+
+The setup script creates `.venv-hf-parity` by default and installs Transformers from source/main, because the current local Qwen3.5 config uses a dev architecture (`qwen3_5`) that may not be available in the latest PyPI release.
+To use an existing Python environment instead, pass `-PythonExe python` to the benchmark wrapper.
+This path is for correctness only; the local validation used the torch fallback implementation, not the optional optimized linear-attention dependencies.
+
+- Compare the CPU reference against Hugging Face Transformers:
+
+```powershell
+.\scripts\benchmark-transformers-parity.ps1 -PromptsFile scripts\bench\parity_prompts_minimal.txt -CsvOut benchmarks\qwen35x-transformers-parity.csv
+```
+
 - Sequential inference benchmark to CSV (minimal schema):
 
 ```powershell
@@ -178,6 +197,7 @@ Results:
 - `src/kernels/cuda/luce_megakernel/`: in-tree MIT-licensed Luce CUDA sources used by the build
 - `configs/`: model profile(s)
 - `scripts/`: build/download/benchmark utilities
+- `scripts/hf/`: optional PyTorch/Transformers comparison tooling
 - `docs/architecture.md`: architecture notes
 - `docs/development_plan.md`: public development plan
 - `third_party/reference/*`: pinned read-only reference submodules

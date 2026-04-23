@@ -4,7 +4,8 @@ The scaffold follows the public project roadmap in `docs/development_plan.md`.
 
 ## Current Runtime Status
 
-- CPU reference path remains the correctness oracle.
+- CPU reference path remains the local correctness oracle for GPU work.
+- Optional PyTorch/Transformers tooling can cross-check the CPU reference against an external implementation.
 - `--infer-gpu` defaults to the in-tree Luce megakernel decode backend for Qwen3.5-0.8B.
 - The legacy CUDA runtime decode backend remains selectable with `--gpu-decode-backend default`.
 - CUDA decode paths use device-resident layer math across hidden/residual/norm/attention/MLP work.
