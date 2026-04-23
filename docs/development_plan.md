@@ -173,3 +173,20 @@ Validation policy for each new size:
 - CPU/GPU token-level parity checks.
 - Long-prompt prefill and decode throughput benchmarks.
 - Regression comparison against the previous model tier before promotion.
+
+## Implementation TODO (Megakernel Adaptation)
+
+- [ ] Extract a reusable Luce decode backend from the current benchmark harness.
+- [ ] Define a runtime-facing decode backend API (`init`, `reset`, `decode_step`, `release`) independent of benchmarking code.
+- [ ] Map current model weights/states into Luce-style packed decode layout at model-load time.
+- [ ] Integrate the reusable decode backend into the main GPU inference loop (replace current decode step path, keep CLI/profile outputs unchanged).
+- [ ] Keep one canonical cache/state layout shared by prefill and decode (no conversion step between phases).
+- [ ] Keep a one-size-fits-all runtime path (no prompt-size gating in execution logic).
+- [ ] Keep Luce prefill code out of runtime integration; implement prefill in our runtime using batched GEMM + flash-style full-attention prefill kernels.
+- [ ] Remove token-wise projection/copy overhead in prefill and move to true batched projection execution.
+- [ ] Parameterize kernel/runtime descriptors by model metadata to support `Qwen3.5-0.8B`, `4B`, `9B`, and `27B`.
+- [ ] Add per-model/per-GPU autotune profiles (decode blocks, tile sizes, chunk sizes, graph boundaries).
+- [x] Establish deterministic CPU vs GPU parity harness + fixed prompt suites (`scripts/benchmark-parity.ps1`, minimal + extended prompt sets). Latest baseline (April 23, 2026): minimal `5/5` pass, extended `12/12` pass.
+- [ ] Run CPU vs GPU token-parity validation on every major step.
+- [ ] Run prompt-length sweep benchmarks (short/medium/long) after each major optimization batch.
+- [ ] Compare every milestone against Luce decode and llama.cpp prefill baselines.
