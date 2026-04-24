@@ -266,9 +266,9 @@ Tasks:
 
 Latest parity status (April 24, 2026):
 - CPU reference vs PyTorch/Transformers external oracle (`scripts/benchmark-transformers-parity.ps1`, minimal prompt suite, `max_new_tokens=4`): pass `5/5` for prompt-token and generated-token parity.
-- Current default GPU path vs CPU reference (`scripts/benchmark-parity.ps1`, minimal prompt suite, `gpu-f32`, Luce `replay`, `max_new_tokens=4`): pass `5/5`.
-- Extended CPU/GPU parity suite (`scripts/bench/parity_prompts.txt`, `max_new_tokens=4`, `gpu-f32`, April 23, 2026): pass `12/12`.
-- Default Luce prefill mode remains `replay`; experimental `batched` mode is not parity-clean yet.
+- Current default GPU path vs CPU reference (`scripts/benchmark-parity.ps1`, minimal prompt suite, `gpu-f32`, Luce `batched`, `max_new_tokens=4`): pass `5/5`.
+- Extended CPU/GPU parity suite (`scripts/bench/parity_prompts.txt`, `max_new_tokens=4`, `gpu-f32`, Luce `batched`, April 24, 2026): pass `12/12`.
+- Default Luce prefill mode is `batched`; `replay` remains available as a fallback.
 
 Files:
 - `scripts/` (new scripts)

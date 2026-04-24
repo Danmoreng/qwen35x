@@ -556,7 +556,7 @@ bool run_prefill_impl(
     state.pf_lm_bmi,
     state.seen_token_mask,
     config.repetition_penalty,
-    config.max_context,
+    kMaxSeqLen,
     nullptr);
 
   if (!check_cuda(cudaGetLastError(), "launch_prefill_bf16", error_message)) {

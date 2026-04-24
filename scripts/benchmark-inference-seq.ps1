@@ -20,6 +20,8 @@ param(
     [int]$TopK = 20,
     [double]$RepeatPenalty = 1.05,
     [int64]$Seed = 123,
+    [ValidateSet("default", "replay", "batched")]
+    [string]$LucePrefillMode = "default",
     [switch]$ProfileSync
 )
 
@@ -58,6 +60,7 @@ function Invoke-BenchmarkRun {
         [Parameter(Mandatory = $true)][int]$TopK,
         [Parameter(Mandatory = $true)][double]$RepeatPenalty,
         [Parameter(Mandatory = $true)][int64]$Seed,
+        [Parameter(Mandatory = $true)][string]$LucePrefillMode,
         [Parameter(Mandatory = $true)][bool]$ProfileSyncEnabled,
         [Parameter(Mandatory = $true)][string]$ProfileJsonPath
     )
@@ -100,6 +103,9 @@ function Invoke-BenchmarkRun {
 
     if ($ProfileSyncEnabled -and $Mode -ne "cpu-reference") {
         $args += @("--profile-sync")
+    }
+    if ($Mode -ne "cpu-reference" -and $LucePrefillMode -ne "default") {
+        $args += @("--luce-prefill-mode", $LucePrefillMode)
     }
 
     Write-Host ("Running mode={0} prompt={1}" -f $Mode, $PromptMode) -ForegroundColor Cyan
@@ -169,6 +175,7 @@ foreach ($mode in $Modes) {
                 -TopK $TopK `
                 -RepeatPenalty $RepeatPenalty `
                 -Seed $Seed `
+                -LucePrefillMode $LucePrefillMode `
                 -ProfileSyncEnabled $ProfileSync.IsPresent `
                 -ProfileJsonPath $warmProfile
             Write-Host ("Warmup completed: mode={0} run={1}/{2}" -f $mode, $warm, $WarmupRuns) -ForegroundColor DarkGray
@@ -196,6 +203,7 @@ foreach ($mode in $Modes) {
                 -TopK $TopK `
                 -RepeatPenalty $RepeatPenalty `
                 -Seed $Seed `
+                -LucePrefillMode $LucePrefillMode `
                 -ProfileSyncEnabled $ProfileSync.IsPresent `
                 -ProfileJsonPath $profilePath
 
@@ -203,6 +211,7 @@ foreach ($mode in $Modes) {
                 timestamp_utc    = [DateTime]::UtcNow.ToString("o")
                 run_label        = $RunLabel
                 mode             = $mode
+                luce_prefill_mode = $LucePrefillMode
                 run_index        = $runIndex
                 prompt_name      = $PromptName
                 prompt_tokens    = [int]$profile.prompt_tokens

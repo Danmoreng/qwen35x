@@ -25,8 +25,8 @@ Current known constraints:
 - Default Luce backend currently supports greedy decode only (`temperature <= 0`)
 - Legacy runtime GPU sampling path currently requires `top_k <= 64` when `temperature > 0`
 - Stop condition checks remain host-side
-- Main Luce inference path currently replays prompt tokens through single-token decode for correctness; batched/specialized prefill is still open
-- Experimental Luce batched prefill is selectable with `--luce-prefill-mode batched`; it is kept off by default until it reaches full CPU parity.
+- Main Luce inference path defaults to batched prefill for prompt processing.
+- Token replay prefill remains selectable with `--luce-prefill-mode replay` as a conservative fallback.
 - The PyTorch/Transformers comparison environment is optional and kept outside the C++ build in `.venv-hf-parity`; it is a correctness oracle, not a performance benchmark.
 
 Latest local benchmark snapshot (Qwen3.5-0.8B, same machine):
@@ -201,13 +201,13 @@ Validation policy for each new size:
 - [x] Keep a one-size-fits-all runtime path (no prompt-size gating in execution logic).
 - [x] Move the Luce CUDA sources used by the build into `src/kernels/cuda/luce_megakernel/` with MIT license attribution.
 - [x] Apply local Luce correctness fixes needed for CPU parity: DeltaNet decode decay, host-side barrier reset, repetition-penalty-aware greedy argmax.
-- [ ] Unify prefill/decode around one canonical cache/state layout without prompt replay or conversion.
-- [ ] Replace correctness-first token replay prefill with batched GEMM + flash-style full-attention prefill kernels.
-  Current status: `--luce-prefill-mode batched` is wired for diagnostics and has sampler/cache-stride fixes, but still has a known token-parity mismatch.
+- [x] Unify the Luce prefill/decode handoff around one canonical cache/state layout without prompt replay or conversion.
+- [x] Replace correctness-first token replay prefill with batched GEMM-based Luce prefill as the default path.
+  Current status: `--luce-prefill-mode batched` is the default after sampler/cache-stride fixes and CPU/GPU parity validation.
 - [ ] Remove token-wise projection/copy overhead in prefill and move to true batched projection execution.
 - [ ] Parameterize kernel/runtime descriptors by model metadata to support `Qwen3.5-0.8B`, `4B`, `9B`, and `27B`.
 - [ ] Add per-model/per-GPU autotune profiles (decode blocks, tile sizes, chunk sizes, graph boundaries).
-- [x] Establish deterministic CPU vs GPU parity harness + fixed prompt suites (`scripts/benchmark-parity.ps1`, minimal + extended prompt sets). Latest baseline (April 24, 2026): minimal `5/5` pass on default Luce `replay`; extended `12/12` pass from April 23, 2026.
+- [x] Establish deterministic CPU vs GPU parity harness + fixed prompt suites (`scripts/benchmark-parity.ps1`, minimal + extended prompt sets). Latest baseline (April 24, 2026): batched Luce prefill passes minimal `5/5` and extended `12/12`.
 - [x] Add optional PyTorch/Transformers parity harness (`scripts/benchmark-transformers-parity.ps1`) to validate tokenizer, prompt formatting, and greedy CPU-reference output against an external implementation. Latest baseline (April 24, 2026): minimal `5/5` pass.
 - [x] Run CPU vs GPU token-parity validation for the Luce default integration and source move.
 - [ ] Run prompt-length sweep benchmarks (short/medium/long) after each major optimization batch.

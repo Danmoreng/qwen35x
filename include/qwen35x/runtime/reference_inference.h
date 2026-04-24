@@ -34,7 +34,7 @@ struct ReferenceInferenceOptions {
   bool use_cuda = false;
   bool use_cuda_matvec_bf16 = false;
   GpuDecodeBackend gpu_decode_backend = GpuDecodeBackend::runtime_default;
-  LucePrefillMode luce_prefill_mode = LucePrefillMode::replay;
+  LucePrefillMode luce_prefill_mode = LucePrefillMode::batched;
   int gpu_decode_blocks = 0;
   bool profile_cuda_sync = false;
   SamplingOptions sampling;
