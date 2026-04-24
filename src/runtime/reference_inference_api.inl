@@ -77,10 +77,18 @@ bool run_luce_qwen35_inference(
   int first_token = 0;
   const auto prefill_start = std::chrono::steady_clock::now();
   if (options.luce_prefill_mode == LucePrefillMode::batched) {
-    if (!backend.run_prefill(options.prompt_tokens, first_token, error_message)) {
+    if (options.prefill_only) {
+      if (!backend.run_prefill_only(options.prompt_tokens, error_message)) {
+        return false;
+      }
+    } else if (!backend.run_prefill(options.prompt_tokens, first_token, error_message)) {
       return false;
     }
   } else {
+    if (options.prefill_only) {
+      error_message = "prefill_only is only supported with Luce batched prefill.";
+      return false;
+    }
     int prefill_position = 0;
     for (const std::int32_t prompt_token : options.prompt_tokens) {
       if (!backend.run_decode_step(prompt_token, prefill_position, first_token, error_message)) {
@@ -97,6 +105,13 @@ bool run_luce_qwen35_inference(
       : 0.0;
 
   result.generated_tokens.clear();
+  if (options.prefill_only) {
+    result.decode_time_ms = 0.0;
+    result.tokens_per_second = 0.0;
+    result.forward_pass_tokens = profiling.forward_pass_tokens;
+    return true;
+  }
+
   result.generated_tokens.reserve(static_cast<std::size_t>(options.max_new_tokens));
 
   int current = first_token;
@@ -168,7 +183,7 @@ bool run_reference_qwen35_inference(
     error_message = "Reference inference requires non-empty prompt token list.";
     return false;
   }
-  if (options.max_new_tokens <= 0) {
+  if (options.max_new_tokens < 0 || (!options.prefill_only && options.max_new_tokens == 0)) {
     error_message = "max_new_tokens must be > 0.";
     return false;
   }
@@ -209,7 +224,9 @@ bool run_reference_qwen35_inference(
     error_message = "max_context must be > 0.";
     return false;
   }
-  if (static_cast<int>(options.prompt_tokens.size()) + options.max_new_tokens > options.max_context) {
+  const int required_context =
+    static_cast<int>(options.prompt_tokens.size()) + (options.prefill_only ? 0 : options.max_new_tokens);
+  if (required_context > options.max_context) {
     error_message = "prompt length + max_new_tokens exceeds max_context.";
     return false;
   }
@@ -410,7 +427,7 @@ bool run_reference_qwen35_inference(
   const auto prefill_start = std::chrono::steady_clock::now();
   for (std::size_t prompt_index = 0; prompt_index < options.prompt_tokens.size(); ++prompt_index) {
     const std::int32_t prompt_token = options.prompt_tokens[prompt_index];
-    const bool compute_next_logits = (prompt_index + 1 == options.prompt_tokens.size());
+    const bool compute_next_logits = !options.prefill_only && (prompt_index + 1 == options.prompt_tokens.size());
     if (!decode_step_with_runtime_backend(
           decode_backend,
           weights,
@@ -439,6 +456,23 @@ bool run_reference_qwen35_inference(
       : 0.0;
 
   result.generated_tokens.clear();
+  if (options.prefill_only) {
+    result.decode_time_ms = 0.0;
+    result.tokens_per_second = 0.0;
+    result.forward_pass_tokens = profiling.forward_pass_tokens;
+    result.timing_breakdown.embedding_ms = profiling.embedding_ms;
+    result.timing_breakdown.attention_ms = profiling.attention_ms;
+    result.timing_breakdown.mlp_ms = profiling.mlp_ms;
+    result.timing_breakdown.logits_ms = profiling.logits_ms;
+    result.timing_breakdown.sampling_ms = profiling.sampling_ms;
+    result.timing_breakdown.stop_checks_ms = profiling.stop_checks_ms;
+    release_cuda_decode_buffers();
+    if (options.use_cuda) {
+      release_cuda_resources();
+    }
+    return true;
+  }
+
   result.generated_tokens.reserve(static_cast<std::size_t>(options.max_new_tokens));
   if (use_cuda_gpu_sampling) {
     const bool defer_stop_checks = stop_token_set.empty() && options.stop_token_sequences.empty();

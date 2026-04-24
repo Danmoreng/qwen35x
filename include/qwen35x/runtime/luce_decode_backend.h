@@ -30,6 +30,9 @@ public:
     const std::vector<std::int32_t> & tokens,
     int & out_first_token,
     std::string & error_message);
+  bool run_prefill_only(
+    const std::vector<std::int32_t> & tokens,
+    std::string & error_message);
   bool run_decode_step(
     int input_token,
     int position,

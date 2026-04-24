@@ -23,7 +23,6 @@ constexpr int FA_Q_SIZE = FA_Q_HEADS * FA_HEAD_DIM;
 constexpr int FA_QPROJ_SIZE = FA_Q_SIZE * 2;
 constexpr int FA_KV_SIZE = FA_KV_HEADS * FA_HEAD_DIM;
 constexpr int FA_ROT_DIM = 64;
-constexpr float FA_ROPE_THETA = 10000000.0f;
 
 constexpr int DN_HEADS = 16;
 constexpr int DN_KEY = 128;
@@ -211,10 +210,181 @@ pf_deltanet_recurrence(
     }
 }
 
+__global__ void pf_deltanet_conv_prepare(
+    const __nv_bfloat16 *qkv_proj, float *qkv_f32,
+    const __nv_bfloat16 *conv_w, float *conv_buf, int S)
+{
+    int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= DN_CONV_CH) return;
+
+    float h0 = conv_buf[ch * DN_CONV_K + 0];
+    float h1 = conv_buf[ch * DN_CONV_K + 1];
+    float h2 = conv_buf[ch * DN_CONV_K + 2];
+    float h3 = conv_buf[ch * DN_CONV_K + 3];
+    const __nv_bfloat16 *cw = conv_w + ch * DN_CONV_K;
+    const float w0 = __bfloat162float(cw[0]);
+    const float w1 = __bfloat162float(cw[1]);
+    const float w2 = __bfloat162float(cw[2]);
+    const float w3 = __bfloat162float(cw[3]);
+
+    for (int t = 0; t < S; ++t) {
+        h0 = h1;
+        h1 = h2;
+        h2 = h3;
+        h3 = __bfloat162float(qkv_proj[t * DN_CONV_CH + ch]);
+        const float co = h0 * w0 + h1 * w1 + h2 * w2 + h3 * w3;
+        qkv_f32[t * DN_CONV_CH + ch] = pf_silu(co);
+    }
+
+    conv_buf[ch * DN_CONV_K + 0] = h0;
+    conv_buf[ch * DN_CONV_K + 1] = h1;
+    conv_buf[ch * DN_CONV_K + 2] = h2;
+    conv_buf[ch * DN_CONV_K + 3] = h3;
+}
+
+__global__ void pf_deltanet_prepare_norm_gate(
+    float *qkv_f32, float *beta_buf, float *alpha_buf,
+    const __nv_bfloat16 *a_log, const __nv_bfloat16 *dt_bias, int S)
+{
+    int idx = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    int lid = threadIdx.x % 32;
+    if (idx >= S * DN_HEADS) return;
+
+    int t = idx / DN_HEADS;
+    int h = idx % DN_HEADS;
+    float *q = qkv_f32 + t * DN_CONV_CH + h * DN_KEY;
+    float *k = qkv_f32 + t * DN_CONV_CH + DN_QK_SIZE + h * DN_KEY;
+
+    float q_sq = 0.0f;
+    float k_sq = 0.0f;
+    for (int i = lid; i < DN_KEY; i += 32) {
+        const float qv = q[i];
+        const float kv = k[i];
+        q_sq += qv * qv;
+        k_sq += kv * kv;
+    }
+    q_sq = pf_warp_sum(q_sq);
+    k_sq = pf_warp_sum(k_sq);
+    const float q_norm = __shfl_sync(0xffffffff, rsqrtf(q_sq + 1e-6f) * (1.0f / 11.313708498984761f), 0);
+    const float k_norm = __shfl_sync(0xffffffff, rsqrtf(k_sq + 1e-6f), 0);
+    for (int i = lid; i < DN_KEY; i += 32) {
+        q[i] *= q_norm;
+        k[i] *= k_norm;
+    }
+
+    if (lid == 0) {
+        const int off = t * DN_HEADS + h;
+        const float beta = beta_buf[off];
+        beta_buf[off] = 1.0f / (1.0f + expf(-beta));
+        const float x = alpha_buf[off] + __bfloat162float(dt_bias[h]);
+        const float sp = (x > 20.0f) ? x : logf(1.0f + expf(x));
+        alpha_buf[off] = expf(-expf(__bfloat162float(a_log[h])) * sp);
+    }
+}
+
+__global__ void __launch_bounds__(128, 4)
+pf_deltanet_recurrence_cols(
+    const float *qkv_f32, const float *beta_buf, const float *alpha_buf,
+    float *state, float *output, int S)
+{
+    int h = blockIdx.x;
+    int col = blockIdx.y * blockDim.y + threadIdx.y;
+    int lid = threadIdx.x;
+    if (h >= DN_HEADS || col >= DN_VAL) return;
+
+    constexpr int RPL = DN_KEY / 32;
+    float sreg[RPL];
+    float *state_col = state + h * DN_KEY * DN_VAL + col * DN_KEY;
+
+#pragma unroll
+    for (int r = 0; r < RPL; ++r) {
+        sreg[r] = state_col[lid + r * 32];
+    }
+
+    for (int t = 0; t < S; ++t) {
+        const float *q = qkv_f32 + t * DN_CONV_CH + h * DN_KEY;
+        const float *k = qkv_f32 + t * DN_CONV_CH + DN_QK_SIZE + h * DN_KEY;
+        const float *v = qkv_f32 + t * DN_CONV_CH + 2 * DN_QK_SIZE + h * DN_VAL;
+        const int gate_off = t * DN_HEADS + h;
+        const float beta = beta_buf[gate_off];
+        const float decay = alpha_buf[gate_off];
+
+        float qreg[RPL];
+        float kreg[RPL];
+        float kv = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPL; ++r) {
+            const int i = lid + r * 32;
+            qreg[r] = q[i];
+            kreg[r] = k[i];
+            kv += sreg[r] * kreg[r];
+        }
+        kv = pf_warp_sum(kv);
+        kv = __shfl_sync(0xffffffff, kv, 0);
+
+        const float delta = (v[col] - decay * kv) * beta;
+        float attn = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPL; ++r) {
+            sreg[r] = decay * sreg[r] + kreg[r] * delta;
+            attn += sreg[r] * qreg[r];
+        }
+        attn = pf_warp_sum(attn);
+        if (lid == 0) {
+            output[t * DN_V_SIZE + h * DN_VAL + col] = attn;
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < RPL; ++r) {
+        state_col[lid + r * 32] = sreg[r];
+    }
+}
+
+__global__ void pf_deltanet_post_norm_gate(
+    const float *input, const __nv_bfloat16 *z_proj,
+    const __nv_bfloat16 *norm_w, __nv_bfloat16 *output, int S)
+{
+    int idx = blockIdx.x;
+    if (idx >= S * DN_HEADS) return;
+    int t = idx / DN_HEADS;
+    int h = idx % DN_HEADS;
+    int tid = threadIdx.x;
+    int wid = tid / 32;
+    int lid = tid % 32;
+    __shared__ float smem[8];
+
+    const float *in = input + t * DN_V_SIZE + h * DN_VAL;
+    const __nv_bfloat16 *z = z_proj + t * DN_V_SIZE + h * DN_VAL;
+    __nv_bfloat16 *out = output + t * DN_V_SIZE + h * DN_VAL;
+
+    float sq = 0.0f;
+    for (int i = tid; i < DN_VAL; i += blockDim.x) {
+        const float v = in[i];
+        sq += v * v;
+    }
+    sq = pf_warp_sum(sq);
+    if (lid == 0) smem[wid] = sq;
+    __syncthreads();
+    if (wid == 0) {
+        float v = (lid < blockDim.x / 32) ? smem[lid] : 0.0f;
+        v = pf_warp_sum(v);
+        if (lid == 0) smem[0] = rsqrtf(v / DN_VAL + RMS_EPS);
+    }
+    __syncthreads();
+    const float rstd = smem[0];
+
+    for (int i = tid; i < DN_VAL; i += blockDim.x) {
+        const float n = in[i] * rstd * __bfloat162float(norm_w[i]);
+        out[i] = __float2bfloat16(n * pf_silu(__bfloat162float(z[i])));
+    }
+}
+
 // ===== QK norm + RoPE + KV cache =====
 __global__ void pf_qk_norm_rope(
     __nv_bfloat16 *q, __nv_bfloat16 *k, const __nv_bfloat16 *v,
     const __nv_bfloat16 *qnw, const __nv_bfloat16 *knw,
+    const float *rope_cos, const float *rope_sin,
     __nv_bfloat16 *k_cache, __nv_bfloat16 *v_cache, int S, int max_seq)
 {
     int idx = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
@@ -228,8 +398,7 @@ __global__ void pf_qk_norm_rope(
         for (int i = lid; i < FA_HEAD_DIM; i += 32) {
             float normed = __bfloat162float(qh[i])*sc*(1.f+__bfloat162float(qnw[i]));
             if (i < FA_ROT_DIM) {
-                float fe=float(2*(i%(FA_ROT_DIM/2)))/FA_ROT_DIM; float freq=float(pos)/powf(FA_ROPE_THETA,fe);
-                float cv=cosf(freq),sv=sinf(freq); int p=(i<FA_ROT_DIM/2)?i+FA_ROT_DIM/2:i-FA_ROT_DIM/2;
+                float cv=rope_cos[pos*FA_ROT_DIM+i],sv=rope_sin[pos*FA_ROT_DIM+i]; int p=(i<FA_ROT_DIM/2)?i+FA_ROT_DIM/2:i-FA_ROT_DIM/2;
                 float pv=__bfloat162float(qh[p])*sc*(1.f+__bfloat162float(qnw[p]));
                 qh[i]=__float2bfloat16((i<FA_ROT_DIM/2)?(normed*cv-pv*sv):(pv*sv+normed*cv));
             } else qh[i]=__float2bfloat16(normed);
@@ -247,8 +416,7 @@ __global__ void pf_qk_norm_rope(
         for (int i = lid; i < FA_HEAD_DIM; i += 32) {
             float normed = __bfloat162float(kh[i])*sc*(1.f+__bfloat162float(knw[i])); float fk;
             if (i < FA_ROT_DIM) {
-                float fe=float(2*(i%(FA_ROT_DIM/2)))/FA_ROT_DIM; float freq=float(pos)/powf(FA_ROPE_THETA,fe);
-                float cv=cosf(freq),sv=sinf(freq); int p=(i<FA_ROT_DIM/2)?i+FA_ROT_DIM/2:i-FA_ROT_DIM/2;
+                float cv=rope_cos[pos*FA_ROT_DIM+i],sv=rope_sin[pos*FA_ROT_DIM+i]; int p=(i<FA_ROT_DIM/2)?i+FA_ROT_DIM/2:i-FA_ROT_DIM/2;
                 float pv=__bfloat162float(kh[p])*sc*(1.f+__bfloat162float(knw[p]));
                 fk=(i<FA_ROT_DIM/2)?(normed*cv-pv*sv):(pv*sv+normed*cv);
             } else fk=normed;
@@ -356,11 +524,14 @@ extern "C" void launch_prefill_bf16(
     __nv_bfloat16 *proj_buf, __nv_bfloat16 *proj_buf2,
     __nv_bfloat16 *attn_buf, __nv_bfloat16 *mlp_buf,
     __nv_bfloat16 *dn_out_buf,
+    float *dn_qkv_f32, float *dn_out_f32,
     float *beta_buf, float *alpha_buf,
     float *final_normed, __nv_bfloat16 *hidden_bf16_out,
     float *lm_bmv, int *lm_bmi,
     float *seen_token_mask, float repetition_penalty,
+    const float *rope_cos, const float *rope_sin,
     int max_seq_len,
+    int compute_logits,
     cudaStream_t stream)
 {
     static cublasHandle_t cublas = nullptr;
@@ -412,13 +583,14 @@ extern "C" void launch_prefill_bf16(
             pf_bf16_matvec<<<S*DN_HEADS, 32, 0, stream>>>(normalized, beta_w, beta_buf, S, HIDDEN, DN_HEADS);
             pf_bf16_matvec<<<S*DN_HEADS, 32, 0, stream>>>(normalized, alpha_w, alpha_buf, S, HIDDEN, DN_HEADS);
 
-            // Standalone recurrence
-            pf_deltanet_recurrence<<<DN_HEADS, 512, 0, stream>>>(
-                proj_buf, proj_buf2, beta_buf, alpha_buf,
-                conv_w, a_log, dt_bias, dn_norm,
-                dn_states + dn_idx*dn_stride,
-                conv_bufs + dn_idx*DN_CONV_CH*DN_CONV_K,
-                dn_out_buf, S);
+            pf_deltanet_conv_prepare<<<(DN_CONV_CH + 255) / 256, 256, 0, stream>>>(
+                proj_buf, dn_qkv_f32, conv_w, conv_bufs + dn_idx*DN_CONV_CH*DN_CONV_K, S);
+            pf_deltanet_prepare_norm_gate<<<(S*DN_HEADS + 15) / 16, 512, 0, stream>>>(
+                dn_qkv_f32, beta_buf, alpha_buf, a_log, dt_bias, S);
+            pf_deltanet_recurrence_cols<<<dim3(DN_HEADS, (DN_VAL + 3) / 4), dim3(32, 4), 0, stream>>>(
+                dn_qkv_f32, beta_buf, alpha_buf, dn_states + dn_idx*dn_stride, dn_out_f32, S);
+            pf_deltanet_post_norm_gate<<<S*DN_HEADS, 256, 0, stream>>>(
+                dn_out_f32, proj_buf2, dn_norm, dn_out_buf, S);
 
             // Out projection + residual
             cublas_bf16_gemm(cublas, dn_out_buf, out_w, proj_buf, S, HIDDEN, DN_V_SIZE);
@@ -454,6 +626,7 @@ extern "C" void launch_prefill_bf16(
             int total_heads = S*(FA_Q_HEADS+FA_KV_HEADS);
             pf_qk_norm_rope<<<(total_heads+15)/16, 512, 0, stream>>>(
                 proj_buf, proj_buf2, attn_buf, q_nw, k_nw,
+                rope_cos, rope_sin,
                 fa_k_cache + fa_idx*fa_stride, fa_v_cache + fa_idx*fa_stride, S, max_seq_len);
 
             pf_causal_attn<<<(S*FA_Q_HEADS+15)/16, 512, 0, stream>>>(
@@ -473,6 +646,10 @@ extern "C" void launch_prefill_bf16(
 
             fa_idx++;
         }
+    }
+
+    if (!compute_logits) {
+        return;
     }
 
     pf_final_norm<<<1, 512, 0, stream>>>(hidden, final_norm_w, final_normed, hidden_bf16_out, S);

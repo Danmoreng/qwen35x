@@ -37,6 +37,7 @@ struct ReferenceInferenceOptions {
   LucePrefillMode luce_prefill_mode = LucePrefillMode::batched;
   int gpu_decode_blocks = 0;
   bool profile_cuda_sync = false;
+  bool prefill_only = false;
   SamplingOptions sampling;
   std::vector<std::int32_t> stop_token_ids;
   std::vector<std::vector<std::int32_t>> stop_token_sequences;

@@ -7,6 +7,7 @@
 #endif
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <utility>
 
@@ -27,6 +28,7 @@ constexpr int kMaxSeqLen = 2048;
 constexpr int kFaNumQHeads = 8;
 constexpr int kFaNumKvHeads = 2;
 constexpr int kFaHeadDim = 256;
+constexpr int kFaRotDim = 64;
 constexpr int kFaQSize = kFaNumQHeads * kFaHeadDim;
 constexpr int kFaQprojSize = kFaQSize * 2;
 constexpr int kFaKvSize = kFaNumKvHeads * kFaHeadDim;
@@ -100,6 +102,8 @@ extern "C" void launch_prefill_bf16(
   void * attn_buf,
   void * mlp_buf,
   void * dn_out_buf,
+  float * dn_qkv_f32,
+  float * dn_out_f32,
   void * beta_buf,
   void * alpha_buf,
   void * final_normed,
@@ -108,7 +112,10 @@ extern "C" void launch_prefill_bf16(
   void * lm_bmi,
   float * seen_token_mask,
   float repetition_penalty,
+  const float * rope_cos,
+  const float * rope_sin,
   int max_seq_len,
+  int compute_logits,
   cudaStream_t stream);
 
 struct DeviceArena {
@@ -174,12 +181,16 @@ struct BackendState {
   void * pf_attn_buf = nullptr;
   void * pf_mlp_buf = nullptr;
   void * pf_dn_out_buf = nullptr;
+  float * pf_dn_qkv_f32 = nullptr;
+  float * pf_dn_out_f32 = nullptr;
   float * pf_beta_buf = nullptr;
   float * pf_alpha_buf = nullptr;
   void * pf_final_normed = nullptr;
   void * pf_hidden_bf16_out = nullptr;
   float * pf_lm_bmv = nullptr;
   int * pf_lm_bmi = nullptr;
+  float * pf_rope_cos = nullptr;
+  float * pf_rope_sin = nullptr;
 };
 
 bool check_cuda(cudaError_t status, const std::string & label, std::string & error_message) {
@@ -456,6 +467,32 @@ bool initialize_backend_state(
     return false;
   }
 
+  const std::size_t rope_elems = static_cast<std::size_t>(config.max_context) * kFaRotDim;
+  if (!arena.alloc_bytes(rope_elems * sizeof(float), reinterpret_cast<void *&>(state.pf_rope_cos), error_message) ||
+      !arena.alloc_bytes(rope_elems * sizeof(float), reinterpret_cast<void *&>(state.pf_rope_sin), error_message)) {
+    return false;
+  }
+  std::vector<float> host_rope_cos(rope_elems);
+  std::vector<float> host_rope_sin(rope_elems);
+  for (int pos = 0; pos < config.max_context; ++pos) {
+    for (int i = 0; i < kFaRotDim; ++i) {
+      const float exponent = static_cast<float>(2 * (i % (kFaRotDim / 2))) / static_cast<float>(kFaRotDim);
+      const float freq = static_cast<float>(pos) / std::pow(10000000.0f, exponent);
+      host_rope_cos[static_cast<std::size_t>(pos) * kFaRotDim + i] = std::cos(freq);
+      host_rope_sin[static_cast<std::size_t>(pos) * kFaRotDim + i] = std::sin(freq);
+    }
+  }
+  if (!check_cuda(
+        cudaMemcpy(state.pf_rope_cos, host_rope_cos.data(), rope_elems * sizeof(float), cudaMemcpyHostToDevice),
+        "cudaMemcpy(H2D rope_cos)",
+        error_message) ||
+      !check_cuda(
+        cudaMemcpy(state.pf_rope_sin, host_rope_sin.data(), rope_elems * sizeof(float), cudaMemcpyHostToDevice),
+        "cudaMemcpy(H2D rope_sin)",
+        error_message)) {
+    return false;
+  }
+
   const int prefill_s = config.max_context;
   const int mx = std::max({kDnConvChannels, kFaQprojSize, kIntermediateSize});
 
@@ -467,6 +504,8 @@ bool initialize_backend_state(
       !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * std::max(kFaQSize, kFaKvSize) * bf16_bytes, state.pf_attn_buf, error_message) ||
       !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * kIntermediateSize * bf16_bytes, state.pf_mlp_buf, error_message) ||
       !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * kDnVSize * bf16_bytes, state.pf_dn_out_buf, error_message) ||
+      !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * kDnConvChannels * sizeof(float), reinterpret_cast<void *&>(state.pf_dn_qkv_f32), error_message) ||
+      !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * kDnVSize * sizeof(float), reinterpret_cast<void *&>(state.pf_dn_out_f32), error_message) ||
       !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * kDnNumHeads * sizeof(float), reinterpret_cast<void *&>(state.pf_beta_buf), error_message) ||
       !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * kDnNumHeads * sizeof(float), reinterpret_cast<void *&>(state.pf_alpha_buf), error_message) ||
       !arena.alloc_bytes(kHiddenSize * f32_bytes, state.pf_final_normed, error_message) ||
@@ -507,6 +546,7 @@ bool run_prefill_impl(
   const LuceDecodeBackendConfig & config,
   const std::vector<std::int32_t> & tokens,
   int & out_first_token,
+  bool compute_first_token,
   std::string & error_message) {
   if (tokens.empty()) {
     error_message = "Prefill tokens are empty.";
@@ -548,6 +588,8 @@ bool run_prefill_impl(
     state.pf_attn_buf,
     state.pf_mlp_buf,
     state.pf_dn_out_buf,
+    state.pf_dn_qkv_f32,
+    state.pf_dn_out_f32,
     state.pf_beta_buf,
     state.pf_alpha_buf,
     state.pf_final_normed,
@@ -556,11 +598,18 @@ bool run_prefill_impl(
     state.pf_lm_bmi,
     state.seen_token_mask,
     config.repetition_penalty,
+    state.pf_rope_cos,
+    state.pf_rope_sin,
     kMaxSeqLen,
+    compute_first_token ? 1 : 0,
     nullptr);
 
   if (!check_cuda(cudaGetLastError(), "launch_prefill_bf16", error_message)) {
     return false;
+  }
+
+  if (!compute_first_token) {
+    return check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(prefill_only)", error_message);
   }
 
   if (!check_cuda(
@@ -712,7 +761,22 @@ bool LuceDecodeBackend::run_prefill(
     error_message = "Prefill token count exceeds configured max_context.";
     return false;
   }
-  return run_prefill_impl(impl_->state, impl_->config, tokens, out_first_token, error_message);
+  return run_prefill_impl(impl_->state, impl_->config, tokens, out_first_token, true, error_message);
+}
+
+bool LuceDecodeBackend::run_prefill_only(
+  const std::vector<std::int32_t> & tokens,
+  std::string & error_message) {
+  if (!is_initialized()) {
+    error_message = "Luce backend prefill_only requested before initialize.";
+    return false;
+  }
+  if (static_cast<int>(tokens.size()) > impl_->config.max_context) {
+    error_message = "Prefill token count exceeds configured max_context.";
+    return false;
+  }
+  int ignored_first_token = 0;
+  return run_prefill_impl(impl_->state, impl_->config, tokens, ignored_first_token, false, error_message);
 }
 
 bool LuceDecodeBackend::run_decode_step(
@@ -789,6 +853,13 @@ bool LuceDecodeBackend::reset(std::string & error_message) {
 bool LuceDecodeBackend::run_prefill(
   const std::vector<std::int32_t> &,
   int &,
+  std::string & error_message) {
+  error_message = "CUDA is not enabled in this build.";
+  return false;
+}
+
+bool LuceDecodeBackend::run_prefill_only(
+  const std::vector<std::int32_t> &,
   std::string & error_message) {
   error_message = "CUDA is not enabled in this build.";
   return false;

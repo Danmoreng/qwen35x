@@ -22,6 +22,7 @@ param(
     [int64]$Seed = 123,
     [ValidateSet("default", "replay", "batched")]
     [string]$LucePrefillMode = "default",
+    [switch]$PrefillOnly,
     [switch]$ProfileSync
 )
 
@@ -61,6 +62,7 @@ function Invoke-BenchmarkRun {
         [Parameter(Mandatory = $true)][double]$RepeatPenalty,
         [Parameter(Mandatory = $true)][int64]$Seed,
         [Parameter(Mandatory = $true)][string]$LucePrefillMode,
+        [Parameter(Mandatory = $true)][bool]$PrefillOnlyEnabled,
         [Parameter(Mandatory = $true)][bool]$ProfileSyncEnabled,
         [Parameter(Mandatory = $true)][string]$ProfileJsonPath
     )
@@ -103,6 +105,9 @@ function Invoke-BenchmarkRun {
 
     if ($ProfileSyncEnabled -and $Mode -ne "cpu-reference") {
         $args += @("--profile-sync")
+    }
+    if ($PrefillOnlyEnabled) {
+        $args += @("--prefill-only")
     }
     if ($Mode -ne "cpu-reference" -and $LucePrefillMode -ne "default") {
         $args += @("--luce-prefill-mode", $LucePrefillMode)
@@ -176,6 +181,7 @@ foreach ($mode in $Modes) {
                 -RepeatPenalty $RepeatPenalty `
                 -Seed $Seed `
                 -LucePrefillMode $LucePrefillMode `
+                -PrefillOnlyEnabled $PrefillOnly.IsPresent `
                 -ProfileSyncEnabled $ProfileSync.IsPresent `
                 -ProfileJsonPath $warmProfile
             Write-Host ("Warmup completed: mode={0} run={1}/{2}" -f $mode, $warm, $WarmupRuns) -ForegroundColor DarkGray
@@ -204,6 +210,7 @@ foreach ($mode in $Modes) {
                 -RepeatPenalty $RepeatPenalty `
                 -Seed $Seed `
                 -LucePrefillMode $LucePrefillMode `
+                -PrefillOnlyEnabled $PrefillOnly.IsPresent `
                 -ProfileSyncEnabled $ProfileSync.IsPresent `
                 -ProfileJsonPath $profilePath
 
@@ -212,6 +219,7 @@ foreach ($mode in $Modes) {
                 run_label        = $RunLabel
                 mode             = $mode
                 luce_prefill_mode = $LucePrefillMode
+                prefill_only     = [bool]$profile.prefill_only
                 run_index        = $runIndex
                 prompt_name      = $PromptName
                 prompt_tokens    = [int]$profile.prompt_tokens
