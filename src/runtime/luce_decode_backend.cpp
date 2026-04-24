@@ -541,36 +541,15 @@ bool reset_state(const BackendState & state, std::string & error_message) {
          check_cuda(cudaMemset(state.seen_token_mask, 0, seen_bytes), "cudaMemset(seen_token_mask)", error_message);
 }
 
-bool run_prefill_impl(
+void launch_prefill_for_state(
   const BackendState & state,
   const LuceDecodeBackendConfig & config,
-  const std::vector<std::int32_t> & tokens,
-  int & out_first_token,
+  int seq_len,
   bool compute_first_token,
-  std::string & error_message) {
-  if (tokens.empty()) {
-    error_message = "Prefill tokens are empty.";
-    return false;
-  }
-  if (tokens.size() > static_cast<std::size_t>(config.max_context)) {
-    error_message = "Prefill token count exceeds max_context.";
-    return false;
-  }
-
-  if (!check_cuda(
-        cudaMemcpy(
-          state.token_ids,
-          tokens.data(),
-          tokens.size() * sizeof(std::int32_t),
-          cudaMemcpyHostToDevice),
-        "cudaMemcpy(H2D token_ids)",
-        error_message)) {
-    return false;
-  }
-
+  cudaStream_t stream) {
   launch_prefill_bf16(
     state.token_ids,
-    static_cast<int>(tokens.size()),
+    seq_len,
     state.output_token,
     state.embed_weight,
     state.layer_weights,
@@ -602,8 +581,55 @@ bool run_prefill_impl(
     state.pf_rope_sin,
     kMaxSeqLen,
     compute_first_token ? 1 : 0,
-    nullptr);
+    stream);
+}
 
+bool warmup_prefill_backend(BackendState & state, const LuceDecodeBackendConfig & config, std::string & error_message) {
+  if (!check_cuda(
+        cudaMemset(state.token_ids, 0, static_cast<std::size_t>(config.max_context) * sizeof(int)),
+        "cudaMemset(prefill warmup token_ids)",
+        error_message)) {
+    return false;
+  }
+
+  launch_prefill_for_state(state, config, 1, false, nullptr);
+  if (!check_cuda(cudaGetLastError(), "warmup launch_prefill_bf16", error_message) ||
+      !check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(prefill warmup)", error_message)) {
+    return false;
+  }
+
+  return reset_state(state, error_message);
+}
+
+bool run_prefill_impl(
+  BackendState & state,
+  const LuceDecodeBackendConfig & config,
+  const std::vector<std::int32_t> & tokens,
+  int & out_first_token,
+  bool compute_first_token,
+  std::string & error_message) {
+  if (tokens.empty()) {
+    error_message = "Prefill tokens are empty.";
+    return false;
+  }
+  if (tokens.size() > static_cast<std::size_t>(config.max_context)) {
+    error_message = "Prefill token count exceeds max_context.";
+    return false;
+  }
+
+  if (!check_cuda(
+        cudaMemcpy(
+          state.token_ids,
+          tokens.data(),
+          tokens.size() * sizeof(std::int32_t),
+          cudaMemcpyHostToDevice),
+        "cudaMemcpy(H2D token_ids)",
+        error_message)) {
+    return false;
+  }
+
+  const int seq_len = static_cast<int>(tokens.size());
+  launch_prefill_for_state(state, config, seq_len, compute_first_token, nullptr);
   if (!check_cuda(cudaGetLastError(), "launch_prefill_bf16", error_message)) {
     return false;
   }
@@ -734,6 +760,10 @@ bool LuceDecodeBackend::initialize(const LuceDecodeBackendConfig & config, std::
   }
 
   if (!initialize_backend_state(config, impl_->arena, impl_->state, error_message)) {
+    impl_ = std::make_unique<Impl>();
+    return false;
+  }
+  if (!warmup_prefill_backend(impl_->state, config, error_message)) {
     impl_ = std::make_unique<Impl>();
     return false;
   }
