@@ -175,21 +175,50 @@ Benchmark gates:
 Model progression:
 - Start from `Qwen3.5-0.8B`, then adapt to `4B`, `9B`, and `27B`.
 
+Current scaling constraint:
+- The default Luce path is still specialized for `Qwen3.5-0.8B`.
+- Hard-coded model dimensions currently live in `src/runtime/luce_decode_backend.cpp`, `src/kernels/cuda/luce_megakernel/kernel.cu`, and `src/kernels/cuda/luce_megakernel/prefill.cu`.
+- The hard-coded values include layer count, hidden size, intermediate size, vocab size, full-attention head counts, DeltaNet dimensions, layer schedule, and maximum sequence length.
+- The legacy runtime path already uses `ModelProfile`/`RuntimeDims` more broadly and should be used as the descriptor model for generalizing the Luce path.
+
 Adaptation approach:
-1. Parameterize kernel/runtime descriptors
-- Drive dimensions (hidden size, head counts, KV heads, layer count, schedule) from model metadata.
-- Keep model-specific compile-time specializations only where they provide measurable speedups.
+1. Introduce a first-class Luce model descriptor
+- Derive a `Qwen35ModelDescriptor`-style structure from HF `config.json` / `ModelProfile`.
+- Include layers, hidden size, intermediate size, vocab size, full-attention heads/KV heads/head dim, RoPE dim/theta, DeltaNet head/dim settings, conv kernel, and exact layer schedule.
+- Pass this descriptor into `LuceDecodeBackendConfig` instead of relying on Luce-local constants.
+- Validate safetensor shapes against the descriptor before allocating or uploading device weights.
 
-2. Retune per model size
-- Generate per-model tuning profiles (tile sizes, decode blocks, chunk sizes, graph capture boundaries).
-- Store and reuse tuned profiles per GPU class.
+2. Keep a stable cache/state ABI
+- Full-attention cache layout should remain `full_layer_slot x kv_heads x max_seq x head_dim x {K,V}`.
+- Linear-attention state layout should remain `linear_layer_slot x linear_v_heads x key_dim x value_dim`, plus linear conv state.
+- Prefill and decode must share the same cache/state layout so larger models do not need handoff conversion.
 
-3. Enforce layout compatibility
-- Keep cache/state ABI stable across model variants to reuse the same runtime orchestration.
-- Avoid model-specific conversion steps between prefill and decode.
+3. Preserve specialized decode variants
+- Do not make the megakernel fully runtime-dynamic if that sacrifices the optimization value.
+- Compile or generate decode variants keyed by `(model_variant, sm)` where dimensions affect shared memory, register layout, unrolling, or occupancy.
+- Start with the current `0.8B/sm120` variant, then add `4B/sm120`, `9B/sm120`, and `27B/sm120` only after descriptor validation and parity gates pass.
+- Dispatch through the existing compiler/runtime/kernel-registry direction rather than embedding model selection inside ad-hoc launch code.
 
-4. Expand memory strategy for larger models
-- For larger variants, plan for stricter VRAM budgeting, cache paging strategy, and potential multi-GPU/tensor-parallel extensions.
+4. Refactor scaling-sensitive kernel assumptions
+- Replace single-kernel shared-memory assumptions that scale with `max(hidden, intermediate)` before moving to larger hidden/intermediate sizes.
+- Tile the LM head over hidden/vocab dimensions instead of assuming the current hidden size is cheap to stage.
+- Keep fast DeltaNet recurrence kernels specialized for known supported shapes, but fail clearly for unsupported descriptors.
+- Remove static per-process prefill state that assumes only one layer count or one model variant can be loaded.
+
+5. Make prefill descriptor-driven first
+- Prefill should lean on cuBLAS/cuBLASLt GEMM with descriptor-driven `M/N/K` dimensions.
+- Custom prefill kernels should specialize mostly on head dimension, RoPE layout, and DeltaNet state shape.
+- Add flash-style block full-attention prefill before promoting long-context larger-model support.
+- Chunk prefill scratch by prompt length and available VRAM instead of allocating all scratch from `max_context * largest_dim`.
+
+6. Expand memory strategy for larger models
+- Track BF16 weight memory, KV cache memory, recurrent state, prefill scratch, and logits/sampling scratch separately.
+- Larger variants require stricter VRAM budgeting, quantized weight paths, cache paging, and possibly multi-GPU/tensor-parallel extensions.
+- The scheduler should be able to refuse unsupported model/context/device combinations with a precise diagnostic.
+
+7. Retune per model size
+- Generate per-model/per-GPU tuning profiles for decode blocks, block size, LM head tiling, prefill chunk size, cuBLASLt algorithms, and graph capture boundaries.
+- Store and reuse tuned profiles per `(model_variant, sm)` instead of relying on a single global default.
 
 Validation policy for each new size:
 - CPU/GPU token-level parity checks.
@@ -211,8 +240,13 @@ Validation policy for each new size:
 - [x] Remove prompt-replay and token-wise projection/copy overhead in prefill; use batched projection execution with direct state/cache handoff.
 - [x] Warm the Luce prefill backend during initialization and reset state before real inference, keeping one-time cuBLAS/kernel setup out of timed prefill.
 - [ ] Reduce actual prefill kernel launch count and recurrence overhead beyond warmup effects.
-- [ ] Parameterize kernel/runtime descriptors by model metadata to support `Qwen3.5-0.8B`, `4B`, `9B`, and `27B`.
-- [ ] Add per-model/per-GPU autotune profiles (decode blocks, tile sizes, chunk sizes, graph boundaries).
+- [ ] Add a Luce model descriptor derived from `ModelProfile`/HF config and pass it through `LuceDecodeBackendConfig`.
+- [ ] Replace Luce-side 0.8B allocation sizes with descriptor-derived sizes while keeping the current 0.8B kernel as the only enabled compiled variant.
+- [ ] Add descriptor validation and clear unsupported-variant errors for larger models until their kernel variants exist.
+- [ ] Split megakernel compile-time constants into per-variant generated/configured values for `0.8B`, `4B`, `9B`, and `27B`.
+- [ ] Refactor shared-memory and LM-head assumptions that scale with hidden/intermediate size before enabling larger variants.
+- [ ] Add prefill chunking and descriptor-driven GEMM dimensions for larger prompt/model shapes.
+- [ ] Add per-model/per-GPU autotune profiles (decode blocks, block size, LM head tiling, chunk sizes, graph boundaries).
 - [x] Establish deterministic CPU vs GPU parity harness + fixed prompt suites (`scripts/benchmark-parity.ps1`, minimal + extended prompt sets). Latest baseline (April 24, 2026): batched Luce prefill passes minimal `5/5` and extended `12/12`.
 - [x] Add optional PyTorch/Transformers parity harness (`scripts/benchmark-transformers-parity.ps1`) to validate tokenizer, prompt formatting, and greedy CPU-reference output against an external implementation. Latest baseline (April 24, 2026): minimal `5/5` pass.
 - [x] Run CPU vs GPU token-parity validation for the Luce default integration and source move.
