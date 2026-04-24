@@ -1,6 +1,6 @@
-# Benchmark Comparison (2026-04-22)
+# Benchmark Comparison
 
-This document summarizes local benchmark results for Qwen3.5-0.8B on a single Windows CUDA machine.
+This document summarizes local benchmark results for Qwen3.5-0.8B on a single Windows CUDA machine. It started as the April 22 comparison and now includes the April 24 follow-up after batched Luce prefill became the default qwen35x prompt-processing path.
 
 ## Environment
 
@@ -11,9 +11,40 @@ This document summarizes local benchmark results for Qwen3.5-0.8B on a single Wi
 ## Implementations compared
 
 - `qwen35x` custom CUDA-hybrid path
+- `qwen35x` default integrated Luce backend
 - Luce megakernel benchmark harness (`qwen35x_lucebench`)
 - `llama.cpp` BF16 CUDA
 - `llama.cpp` BF16 CUDA with FlashAttention
+
+## 2026-04-24 Follow-up: current default Luce path
+
+Current `qwen35x` uses batched Luce prefill by default and warms the prefill backend during initialization. Timed prefill and decode measurements therefore exclude one-time CUDA/cuBLAS setup; `load_time` includes the warmup.
+
+Source `qwen35x` CSVs:
+
+- `benchmarks/qwen35x-pp256-prefill-only-current-rerun.csv`
+- `benchmarks/qwen35x-tg-prompt1-current-rerun.csv`
+- `benchmarks/qwen35x-full-pp256-gen128-current-ctx384.csv`
+
+Saved `llama.cpp` artifacts reused from the earlier local comparison:
+
+- `benchmarks/llama-bench/qwen3.5-0.8b-bf16-pp256-current.json`
+- `benchmarks/llama-bench/qwen3.5-0.8b-bf16-pp256-fa-current.json`
+- `benchmarks/llama-bench/qwen3.5-0.8b-bf16-tg-current.json`
+- `benchmarks/llama-bench/qwen3.5-0.8b-bf16-tg-fa-current.json`
+
+| Metric | qwen35x | llama.cpp | llama.cpp + FA | qwen35x vs llama.cpp | qwen35x vs llama.cpp + FA |
+|---|---:|---:|---:|---:|---:|
+| `pp256` prefill tok/s | `19,739.13` | `12,597.12` | `13,681.26` | `1.57x` | `1.44x` |
+| `prompt1/gen128` generation tok/s | `300.46` | `140.15` | `142.59` | `2.14x` | `2.11x` |
+
+End-to-end `qwen35x` `pp256/gen128` with `MaxContext=384` measured `18,915.00 tok/s` prefill and `302.38 tok/s` generation. The same `pp256/gen128` shape cannot use `MaxContext=256` in `qwen35x` because the prompt length plus requested new tokens exceeds the context guard, so the direct comparison uses split prefill-only and generation-only runs plus the `MaxContext=384` end-to-end sanity run.
+
+Current takeaways:
+
+1. The current default `qwen35x` Luce path is ahead of the saved `llama.cpp` BF16 CUDA artifacts for both `pp256` prefill and `prompt1/gen128` generation on this machine.
+2. The backend warmup improves measurement hygiene; remaining prefill work should reduce actual kernel work, launch count, and recurrence overhead.
+3. The April 22 results below are historical and describe the pre-batched-prefill custom path.
 
 ## Workload settings
 
@@ -29,10 +60,10 @@ This document summarizes local benchmark results for Qwen3.5-0.8B on a single Wi
 
 Notes:
 
-- `qwen35x` prefill is currently measured from the existing single-token forward loop (not yet a dedicated batched prefill kernel path).
+- Historical April 22 `qwen35x` prefill was measured from the previous single-token forward loop, before the default batched Luce prefill path.
 - `llama.cpp` prefill numbers come from `llama-bench` `n_prompt=256, n_gen=0`.
 
-## Results
+## 2026-04-22 Historical Results
 
 Source CSV:
 
@@ -80,5 +111,5 @@ Head-to-head revalidation showed `256/52` outperforming `512/32` by about `11.75
 
 1. On this machine, Luce decode path is fastest in this comparison set.
 2. `llama.cpp` gains substantially from FlashAttention for decode.
-3. `qwen35x` decode is near `llama.cpp` non-FA decode, but prefill is currently much lower due to lack of a true batched prefill kernel path.
+3. Historical `qwen35x` decode was near `llama.cpp` non-FA decode, but historical prefill was much lower before the true batched Luce prefill path.
 4. Luce tuning is hardware-sensitive; occupancy-safe defaults are not necessarily throughput-optimal.

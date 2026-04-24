@@ -17,6 +17,7 @@ The goal is not a generic multi-model runtime. The goal is a small, hardware-awa
 - Reference generation via `--infer-reference` (CPU) and `--infer-gpu` (CUDA)
 - `--infer-gpu` defaults to the in-tree Luce megakernel decode backend for Qwen3.5-0.8B
 - Legacy CUDA runtime decode backend remains available with `--gpu-decode-backend default`
+- Batched Luce prefill is the default prompt-processing path and warms the prefill backend during initialization
 - Device-resident decode path for per-layer hidden/residual/norm/attention/MLP math in `--infer-gpu`
 - GPU logits + GPU sampling path in the legacy runtime decode backend
 - Device-token decode loop path in the legacy runtime decode backend (sampled token stays on GPU for next-step embedding gather)
@@ -39,6 +40,7 @@ Current GPU sampling constraint:
 Current Luce prefill behavior:
 - `--luce-prefill-mode batched` is the default path.
 - `--luce-prefill-mode replay` remains available as a conservative fallback.
+- The default backend performs a one-token prefill warmup during initialization, then resets recurrent/cache state before real inference. This keeps one-time cuBLAS/kernel setup outside timed prefill and decode paths.
 
 Current decode control behavior:
 - The default Luce path returns the selected token id each step and performs stop checks on the host.
@@ -79,21 +81,33 @@ Current decode control behavior:
 
 ## Performance Snapshot
 
-Latest local integrated Luce benchmark snapshot (April 23, 2026):
+Latest local integrated Luce benchmark snapshot (April 24, 2026, Qwen3.5-0.8B, RTX 5080 Laptop GPU):
 
-Command:
+| Workload | qwen35x avg | Samples | CSV |
+|---|---:|---|---|
+| `pp256` prefill-only | `19,739.13 tok/s` | `20,112.19`, `18,994.76`, `20,110.50` | `benchmarks/qwen35x-pp256-prefill-only-current-rerun.csv` |
+| `prompt1/gen128` generation | `300.46 tok/s` | `317.89`, `312.77`, `270.72` | `benchmarks/qwen35x-tg-prompt1-current-rerun.csv` |
+| `pp256/gen128`, `MaxContext=384`, prefill | `18,915.00 tok/s` | end-to-end run | `benchmarks/qwen35x-full-pp256-gen128-current-ctx384.csv` |
+| `pp256/gen128`, `MaxContext=384`, generation | `302.38 tok/s` | end-to-end run | `benchmarks/qwen35x-full-pp256-gen128-current-ctx384.csv` |
+
+Comparison against saved llama.cpp BF16 CUDA artifacts from the earlier local run:
+
+| Metric | qwen35x | llama.cpp | llama.cpp + FA | qwen35x vs llama.cpp | qwen35x vs llama.cpp + FA |
+|---|---:|---:|---:|---:|---:|
+| `pp256` prefill tok/s | `19,739.13` | `12,597.12` | `13,681.26` | `1.57x` | `1.44x` |
+| `prompt1/gen128` generation tok/s | `300.46` | `140.15` | `142.59` | `2.14x` | `2.11x` |
+
+Commands:
 
 ```powershell
-.\scripts\benchmark-inference-seq.ps1 -Runs 3 -WarmupRuns 1 -MaxNewTokens 128 -MaxContext 256 -CsvOut benchmarks\qwen35x-inference-seq-luce-current.csv -RunLabel luce-current
+$tokens = (1..256 | ForEach-Object { "198" }) -join ","
+.\scripts\benchmark-inference-seq.ps1 -Modes gpu-f32 -PromptMode prompt-tokens -PromptName pp_256_prefill_only_current_rerun -PromptTokensCsv $tokens -Runs 3 -WarmupRuns 1 -MaxNewTokens 0 -MaxContext 256 -PrefillOnly -CsvOut benchmarks\qwen35x-pp256-prefill-only-current-rerun.csv -RunLabel qwen35x-pp256-prefill-only-current-rerun
+.\scripts\benchmark-inference-seq.ps1 -Modes gpu-f32 -PromptMode prompt-tokens -PromptName tg_prompt1_current_rerun -PromptTokensCsv "198" -Runs 3 -WarmupRuns 1 -MaxNewTokens 128 -MaxContext 256 -CsvOut benchmarks\qwen35x-tg-prompt1-current-rerun.csv -RunLabel qwen35x-tg-prompt1-current-rerun
 ```
-
-Results:
-- `gpu-bf16` label: avg `289.43 tok/s` (`289.02` min, `290.15` max)
-- `gpu-f32` label: avg `287.88 tok/s` (`287.43` min, `288.31` max)
 
 With the default Luce backend, the `gpu-bf16`/`gpu-f32` labels are legacy benchmark modes; both exercise the same Luce decode path.
 
-Historical benchmark comparison is documented here:
+Benchmark comparison history is documented here:
 
 - [docs/benchmark-comparison-2026-04-22.md](docs/benchmark-comparison-2026-04-22.md)
 
@@ -104,16 +118,15 @@ It includes:
 - Luce block-size/decode-block tuning results
 - CSV source file references for reproducibility
 
-Quick headline numbers from that historical report:
+Quick headline numbers from the latest comparison update:
 
-- Luce decode: `267.45 tok/s`
-- llama.cpp BF16 + FA decode: `222.62 tok/s`
-- qwen35x pre-Luce custom decode: `199.17 tok/s`
+- Current qwen35x Luce default: `300.46 tok/s` generation and `19,739.13 tok/s` `pp256` prefill
+- llama.cpp BF16 + FA saved run: `142.59 tok/s` generation and `13,681.26 tok/s` `pp256` prefill
+- Historical standalone Luce harness decode: `267.45 tok/s`
 
 Parity status (April 24, 2026):
 - CPU reference vs PyTorch/Transformers external oracle (`max_new_tokens=4`): `5/5` minimal prompts pass for both prompt token IDs and generated token IDs.
-- Default GPU path vs CPU reference (`--infer-gpu`, Luce `replay`, `gpu-f32`, `max_new_tokens=4`): `5/5` minimal prompts pass.
-- Extended deterministic CPU/GPU suite (`gpu-f32`, `max_new_tokens=4`, April 23, 2026): `12/12` prompts pass.
+- Default GPU path vs CPU reference (`--infer-gpu`, Luce batched prefill, `gpu-f32`, `max_new_tokens=4`): `5/5` minimal prompts pass and `12/12` extended prompts pass.
 - The CPU reference remains the primary local oracle for GPU work. `scripts/benchmark-transformers-parity.ps1` cross-checks that oracle against PyTorch/Transformers.
 
 Historical pre-Luce local sequential benchmark command (kept for reference):

@@ -18,6 +18,7 @@ Completed:
 - Streaming full-attention decode kernel with online softmax/value accumulation
 - Luce megakernel decode backend integrated into `--infer-gpu` as the default Qwen3.5-0.8B decode path
 - Luce CUDA sources used by the build moved into `src/kernels/cuda/luce_megakernel/` with local correctness fixes and MIT attribution
+- Batched Luce prefill integrated as the default prompt-processing path, including a backend warmup during initialization to remove one-time CUDA/cuBLAS setup from timed inference
 - Deterministic CPU/GPU parity harness with minimal and extended prompt suites
 - Optional PyTorch/Transformers parity harness for checking the CPU reference against an external implementation
 
@@ -27,14 +28,16 @@ Current known constraints:
 - Stop condition checks remain host-side
 - Main Luce inference path defaults to batched prefill for prompt processing.
 - Token replay prefill remains selectable with `--luce-prefill-mode replay` as a conservative fallback.
+- Luce backend initialization includes a dummy one-token prefill warmup and state reset; benchmark load time includes this warmup.
 - The PyTorch/Transformers comparison environment is optional and kept outside the C++ build in `.venv-hf-parity`; it is a correctness oracle, not a performance benchmark.
 
 Latest local benchmark snapshot (Qwen3.5-0.8B, same machine):
+- Current integrated Luce benchmark (April 24, 2026, `Runs=3`, `WarmupRuns=1`):
+  - `pp256` prefill-only: avg `19,739.13 tok/s` (`20,112.19`, `18,994.76`, `20,110.50` samples), CSV `benchmarks/qwen35x-pp256-prefill-only-current-rerun.csv`
+  - `prompt1/gen128` generation: avg `300.46 tok/s` (`317.89`, `312.77`, `270.72` samples), CSV `benchmarks/qwen35x-tg-prompt1-current-rerun.csv`
+  - End-to-end `pp256/gen128` with `MaxContext=384`: prefill avg `18,915.00 tok/s`, generation avg `302.38 tok/s`, CSV `benchmarks/qwen35x-full-pp256-gen128-current-ctx384.csv`
+  - Saved llama.cpp comparison artifacts from the earlier run: `pp256` prefill `12,597.12 tok/s` without FA and `13,681.26 tok/s` with FA; `gen128` generation `140.15 tok/s` without FA and `142.59 tok/s` with FA.
 - Historical chat baseline (early April 2026): ~91 tokens/s
-- Current integrated Luce sequential chat benchmark (April 23, 2026, `Runs=3`, `WarmupRuns=1`, `MaxNewTokens=128`, `MaxContext=256`):
-  - `gpu-bf16` label: avg `289.43 tok/s` (`289.02` min, `290.15` max)
-  - `gpu-f32` label: avg `287.88 tok/s` (`287.43` min, `288.31` max)
-  - CSV: `benchmarks/qwen35x-inference-seq-luce-current.csv`
 - Historical sequential chat benchmark (April 21, 2026, post streaming full-attention kernel):
   - BF16 matvec ON (historical `--infer-gpu` default at the time): `180.76`, `182.03`, `169.35` tokens/s (avg `177.38`)
   - FP32 matvec (`--gpu-f32-matvec`): `116.99`, `117.77`, `117.35` tokens/s (avg `117.37`)
@@ -42,8 +45,8 @@ Latest local benchmark snapshot (Qwen3.5-0.8B, same machine):
 
 Latest validation snapshot (April 24, 2026):
 - CPU reference vs PyTorch/Transformers external oracle (`scripts/benchmark-transformers-parity.ps1`, minimal prompt suite, `max_new_tokens=4`): pass `5/5` with prompt-token and generated-token parity.
-- Default GPU path vs CPU reference (`scripts/benchmark-parity.ps1`, minimal prompt suite, `gpu-f32`, Luce `replay`, `max_new_tokens=4`): pass `5/5`.
-- Extended CPU/GPU parity baseline from April 23, 2026 remains pass `12/12`.
+- Default GPU path vs CPU reference (`scripts/benchmark-parity.ps1`, minimal prompt suite, `gpu-f32`, Luce batched prefill, `max_new_tokens=4`): pass `5/5`.
+- Extended CPU/GPU parity suite (`gpu-f32`, Luce batched prefill + warmup, `max_new_tokens=4`): pass `12/12`.
 
 ## Vision
 
@@ -134,12 +137,13 @@ Milestone progress:
 ## Current Performance Plan (April 2026 Update)
 
 Primary objective:
-- Reach Luce-level decode throughput and llama.cpp-level prefill throughput on the same hardware class.
+- Maintain Luce-level decode throughput and current llama.cpp-leading `pp256` prefill throughput on the same hardware class.
 
 Technical direction:
 - Use Luce-style decode as the baseline runtime architecture.
 - Improve prefill inside the same engine, using llama.cpp-inspired methods (large batched GEMM + flash-style attention), without splitting into two incompatible runtime stacks.
 - Keep one canonical cache/state layout so prefill can hand off directly to decode without conversion or reorder steps.
+- Treat the current initialization warmup as a measurement hygiene improvement, not a substitute for reducing actual prefill kernel work.
 
 Execution phases:
 1. Stabilize runtime baseline
@@ -152,10 +156,10 @@ Execution phases:
 - Keep sampling fully device-resident and remove avoidable host-side sync points.
 
 3. Prefill optimization track (llama.cpp target)
-- Replace token-by-token prefill projections with true batched GEMM paths for QKV and MLP projections.
+- Batched GEMM-based prefill is now the default path for QKV/MLP projections and cache/state handoff.
 - Add specialized full-attention prefill kernels with flash-style block processing.
-- Add chunked linear-attention prefill with sequence-level kernels instead of per-token micro-dispatch.
-- Minimize copy traffic and kernel launch count in prefill (eliminate token-wise buffer shuffles).
+- Continue reducing linear-attention recurrence overhead and prefill kernel launch count.
+- Minimize copy traffic and avoid any prompt replay or prefill/decode state conversion.
 
 4. Unified scheduler and fallback policy
 - Use one scheduler that chooses optimized paths by workload shape (prompt length, batch shape, model size, GPU profile).
@@ -203,12 +207,14 @@ Validation policy for each new size:
 - [x] Apply local Luce correctness fixes needed for CPU parity: DeltaNet decode decay, host-side barrier reset, repetition-penalty-aware greedy argmax.
 - [x] Unify the Luce prefill/decode handoff around one canonical cache/state layout without prompt replay or conversion.
 - [x] Replace correctness-first token replay prefill with batched GEMM-based Luce prefill as the default path.
-  Current status: `--luce-prefill-mode batched` is the default after sampler/cache-stride fixes and CPU/GPU parity validation.
-- [ ] Remove token-wise projection/copy overhead in prefill and move to true batched projection execution.
+  Current status: `--luce-prefill-mode batched` is the default after sampler/cache-stride fixes, batched recurrence work, and CPU/GPU parity validation.
+- [x] Remove prompt-replay and token-wise projection/copy overhead in prefill; use batched projection execution with direct state/cache handoff.
+- [x] Warm the Luce prefill backend during initialization and reset state before real inference, keeping one-time cuBLAS/kernel setup out of timed prefill.
+- [ ] Reduce actual prefill kernel launch count and recurrence overhead beyond warmup effects.
 - [ ] Parameterize kernel/runtime descriptors by model metadata to support `Qwen3.5-0.8B`, `4B`, `9B`, and `27B`.
 - [ ] Add per-model/per-GPU autotune profiles (decode blocks, tile sizes, chunk sizes, graph boundaries).
 - [x] Establish deterministic CPU vs GPU parity harness + fixed prompt suites (`scripts/benchmark-parity.ps1`, minimal + extended prompt sets). Latest baseline (April 24, 2026): batched Luce prefill passes minimal `5/5` and extended `12/12`.
 - [x] Add optional PyTorch/Transformers parity harness (`scripts/benchmark-transformers-parity.ps1`) to validate tokenizer, prompt formatting, and greedy CPU-reference output against an external implementation. Latest baseline (April 24, 2026): minimal `5/5` pass.
 - [x] Run CPU vs GPU token-parity validation for the Luce default integration and source move.
 - [ ] Run prompt-length sweep benchmarks (short/medium/long) after each major optimization batch.
-- [x] Compare the integrated Luce default decode milestone against prior qwen35x and Luce decode baselines.
+- [x] Compare the integrated Luce default decode/prefill milestone against prior qwen35x, Luce harness, and saved llama.cpp benchmark artifacts.
