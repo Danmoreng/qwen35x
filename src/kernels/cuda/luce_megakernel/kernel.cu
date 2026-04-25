@@ -15,6 +15,8 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <cfloat>
+
 // =============================================================================
 // Model constants
 // =============================================================================
@@ -47,8 +49,6 @@ constexpr int DN_QK_SIZE = DN_NUM_HEADS * DN_KEY_DIM;
 constexpr int DN_V_SIZE = DN_NUM_HEADS * DN_VALUE_DIM;
 constexpr int DN_CONV_CHANNELS = DN_QK_SIZE + DN_QK_SIZE + DN_V_SIZE;
 
-constexpr int MAX_ACT_DIM = (HIDDEN_SIZE > INTERMEDIATE_SIZE) ? HIDDEN_SIZE : INTERMEDIATE_SIZE;
-
 #ifndef NUM_BLOCKS
 #define NUM_BLOCKS 82
 #endif
@@ -57,6 +57,10 @@ constexpr int MAX_ACT_DIM = (HIDDEN_SIZE > INTERMEDIATE_SIZE) ? HIDDEN_SIZE : IN
 #endif
 
 constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
+constexpr int ATTENTION_WARP_SCRATCH = NUM_WARPS * FA_HEAD_DIM;
+constexpr int BASE_MAX_ACT_DIM = (HIDDEN_SIZE > INTERMEDIATE_SIZE) ? HIDDEN_SIZE : INTERMEDIATE_SIZE;
+constexpr int MAX_ACT_DIM = (BASE_MAX_ACT_DIM > ATTENTION_WARP_SCRATCH) ? BASE_MAX_ACT_DIM : ATTENTION_WARP_SCRATCH;
+constexpr int MAX_DECODE_BLOCKS = 1024;
 
 #ifndef LM_NUM_BLOCKS
 #define LM_NUM_BLOCKS 512
@@ -152,6 +156,12 @@ struct AtomicGridSync {
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2)
         val += __shfl_down_sync(0xffffffff, val, offset);
+    return val;
+}
+
+__device__ __forceinline__ float warp_reduce_max(float val) {
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2)
+        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
     return val;
 }
 
@@ -433,6 +443,7 @@ __device__ void full_attention_layer(
     float *__restrict__ g_q,                  // [FA_QPROJ_SIZE] f32
     float *__restrict__ g_kv,                 // [FA_KV_SIZE*2] f32
     float *__restrict__ g_attn_out,           // [FA_Q_SIZE] f32
+    float *__restrict__ g_attn_partials,      // [gridDim.x * (2 + FA_HEAD_DIM)] f32
     float *__restrict__ g_mlp_inter,          // [INTER] f32
     __nv_bfloat16 *__restrict__ hidden_out,   // [HIDDEN] bf16
     int position, int max_seq_len,
@@ -507,55 +518,159 @@ __device__ void full_attention_layer(
     {
         int cache_len = position + 1;
         float attn_scale = 1.0f / sqrtf(float(FA_HEAD_DIM));
-        int hpb = (FA_NUM_Q_HEADS + num_blocks - 1) / num_blocks;
-        int hs = block_id * hpb, he = min(hs + hpb, FA_NUM_Q_HEADS);
         __shared__ float s_max_score[NUM_WARPS];
         __shared__ float s_sum_exp[NUM_WARPS];
+        float *s_warp_out = reinterpret_cast<float *>(shmem);
         constexpr int EPL = FA_HEAD_DIM / WARP_SIZE;
 
-        for (int qh = hs; qh < he; qh++) {
-            int kvh = qh / FA_GQA_RATIO;
-            float *q_head = g_q + qh * FA_HEAD_DIM * 2;
-            float *out_head = g_attn_out + qh * FA_HEAD_DIM;
-            float max_score = -INFINITY, sum_exp = 0;
-            float out_acc[EPL], q_local[EPL];
-            for (int e = 0; e < EPL; e++) { out_acc[e] = 0; q_local[e] = q_head[lane_id*EPL+e]; }
+        const int segments_per_head = num_blocks / FA_NUM_Q_HEADS;
+        if (segments_per_head >= 2 && g_attn_partials != nullptr) {
+            float *partial_max = g_attn_partials;
+            float *partial_sum = partial_max + num_blocks;
+            float *partial_out = partial_sum + num_blocks;
 
-            for (int pos = warp_id; pos < cache_len; pos += NUM_WARPS) {
-                const __nv_bfloat16 *k_pos = k_cache + kvh*max_seq_len*FA_HEAD_DIM + pos*FA_HEAD_DIM;
-                const __nv_bfloat16 *v_pos = v_cache + kvh*max_seq_len*FA_HEAD_DIM + pos*FA_HEAD_DIM;
-                float score = 0;
-                for (int e = 0; e < EPL; e++) score += q_local[e] * __bfloat162float(__ldg(k_pos + lane_id*EPL+e));
-                score = warp_reduce_sum(score) * attn_scale;
-                score = __shfl_sync(0xffffffff, score, 0);
-                float old_max = max_score; max_score = fmaxf(max_score, score);
-                float exp_diff = fast_exp(old_max - max_score);
-                sum_exp = sum_exp * exp_diff + fast_exp(score - max_score);
-                float wt = fast_exp(score - max_score);
-                for (int e = 0; e < EPL; e++)
-                    out_acc[e] = out_acc[e]*exp_diff + wt*__bfloat162float(__ldg(v_pos + lane_id*EPL+e));
-            }
-            if (lane_id == 0) { s_max_score[warp_id] = max_score; s_sum_exp[warp_id] = sum_exp; }
-            for (int e = 0; e < EPL; e++) g_activations[warp_id*FA_HEAD_DIM + lane_id*EPL+e] = out_acc[e];
-            __syncthreads();
+            const int active_blocks = segments_per_head * FA_NUM_Q_HEADS;
+            if (block_id < active_blocks) {
+                const int qh = block_id % FA_NUM_Q_HEADS;
+                const int segment_idx = block_id / FA_NUM_Q_HEADS;
+                const int kvh = qh / FA_GQA_RATIO;
+                const int segment_size = (cache_len + segments_per_head - 1) / segments_per_head;
+                const int segment_start = segment_idx * segment_size;
+                const int segment_end = min(cache_len, segment_start + segment_size);
 
-            if (warp_id == 0) {
-                float gm = -INFINITY; for (int ww = 0; ww < NUM_WARPS; ww++) if (s_max_score[ww] > -INFINITY) gm = fmaxf(gm, s_max_score[ww]);
-                float ts = 0; float fo[EPL]; for (int e = 0; e < EPL; e++) fo[e] = 0;
-                for (int ww = 0; ww < NUM_WARPS; ww++) {
-                    if (s_max_score[ww] > -INFINITY) {
-                        float s = fast_exp(s_max_score[ww]-gm); ts += s_sum_exp[ww]*s;
-                        for (int e = 0; e < EPL; e++) fo[e] += g_activations[ww*FA_HEAD_DIM+lane_id*EPL+e]*s;
+                float *q_head = g_q + qh * FA_HEAD_DIM * 2;
+                float max_score = -FLT_MAX;
+                float sum_exp = 0.0f;
+                float out_acc[EPL], q_local[EPL];
+                for (int e = 0; e < EPL; e++) { out_acc[e] = 0.0f; q_local[e] = q_head[lane_id*EPL+e]; }
+
+                for (int pos = segment_start + warp_id; pos < segment_end; pos += NUM_WARPS) {
+                    const __nv_bfloat16 *k_pos = k_cache + kvh*max_seq_len*FA_HEAD_DIM + pos*FA_HEAD_DIM;
+                    const __nv_bfloat16 *v_pos = v_cache + kvh*max_seq_len*FA_HEAD_DIM + pos*FA_HEAD_DIM;
+                    float score = 0.0f;
+                    for (int e = 0; e < EPL; e++) score += q_local[e] * __bfloat162float(__ldg(k_pos + lane_id*EPL+e));
+                    score = warp_reduce_sum(score) * attn_scale;
+                    score = __shfl_sync(0xffffffff, score, 0);
+                    float old_max = max_score; max_score = fmaxf(max_score, score);
+                    float exp_diff = fast_exp(old_max - max_score);
+                    sum_exp = sum_exp * exp_diff + fast_exp(score - max_score);
+                    float wt = fast_exp(score - max_score);
+                    for (int e = 0; e < EPL; e++)
+                        out_acc[e] = out_acc[e]*exp_diff + wt*__bfloat162float(__ldg(v_pos + lane_id*EPL+e));
+                }
+                if (lane_id == 0) { s_max_score[warp_id] = max_score; s_sum_exp[warp_id] = sum_exp; }
+                for (int e = 0; e < EPL; e++) s_warp_out[warp_id*FA_HEAD_DIM + lane_id*EPL+e] = out_acc[e];
+                __syncthreads();
+
+                if (warp_id == 0) {
+                    float gm = -FLT_MAX;
+                    for (int ww = 0; ww < NUM_WARPS; ww++) {
+                        if (s_sum_exp[ww] > 0.0f) gm = fmaxf(gm, s_max_score[ww]);
+                    }
+                    float ts = 0.0f; float fo[EPL]; for (int e = 0; e < EPL; e++) fo[e] = 0.0f;
+                    for (int ww = 0; ww < NUM_WARPS; ww++) {
+                        if (s_sum_exp[ww] > 0.0f) {
+                            float s = fast_exp(s_max_score[ww] - gm); ts += s_sum_exp[ww] * s;
+                            for (int e = 0; e < EPL; e++) fo[e] += s_warp_out[ww*FA_HEAD_DIM+lane_id*EPL+e] * s;
+                        }
+                    }
+                    if (lane_id == 0) {
+                        partial_max[block_id] = gm;
+                        partial_sum[block_id] = ts;
+                    }
+                    for (int e = 0; e < EPL; e++) {
+                        partial_out[block_id*FA_HEAD_DIM + lane_id*EPL+e] = fo[e];
                     }
                 }
+            }
+            grid.sync();
+
+            if (block_id < FA_NUM_Q_HEADS) {
+                const int qh = block_id;
+                float *q_head = g_q + qh * FA_HEAD_DIM * 2;
+                float *out_head = g_attn_out + qh * FA_HEAD_DIM;
+                if (threadIdx.x == 0) {
+                    float gm = -FLT_MAX;
+                    for (int seg = 0; seg < segments_per_head; ++seg) {
+                        const int partial_block = seg * FA_NUM_Q_HEADS + qh;
+                        if (partial_sum[partial_block] > 0.0f) {
+                            gm = fmaxf(gm, partial_max[partial_block]);
+                        }
+                    }
+                    float ts = 0.0f;
+                    for (int seg = 0; seg < segments_per_head; ++seg) {
+                        const int partial_block = seg * FA_NUM_Q_HEADS + qh;
+                        if (partial_sum[partial_block] > 0.0f) {
+                            ts += partial_sum[partial_block] * fast_exp(partial_max[partial_block] - gm);
+                        }
+                    }
+                    s_max_score[0] = gm;
+                    s_sum_exp[0] = ts;
+                }
+                __syncthreads();
+
+                const float gm = s_max_score[0];
+                const float rcp = (s_sum_exp[0] > 0.0f) ? (1.0f / s_sum_exp[0]) : 0.0f;
                 float *gate_ptr = q_head + FA_HEAD_DIM;
-                float rcp = 1.0f / ts;
-                for (int e = 0; e < EPL; e++) {
-                    int idx = lane_id*EPL+e;
-                    out_head[idx] = fo[e]*rcp * fast_sigmoid(gate_ptr[idx]);
+                for (int d = threadIdx.x; d < FA_HEAD_DIM; d += BLOCK_SIZE) {
+                    float value = 0.0f;
+                    for (int seg = 0; seg < segments_per_head; ++seg) {
+                        const int partial_block = seg * FA_NUM_Q_HEADS + qh;
+                        if (partial_sum[partial_block] > 0.0f) {
+                            value += partial_out[partial_block*FA_HEAD_DIM + d] * fast_exp(partial_max[partial_block] - gm);
+                        }
+                    }
+                    out_head[d] = value * rcp * fast_sigmoid(gate_ptr[d]);
                 }
             }
-            __syncthreads();
+        } else {
+            int hpb = (FA_NUM_Q_HEADS + num_blocks - 1) / num_blocks;
+            int hs = block_id * hpb, he = min(hs + hpb, FA_NUM_Q_HEADS);
+
+            for (int qh = hs; qh < he; qh++) {
+                int kvh = qh / FA_GQA_RATIO;
+                float *q_head = g_q + qh * FA_HEAD_DIM * 2;
+                float *out_head = g_attn_out + qh * FA_HEAD_DIM;
+                float max_score = -FLT_MAX, sum_exp = 0.0f;
+                float out_acc[EPL], q_local[EPL];
+                for (int e = 0; e < EPL; e++) { out_acc[e] = 0.0f; q_local[e] = q_head[lane_id*EPL+e]; }
+
+                for (int pos = warp_id; pos < cache_len; pos += NUM_WARPS) {
+                    const __nv_bfloat16 *k_pos = k_cache + kvh*max_seq_len*FA_HEAD_DIM + pos*FA_HEAD_DIM;
+                    const __nv_bfloat16 *v_pos = v_cache + kvh*max_seq_len*FA_HEAD_DIM + pos*FA_HEAD_DIM;
+                    float score = 0.0f;
+                    for (int e = 0; e < EPL; e++) score += q_local[e] * __bfloat162float(__ldg(k_pos + lane_id*EPL+e));
+                    score = warp_reduce_sum(score) * attn_scale;
+                    score = __shfl_sync(0xffffffff, score, 0);
+                    float old_max = max_score; max_score = fmaxf(max_score, score);
+                    float exp_diff = fast_exp(old_max - max_score);
+                    sum_exp = sum_exp * exp_diff + fast_exp(score - max_score);
+                    float wt = fast_exp(score - max_score);
+                    for (int e = 0; e < EPL; e++)
+                        out_acc[e] = out_acc[e]*exp_diff + wt*__bfloat162float(__ldg(v_pos + lane_id*EPL+e));
+                }
+                if (lane_id == 0) { s_max_score[warp_id] = max_score; s_sum_exp[warp_id] = sum_exp; }
+                for (int e = 0; e < EPL; e++) s_warp_out[warp_id*FA_HEAD_DIM + lane_id*EPL+e] = out_acc[e];
+                __syncthreads();
+
+                if (warp_id == 0) {
+                    float gm = -FLT_MAX; for (int ww = 0; ww < NUM_WARPS; ww++) if (s_sum_exp[ww] > 0.0f) gm = fmaxf(gm, s_max_score[ww]);
+                    float ts = 0.0f; float fo[EPL]; for (int e = 0; e < EPL; e++) fo[e] = 0.0f;
+                    for (int ww = 0; ww < NUM_WARPS; ww++) {
+                        if (s_sum_exp[ww] > 0.0f) {
+                            float s = fast_exp(s_max_score[ww]-gm); ts += s_sum_exp[ww]*s;
+                            for (int e = 0; e < EPL; e++) fo[e] += s_warp_out[ww*FA_HEAD_DIM+lane_id*EPL+e]*s;
+                        }
+                    }
+                    float *gate_ptr = q_head + FA_HEAD_DIM;
+                    float rcp = (ts > 0.0f) ? (1.0f / ts) : 0.0f;
+                    for (int e = 0; e < EPL; e++) {
+                        int idx = lane_id*EPL+e;
+                        out_head[idx] = fo[e]*rcp * fast_sigmoid(gate_ptr[idx]);
+                    }
+                }
+                __syncthreads();
+            }
         }
     }
     grid.sync();
@@ -779,7 +894,7 @@ __global__ void lm_head_kernel(
     int rpb = (VOCAB_SIZE + gridDim.x - 1) / gridDim.x;
     int rs = blockIdx.x * rpb, re = min(rs + rpb, VOCAB_SIZE);
 
-    float local_max = -INFINITY; int local_max_idx = -1;
+    float local_max = -FLT_MAX; int local_max_idx = -1;
     for (int m = rs + warp_id; m < re; m += num_warps) {
         const __nv_bfloat16 *w_row = weight + m * HIDDEN_SIZE;
         float sum = 0;
@@ -802,7 +917,7 @@ __global__ void lm_head_kernel(
     if (lane_id == 0) { wm[warp_id] = local_max; wi[warp_id] = local_max_idx; }
     __syncthreads();
     if (warp_id == 0) {
-        float mv = (lane_id < num_warps) ? wm[lane_id] : -INFINITY;
+        float mv = (lane_id < num_warps) ? wm[lane_id] : -FLT_MAX;
         int mi = (lane_id < num_warps) ? wi[lane_id] : -1;
         for (int o = WARP_SIZE/2; o > 0; o /= 2) {
             float ov = __shfl_down_sync(0xffffffff, mv, o);
@@ -816,7 +931,7 @@ __global__ void lm_head_kernel(
     if (blockIdx.x == 0) {
         if (threadIdx.x == 0) { volatile unsigned int *vc = (volatile unsigned int *)sync_counter; while (*vc < (unsigned int)gridDim.x) {} __threadfence(); }
         __syncthreads();
-        int tid = threadIdx.x; float bv = -INFINITY; int bi = -1;
+        int tid = threadIdx.x; float bv = -FLT_MAX; int bi = -1;
         for (int i = tid; i < gridDim.x; i += LM_BLOCK_SIZE) { float v = block_max_vals[i]; if (v > bv) { bv = v; bi = block_max_idxs[i]; } }
         __shared__ float sv[256]; __shared__ int si[256];
         sv[tid] = bv; si[tid] = bi; __syncthreads();
@@ -845,6 +960,7 @@ decode_kernel(
     float *__restrict__ g_qkv_scratch,
     float *__restrict__ g_kv_scratch,
     float *__restrict__ g_attn_out,
+    float *__restrict__ g_attn_partials,
     float *__restrict__ g_mlp_inter,
     float *__restrict__ g_z_scratch,
     float *__restrict__ g_beta_scratch,
@@ -887,7 +1003,7 @@ decode_kernel(
                 fa_k_cache + fa_layer_idx * fa_kv_stride,
                 fa_v_cache + fa_layer_idx * fa_kv_stride,
                 g_residual, g_activations, g_qkv_scratch, g_kv_scratch,
-                g_attn_out, g_mlp_inter, hidden_buffer,
+                g_attn_out, g_attn_partials, g_mlp_inter, hidden_buffer,
                 position, max_seq_len, shmem_bf16);
             fa_layer_idx++;
         }
@@ -925,7 +1041,7 @@ extern "C" void launch_decode(
     void *dn_states, void *conv_bufs,
     void *hidden_buffer, void *g_activations, void *g_residual,
     void *g_qkv_scratch, void *g_kv_scratch, void *g_attn_out,
-    void *g_mlp_inter, void *g_z_scratch, void *g_beta_scratch,
+    void *g_attn_partials, void *g_mlp_inter, void *g_z_scratch, void *g_beta_scratch,
     void *g_alpha_scratch, void *g_normalized,
     unsigned int *barrier_counter, unsigned int *barrier_generation,
     float *block_max_vals, int *block_max_idxs,
@@ -965,6 +1081,7 @@ extern "C" void launch_decode(
     }
 
     if (decode_blocks < 1) decode_blocks = 1;
+    if (decode_blocks > MAX_DECODE_BLOCKS) decode_blocks = MAX_DECODE_BLOCKS;
 
     cudaEvent_t profile_total_start = nullptr;
     cudaEvent_t profile_decode_end = nullptr;
@@ -989,7 +1106,7 @@ extern "C" void launch_decode(
         (__nv_bfloat16 *)hidden_buffer,
         (float *)g_activations, (__nv_bfloat16 *)g_residual,
         (float *)g_qkv_scratch, (float *)g_kv_scratch,
-        (float *)g_attn_out, (float *)g_mlp_inter,
+        (float *)g_attn_out, (float *)g_attn_partials, (float *)g_mlp_inter,
         (float *)g_z_scratch, (float *)g_beta_scratch,
         (float *)g_alpha_scratch, (float *)g_normalized,
         barrier_counter, barrier_generation,

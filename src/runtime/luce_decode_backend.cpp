@@ -39,6 +39,7 @@ constexpr int kDnQkSize = kDnNumHeads * kDnKeyDim;
 constexpr int kDnVSize = kDnNumHeads * kDnValueDim;
 constexpr int kDnConvChannels = kDnQkSize * 2 + kDnVSize;
 constexpr int kDnConvKernel = 4;
+constexpr int kMaxDecodeBlocks = 1024;
 constexpr int kLayerType[kNumLayers] = {
   0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1
 };
@@ -66,6 +67,7 @@ extern "C" void launch_decode(
   void * g_qkv_scratch,
   void * g_kv_scratch,
   void * g_attn_out,
+  void * g_attn_partials,
   void * g_mlp_inter,
   void * g_z_scratch,
   void * g_beta_scratch,
@@ -160,6 +162,7 @@ struct BackendState {
   void * g_qkv_scratch = nullptr;
   void * g_kv_scratch = nullptr;
   void * g_attn_out = nullptr;
+  void * g_attn_partials = nullptr;
   void * g_mlp_inter = nullptr;
   void * g_z_scratch = nullptr;
   void * g_beta_scratch = nullptr;
@@ -450,6 +453,7 @@ bool initialize_backend_state(
       !arena.alloc_bytes(std::max(kFaQprojSize, kDnConvChannels) * f32_bytes, state.g_qkv_scratch, error_message) ||
       !arena.alloc_bytes((kFaKvSize * 2) * f32_bytes, state.g_kv_scratch, error_message) ||
       !arena.alloc_bytes(std::max(kFaQSize, kDnVSize) * f32_bytes, state.g_attn_out, error_message) ||
+      !arena.alloc_bytes(static_cast<std::size_t>(kMaxDecodeBlocks) * (kFaHeadDim + 2) * f32_bytes, state.g_attn_partials, error_message) ||
       !arena.alloc_bytes(kIntermediateSize * f32_bytes, state.g_mlp_inter, error_message) ||
       !arena.alloc_bytes(kDnVSize * f32_bytes, state.g_z_scratch, error_message) ||
       !arena.alloc_bytes(kDnNumHeads * f32_bytes, state.g_beta_scratch, error_message) ||
@@ -747,6 +751,7 @@ bool run_decode_step_impl(
     state.g_qkv_scratch,
     state.g_kv_scratch,
     state.g_attn_out,
+    state.g_attn_partials,
     state.g_mlp_inter,
     state.g_z_scratch,
     state.g_beta_scratch,
