@@ -15,8 +15,6 @@
 
 namespace {
 
-constexpr int kLuceMaxSeqLen = 2048;
-
 struct BenchmarkOptions {
   std::string model_dir = "models/qwen3.5-0.8b";
   std::string prompt_text = "Hello";
@@ -155,8 +153,8 @@ bool parse_args(int argc, char ** argv, BenchmarkOptions & options, std::string 
     error_message = "max-new-tokens must be > 0";
     return false;
   }
-  if (options.max_context <= 0 || options.max_context > kLuceMaxSeqLen) {
-    error_message = "max-context must be in [1, " + std::to_string(kLuceMaxSeqLen) + "]";
+  if (options.max_context <= 0) {
+    error_message = "max-context must be > 0";
     return false;
   }
   if (options.runs <= 0) {

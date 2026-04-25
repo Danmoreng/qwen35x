@@ -24,7 +24,6 @@ constexpr int kNumLayers = 24;
 constexpr int kHiddenSize = 1024;
 constexpr int kIntermediateSize = 3584;
 constexpr int kVocabSize = 248320;
-constexpr int kMaxSeqLen = 2048;
 constexpr int kFaNumQHeads = 8;
 constexpr int kFaNumKvHeads = 2;
 constexpr int kFaHeadDim = 256;
@@ -409,16 +408,17 @@ bool initialize_backend_state(
 
   const std::size_t bf16_bytes = sizeof(std::uint16_t);
   const std::size_t f32_bytes = sizeof(float);
+  const int max_seq_len = config.max_context;
 
   if (!alloc_and_zero(
         arena,
-        static_cast<std::size_t>(n_full_layers) * kFaNumKvHeads * kMaxSeqLen * kFaHeadDim * bf16_bytes,
+        static_cast<std::size_t>(n_full_layers) * kFaNumKvHeads * max_seq_len * kFaHeadDim * bf16_bytes,
         state.fa_k_cache,
         "fa_k_cache",
         error_message) ||
       !alloc_and_zero(
         arena,
-        static_cast<std::size_t>(n_full_layers) * kFaNumKvHeads * kMaxSeqLen * kFaHeadDim * bf16_bytes,
+        static_cast<std::size_t>(n_full_layers) * kFaNumKvHeads * max_seq_len * kFaHeadDim * bf16_bytes,
         state.fa_v_cache,
         "fa_v_cache",
         error_message) ||
@@ -518,7 +518,7 @@ bool initialize_backend_state(
   return true;
 }
 
-bool reset_state(const BackendState & state, std::string & error_message) {
+bool reset_state(const BackendState & state, int max_seq_len, std::string & error_message) {
   int n_full_layers = 0;
   int n_delta_layers = 0;
   for (const int layer_type : kLayerType) {
@@ -529,7 +529,7 @@ bool reset_state(const BackendState & state, std::string & error_message) {
     }
   }
 
-  const std::size_t fa_bytes = static_cast<std::size_t>(n_full_layers) * kFaNumKvHeads * kMaxSeqLen * kFaHeadDim * sizeof(std::uint16_t);
+  const std::size_t fa_bytes = static_cast<std::size_t>(n_full_layers) * kFaNumKvHeads * max_seq_len * kFaHeadDim * sizeof(std::uint16_t);
   const std::size_t dn_bytes = static_cast<std::size_t>(n_delta_layers) * kDnNumHeads * kDnKeyDim * kDnValueDim * sizeof(float);
   const std::size_t conv_bytes = static_cast<std::size_t>(n_delta_layers) * kDnConvChannels * kDnConvKernel * sizeof(float);
   const std::size_t seen_bytes = static_cast<std::size_t>(kVocabSize) * sizeof(float);
@@ -579,7 +579,7 @@ void launch_prefill_for_state(
     config.repetition_penalty,
     state.pf_rope_cos,
     state.pf_rope_sin,
-    kMaxSeqLen,
+    config.max_context,
     compute_first_token ? 1 : 0,
     stream);
 }
@@ -598,7 +598,7 @@ bool warmup_prefill_backend(BackendState & state, const LuceDecodeBackendConfig 
     return false;
   }
 
-  return reset_state(state, error_message);
+  return reset_state(state, config.max_context, error_message);
 }
 
 bool run_prefill_impl(
@@ -659,9 +659,16 @@ bool run_decode_step_impl(
   const BackendState & state,
   int input_token,
   int position,
+  int max_seq_len,
   float repetition_penalty,
   int & out_next_token,
   std::string & error_message) {
+  if (position < 0 || position >= max_seq_len) {
+    error_message = "Decode position " + std::to_string(position) + " exceeds configured max_context " +
+                    std::to_string(max_seq_len) + ".";
+    return false;
+  }
+
   if (repetition_penalty > 1.0f && input_token >= 0 && input_token < kVocabSize) {
     const float seen = 1.0f;
     if (!check_cuda(
@@ -706,7 +713,7 @@ bool run_decode_step_impl(
     state.seen_token_mask,
     repetition_penalty,
     position,
-    kMaxSeqLen,
+    max_seq_len,
     nullptr);
 
   if (!check_cuda(cudaGetLastError(), "launch_decode", error_message)) {
@@ -740,8 +747,8 @@ LuceDecodeBackend::LuceDecodeBackend(LuceDecodeBackend &&) noexcept = default;
 LuceDecodeBackend & LuceDecodeBackend::operator=(LuceDecodeBackend &&) noexcept = default;
 
 bool LuceDecodeBackend::initialize(const LuceDecodeBackendConfig & config, std::string & error_message) {
-  if (config.max_context <= 0 || config.max_context > kMaxSeqLen) {
-    error_message = "max_context must be in [1, " + std::to_string(kMaxSeqLen) + "].";
+  if (config.max_context <= 0) {
+    error_message = "max_context must be > 0.";
     return false;
   }
   if (config.decode_blocks < 0) {
@@ -776,7 +783,7 @@ bool LuceDecodeBackend::reset(std::string & error_message) {
     error_message = "Luce backend reset requested before initialize.";
     return false;
   }
-  return reset_state(impl_->state, error_message);
+  return reset_state(impl_->state, impl_->config.max_context, error_message);
 }
 
 bool LuceDecodeBackend::run_prefill(
@@ -822,6 +829,7 @@ bool LuceDecodeBackend::run_decode_step(
     impl_->state,
     input_token,
     position,
+    impl_->config.max_context,
     impl_->config.repetition_penalty,
     out_next_token,
     error_message);
