@@ -94,55 +94,35 @@ The same binary can run the 4B model:
 
 ## Performance Snapshot
 
-Latest local actual-prompt matrix benchmark (April 25, 2026, RTX 5080 Laptop GPU, `MaxNewTokens=128`):
+Latest local actual-prompt matrix benchmark (April 25, 2026, RTX 5080 Laptop GPU, `MaxNewTokens=128`). Table cells are `prefill tok/s / generation tok/s`.
 
-| Model | Implementation | Ctx | Prefill tok/s | Generation tok/s |
-|---|---|---:|---:|---:|
-| 0.8B | llama.cpp + FA | 256 | 2,273.65 | 242.01 |
-| 0.8B | llama.cpp | 256 | 1,690.94 | 250.39 |
-| 0.8B | qwen35x | 256 | 17,544.39 | 325.97 |
-| 4B | llama.cpp + FA | 256 | 1,683.33 | 48.96 |
-| 4B | llama.cpp | 256 | 1,380.84 | 48.15 |
-| 4B | qwen35x | 256 | 4,660.76 | 61.31 |
-| 0.8B | llama.cpp + FA | 512 | 4,847.56 | 240.64 |
-| 0.8B | llama.cpp | 512 | 3,581.55 | 232.55 |
-| 0.8B | qwen35x | 512 | 21,726.28 | 331.72 |
-| 4B | llama.cpp + FA | 512 | 2,479.89 | 49.40 |
-| 4B | llama.cpp | 512 | 2,094.46 | 48.71 |
-| 4B | qwen35x | 512 | 4,915.72 | 61.24 |
-| 0.8B | llama.cpp + FA | 1024 | 6,907.04 | 236.67 |
-| 0.8B | llama.cpp | 1024 | 5,805.89 | 234.93 |
-| 0.8B | qwen35x | 1024 | 22,783.52 | 312.55 |
-| 4B | llama.cpp + FA | 1024 | 3,045.82 | 47.39 |
-| 4B | llama.cpp | 1024 | 2,805.96 | 48.49 |
-| 4B | qwen35x | 1024 | 4,844.64 | 57.89 |
-| 0.8B | llama.cpp + FA | 2048 | 9,948.61 | 236.13 |
-| 0.8B | llama.cpp | 2048 | 8,272.06 | 233.20 |
-| 0.8B | qwen35x | 2048 | 20,562.67 | 316.40 |
-| 4B | llama.cpp + FA | 2048 | 3,401.26 | 46.45 |
-| 4B | llama.cpp | 2048 | 3,168.92 | 46.84 |
-| 4B | qwen35x | 2048 | 4,716.04 | 58.14 |
-| 0.8B | llama.cpp + FA | 4096 | 11,698.09 | 207.91 |
-| 0.8B | llama.cpp | 4096 | 9,852.25 | 202.25 |
-| 0.8B | qwen35x | 4096 | 18,446.63 | 306.01 |
-| 4B | llama.cpp + FA | 4096 | 3,196.20 | 49.39 |
-| 4B | llama.cpp | 4096 | 2,970.99 | 51.99 |
-| 4B | qwen35x | 4096 | 4,010.30 | 55.24 |
+| Model | Ctx | qwen35x | llama.cpp + FA | llama.cpp |
+|---|---:|---:|---:|---:|
+| 0.8B | 256 | 17,544.39 / 325.97 | 7,758.50 / 244.68 | 3,429.27 / 252.01 |
+| 0.8B | 512 | 21,726.28 / 331.72 | 16,240.52 / 247.80 | 6,868.95 / 225.39 |
+| 0.8B | 1024 | 22,783.52 / 312.55 | 14,456.74 / 243.20 | 9,205.30 / 247.52 |
+| 0.8B | 2048 | 20,562.67 / 316.40 | 14,933.44 / 234.52 | 11,450.36 / 242.46 |
+| 0.8B | 4096 | 18,446.63 / 306.01 | 15,315.75 / 217.94 | 12,615.59 / 222.91 |
+| 4B | 256 | 4,660.76 / 61.31 | 1,942.74 / 52.03 | 1,520.10 / 52.25 |
+| 4B | 512 | 4,915.72 / 61.24 | 2,729.85 / 51.39 | 2,277.65 / 51.43 |
+| 4B | 1024 | 4,844.64 / 57.89 | 3,385.12 / 50.28 | 2,976.50 / 50.77 |
+| 4B | 2048 | 4,716.04 / 58.14 | 3,594.46 / 48.32 | 3,262.50 / 47.97 |
+| 4B | 4096 | 4,010.30 / 55.24 | 3,311.87 / 51.32 | 3,061.02 / 50.03 |
 
-Source: `benchmarks/model-matrix/qwen35x-vs-llama-matrix-summary.csv`. qwen35x uses the sequential inference harness with real prompt files; llama.cpp uses `llama-completion` actual prompt/eval timings. Reproduce with:
+Source: `benchmarks/model-matrix/qwen35x-vs-llama-matrix-summary.csv`. qwen35x uses the sequential inference harness with real prompt files; llama.cpp uses warmed `llama-completion` actual prompt/eval timings. These actual-run prompt-eval timings are not directly equivalent to synthetic `llama-bench pp*` prefill-only timings, especially at small context sizes. Reproduce with:
 
 ```powershell
 .\scripts\benchmark-qwen35x-vs-llama-matrix.ps1
 ```
 
-Latest local long-context Qwen35x CUDA benchmark snapshot (April 25, 2026, Qwen3.5-0.8B, RTX 5080 Laptop GPU):
+Latest local long-context Qwen35x CUDA benchmark snapshot (April 25, 2026, RTX 5080 Laptop GPU):
 
 | Workload | qwen35x | llama.cpp | llama.cpp + FA | CSV |
 |---|---:|---:|---:|---|
 | 0.8B 64k Wikipedia prompt prefill | `8,144.61 tok/s` (`8,030.47 ms`) | `5,369.00 tok/s` (`12,181.78 ms`) | `9,371.15 tok/s` (`6,979.29 ms`) | `benchmarks/qwen35x-0p8b-wiki-ai-64k-gen128-chunked-variant-tile.csv` |
 | 0.8B 64k Wikipedia prompt generation | `198.24 tok/s` (`645.69 ms`) | `139.88 tok/s` (`907.89 ms`) | `165.42 tok/s` (`767.73 ms`) | `benchmarks/qwen35x-0p8b-wiki-ai-64k-gen128-chunked-variant-tile.csv` |
-| 4B 64k Wikipedia prompt prefill | `2,170.42 tok/s` (`30,134.70 ms`) | not rerun | not rerun | `benchmarks/qwen35x-4b-wiki-ai-64k-gen128-chunked-prefill.csv` |
-| 4B 64k Wikipedia prompt generation | `48.29 tok/s` (`2,650.58 ms`) | not rerun | not rerun | `benchmarks/qwen35x-4b-wiki-ai-64k-gen128-chunked-prefill.csv` |
+| 4B 64k Wikipedia prompt prefill | `2,170.42 tok/s` (`30,134.70 ms`) | `1,795.70 tok/s` (`36,422.64 ms`) | `2,894.05 tok/s` (`22,599.51 ms`) | `benchmarks/qwen35x-4b-wiki-ai-64k-gen128-chunked-prefill.csv`, `benchmarks/llama-cli/qwen35x-4b-wiki-ai-64k-gen128.csv` |
+| 4B 64k Wikipedia prompt generation | `48.29 tok/s` (`2,650.58 ms`) | `38.23 tok/s` (`3,322.16 ms`) | `43.87 tok/s` (`2,894.71 ms`) | `benchmarks/qwen35x-4b-wiki-ai-64k-gen128-chunked-prefill.csv`, `benchmarks/llama-cli/qwen35x-4b-wiki-ai-64k-gen128.csv` |
 
 The current Qwen35x long-context prefill path still uses materialized tiled full attention, but its scratch allocation is now chunked for MLP/DeltaNet and uses variant-aware attention query tiling. This keeps the 0.8B 64k prefill path near the previous throughput while allowing the 4B 64k Wikipedia benchmark to complete without the prior VRAM spill collapse. The 0.8B path remains faster than llama.cpp without Flash Attention on 64k prefill, but still trails llama.cpp with Flash Attention.
 

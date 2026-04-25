@@ -24,6 +24,7 @@ param(
     [int]$LlamaBatchSize = 2048,
     [int]$LlamaUBatchSize = 512,
     [int]$LlamaTimeoutSeconds = 1800,
+    [switch]$LlamaNoWarmup,
     [switch]$SkipQwen,
     [switch]$SkipLlama,
     [switch]$SummarizeOnly
@@ -518,20 +519,25 @@ foreach ($model in $models) {
                 $llamaActualOutDir = Join-Path $resolvedOutDir ("llama-{0}-{1}-ctx{2}-actual-gen{3}" -f $safeModel, $flashSuffix, $context, $MaxNewTokens)
                 Remove-Item -LiteralPath $llamaActualCsv -Force -ErrorAction SilentlyContinue
                 Invoke-Checked -Label ("llama.cpp {0} {1} actual generation ctx={2}" -f $model.name, $flashSuffix, $context) -Script {
-                    & $llamaActualBench `
-                        -LlamaExe $resolvedLlamaExe `
-                        -Model $model.llama_gguf `
-                        -PromptFile $promptFile `
-                        -OutputDir $llamaActualOutDir `
-                        -CsvOut $llamaActualCsv `
-                        -RunLabel ("llama-{0}-{1}-ctx{2}-actual-gen{3}" -f $safeModel, $flashSuffix, $context, $MaxNewTokens) `
-                        -FlashAttention $flash `
-                        -MaxContext ($context + $MaxNewTokens) `
-                        -MaxNewTokens $MaxNewTokens `
-                        -GpuLayers $LlamaGpuLayers `
-                        -BatchSize $LlamaBatchSize `
-                        -UBatchSize $LlamaUBatchSize `
-                        -TimeoutSeconds $LlamaTimeoutSeconds
+                    $llamaActualArgs = @{
+                        LlamaExe = $resolvedLlamaExe
+                        Model = $model.llama_gguf
+                        PromptFile = $promptFile
+                        OutputDir = $llamaActualOutDir
+                        CsvOut = $llamaActualCsv
+                        RunLabel = ("llama-{0}-{1}-ctx{2}-actual-gen{3}" -f $safeModel, $flashSuffix, $context, $MaxNewTokens)
+                        FlashAttention = $flash
+                        MaxContext = ($context + $MaxNewTokens)
+                        MaxNewTokens = $MaxNewTokens
+                        GpuLayers = $LlamaGpuLayers
+                        BatchSize = $LlamaBatchSize
+                        UBatchSize = $LlamaUBatchSize
+                        TimeoutSeconds = $LlamaTimeoutSeconds
+                    }
+                    if ($LlamaNoWarmup.IsPresent) {
+                        $llamaActualArgs.NoWarmup = $true
+                    }
+                    & $llamaActualBench @llamaActualArgs
                 }
                 $summaryRows += Import-LlamaActualRows -CsvPath $llamaActualCsv -Model $model.name -ContextTokens $context
             }

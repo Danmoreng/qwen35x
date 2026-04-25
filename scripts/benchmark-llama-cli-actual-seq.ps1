@@ -19,6 +19,7 @@ param(
     [double]$RepeatPenalty = 1.05,
     [int]$Seed = 123,
     [int]$TimeoutSeconds = 1800,
+    [switch]$NoWarmup,
     [switch]$Warmup
 )
 
@@ -102,7 +103,7 @@ function Invoke-LlamaCompletionRun {
         "--perf",
         "--simple-io"
     )
-    if (-not $Warmup.IsPresent) {
+    if ($NoWarmup.IsPresent) {
         $args += "--no-warmup"
     }
 
