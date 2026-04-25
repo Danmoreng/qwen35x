@@ -30,7 +30,7 @@ The scaffold follows the public project roadmap in `docs/development_plan.md`.
   - Input: key `(op, mode, dtype, layout, sm)`
   - Output: callable kernel symbol
   - Responsibility: architecture-specific CUDA fast paths and reference fallbacks
-  - In-tree Qwen35x CUDA kernel sources live under `src/kernels/cuda/qwen35x_megakernel/`
+  - In-tree Qwen35x CUDA kernel sources live directly under `src/kernels/cuda/`
 
 ## Initial scope
 

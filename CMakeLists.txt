@@ -45,8 +45,8 @@ if (CMAKE_CUDA_COMPILER)
     qwen35x_core
     PRIVATE
       src/kernels/cuda/qwen35x_decode_stub.cu
-      src/kernels/cuda/qwen35x_megakernel/kernel.cu
-      src/kernels/cuda/qwen35x_megakernel/prefill.cu
+      src/kernels/cuda/kernel.cu
+      src/kernels/cuda/prefill.cu
       src/runtime/cuda_bench.cu
       src/runtime/cuda_inference.cu
   )

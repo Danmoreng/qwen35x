@@ -230,7 +230,7 @@ This path is for correctness only; the local validation used the torch fallback 
 ## Project Layout
 
 - `src/`, `include/`: engine implementation
-- `src/kernels/cuda/qwen35x_megakernel/`: in-tree MIT-licensed Qwen35x CUDA kernel sources used by the build
+- `src/kernels/cuda/`: in-tree MIT-licensed Qwen35x CUDA kernel sources used by the build
 - `configs/`: model profile(s)
 - `scripts/`: build/download/benchmark utilities
 - `scripts/hf/`: optional PyTorch/Transformers comparison tooling

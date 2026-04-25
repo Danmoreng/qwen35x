@@ -17,7 +17,7 @@ Completed:
 - Packed full-attention projection (`q+gate+k+v`) to reduce full-attention decode matvec launches
 - Streaming full-attention decode kernel with online softmax/value accumulation
 - Qwen35x CUDA backend integrated into `--infer-gpu` as the default Qwen3.5-0.8B decode path
-- Qwen35x CUDA kernel sources used by the build moved into `src/kernels/cuda/qwen35x_megakernel/` with local correctness fixes and MIT attribution
+- Qwen35x CUDA kernel sources used by the build live directly under `src/kernels/cuda/` with local correctness fixes and MIT attribution
 - Batched Qwen35x prefill integrated as the default prompt-processing path, including a backend warmup during initialization to remove one-time CUDA/cuBLAS setup from timed inference
 - Qwen35x prefill/decode phase profiling, including per-layer full-attention QK/softmax/PV/gate timing
 - Long-context full-attention decode split across context blocks
@@ -249,7 +249,7 @@ Model progression:
 
 Current scaling constraint:
 - The default Qwen35x CUDA path is still specialized for `Qwen3.5-0.8B`.
-- Hard-coded model dimensions currently live in `src/runtime/qwen35x_cuda_backend.cpp`, `src/kernels/cuda/qwen35x_megakernel/kernel.cu`, and `src/kernels/cuda/qwen35x_megakernel/prefill.cu`.
+- Hard-coded model dimensions currently live in `src/runtime/qwen35x_cuda_backend.cpp`, `src/kernels/cuda/kernel.cu`, and `src/kernels/cuda/prefill.cu`.
 - The hard-coded values include layer count, hidden size, intermediate size, vocab size, full-attention head counts, DeltaNet dimensions, layer schedule, and maximum sequence length.
 - The legacy runtime path already uses `ModelProfile`/`RuntimeDims` more broadly and should be used as the descriptor model for generalizing the Qwen35x CUDA path.
 
@@ -304,7 +304,7 @@ Validation policy for each new size:
 - [x] Map current model weights/states into Qwen35x CUDA-style packed decode layout at model-load time.
 - [x] Integrate the reusable decode backend into the main GPU inference loop (default for `--infer-gpu`; legacy runtime backend remains selectable).
 - [x] Keep a one-size-fits-all runtime path (no prompt-size gating in execution logic).
-- [x] Move the Qwen35x CUDA kernel sources used by the build into `src/kernels/cuda/qwen35x_megakernel/` with MIT license attribution.
+- [x] Move the Qwen35x CUDA kernel sources used by the build into `src/kernels/cuda/` with MIT license attribution.
 - [x] Apply local Qwen35x CUDA correctness fixes needed for CPU parity: DeltaNet decode decay, host-side barrier reset, repetition-penalty-aware greedy argmax.
 - [x] Unify the Qwen35x prefill/decode handoff around one canonical cache/state layout without prompt replay or conversion.
 - [x] Replace correctness-first token replay prefill with batched GEMM-based Qwen35x prefill as the default path.
