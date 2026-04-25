@@ -14,8 +14,8 @@ Progress snapshot (April 2026):
 - `--infer-gpu` now defaults to the in-tree Qwen35x CUDA backend for Qwen3.5-0.8B.
 - The Qwen35x CUDA backend passes deterministic CPU parity on both minimal and extended prompt suites.
 - Legacy runtime measured transfer footprint is near control-path scale (`~3-4 bytes D2H per forward token`); Qwen35x CUDA backend transfer accounting is currently outside the shared CUDA stats path.
-- Current measured 64k long-context generation benchmark (April 25, 2026, integrated Qwen35x CUDA default): `201.18 tok/s` with effective decode blocks `60/60`.
-- Current open bottlenecks are greedy-only Qwen35x CUDA sampling support, long-context prefill behind llama.cpp Flash Attention, LM-head decode time, and larger-model generalization.
+- Current accepted 64k long-context benchmark (April 25, 2026, integrated Qwen35x CUDA default after reboot): prefill `7,958.17 tok/s`; generation `202.33 tok/s` with effective decode blocks `60/60`.
+- Current active focus is larger-model generalization through descriptor-driven allocation, validation, and variant dispatch. Deferred bottlenecks are greedy-only Qwen35x CUDA sampling support, long-context prefill behind llama.cpp Flash Attention, LM-head decode time, and further decode graph reuse.
 
 Scope:
 - Model family: Qwen3.5 (current profile `qwen3_5_0_8b.profile.json`)

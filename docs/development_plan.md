@@ -133,45 +133,48 @@ Milestone progress:
 - Milestone 5: completed for the Qwen3.5-0.8B default decode path (legacy kernels + integrated Qwen35x kernel backend)
 - Milestones 6-7: in progress
 
-## Immediate Priority: Long-Context Performance First
+## Immediate Priority: Model Generalization
 
-This is the next work item and takes precedence over larger-model generalization and the remaining scaling roadmap.
+This is the next work item. The current Qwen3.5-0.8B CUDA performance is accepted as good enough for now, so larger-model descriptor and variant work should resume before further long-context performance tuning.
 
 Rationale:
-- The 64k actual-prompt benchmark now shows Qwen35x CUDA generation ahead of the saved llama.cpp runs after grouped-GQA decode, while prefill still trails llama.cpp with Flash Attention.
-- The remaining bottlenecks are structural rather than specific to the 0.8B model size: the current materialized full-attention prefill path still spends seconds across QK/softmax/PV at 64k, decode now spends a meaningful share in LM head, prefill beta/alpha projections remain inefficient, and the Qwen35x CUDA path still lacks compatible steady-state decode graph reuse.
-- Generalizing the current kernels to larger Qwen3.5 variants before fixing these issues would mostly generalize a long-context design that already fails the target performance shape.
+- The 64k actual-prompt benchmark after the grouped-GQA decode work is stable enough for the current target: prefill `8,218.60 ms` / `7,958.17 tok/s`; decode `632.65 ms` / `202.33 tok/s`, CSV `benchmarks/qwen35x-wiki-ai-64k-gen128-baseline-after-reboot.csv`.
+- A cuBLAS-streaming flash-style prefill prototype was tested and rejected because it regressed the same 64k run to roughly `4,328 tok/s` prefill and `134.6 tok/s` generation. Future flash-style work should be a real fused/tensor-core attention implementation rather than a tiled cuBLAS wrapper.
+- The remaining performance work is still valuable, but it should no longer block model-size generalization.
 
-Required work before model-size generalization:
-1. Add Qwen35x phase profiling for prefill and decode
-- Capture per-layer and per-phase timings for projection, DeltaNet recurrence, full-attention QKV/cache work, attention scan, MLP, LM head, sampling, synchronization, and host/device transfers.
-- Current status: implemented for Qwen35x prefill/decode and used on both short-context progress gates and 64k actual-prompt runs.
+Active work for model-size generalization:
+1. Add a Qwen35x CUDA model descriptor
+- Derive descriptor values from `ModelProfile` / HF config instead of Qwen35x CUDA-local constants.
+- Include layer count, hidden size, intermediate size, vocab size, attention heads/KV heads/head dim, RoPE dim/theta, DeltaNet dimensions, conv settings, and exact layer schedule.
+- Validate safetensor shapes against the descriptor before allocating or uploading device weights.
 
-2. Fix long-context full-attention prefill
-- Current status: replaced the naive causal full-attention prefill fallback with one tiled cuBLAS-backed path for all prompt lengths, using larger scratch-safe tiles, 512-thread softmax, fast exponentials, and full QK/softmax/PV/gate profiling.
-- Next step: replace the materialized score/probability tiled path with one unified fused/flash-style implementation; do not add prompt-length-specific kernel dispatch.
-- Preserve the existing canonical KV cache layout so prefill still hands off directly to decode.
-- Continue benchmarking against llama.cpp with and without Flash Attention.
+2. Make allocation and validation descriptor-driven
+- Replace hard-coded 0.8B allocation sizes in `src/runtime/qwen35x_cuda_backend.cpp` with descriptor-derived sizes.
+- Keep the current 0.8B compiled kernels as the only enabled fast variant until additional variants have explicit kernels and parity gates.
+- Add precise unsupported-variant errors for model shapes that do not yet have a compiled kernel variant.
 
-3. Fix long-context decode attention
-- Current status: split-context full-attention decode plus grouped-GQA KV sharing is implemented. The 64k generation path improved from `103.31 tok/s` to `201.18 tok/s` on the saved Wikipedia prompt, ahead of the saved llama.cpp runs.
-- Decode-block override and effective block reporting are wired into `scripts/benchmark-inference-seq.ps1`; unsafe low overrides are clamped to one block per DeltaNet head.
-- Next step: optimize LM head and preserve the current decode attention path as the baseline.
-- Keep short-context decode throughput from regressing.
+3. Split compile-time kernel constants into per-variant configuration
+- Start by preserving the existing `0.8B/sm120` kernel behavior exactly.
+- Prepare configured/generated values for `4B`, `9B`, and `27B` only after descriptor validation is in place.
+- Dispatch through the compiler/runtime/kernel-registry direction instead of adding ad-hoc model checks in launch code.
 
-4. Replace inefficient long-prefill recurrent projections
-- Replace per-token/per-head beta and alpha scalar matvec launches with packed GEMM or another batched tensor-core path.
-- Reduce DeltaNet prefill kernel launch count and global-memory traffic.
+4. Keep cache/state ABI stable
+- Full-attention cache layout stays compatible between prefill and decode.
+- Linear-attention recurrent state and conv state stay compatible between prefill and decode.
+- Larger variants must not require handoff conversion between prefill and decode.
 
-5. Add steady-state decode graph reuse where it is compatible with the Qwen35x CUDA path
-- Capture/replay stable decode work when context shape and selected kernels allow it.
-- Keep correctness and stop-condition behavior unchanged.
+Deferred performance backlog:
+- Replace the materialized tiled full-attention prefill path with a real fused/flash-style implementation.
+- Optimize LM head for long-context token generation.
+- Replace prefill beta/alpha scalar matvec launches with packed GEMM or another batched tensor-core path.
+- Add compatible steady-state decode graph reuse for the Qwen35x CUDA path.
+- Reduce prefill kernel launch count and recurrent overhead beyond warmup effects.
 
-Exit criteria for resuming larger-model generalization:
-- 64k actual-prompt prefill and decode are materially closer to llama.cpp on the same hardware.
-- Short-context benchmarks do not regress from the current Qwen35x CUDA advantage.
-- CPU/GPU parity still passes the minimal and extended suites.
-- The optimized kernels are structured as reusable primitives or per-variant specializations so later generalization does not require redoing the same work.
+Exit criteria for the first generalization phase:
+- The current 0.8B path remains behaviorally and performance compatible with the accepted baseline.
+- Unsupported larger variants fail with clear descriptor/variant diagnostics instead of silent shape misuse.
+- Descriptor-derived allocation and shape validation are wired through the Qwen35x CUDA backend.
+- CPU/GPU parity still passes the minimal and extended suites for the enabled 0.8B variant.
 
 ## Validation and Benchmarking Plan
 
@@ -189,7 +192,7 @@ Exit criteria for resuming larger-model generalization:
 ## Current Performance Plan (April 2026 Update)
 
 Primary objective:
-- Maintain current-kernel-level short-context decode throughput and current llama.cpp-leading `pp256` prefill throughput on the same hardware class, while closing the newly identified 64k-context prefill and decode gap versus llama.cpp.
+- Preserve the accepted Qwen3.5-0.8B CUDA performance baseline while making the backend descriptor-driven enough to support larger Qwen3.5 variants.
 
 Technical direction:
 - Use Qwen35x CUDA-style decode as the baseline runtime architecture.
@@ -201,28 +204,34 @@ Execution phases:
 1. Stabilize and instrument runtime baseline
 - Keep persistent, device-resident decode flow as the default path.
 - Preserve deterministic correctness against CPU reference for fixed prompts/seeds.
-- Detailed Qwen35x phase profiling is available and should remain enabled for long-context performance work.
+- Detailed Qwen35x phase profiling is available and should remain enabled for regression checks.
 
-2. Long-context decode optimization track
+2. Model descriptor and variant enablement track
+- Add a Qwen35x CUDA model descriptor derived from `ModelProfile` / HF config.
+- Use descriptor-derived allocation and shape validation in the Qwen35x CUDA backend.
+- Keep the existing 0.8B kernel variant as the only enabled compiled variant until larger variants are explicitly added.
+- Add clear unsupported-variant errors for shapes without a matching compiled kernel.
+
+3. Long-context decode optimization track
 - Split-context/split-K full-attention decode for long contexts has landed.
 - Grouped-GQA decode sharing is implemented, so each KV segment feeds all query heads in its GQA group.
 - Decode occupancy controls are exposed and profiled; current default uses dynamic max-safe blocks with a minimum safety clamp.
-- Optimize LM head, which is now a visible share of long-context decode time.
-- Add compatible CUDA graph reuse for steady-state decode.
+- Deferred: optimize LM head, which is now a visible share of long-context decode time.
+- Deferred: add compatible CUDA graph reuse for steady-state decode.
 - Keep short-prompt decode throughput as a non-regression gate.
 
-3. Long-context prefill optimization track
+4. Long-context prefill optimization track
 - The current full-attention prefill path is a single tiled cuBLAS-backed implementation for all prompt lengths.
-- Replace the materialized score/probability path with one unified fused/flash-style block implementation.
-- Replace beta/alpha per-token scalar matvec launches with packed GEMM or a comparable batched path.
-- Continue reducing linear-attention recurrence overhead and prefill kernel launch count.
+- Deferred: replace the materialized score/probability path with one unified fused/flash-style block implementation.
+- Deferred: replace beta/alpha per-token scalar matvec launches with packed GEMM or a comparable batched path.
+- Deferred: continue reducing linear-attention recurrence overhead and prefill kernel launch count.
 - Minimize copy traffic and avoid any prompt replay or prefill/decode state conversion.
 
-4. Short-context decode optimization track (Qwen35x CUDA target)
+5. Short-context decode optimization track (Qwen35x CUDA target)
 - Prioritize persistent/megakernel-style decode execution and reduce per-token launch overhead.
 - Keep sampling fully device-resident and remove avoidable host-side sync points.
 
-5. Unified scheduler and fallback policy
+6. Unified scheduler and fallback policy
 - Keep the Qwen35x CUDA default path free of prompt-length-specific kernel dispatch; use specialized variants by model/GPU capability only when they preserve the same execution policy.
 - Keep safe fallback paths for short prompts and unsupported configurations.
 
@@ -233,7 +242,7 @@ Benchmark gates:
 
 ## Scaling Plan for Larger Qwen3.5 Models
 
-Scaling work is intentionally paused behind the long-context performance priority above. Descriptor and larger-model work should resume only after the long-context exit criteria are met.
+Scaling work is now the active priority. Long-context performance remains tracked, but it no longer blocks descriptor and larger-model work.
 
 Model progression:
 - Start from `Qwen3.5-0.8B`, then adapt to `4B`, `9B`, and `27B`.
@@ -271,7 +280,7 @@ Adaptation approach:
 5. Make prefill descriptor-driven first
 - Prefill should lean on cuBLAS/cuBLASLt GEMM with descriptor-driven `M/N/K` dimensions.
 - Custom prefill kernels should specialize mostly on head dimension, RoPE layout, and DeltaNet state shape.
-- Replace the current materialized full-attention prefill path with a unified fused/flash-style implementation before promoting long-context larger-model support.
+- Keep the current materialized tiled full-attention prefill path as the accepted baseline for the first descriptor-driven phase; revisit fused/flash-style attention as deferred performance work.
 - Chunk prefill scratch by prompt length and available VRAM instead of allocating all scratch from `max_context * largest_dim`.
 
 6. Expand memory strategy for larger models
