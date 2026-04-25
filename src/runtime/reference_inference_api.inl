@@ -54,6 +54,7 @@ bool run_luce_qwen35_inference(
   config.max_context = options.max_context;
   config.decode_blocks = options.gpu_decode_blocks;
   config.repetition_penalty = options.sampling.repetition_penalty;
+  config.profile_enabled = options.profile_luce;
   if (!backend.initialize(config, error_message)) {
     return false;
   }
@@ -107,6 +108,7 @@ bool run_luce_qwen35_inference(
     result.decode_time_ms = 0.0;
     result.tokens_per_second = 0.0;
     result.forward_pass_tokens = profiling.forward_pass_tokens;
+    result.luce_profile = backend.profile();
     return true;
   }
 
@@ -160,6 +162,7 @@ bool run_luce_qwen35_inference(
       : 0.0;
   result.forward_pass_tokens = profiling.forward_pass_tokens;
   result.timing_breakdown.stop_checks_ms = profiling.stop_checks_ms;
+  result.luce_profile = backend.profile();
   return true;
 }
 

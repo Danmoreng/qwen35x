@@ -7,6 +7,7 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <utility>
@@ -79,6 +80,7 @@ extern "C" void launch_decode(
   float repetition_penalty,
   int position,
   int max_seq_len,
+  LuceDecodeProfile * profile,
   cudaStream_t stream);
 
 extern "C" void launch_prefill_bf16(
@@ -115,6 +117,7 @@ extern "C" void launch_prefill_bf16(
   const float * rope_sin,
   int max_seq_len,
   int compute_logits,
+  LucePrefillProfile * profile,
   cudaStream_t stream);
 
 struct DeviceArena {
@@ -198,6 +201,10 @@ bool check_cuda(cudaError_t status, const std::string & label, std::string & err
   }
   error_message = label + " failed: " + cudaGetErrorString(status);
   return false;
+}
+
+double elapsed_ms_since(const std::chrono::steady_clock::time_point start) {
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
 bool load_bf16_tensor_to_device(
@@ -546,6 +553,7 @@ void launch_prefill_for_state(
   const LuceDecodeBackendConfig & config,
   int seq_len,
   bool compute_first_token,
+  LucePrefillProfile * profile,
   cudaStream_t stream) {
   launch_prefill_bf16(
     state.token_ids,
@@ -581,6 +589,7 @@ void launch_prefill_for_state(
     state.pf_rope_sin,
     config.max_context,
     compute_first_token ? 1 : 0,
+    profile,
     stream);
 }
 
@@ -592,7 +601,7 @@ bool warmup_prefill_backend(BackendState & state, const LuceDecodeBackendConfig 
     return false;
   }
 
-  launch_prefill_for_state(state, config, 1, false, nullptr);
+  launch_prefill_for_state(state, config, 1, false, nullptr, nullptr);
   if (!check_cuda(cudaGetLastError(), "warmup launch_prefill_bf16", error_message) ||
       !check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(prefill warmup)", error_message)) {
     return false;
@@ -607,7 +616,14 @@ bool run_prefill_impl(
   const std::vector<std::int32_t> & tokens,
   int & out_first_token,
   bool compute_first_token,
+  LucePrefillProfile * profile,
   std::string & error_message) {
+  const auto host_start = std::chrono::steady_clock::now();
+  if (profile != nullptr) {
+    *profile = LucePrefillProfile{};
+    profile->enabled = true;
+  }
+
   if (tokens.empty()) {
     error_message = "Prefill tokens are empty.";
     return false;
@@ -617,6 +633,7 @@ bool run_prefill_impl(
     return false;
   }
 
+  const auto upload_start = std::chrono::steady_clock::now();
   if (!check_cuda(
         cudaMemcpy(
           state.token_ids,
@@ -627,29 +644,47 @@ bool run_prefill_impl(
         error_message)) {
     return false;
   }
+  if (profile != nullptr) {
+    profile->token_upload_ms += elapsed_ms_since(upload_start);
+  }
 
   const int seq_len = static_cast<int>(tokens.size());
-  launch_prefill_for_state(state, config, seq_len, compute_first_token, nullptr);
+  launch_prefill_for_state(state, config, seq_len, compute_first_token, profile, nullptr);
   if (!check_cuda(cudaGetLastError(), "launch_prefill_bf16", error_message)) {
     return false;
   }
 
   if (!compute_first_token) {
-    return check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(prefill_only)", error_message);
+    if (!check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(prefill_only)", error_message)) {
+      return false;
+    }
+    if (profile != nullptr) {
+      profile->host_total_ms = elapsed_ms_since(host_start);
+    }
+    return true;
   }
 
+  const auto handoff_start = std::chrono::steady_clock::now();
   if (!check_cuda(
         cudaMemcpy(state.hidden_buffer, state.pf_hidden_bf16_out, kHiddenSize * sizeof(std::uint16_t), cudaMemcpyDeviceToDevice),
         "cudaMemcpy(D2D hidden handoff)",
         error_message)) {
     return false;
   }
+  if (profile != nullptr) {
+    profile->hidden_handoff_ms += elapsed_ms_since(handoff_start);
+  }
 
+  const auto token_download_start = std::chrono::steady_clock::now();
   if (!check_cuda(
         cudaMemcpy(&out_first_token, state.output_token, sizeof(int), cudaMemcpyDeviceToHost),
         "cudaMemcpy(D2H first_token)",
         error_message)) {
     return false;
+  }
+  if (profile != nullptr) {
+    profile->output_token_download_ms += elapsed_ms_since(token_download_start);
+    profile->host_total_ms = elapsed_ms_since(host_start);
   }
 
   return true;
@@ -661,8 +696,16 @@ bool run_decode_step_impl(
   int position,
   int max_seq_len,
   float repetition_penalty,
+  LuceDecodeProfile * profile,
   int & out_next_token,
   std::string & error_message) {
+  const auto host_start = std::chrono::steady_clock::now();
+  if (profile != nullptr) {
+    profile->enabled = true;
+    profile->steps += 1;
+    profile->last_position = position;
+  }
+
   if (position < 0 || position >= max_seq_len) {
     error_message = "Decode position " + std::to_string(position) + " exceeds configured max_context " +
                     std::to_string(max_seq_len) + ".";
@@ -671,6 +714,7 @@ bool run_decode_step_impl(
 
   if (repetition_penalty > 1.0f && input_token >= 0 && input_token < kVocabSize) {
     const float seen = 1.0f;
+    const auto seen_upload_start = std::chrono::steady_clock::now();
     if (!check_cuda(
           cudaMemcpy(
             state.seen_token_mask + input_token,
@@ -680,6 +724,9 @@ bool run_decode_step_impl(
           "cudaMemcpy(H2D seen_token_mask)",
           error_message)) {
       return false;
+    }
+    if (profile != nullptr) {
+      profile->seen_token_upload_ms += elapsed_ms_since(seen_upload_start);
     }
   }
 
@@ -714,17 +761,23 @@ bool run_decode_step_impl(
     repetition_penalty,
     position,
     max_seq_len,
+    profile,
     nullptr);
 
   if (!check_cuda(cudaGetLastError(), "launch_decode", error_message)) {
     return false;
   }
 
+  const auto token_download_start = std::chrono::steady_clock::now();
   if (!check_cuda(
         cudaMemcpy(&out_next_token, state.output_token, sizeof(int), cudaMemcpyDeviceToHost),
         "cudaMemcpy(D2H next_token)",
         error_message)) {
     return false;
+  }
+  if (profile != nullptr) {
+    profile->output_token_download_ms += elapsed_ms_since(token_download_start);
+    profile->host_total_ms += elapsed_ms_since(host_start);
   }
   return true;
 }
@@ -735,6 +788,7 @@ struct LuceDecodeBackend::Impl {
   LuceDecodeBackendConfig config;
   DeviceArena arena;
   BackendState state;
+  LuceRuntimeProfile profile;
   bool initialized = false;
 };
 
@@ -774,6 +828,8 @@ bool LuceDecodeBackend::initialize(const LuceDecodeBackendConfig & config, std::
     impl_ = std::make_unique<Impl>();
     return false;
   }
+  impl_->profile = LuceRuntimeProfile{};
+  impl_->profile.enabled = config.profile_enabled;
   impl_->initialized = true;
   return true;
 }
@@ -798,7 +854,13 @@ bool LuceDecodeBackend::run_prefill(
     error_message = "Prefill token count exceeds configured max_context.";
     return false;
   }
-  return run_prefill_impl(impl_->state, impl_->config, tokens, out_first_token, true, error_message);
+  LucePrefillProfile * profile = impl_->config.profile_enabled ? &impl_->profile.prefill : nullptr;
+  const bool ok = run_prefill_impl(impl_->state, impl_->config, tokens, out_first_token, true, profile, error_message);
+  if (ok && profile != nullptr) {
+    impl_->profile.enabled = true;
+    impl_->profile.prefill_runs += 1;
+  }
+  return ok;
 }
 
 bool LuceDecodeBackend::run_prefill_only(
@@ -813,7 +875,13 @@ bool LuceDecodeBackend::run_prefill_only(
     return false;
   }
   int ignored_first_token = 0;
-  return run_prefill_impl(impl_->state, impl_->config, tokens, ignored_first_token, false, error_message);
+  LucePrefillProfile * profile = impl_->config.profile_enabled ? &impl_->profile.prefill : nullptr;
+  const bool ok = run_prefill_impl(impl_->state, impl_->config, tokens, ignored_first_token, false, profile, error_message);
+  if (ok && profile != nullptr) {
+    impl_->profile.enabled = true;
+    impl_->profile.prefill_runs += 1;
+  }
+  return ok;
 }
 
 bool LuceDecodeBackend::run_decode_step(
@@ -831,6 +899,7 @@ bool LuceDecodeBackend::run_decode_step(
     position,
     impl_->config.max_context,
     impl_->config.repetition_penalty,
+    impl_->config.profile_enabled ? &impl_->profile.decode : nullptr,
     out_next_token,
     error_message);
 }
@@ -852,6 +921,13 @@ int LuceDecodeBackend::max_context() const {
     return 0;
   }
   return impl_->config.max_context;
+}
+
+LuceRuntimeProfile LuceDecodeBackend::profile() const {
+  if (impl_ == nullptr) {
+    return LuceRuntimeProfile{};
+  }
+  return impl_->profile;
 }
 
 int query_max_safe_decode_blocks() {
@@ -923,6 +999,10 @@ bool LuceDecodeBackend::is_initialized() const {
 
 int LuceDecodeBackend::max_context() const {
   return 0;
+}
+
+LuceRuntimeProfile LuceDecodeBackend::profile() const {
+  return LuceRuntimeProfile{};
 }
 
 int query_max_safe_decode_blocks() {

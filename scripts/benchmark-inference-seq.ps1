@@ -24,7 +24,10 @@ param(
     [ValidateSet("default", "replay", "batched")]
     [string]$LucePrefillMode = "default",
     [switch]$PrefillOnly,
-    [switch]$ProfileSync
+    [switch]$ProfileSync,
+    [switch]$LuceProfile,
+    [switch]$KeepProfiles,
+    [string]$ProfileDir = ""
 )
 
 Set-StrictMode -Version Latest
@@ -47,6 +50,63 @@ function To-InvariantString {
     return [System.Convert]::ToString($Value, [System.Globalization.CultureInfo]::InvariantCulture)
 }
 
+function To-OptionalInvariantString {
+    param($Value)
+    if ($null -eq $Value) {
+        return ""
+    }
+    return [System.Convert]::ToString($Value, [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Get-JsonProperty {
+    param(
+        $Object,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    if ($null -eq $Object) {
+        return $null
+    }
+
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return $null
+    }
+
+    return $property.Value
+}
+
+function Measure-LuceLayerMs {
+    param(
+        $RuntimeProfile,
+        [string]$LayerType,
+        [Parameter(Mandatory = $true)][string[]]$Fields
+    )
+
+    $prefill = Get-JsonProperty -Object $RuntimeProfile -Name "prefill"
+    $layers = Get-JsonProperty -Object $prefill -Name "layers"
+    if ($null -eq $layers) {
+        return ""
+    }
+
+    $sum = 0.0
+    foreach ($layer in @($layers)) {
+        $currentLayerType = [string](Get-JsonProperty -Object $layer -Name "layer_type")
+        if (-not [string]::IsNullOrEmpty($LayerType) -and $currentLayerType -ne $LayerType) {
+            continue
+        }
+
+        foreach ($field in $Fields) {
+            $value = Get-JsonProperty -Object $layer -Name $field
+            if ($null -ne $value) {
+                $sum += [double]$value
+            }
+        }
+    }
+
+    return To-InvariantString $sum
+}
+
 function Invoke-BenchmarkRun {
     param(
         [Parameter(Mandatory = $true)][string]$ExePath,
@@ -66,6 +126,7 @@ function Invoke-BenchmarkRun {
         [Parameter(Mandatory = $true)][string]$LucePrefillMode,
         [Parameter(Mandatory = $true)][bool]$PrefillOnlyEnabled,
         [Parameter(Mandatory = $true)][bool]$ProfileSyncEnabled,
+        [Parameter(Mandatory = $true)][bool]$LuceProfileEnabled,
         [Parameter(Mandatory = $true)][string]$ProfileJsonPath
     )
 
@@ -110,6 +171,9 @@ function Invoke-BenchmarkRun {
     if ($ProfileSyncEnabled -and $Mode -ne "cpu-reference") {
         $args += @("--profile-sync")
     }
+    if ($LuceProfileEnabled -and $Mode -ne "cpu-reference") {
+        $args += @("--luce-profile")
+    }
     if ($PrefillOnlyEnabled) {
         $args += @("--prefill-only")
     }
@@ -139,11 +203,15 @@ $repoRoot = Split-Path -Parent $scriptDir
 $resolvedExe = Resolve-RepoPath -Path $Executable -RepoRoot $repoRoot
 $resolvedModelDir = Resolve-RepoPath -Path $HFModelDir -RepoRoot $repoRoot
 $resolvedCsvOut = Resolve-RepoPath -Path $CsvOut -RepoRoot $repoRoot
+$profileTmpDir = if ([string]::IsNullOrWhiteSpace($ProfileDir)) {
+    Join-Path $repoRoot "build\bench-profiles"
+} else {
+    Resolve-RepoPath -Path $ProfileDir -RepoRoot $repoRoot
+}
 $resolvedPromptFile = ""
 if ($PromptMode -eq "prompt-file") {
     $resolvedPromptFile = Resolve-RepoPath -Path $PromptFile -RepoRoot $repoRoot
 }
-$profileTmpDir = Join-Path $repoRoot "build\bench-profiles"
 
 if (-not (Test-Path $resolvedExe)) {
     throw "Executable not found: $resolvedExe"
@@ -169,12 +237,18 @@ if ($PromptMode -eq "prompt-file" -and -not (Test-Path -LiteralPath $resolvedPro
 if ($PromptMode -eq "prompt-tokens" -and [string]::IsNullOrWhiteSpace($PromptTokensCsv)) {
     throw "PromptTokensCsv must be non-empty when PromptMode is 'prompt-tokens'."
 }
+if ($LuceProfile.IsPresent -and $Modes -contains "cpu-reference") {
+    Write-Warning "LuceProfile is ignored for cpu-reference mode."
+}
 
 New-Item -ItemType Directory -Path (Split-Path -Parent $resolvedCsvOut) -Force | Out-Null
 New-Item -ItemType Directory -Path $profileTmpDir -Force | Out-Null
 
 Write-Host ("Sequential benchmark start: modes={0}, warmup={1}, runs={2}" -f ($Modes -join ","), $WarmupRuns, $Runs) -ForegroundColor Green
 Write-Host ("CSV output: {0}" -f $resolvedCsvOut) -ForegroundColor Green
+if ($KeepProfiles.IsPresent -or $LuceProfile.IsPresent) {
+    Write-Host ("Profile JSON output: {0}" -f $profileTmpDir) -ForegroundColor Green
+}
 
 foreach ($mode in $Modes) {
     for ($warm = 1; $warm -le $WarmupRuns; ++$warm) {
@@ -198,10 +272,11 @@ foreach ($mode in $Modes) {
                 -LucePrefillMode $LucePrefillMode `
                 -PrefillOnlyEnabled $PrefillOnly.IsPresent `
                 -ProfileSyncEnabled $ProfileSync.IsPresent `
+                -LuceProfileEnabled $LuceProfile.IsPresent `
                 -ProfileJsonPath $warmProfile
             Write-Host ("Warmup completed: mode={0} run={1}/{2}" -f $mode, $warm, $WarmupRuns) -ForegroundColor DarkGray
         } finally {
-            if (Test-Path $warmProfile) {
+            if ((Test-Path $warmProfile) -and -not $KeepProfiles.IsPresent) {
                 Remove-Item -LiteralPath $warmProfile -Force
             }
         }
@@ -228,13 +303,27 @@ foreach ($mode in $Modes) {
                 -LucePrefillMode $LucePrefillMode `
                 -PrefillOnlyEnabled $PrefillOnly.IsPresent `
                 -ProfileSyncEnabled $ProfileSync.IsPresent `
+                -LuceProfileEnabled $LuceProfile.IsPresent `
                 -ProfileJsonPath $profilePath
+
+            $luceProfileJson = Get-JsonProperty -Object $profile -Name "luce_profile"
+            $lucePrefillJson = Get-JsonProperty -Object $luceProfileJson -Name "prefill"
+            $luceDecodeJson = Get-JsonProperty -Object $luceProfileJson -Name "decode"
+            $luceProfileEnabledValue = Get-JsonProperty -Object $luceProfileJson -Name "enabled"
+            $profilePathForCsv = ""
+            if ($KeepProfiles.IsPresent -or $LuceProfile.IsPresent) {
+                $profilePathForCsv = $profilePath
+            }
+            $effectiveLucePrefillMode = [string](Get-JsonProperty -Object $profile -Name "luce_prefill_mode")
+            if ([string]::IsNullOrWhiteSpace($effectiveLucePrefillMode)) {
+                $effectiveLucePrefillMode = $LucePrefillMode
+            }
 
             $row = [PSCustomObject]@{
                 timestamp_utc    = [DateTime]::UtcNow.ToString("o")
                 run_label        = $RunLabel
                 mode             = $mode
-                luce_prefill_mode = $LucePrefillMode
+                luce_prefill_mode = $effectiveLucePrefillMode
                 prefill_only     = [bool]$profile.prefill_only
                 run_index        = $runIndex
                 prompt_name      = $PromptName
@@ -245,6 +334,33 @@ foreach ($mode in $Modes) {
                 prefill_tokens_per_second = To-InvariantString $profile.prefill_tokens_per_second
                 decode_time_ms   = To-InvariantString $profile.decode_time_ms
                 tokens_per_second = To-InvariantString $profile.tokens_per_second
+                profile_json     = $profilePathForCsv
+                luce_profile_enabled = [bool]$luceProfileEnabledValue
+                luce_prefill_host_total_ms = To-OptionalInvariantString (Get-JsonProperty -Object $lucePrefillJson -Name "host_total_ms")
+                luce_prefill_gpu_total_ms = To-OptionalInvariantString (Get-JsonProperty -Object $lucePrefillJson -Name "gpu_total_ms")
+                luce_prefill_token_upload_ms = To-OptionalInvariantString (Get-JsonProperty -Object $lucePrefillJson -Name "token_upload_ms")
+                luce_prefill_embed_ms = To-OptionalInvariantString (Get-JsonProperty -Object $lucePrefillJson -Name "embed_ms")
+                luce_prefill_mark_seen_ms = To-OptionalInvariantString (Get-JsonProperty -Object $lucePrefillJson -Name "mark_seen_ms")
+                luce_prefill_final_norm_ms = To-OptionalInvariantString (Get-JsonProperty -Object $lucePrefillJson -Name "final_norm_ms")
+                luce_prefill_lm_head_ms = To-OptionalInvariantString (Get-JsonProperty -Object $lucePrefillJson -Name "lm_head_ms")
+                luce_prefill_lm_reduce_ms = To-OptionalInvariantString (Get-JsonProperty -Object $lucePrefillJson -Name "lm_reduce_ms")
+                luce_prefill_hidden_handoff_ms = To-OptionalInvariantString (Get-JsonProperty -Object $lucePrefillJson -Name "hidden_handoff_ms")
+                luce_prefill_output_token_download_ms = To-OptionalInvariantString (Get-JsonProperty -Object $lucePrefillJson -Name "output_token_download_ms")
+                luce_prefill_deltanet_total_ms = Measure-LuceLayerMs -RuntimeProfile $luceProfileJson -LayerType "deltanet" -Fields @("total_ms")
+                luce_prefill_deltanet_recurrence_ms = Measure-LuceLayerMs -RuntimeProfile $luceProfileJson -LayerType "deltanet" -Fields @("recurrence_ms")
+                luce_prefill_deltanet_projection_ms = Measure-LuceLayerMs -RuntimeProfile $luceProfileJson -LayerType "deltanet" -Fields @("qkv_projection_ms", "z_projection_ms", "beta_alpha_projection_ms", "out_projection_ms")
+                luce_prefill_full_attention_total_ms = Measure-LuceLayerMs -RuntimeProfile $luceProfileJson -LayerType "full_attention" -Fields @("total_ms")
+                luce_prefill_full_attention_attention_ms = Measure-LuceLayerMs -RuntimeProfile $luceProfileJson -LayerType "full_attention" -Fields @("attention_ms")
+                luce_prefill_full_attention_qk_norm_rope_ms = Measure-LuceLayerMs -RuntimeProfile $luceProfileJson -LayerType "full_attention" -Fields @("qk_norm_rope_ms")
+                luce_prefill_full_attention_projection_ms = Measure-LuceLayerMs -RuntimeProfile $luceProfileJson -LayerType "full_attention" -Fields @("qkv_projection_ms", "kv_projection_ms", "out_projection_ms")
+                luce_prefill_mlp_total_ms = Measure-LuceLayerMs -RuntimeProfile $luceProfileJson -LayerType "" -Fields @("mlp_norm_ms", "mlp_projection_ms", "mlp_activation_ms", "mlp_down_projection_ms", "mlp_residual_ms")
+                luce_decode_steps = To-OptionalInvariantString (Get-JsonProperty -Object $luceDecodeJson -Name "steps")
+                luce_decode_host_total_ms = To-OptionalInvariantString (Get-JsonProperty -Object $luceDecodeJson -Name "host_total_ms")
+                luce_decode_seen_token_upload_ms = To-OptionalInvariantString (Get-JsonProperty -Object $luceDecodeJson -Name "seen_token_upload_ms")
+                luce_decode_launch_total_ms = To-OptionalInvariantString (Get-JsonProperty -Object $luceDecodeJson -Name "launch_total_ms")
+                luce_decode_kernel_ms = To-OptionalInvariantString (Get-JsonProperty -Object $luceDecodeJson -Name "decode_kernel_ms")
+                luce_decode_lm_head_ms = To-OptionalInvariantString (Get-JsonProperty -Object $luceDecodeJson -Name "lm_head_ms")
+                luce_decode_output_token_download_ms = To-OptionalInvariantString (Get-JsonProperty -Object $luceDecodeJson -Name "output_token_download_ms")
             }
 
             if (Test-Path $resolvedCsvOut) {
@@ -254,8 +370,11 @@ foreach ($mode in $Modes) {
             }
 
             Write-Host ("Recorded: mode={0} run={1}/{2} tps={3}" -f $mode, $runIndex, $Runs, $row.tokens_per_second) -ForegroundColor Yellow
+            if ($profilePathForCsv -ne "") {
+                Write-Host ("Profile JSON kept: {0}" -f $profilePathForCsv) -ForegroundColor DarkGray
+            }
         } finally {
-            if (Test-Path $profilePath) {
+            if ((Test-Path $profilePath) -and -not $KeepProfiles.IsPresent -and -not $LuceProfile.IsPresent) {
                 Remove-Item -LiteralPath $profilePath -Force
             }
         }

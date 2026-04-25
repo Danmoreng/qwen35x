@@ -6,9 +6,13 @@
  * Weights bf16, activations bf16, state f32. No quantization, no conversion.
  */
 
+#include "qwen35x/runtime/luce_profile.h"
+
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+
+#include <vector>
 
 constexpr int HIDDEN = 1024;
 constexpr int INTER = 3584;
@@ -36,6 +40,12 @@ constexpr int NUM_LAYERS = 24;
 constexpr int LAYER_TYPE[24] = {0,0,0,1,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0,1};
 
 struct PFLayerWeights { int layer_type; int _pad[3]; void *ptrs[14]; };
+
+struct ProfileEvent {
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop = nullptr;
+    double *dst = nullptr;
+};
 
 __device__ __forceinline__ float pf_warp_sum(float v) {
     for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffff, v, o); return v;
@@ -532,6 +542,7 @@ extern "C" void launch_prefill_bf16(
     const float *rope_cos, const float *rope_sin,
     int max_seq_len,
     int compute_logits,
+    qwen35x::luce::LucePrefillProfile *profile,
     cudaStream_t stream)
 {
     static cublasHandle_t cublas = nullptr;
@@ -545,9 +556,88 @@ extern "C" void launch_prefill_bf16(
     int S = seq_len;
     int bk = (S*HIDDEN+255)/256;
 
-    pf_embed<<<bk, 256, 0, stream>>>(token_ids, embed_weight, hidden, S);
+    std::vector<ProfileEvent> profile_events;
+    cudaEvent_t profile_total_start = nullptr;
+    cudaEvent_t profile_total_stop = nullptr;
+    if (profile) {
+        *profile = qwen35x::luce::LucePrefillProfile{};
+        profile->enabled = true;
+        profile->seq_len = S;
+        profile->compute_logits = compute_logits != 0;
+        profile->layer_count = NUM_LAYERS;
+        for (int li = 0; li < NUM_LAYERS; ++li) {
+            profile->layers[li].layer_index = li;
+            profile->layers[li].layer_type = LAYER_TYPE[li];
+        }
+        cudaEventCreate(&profile_total_start);
+        cudaEventCreate(&profile_total_stop);
+        cudaEventRecord(profile_total_start, stream);
+    }
+    auto profile_phase = [&](double *dst, auto &&launch) {
+        if (!profile || dst == nullptr) {
+            launch();
+            return;
+        }
+        ProfileEvent event;
+        event.dst = dst;
+        cudaEventCreate(&event.start);
+        cudaEventCreate(&event.stop);
+        cudaEventRecord(event.start, stream);
+        launch();
+        cudaEventRecord(event.stop, stream);
+        profile_events.push_back(event);
+    };
+    auto flush_profile = [&]() {
+        if (!profile) {
+            return;
+        }
+        cudaEventRecord(profile_total_stop, stream);
+        cudaEventSynchronize(profile_total_stop);
+        for (const auto &event : profile_events) {
+            float ms = 0.0f;
+            if (cudaEventElapsedTime(&ms, event.start, event.stop) == cudaSuccess && event.dst) {
+                *event.dst += static_cast<double>(ms);
+            }
+            cudaEventDestroy(event.start);
+            cudaEventDestroy(event.stop);
+        }
+        float total_ms = 0.0f;
+        if (cudaEventElapsedTime(&total_ms, profile_total_start, profile_total_stop) == cudaSuccess) {
+            profile->gpu_total_ms = static_cast<double>(total_ms);
+        }
+        cudaEventDestroy(profile_total_start);
+        cudaEventDestroy(profile_total_stop);
+        for (int li = 0; li < NUM_LAYERS; ++li) {
+            auto &layer = profile->layers[li];
+            layer.total_ms =
+                layer.rms_norm_ms +
+                layer.qkv_projection_ms +
+                layer.kv_projection_ms +
+                layer.z_projection_ms +
+                layer.beta_alpha_projection_ms +
+                layer.conv_ms +
+                layer.gate_ms +
+                layer.recurrence_ms +
+                layer.post_norm_gate_ms +
+                layer.qk_norm_rope_ms +
+                layer.attention_ms +
+                layer.out_projection_ms +
+                layer.residual_ms +
+                layer.mlp_norm_ms +
+                layer.mlp_projection_ms +
+                layer.mlp_activation_ms +
+                layer.mlp_down_projection_ms +
+                layer.mlp_residual_ms;
+        }
+    };
+
+    profile_phase(profile ? &profile->embed_ms : nullptr, [&]() {
+        pf_embed<<<bk, 256, 0, stream>>>(token_ids, embed_weight, hidden, S);
+    });
     if (seen_token_mask && repetition_penalty > 1.0f) {
-        pf_mark_seen_tokens<<<(S+255)/256, 256, 0, stream>>>(token_ids, S, seen_token_mask);
+        profile_phase(profile ? &profile->mark_seen_ms : nullptr, [&]() {
+            pf_mark_seen_tokens<<<(S+255)/256, 256, 0, stream>>>(token_ids, S, seen_token_mask);
+        });
     }
 
     int fa_stride = FA_KV_HEADS * max_seq_len * FA_HEAD_DIM;
@@ -557,9 +647,12 @@ extern "C" void launch_prefill_bf16(
     for (int li = 0; li < NUM_LAYERS; li++) {
         const PFLayerWeights &lw = hl[li];
         int lt = LAYER_TYPE[li];
+        auto *layer_profile = profile ? &profile->layers[li] : nullptr;
 
         const __nv_bfloat16 *norm_w = (const __nv_bfloat16 *)lw.ptrs[0];
-        pf_rmsnorm<<<S, 512, 0, stream>>>(hidden, norm_w, normalized, residual, S, HIDDEN);
+        profile_phase(layer_profile ? &layer_profile->rms_norm_ms : nullptr, [&]() {
+            pf_rmsnorm<<<S, 512, 0, stream>>>(hidden, norm_w, normalized, residual, S, HIDDEN);
+        });
 
         if (lt == 0) {
             // DeltaNet
@@ -578,32 +671,60 @@ extern "C" void launch_prefill_bf16(
             const __nv_bfloat16 *down_w=(const __nv_bfloat16*)lw.ptrs[13];
 
             // cuBLAS projections — direct bf16, no conversion!
-            cublas_bf16_gemm(cublas, normalized, qkv_w, proj_buf, S, DN_CONV_CH, HIDDEN);
-            cublas_bf16_gemm(cublas, normalized, z_w, proj_buf2, S, DN_V_SIZE, HIDDEN);
-            pf_bf16_matvec<<<S*DN_HEADS, 32, 0, stream>>>(normalized, beta_w, beta_buf, S, HIDDEN, DN_HEADS);
-            pf_bf16_matvec<<<S*DN_HEADS, 32, 0, stream>>>(normalized, alpha_w, alpha_buf, S, HIDDEN, DN_HEADS);
+            profile_phase(layer_profile ? &layer_profile->qkv_projection_ms : nullptr, [&]() {
+                cublas_bf16_gemm(cublas, normalized, qkv_w, proj_buf, S, DN_CONV_CH, HIDDEN);
+            });
+            profile_phase(layer_profile ? &layer_profile->z_projection_ms : nullptr, [&]() {
+                cublas_bf16_gemm(cublas, normalized, z_w, proj_buf2, S, DN_V_SIZE, HIDDEN);
+            });
+            profile_phase(layer_profile ? &layer_profile->beta_alpha_projection_ms : nullptr, [&]() {
+                pf_bf16_matvec<<<S*DN_HEADS, 32, 0, stream>>>(normalized, beta_w, beta_buf, S, HIDDEN, DN_HEADS);
+                pf_bf16_matvec<<<S*DN_HEADS, 32, 0, stream>>>(normalized, alpha_w, alpha_buf, S, HIDDEN, DN_HEADS);
+            });
 
-            pf_deltanet_conv_prepare<<<(DN_CONV_CH + 255) / 256, 256, 0, stream>>>(
-                proj_buf, dn_qkv_f32, conv_w, conv_bufs + dn_idx*DN_CONV_CH*DN_CONV_K, S);
-            pf_deltanet_prepare_norm_gate<<<(S*DN_HEADS + 15) / 16, 512, 0, stream>>>(
-                dn_qkv_f32, beta_buf, alpha_buf, a_log, dt_bias, S);
-            pf_deltanet_recurrence_cols<<<dim3(DN_HEADS, (DN_VAL + 3) / 4), dim3(32, 4), 0, stream>>>(
-                dn_qkv_f32, beta_buf, alpha_buf, dn_states + dn_idx*dn_stride, dn_out_f32, S);
-            pf_deltanet_post_norm_gate<<<S*DN_HEADS, 256, 0, stream>>>(
-                dn_out_f32, proj_buf2, dn_norm, dn_out_buf, S);
+            profile_phase(layer_profile ? &layer_profile->conv_ms : nullptr, [&]() {
+                pf_deltanet_conv_prepare<<<(DN_CONV_CH + 255) / 256, 256, 0, stream>>>(
+                    proj_buf, dn_qkv_f32, conv_w, conv_bufs + dn_idx*DN_CONV_CH*DN_CONV_K, S);
+            });
+            profile_phase(layer_profile ? &layer_profile->gate_ms : nullptr, [&]() {
+                pf_deltanet_prepare_norm_gate<<<(S*DN_HEADS + 15) / 16, 512, 0, stream>>>(
+                    dn_qkv_f32, beta_buf, alpha_buf, a_log, dt_bias, S);
+            });
+            profile_phase(layer_profile ? &layer_profile->recurrence_ms : nullptr, [&]() {
+                pf_deltanet_recurrence_cols<<<dim3(DN_HEADS, (DN_VAL + 3) / 4), dim3(32, 4), 0, stream>>>(
+                    dn_qkv_f32, beta_buf, alpha_buf, dn_states + dn_idx*dn_stride, dn_out_f32, S);
+            });
+            profile_phase(layer_profile ? &layer_profile->post_norm_gate_ms : nullptr, [&]() {
+                pf_deltanet_post_norm_gate<<<S*DN_HEADS, 256, 0, stream>>>(
+                    dn_out_f32, proj_buf2, dn_norm, dn_out_buf, S);
+            });
 
             // Out projection + residual
-            cublas_bf16_gemm(cublas, dn_out_buf, out_w, proj_buf, S, HIDDEN, DN_V_SIZE);
-            pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
+            profile_phase(layer_profile ? &layer_profile->out_projection_ms : nullptr, [&]() {
+                cublas_bf16_gemm(cublas, dn_out_buf, out_w, proj_buf, S, HIDDEN, DN_V_SIZE);
+            });
+            profile_phase(layer_profile ? &layer_profile->residual_ms : nullptr, [&]() {
+                pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
+            });
 
             // MLP
-            pf_rmsnorm<<<S, 512, 0, stream>>>(hidden, post_norm, normalized, residual, S, HIDDEN);
-            cublas_bf16_gemm(cublas, normalized, gate_w, proj_buf, S, INTER, HIDDEN);
-            cublas_bf16_gemm(cublas, normalized, up_w, proj_buf2, S, INTER, HIDDEN);
+            profile_phase(layer_profile ? &layer_profile->mlp_norm_ms : nullptr, [&]() {
+                pf_rmsnorm<<<S, 512, 0, stream>>>(hidden, post_norm, normalized, residual, S, HIDDEN);
+            });
+            profile_phase(layer_profile ? &layer_profile->mlp_projection_ms : nullptr, [&]() {
+                cublas_bf16_gemm(cublas, normalized, gate_w, proj_buf, S, INTER, HIDDEN);
+                cublas_bf16_gemm(cublas, normalized, up_w, proj_buf2, S, INTER, HIDDEN);
+            });
             int mlp_bk = (S*INTER+255)/256;
-            pf_silu_mul_bf16<<<mlp_bk, 256, 0, stream>>>(proj_buf, proj_buf2, mlp_buf, S*INTER);
-            cublas_bf16_gemm(cublas, mlp_buf, down_w, proj_buf, S, HIDDEN, INTER);
-            pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
+            profile_phase(layer_profile ? &layer_profile->mlp_activation_ms : nullptr, [&]() {
+                pf_silu_mul_bf16<<<mlp_bk, 256, 0, stream>>>(proj_buf, proj_buf2, mlp_buf, S*INTER);
+            });
+            profile_phase(layer_profile ? &layer_profile->mlp_down_projection_ms : nullptr, [&]() {
+                cublas_bf16_gemm(cublas, mlp_buf, down_w, proj_buf, S, HIDDEN, INTER);
+            });
+            profile_phase(layer_profile ? &layer_profile->mlp_residual_ms : nullptr, [&]() {
+                pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
+            });
 
             dn_idx++;
         } else {
@@ -619,42 +740,72 @@ extern "C" void launch_prefill_bf16(
             const __nv_bfloat16 *up_w=(const __nv_bfloat16*)lw.ptrs[9];
             const __nv_bfloat16 *down_w=(const __nv_bfloat16*)lw.ptrs[10];
 
-            cublas_bf16_gemm(cublas, normalized, q_w, proj_buf, S, FA_QPROJ_SIZE, HIDDEN);
-            cublas_bf16_gemm(cublas, normalized, k_w, proj_buf2, S, FA_KV_SIZE, HIDDEN);
-            cublas_bf16_gemm(cublas, normalized, v_w, attn_buf, S, FA_KV_SIZE, HIDDEN);
+            profile_phase(layer_profile ? &layer_profile->qkv_projection_ms : nullptr, [&]() {
+                cublas_bf16_gemm(cublas, normalized, q_w, proj_buf, S, FA_QPROJ_SIZE, HIDDEN);
+            });
+            profile_phase(layer_profile ? &layer_profile->kv_projection_ms : nullptr, [&]() {
+                cublas_bf16_gemm(cublas, normalized, k_w, proj_buf2, S, FA_KV_SIZE, HIDDEN);
+                cublas_bf16_gemm(cublas, normalized, v_w, attn_buf, S, FA_KV_SIZE, HIDDEN);
+            });
 
             int total_heads = S*(FA_Q_HEADS+FA_KV_HEADS);
-            pf_qk_norm_rope<<<(total_heads+15)/16, 512, 0, stream>>>(
-                proj_buf, proj_buf2, attn_buf, q_nw, k_nw,
-                rope_cos, rope_sin,
-                fa_k_cache + fa_idx*fa_stride, fa_v_cache + fa_idx*fa_stride, S, max_seq_len);
+            profile_phase(layer_profile ? &layer_profile->qk_norm_rope_ms : nullptr, [&]() {
+                pf_qk_norm_rope<<<(total_heads+15)/16, 512, 0, stream>>>(
+                    proj_buf, proj_buf2, attn_buf, q_nw, k_nw,
+                    rope_cos, rope_sin,
+                    fa_k_cache + fa_idx*fa_stride, fa_v_cache + fa_idx*fa_stride, S, max_seq_len);
+            });
 
-            pf_causal_attn<<<(S*FA_Q_HEADS+15)/16, 512, 0, stream>>>(
-                proj_buf, proj_buf2, attn_buf, dn_out_buf, S);
+            profile_phase(layer_profile ? &layer_profile->attention_ms : nullptr, [&]() {
+                pf_causal_attn<<<(S*FA_Q_HEADS+15)/16, 512, 0, stream>>>(
+                    proj_buf, proj_buf2, attn_buf, dn_out_buf, S);
+            });
 
-            cublas_bf16_gemm(cublas, dn_out_buf, o_w, proj_buf, S, HIDDEN, FA_Q_SIZE);
-            pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
+            profile_phase(layer_profile ? &layer_profile->out_projection_ms : nullptr, [&]() {
+                cublas_bf16_gemm(cublas, dn_out_buf, o_w, proj_buf, S, HIDDEN, FA_Q_SIZE);
+            });
+            profile_phase(layer_profile ? &layer_profile->residual_ms : nullptr, [&]() {
+                pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
+            });
 
             // MLP
-            pf_rmsnorm<<<S, 512, 0, stream>>>(hidden, post_norm, normalized, residual, S, HIDDEN);
-            cublas_bf16_gemm(cublas, normalized, gate_w, proj_buf, S, INTER, HIDDEN);
-            cublas_bf16_gemm(cublas, normalized, up_w, proj_buf2, S, INTER, HIDDEN);
+            profile_phase(layer_profile ? &layer_profile->mlp_norm_ms : nullptr, [&]() {
+                pf_rmsnorm<<<S, 512, 0, stream>>>(hidden, post_norm, normalized, residual, S, HIDDEN);
+            });
+            profile_phase(layer_profile ? &layer_profile->mlp_projection_ms : nullptr, [&]() {
+                cublas_bf16_gemm(cublas, normalized, gate_w, proj_buf, S, INTER, HIDDEN);
+                cublas_bf16_gemm(cublas, normalized, up_w, proj_buf2, S, INTER, HIDDEN);
+            });
             int mlp_bk = (S*INTER+255)/256;
-            pf_silu_mul_bf16<<<mlp_bk, 256, 0, stream>>>(proj_buf, proj_buf2, mlp_buf, S*INTER);
-            cublas_bf16_gemm(cublas, mlp_buf, down_w, proj_buf, S, HIDDEN, INTER);
-            pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
+            profile_phase(layer_profile ? &layer_profile->mlp_activation_ms : nullptr, [&]() {
+                pf_silu_mul_bf16<<<mlp_bk, 256, 0, stream>>>(proj_buf, proj_buf2, mlp_buf, S*INTER);
+            });
+            profile_phase(layer_profile ? &layer_profile->mlp_down_projection_ms : nullptr, [&]() {
+                cublas_bf16_gemm(cublas, mlp_buf, down_w, proj_buf, S, HIDDEN, INTER);
+            });
+            profile_phase(layer_profile ? &layer_profile->mlp_residual_ms : nullptr, [&]() {
+                pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
+            });
 
             fa_idx++;
         }
     }
 
     if (!compute_logits) {
+        flush_profile();
         return;
     }
 
-    pf_final_norm<<<1, 512, 0, stream>>>(hidden, final_norm_w, final_normed, hidden_bf16_out, S);
+    profile_phase(profile ? &profile->final_norm_ms : nullptr, [&]() {
+        pf_final_norm<<<1, 512, 0, stream>>>(hidden, final_norm_w, final_normed, hidden_bf16_out, S);
+    });
 
     int lm_blocks = 512;
-    pf_lm_head<<<lm_blocks, 256, 0, stream>>>(final_normed, lm_head_w, lm_bmv, lm_bmi, VOCAB, seen_token_mask, repetition_penalty);
-    pf_lm_reduce<<<1, 256, 0, stream>>>(lm_bmv, lm_bmi, output_token, lm_blocks);
+    profile_phase(profile ? &profile->lm_head_ms : nullptr, [&]() {
+        pf_lm_head<<<lm_blocks, 256, 0, stream>>>(final_normed, lm_head_w, lm_bmv, lm_bmi, VOCAB, seen_token_mask, repetition_penalty);
+    });
+    profile_phase(profile ? &profile->lm_reduce_ms : nullptr, [&]() {
+        pf_lm_reduce<<<1, 256, 0, stream>>>(lm_bmv, lm_bmi, output_token, lm_blocks);
+    });
+    flush_profile();
 }

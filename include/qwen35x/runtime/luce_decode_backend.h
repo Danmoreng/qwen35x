@@ -1,5 +1,7 @@
 #pragma once
 
+#include "qwen35x/runtime/luce_profile.h"
+
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -12,6 +14,7 @@ struct LuceDecodeBackendConfig {
   int max_context = 256;
   int decode_blocks = 0;
   float repetition_penalty = 1.0f;
+  bool profile_enabled = false;
 };
 
 class LuceDecodeBackend {
@@ -42,6 +45,7 @@ public:
 
   bool is_initialized() const;
   int max_context() const;
+  LuceRuntimeProfile profile() const;
 
 private:
   struct Impl;

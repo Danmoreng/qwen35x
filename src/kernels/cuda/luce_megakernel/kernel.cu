@@ -10,6 +10,8 @@
  * Model:         Qwen/Qwen3.5-0.8B (bf16 weights)
  */
 
+#include "qwen35x/runtime/luce_profile.h"
+
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -930,7 +932,9 @@ extern "C" void launch_decode(
     unsigned int *lm_sync_counter,
     float *seen_token_mask,
     float repetition_penalty,
-    int position, int max_seq_len, cudaStream_t stream)
+    int position, int max_seq_len,
+    qwen35x::luce::LuceDecodeProfile *profile,
+    cudaStream_t stream)
 {
     int device_id = 0;
     int sm_count = 0;
@@ -962,6 +966,16 @@ extern "C" void launch_decode(
 
     if (decode_blocks < 1) decode_blocks = 1;
 
+    cudaEvent_t profile_total_start = nullptr;
+    cudaEvent_t profile_decode_end = nullptr;
+    cudaEvent_t profile_lm_end = nullptr;
+    if (profile) {
+        cudaEventCreate(&profile_total_start);
+        cudaEventCreate(&profile_decode_end);
+        cudaEventCreate(&profile_lm_end);
+        cudaEventRecord(profile_total_start, stream);
+    }
+
     cudaMemsetAsync(barrier_counter, 0, sizeof(unsigned int), stream);
     cudaMemsetAsync(barrier_generation, 0, sizeof(unsigned int), stream);
 
@@ -981,6 +995,10 @@ extern "C" void launch_decode(
         barrier_counter, barrier_generation,
         input_token_id, position, max_seq_len);
 
+    if (profile) {
+        cudaEventRecord(profile_decode_end, stream);
+    }
+
     cudaMemsetAsync(lm_sync_counter, 0, sizeof(unsigned int), stream);
 
     lm_head_kernel<<<LM_NUM_BLOCKS, LM_BLOCK_SIZE, 0, stream>>>(
@@ -989,6 +1007,26 @@ extern "C" void launch_decode(
         block_max_vals, block_max_idxs,
         output_token_id, lm_sync_counter,
         seen_token_mask, repetition_penalty);
+
+    if (profile) {
+        cudaEventRecord(profile_lm_end, stream);
+        cudaEventSynchronize(profile_lm_end);
+        float decode_ms = 0.0f;
+        float lm_ms = 0.0f;
+        float total_ms = 0.0f;
+        if (cudaEventElapsedTime(&decode_ms, profile_total_start, profile_decode_end) == cudaSuccess) {
+            profile->decode_kernel_ms += static_cast<double>(decode_ms);
+        }
+        if (cudaEventElapsedTime(&lm_ms, profile_decode_end, profile_lm_end) == cudaSuccess) {
+            profile->lm_head_ms += static_cast<double>(lm_ms);
+        }
+        if (cudaEventElapsedTime(&total_ms, profile_total_start, profile_lm_end) == cudaSuccess) {
+            profile->launch_total_ms += static_cast<double>(total_ms);
+        }
+        cudaEventDestroy(profile_total_start);
+        cudaEventDestroy(profile_decode_end);
+        cudaEventDestroy(profile_lm_end);
+    }
 }
 extern "C" void set_decode_blocks_override(int blocks) {
     g_decode_blocks_override = blocks;

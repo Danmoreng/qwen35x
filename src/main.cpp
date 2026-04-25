@@ -3,6 +3,7 @@
 #include "qwen35x/runtime/runtime.h"
 #include "qwen35x/tokenizer/tokenizer.h"
 
+#include <algorithm>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -60,6 +61,76 @@ const char * luce_prefill_mode_name(const qwen35x::LucePrefillMode mode) {
     default:
       return "unknown";
   }
+}
+
+const char * luce_layer_type_name(const int layer_type) {
+  return layer_type == 0 ? "deltanet" : "full_attention";
+}
+
+void write_luce_layer_profile_json(std::ostream & out, const qwen35x::luce::LuceLayerProfile & layer) {
+  out << "      {\n";
+  out << "        \"layer_index\": " << layer.layer_index << ",\n";
+  out << "        \"layer_type\": \"" << luce_layer_type_name(layer.layer_type) << "\",\n";
+  out << "        \"total_ms\": " << layer.total_ms << ",\n";
+  out << "        \"rms_norm_ms\": " << layer.rms_norm_ms << ",\n";
+  out << "        \"qkv_projection_ms\": " << layer.qkv_projection_ms << ",\n";
+  out << "        \"kv_projection_ms\": " << layer.kv_projection_ms << ",\n";
+  out << "        \"z_projection_ms\": " << layer.z_projection_ms << ",\n";
+  out << "        \"beta_alpha_projection_ms\": " << layer.beta_alpha_projection_ms << ",\n";
+  out << "        \"conv_ms\": " << layer.conv_ms << ",\n";
+  out << "        \"gate_ms\": " << layer.gate_ms << ",\n";
+  out << "        \"recurrence_ms\": " << layer.recurrence_ms << ",\n";
+  out << "        \"post_norm_gate_ms\": " << layer.post_norm_gate_ms << ",\n";
+  out << "        \"qk_norm_rope_ms\": " << layer.qk_norm_rope_ms << ",\n";
+  out << "        \"attention_ms\": " << layer.attention_ms << ",\n";
+  out << "        \"out_projection_ms\": " << layer.out_projection_ms << ",\n";
+  out << "        \"residual_ms\": " << layer.residual_ms << ",\n";
+  out << "        \"mlp_norm_ms\": " << layer.mlp_norm_ms << ",\n";
+  out << "        \"mlp_projection_ms\": " << layer.mlp_projection_ms << ",\n";
+  out << "        \"mlp_activation_ms\": " << layer.mlp_activation_ms << ",\n";
+  out << "        \"mlp_down_projection_ms\": " << layer.mlp_down_projection_ms << ",\n";
+  out << "        \"mlp_residual_ms\": " << layer.mlp_residual_ms << "\n";
+  out << "      }";
+}
+
+void write_luce_profile_json(std::ostream & out, const qwen35x::luce::LuceRuntimeProfile & profile) {
+  out << "  \"luce_profile\": {\n";
+  out << "    \"enabled\": " << (profile.enabled ? "true" : "false") << ",\n";
+  out << "    \"prefill_runs\": " << profile.prefill_runs << ",\n";
+  out << "    \"prefill\": {\n";
+  out << "      \"enabled\": " << (profile.prefill.enabled ? "true" : "false") << ",\n";
+  out << "      \"seq_len\": " << profile.prefill.seq_len << ",\n";
+  out << "      \"compute_logits\": " << (profile.prefill.compute_logits ? "true" : "false") << ",\n";
+  out << "      \"host_total_ms\": " << profile.prefill.host_total_ms << ",\n";
+  out << "      \"gpu_total_ms\": " << profile.prefill.gpu_total_ms << ",\n";
+  out << "      \"token_upload_ms\": " << profile.prefill.token_upload_ms << ",\n";
+  out << "      \"embed_ms\": " << profile.prefill.embed_ms << ",\n";
+  out << "      \"mark_seen_ms\": " << profile.prefill.mark_seen_ms << ",\n";
+  out << "      \"final_norm_ms\": " << profile.prefill.final_norm_ms << ",\n";
+  out << "      \"lm_head_ms\": " << profile.prefill.lm_head_ms << ",\n";
+  out << "      \"lm_reduce_ms\": " << profile.prefill.lm_reduce_ms << ",\n";
+  out << "      \"hidden_handoff_ms\": " << profile.prefill.hidden_handoff_ms << ",\n";
+  out << "      \"output_token_download_ms\": " << profile.prefill.output_token_download_ms << ",\n";
+  out << "      \"layers\": [\n";
+  const int layer_count = std::min(profile.prefill.layer_count, qwen35x::luce::kLuceProfileMaxLayers);
+  for (int i = 0; i < layer_count; ++i) {
+    write_luce_layer_profile_json(out, profile.prefill.layers[i]);
+    out << (i + 1 < layer_count ? ",\n" : "\n");
+  }
+  out << "      ]\n";
+  out << "    },\n";
+  out << "    \"decode\": {\n";
+  out << "      \"enabled\": " << (profile.decode.enabled ? "true" : "false") << ",\n";
+  out << "      \"steps\": " << profile.decode.steps << ",\n";
+  out << "      \"last_position\": " << profile.decode.last_position << ",\n";
+  out << "      \"host_total_ms\": " << profile.decode.host_total_ms << ",\n";
+  out << "      \"seen_token_upload_ms\": " << profile.decode.seen_token_upload_ms << ",\n";
+  out << "      \"launch_total_ms\": " << profile.decode.launch_total_ms << ",\n";
+  out << "      \"decode_kernel_ms\": " << profile.decode.decode_kernel_ms << ",\n";
+  out << "      \"lm_head_ms\": " << profile.decode.lm_head_ms << ",\n";
+  out << "      \"output_token_download_ms\": " << profile.decode.output_token_download_ms << "\n";
+  out << "    }\n";
+  out << "  }";
 }
 
 bool write_profile_json(
@@ -125,6 +196,10 @@ bool write_profile_json(
   out << "    \"host_to_device_bytes_per_forward_token\": " << result.host_to_device_bytes_per_forward_token << ",\n";
   out << "    \"device_to_host_bytes_per_forward_token\": " << result.device_to_host_bytes_per_forward_token << "\n";
   out << "  },\n";
+  if (result.luce_profile.enabled) {
+    write_luce_profile_json(out, result.luce_profile);
+    out << ",\n";
+  }
   out << "  \"output_token_ids\": [";
   for (std::size_t i = 0; i < result.generated_tokens.size(); ++i) {
     if (i > 0) {
@@ -253,6 +328,8 @@ int main(int argc, char ** argv) {
       }
     } else if (arg == "--profile-sync") {
       infer_options.profile_cuda_sync = true;
+    } else if (arg == "--luce-profile") {
+      infer_options.profile_luce = true;
     } else if (arg == "--prefill-only") {
       infer_options.prefill_only = true;
     } else if (arg == "--stop-token" && i + 1 < argc) {
@@ -276,7 +353,7 @@ int main(int argc, char ** argv) {
       std::cout << "       qwen35x --infer-reference --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "       qwen35x --infer-gpu --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "               [--temperature <float>] [--top-p <float>] [--top-k <int>] [--repeat-penalty <float>] [--seed <int64>]\n";
-      std::cout << "               [--gpu-bf16|--gpu-f32-matvec] [--gpu-decode-backend <default|luce>] [--gpu-decode-blocks <n>] [--luce-prefill-mode <replay|batched>] [--profile-sync] [--prefill-only]\n";
+      std::cout << "               [--gpu-bf16|--gpu-f32-matvec] [--gpu-decode-backend <default|luce>] [--gpu-decode-blocks <n>] [--luce-prefill-mode <replay|batched>] [--profile-sync] [--luce-profile] [--prefill-only]\n";
       std::cout << "               [--stop-token <csv>] [--stop-text <text>] [--stop-on-im-end] [--profile-json <path>]\n";
       return 0;
     }
