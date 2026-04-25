@@ -9,7 +9,7 @@ option(QWEN35X_ENABLE_CUDA "Enable CUDA kernels when a CUDA compiler is availabl
 set(QWEN35X_CUDA_ARCHITECTURES "native" CACHE STRING "CUDA architectures passed to CMAKE_CUDA_ARCHITECTURES")
 set(QWEN35X_KERNEL_BENCH_BLOCK_SIZE "256" CACHE STRING "Compile-time BLOCK_SIZE for qwen35x kernel bench")
 set(QWEN35X_KERNEL_BENCH_NUM_BLOCKS "82" CACHE STRING "Compile-time NUM_BLOCKS default for qwen35x kernel bench")
-set(QWEN35X_CUDA_VARIANT "0p8b" CACHE STRING "Qwen3.5 CUDA kernel specialization: 0p8b or 4b")
+set(QWEN35X_CUDA_VARIANT "0p8b" CACHE STRING "Qwen3.5 CUDA kernel specialization for qwen35x_kernelbench: 0p8b or 4b")
 set_property(CACHE QWEN35X_CUDA_VARIANT PROPERTY STRINGS 0p8b 4b)
 
 include(CheckLanguage)
@@ -47,12 +47,67 @@ if (CMAKE_CUDA_COMPILER)
     message(FATAL_ERROR "QWEN35X_CUDA_VARIANT must be one of: 0p8b, 4b")
   endif ()
 
+  function(add_qwen35x_cuda_variant variant_name variant_define)
+    add_library(qwen35x_cuda_${variant_name} OBJECT
+      src/kernels/cuda/kernel.cu
+      src/kernels/cuda/prefill.cu
+    )
+    target_include_directories(qwen35x_cuda_${variant_name}
+      PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_compile_definitions(qwen35x_cuda_${variant_name}
+      PRIVATE
+        BLOCK_SIZE=${QWEN35X_KERNEL_BENCH_BLOCK_SIZE}
+        NUM_BLOCKS=${QWEN35X_KERNEL_BENCH_NUM_BLOCKS}
+        ${variant_define}=1
+        QWEN35X_CUDA_VARIANT_${variant_name}=1
+        LAYER_TYPE=LAYER_TYPE_${variant_name}
+        decode_kernel=decode_kernel_${variant_name}
+        lm_head_kernel=lm_head_kernel_${variant_name}
+        rmsnorm_redundant=rmsnorm_redundant_${variant_name}
+        rmsnorm_from_bf16=rmsnorm_from_bf16_${variant_name}
+        matvec_bf16=matvec_bf16_${variant_name}
+        matvec_gate_up_silu_bf16=matvec_gate_up_silu_bf16_${variant_name}
+        matvec_down_residual_bf16=matvec_down_residual_bf16_${variant_name}
+        matvec_o_residual_bf16=matvec_o_residual_bf16_${variant_name}
+        full_attention_layer=full_attention_layer_${variant_name}
+        deltanet_layer=deltanet_layer_${variant_name}
+        pf_embed=pf_embed_${variant_name}
+        pf_mark_seen_tokens=pf_mark_seen_tokens_${variant_name}
+        pf_rmsnorm=pf_rmsnorm_${variant_name}
+        pf_bf16_matvec=pf_bf16_matvec_${variant_name}
+        pf_add_residual_bf16=pf_add_residual_bf16_${variant_name}
+        pf_silu_mul_bf16=pf_silu_mul_bf16_${variant_name}
+        pf_deltanet_recurrence=pf_deltanet_recurrence_${variant_name}
+        pf_deltanet_conv_prepare=pf_deltanet_conv_prepare_${variant_name}
+        pf_deltanet_prepare_norm_gate=pf_deltanet_prepare_norm_gate_${variant_name}
+        pf_deltanet_recurrence_cols=pf_deltanet_recurrence_cols_${variant_name}
+        pf_deltanet_post_norm_gate=pf_deltanet_post_norm_gate_${variant_name}
+        pf_qk_norm_rope=pf_qk_norm_rope_${variant_name}
+        pf_causal_softmax_to_bf16=pf_causal_softmax_to_bf16_${variant_name}
+        pf_apply_attention_gate_bf16=pf_apply_attention_gate_bf16_${variant_name}
+        pf_final_norm=pf_final_norm_${variant_name}
+        pf_lm_head=pf_lm_head_${variant_name}
+        pf_lm_reduce=pf_lm_reduce_${variant_name}
+        launch_decode=launch_decode_${variant_name}
+        launch_prefill_bf16=launch_prefill_bf16_${variant_name}
+        set_decode_blocks_override=set_decode_blocks_override_${variant_name}
+        query_max_safe_decode_blocks=query_max_safe_decode_blocks_${variant_name}
+    )
+    set_target_properties(qwen35x_cuda_${variant_name} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+  endfunction()
+
+  add_qwen35x_cuda_variant(0p8b QWEN35X_VARIANT_0P8B)
+  add_qwen35x_cuda_variant(4b QWEN35X_VARIANT_4B)
+
   target_sources(
     qwen35x_core
     PRIVATE
       src/kernels/cuda/qwen35x_decode_stub.cu
-      src/kernels/cuda/kernel.cu
-      src/kernels/cuda/prefill.cu
+      $<TARGET_OBJECTS:qwen35x_cuda_0p8b>
+      $<TARGET_OBJECTS:qwen35x_cuda_4b>
       src/runtime/cuda_bench.cu
       src/runtime/cuda_inference.cu
   )
@@ -61,13 +116,7 @@ if (CMAKE_CUDA_COMPILER)
     PRIVATE
       BLOCK_SIZE=${QWEN35X_KERNEL_BENCH_BLOCK_SIZE}
       NUM_BLOCKS=${QWEN35X_KERNEL_BENCH_NUM_BLOCKS}
-      QWEN35X_CUDA_VARIANT_${QWEN35X_CUDA_VARIANT}=1
   )
-  if (QWEN35X_CUDA_VARIANT STREQUAL "4b")
-    target_compile_definitions(qwen35x_core PRIVATE QWEN35X_VARIANT_4B=1)
-  else ()
-    target_compile_definitions(qwen35x_core PRIVATE QWEN35X_VARIANT_0P8B=1)
-  endif ()
   target_link_libraries(qwen35x_core PRIVATE CUDA::cublasLt CUDA::cublas)
   target_compile_definitions(qwen35x_core PUBLIC QWEN35X_HAS_CUDA=1)
   set_target_properties(qwen35x_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)

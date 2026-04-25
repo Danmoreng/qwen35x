@@ -6,7 +6,7 @@ The scaffold follows the public project roadmap in `docs/development_plan.md`.
 
 - CPU reference path remains the local correctness oracle for GPU work.
 - Optional PyTorch/Transformers tooling can cross-check the CPU reference against an external implementation.
-- `--infer-gpu` defaults to the in-tree Qwen35x CUDA backend for Qwen3.5-0.8B.
+- `--infer-gpu` defaults to the in-tree Qwen35x CUDA backend and auto-selects the compiled 0.8B or 4B CUDA layout from the loaded model profile.
 - The legacy CUDA runtime decode backend remains selectable with `--gpu-decode-backend default`.
 - CUDA decode paths use device-resident layer math across hidden/residual/norm/attention/MLP work.
 - Device-token GPU decode loop is implemented for the no-stop-controls path.
@@ -35,7 +35,7 @@ The scaffold follows the public project roadmap in `docs/development_plan.md`.
 ## Initial scope
 
 - Family: Qwen3.5
-- Starter profile: 0.8B
+- Starter profiles: 0.8B and 4B
 - Target GPU class: Blackwell (SM120)
 - Precision phase 1: BF16/FP16 dense path
 - Precision phase 2: low precision path (FP8/FP4 or custom packed W4A16-style)

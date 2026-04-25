@@ -15,7 +15,7 @@ The goal is not a generic multi-model runtime. The goal is a small, hardware-awa
 - Load Qwen3.5 profile/config from Hugging Face model folders
 - Native tokenizer (`vocab.json` + `merges.txt` + added tokens)
 - Reference generation via `--infer-reference` (CPU) and `--infer-gpu` (CUDA)
-- `--infer-gpu` defaults to the in-tree Qwen35x CUDA backend for the compiled Qwen3.5 variant (`0p8b` or `4b`)
+- `--infer-gpu` defaults to the in-tree Qwen35x CUDA backend and auto-selects the compiled 0.8B or 4B CUDA layout from the loaded model profile
 - Legacy CUDA runtime decode backend remains available with `--gpu-decode-backend default`
 - Batched Qwen35x prefill is the default prompt-processing path and warms the prefill backend during initialization
 - Device-resident decode path for per-layer hidden/residual/norm/attention/MLP math in `--infer-gpu`
@@ -66,11 +66,7 @@ Current decode control behavior:
 .\scripts\build.ps1 -UseNinja -EnableCuda -Configuration Release
 ```
 
-Build the 4B CUDA variant:
-
-```powershell
-.\scripts\build.ps1 -UseNinja -EnableCuda -Configuration Release -BuildDir build-4b -CudaVariant 4b
-```
+The main `qwen35x.exe` includes the supported 0.8B and 4B CUDA variants and selects the correct one automatically from `--hf-model-dir`. The build script still accepts `-CudaVariant` for older benchmark workflows, but it no longer changes the main inference binary.
 
 3. Run chat inference (CPU reference)
 
@@ -82,6 +78,12 @@ Build the 4B CUDA variant:
 
 ```powershell
 .\build\qwen35x.exe --infer-gpu --hf-model-dir models/qwen3.5-0.8b --chat-user "Tell me a short joke." --max-new-tokens 64 --max-context 256 --temperature 0 --stop-on-im-end
+```
+
+The same binary can run the 4B model:
+
+```powershell
+.\build\qwen35x.exe --infer-gpu --hf-model-dir models/qwen3.5-4b --chat-user "Tell me a short joke." --max-new-tokens 64 --max-context 256 --temperature 0 --stop-on-im-end
 ```
 
 5. Run with profiling JSON
