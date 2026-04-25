@@ -32,6 +32,11 @@ Current known constraints:
 - The PyTorch/Transformers comparison environment is optional and kept outside the C++ build in `.venv-hf-parity`; it is a correctness oracle, not a performance benchmark.
 
 Latest local benchmark snapshot (Qwen3.5-0.8B, same machine):
+- Long-context actual-prompt benchmark (April 25, 2026, Wikipedia prompt, ~65k prompt tokens, `MaxContext=65536`, `MaxNewTokens=128`):
+  - Current integrated Luce path: prefill `64,195.49 ms` / `1,018.84 tok/s`; decode `5,956.93 ms` / reported `21.49 tok/s`, CSV `benchmarks/qwen35x-wiki-ai-64k-gen128-rerun.csv`.
+  - llama.cpp `llama-completion` without Flash Attention: prefill `12,181.78 ms` / `5,369.00 tok/s`; decode `907.89 ms` / `139.88 tok/s`, CSV `benchmarks/llama-cli/qwen35x-wiki-ai-64k-gen128.csv`.
+  - llama.cpp `llama-completion` with Flash Attention: prefill `6,979.29 ms` / `9,371.15 tok/s`; decode `767.73 ms` / `165.42 tok/s`, CSV `benchmarks/llama-cli/qwen35x-wiki-ai-64k-gen128.csv`.
+  - Interpretation: the current Luce path remains strong at short context, but its long-context kernels are now the highest-priority bottleneck.
 - Current integrated Luce benchmark (April 24, 2026, `Runs=3`, `WarmupRuns=1`):
   - `pp256` prefill-only: avg `19,739.13 tok/s` (`20,112.19`, `18,994.76`, `20,110.50` samples), CSV `benchmarks/qwen35x-pp256-prefill-only-current-rerun.csv`
   - `prompt1/gen128` generation: avg `300.46 tok/s` (`317.89`, `312.77`, `270.72` samples), CSV `benchmarks/qwen35x-tg-prompt1-current-rerun.csv`
@@ -121,6 +126,44 @@ Milestone progress:
 - Milestone 5: completed for the Qwen3.5-0.8B default decode path (legacy kernels + integrated Luce megakernel backend)
 - Milestones 6-7: in progress
 
+## Immediate Priority: Long-Context Performance First
+
+This is the next work item and takes precedence over larger-model generalization and the remaining scaling roadmap.
+
+Rationale:
+- The 64k actual-prompt benchmark shows llama.cpp is substantially faster than the current Luce path for both prefill and generation.
+- The bottlenecks are structural rather than specific to the 0.8B model size: naive full-attention prefill, under-parallelized long-context decode attention, inefficient small recurrent projections during prefill, and missing decode graph reuse in the Luce path.
+- Generalizing the current kernels to larger Qwen3.5 variants before fixing these issues would mostly generalize a long-context design that already fails the target performance shape.
+
+Required work before model-size generalization:
+1. Add Luce phase profiling for prefill and decode
+- Capture per-layer and per-phase timings for projection, DeltaNet recurrence, full-attention QKV/cache work, attention scan, MLP, LM head, sampling, synchronization, and host/device transfers.
+- Make the profiler usable on both short-context progress gates and 64k actual-prompt runs.
+
+2. Fix long-context full-attention prefill
+- Replace the current naive causal full-attention prefill kernel with a tiled/flash-style implementation for the six full-attention layers.
+- Preserve the existing canonical KV cache layout so prefill still hands off directly to decode.
+- Benchmark both Flash-Attention-like and non-FA comparison modes against llama.cpp.
+
+3. Fix long-context decode attention
+- Split full-attention decode work across context blocks and reduce partial results per query head, instead of assigning only a small number of blocks to scan the whole KV cache.
+- Retune `decode_blocks` after split-context decode is available.
+- Keep short-context decode throughput from regressing.
+
+4. Replace inefficient long-prefill recurrent projections
+- Replace per-token/per-head beta and alpha scalar matvec launches with packed GEMM or another batched tensor-core path.
+- Reduce DeltaNet prefill kernel launch count and global-memory traffic.
+
+5. Add steady-state decode graph reuse where it is compatible with the Luce path
+- Capture/replay stable decode work when context shape and selected kernels allow it.
+- Keep correctness and stop-condition behavior unchanged.
+
+Exit criteria for resuming larger-model generalization:
+- 64k actual-prompt prefill and decode are materially closer to llama.cpp on the same hardware.
+- Short-context benchmarks do not regress from the current Luce advantage.
+- CPU/GPU parity still passes the minimal and extended suites.
+- The optimized kernels are structured as reusable primitives or per-variant specializations so later generalization does not require redoing the same work.
+
 ## Validation and Benchmarking Plan
 
 - Correctness tests:
@@ -137,7 +180,7 @@ Milestone progress:
 ## Current Performance Plan (April 2026 Update)
 
 Primary objective:
-- Maintain Luce-level decode throughput and current llama.cpp-leading `pp256` prefill throughput on the same hardware class.
+- Maintain Luce-level short-context decode throughput and current llama.cpp-leading `pp256` prefill throughput on the same hardware class, while closing the newly identified 64k-context prefill and decode gap versus llama.cpp.
 
 Technical direction:
 - Use Luce-style decode as the baseline runtime architecture.
@@ -146,22 +189,28 @@ Technical direction:
 - Treat the current initialization warmup as a measurement hygiene improvement, not a substitute for reducing actual prefill kernel work.
 
 Execution phases:
-1. Stabilize runtime baseline
+1. Stabilize and instrument runtime baseline
 - Keep persistent, device-resident decode flow as the default path.
 - Preserve deterministic correctness against CPU reference for fixed prompts/seeds.
+- Add detailed Luce phase profiling before making further long-context kernel changes.
 
-2. Decode optimization track (Luce target)
-- Prioritize persistent/megakernel-style decode execution and reduce per-token launch overhead.
-- Tune decode occupancy controls (`decode_blocks`, launch geometry) per GPU profile.
-- Keep sampling fully device-resident and remove avoidable host-side sync points.
+2. Long-context decode optimization track
+- Add split-context/split-K full-attention decode for long contexts.
+- Retune decode occupancy controls (`decode_blocks`, launch geometry) per GPU profile after split-context decode lands.
+- Add compatible CUDA graph reuse for steady-state decode.
+- Keep short-prompt decode throughput as a non-regression gate.
 
-3. Prefill optimization track (llama.cpp target)
-- Batched GEMM-based prefill is now the default path for QKV/MLP projections and cache/state handoff.
-- Add specialized full-attention prefill kernels with flash-style block processing.
+3. Long-context prefill optimization track
+- Replace naive full-attention prefill with tiled/flash-style block processing.
+- Replace beta/alpha per-token scalar matvec launches with packed GEMM or a comparable batched path.
 - Continue reducing linear-attention recurrence overhead and prefill kernel launch count.
 - Minimize copy traffic and avoid any prompt replay or prefill/decode state conversion.
 
-4. Unified scheduler and fallback policy
+4. Short-context decode optimization track (Luce target)
+- Prioritize persistent/megakernel-style decode execution and reduce per-token launch overhead.
+- Keep sampling fully device-resident and remove avoidable host-side sync points.
+
+5. Unified scheduler and fallback policy
 - Use one scheduler that chooses optimized paths by workload shape (prompt length, batch shape, model size, GPU profile).
 - Keep safe fallback paths for short prompts and unsupported configurations.
 
@@ -171,6 +220,8 @@ Benchmark gates:
 - Maintain comparable A/B runs versus old commits, Luce benchmark harness, and llama.cpp benchmark output.
 
 ## Scaling Plan for Larger Qwen3.5 Models
+
+Scaling work is intentionally paused behind the long-context performance priority above. Descriptor and larger-model work should resume only after the long-context exit criteria are met.
 
 Model progression:
 - Start from `Qwen3.5-0.8B`, then adapt to `4B`, `9B`, and `27B`.
@@ -239,6 +290,12 @@ Validation policy for each new size:
   Current status: `--luce-prefill-mode batched` is the default after sampler/cache-stride fixes, batched recurrence work, and CPU/GPU parity validation.
 - [x] Remove prompt-replay and token-wise projection/copy overhead in prefill; use batched projection execution with direct state/cache handoff.
 - [x] Warm the Luce prefill backend during initialization and reset state before real inference, keeping one-time cuBLAS/kernel setup out of timed prefill.
+- [ ] Add detailed Luce phase profiling for prefill and decode, including long-context 64k runs.
+- [ ] Replace naive full-attention prefill with tiled/flash-style block attention for long prompts.
+- [ ] Add split-context/split-K full-attention decode for long-context generation.
+- [ ] Replace prefill beta/alpha scalar matvec launches with packed GEMM or another batched tensor-core path.
+- [ ] Add compatible steady-state decode graph reuse for the Luce path.
+- [ ] Run prompt-length sweep benchmarks (short/medium/long/64k) after each major long-context optimization batch.
 - [ ] Reduce actual prefill kernel launch count and recurrence overhead beyond warmup effects.
 - [ ] Add a Luce model descriptor derived from `ModelProfile`/HF config and pass it through `LuceDecodeBackendConfig`.
 - [ ] Replace Luce-side 0.8B allocation sizes with descriptor-derived sizes while keeping the current 0.8B kernel as the only enabled compiled variant.
@@ -250,5 +307,4 @@ Validation policy for each new size:
 - [x] Establish deterministic CPU vs GPU parity harness + fixed prompt suites (`scripts/benchmark-parity.ps1`, minimal + extended prompt sets). Latest baseline (April 24, 2026): batched Luce prefill passes minimal `5/5` and extended `12/12`.
 - [x] Add optional PyTorch/Transformers parity harness (`scripts/benchmark-transformers-parity.ps1`) to validate tokenizer, prompt formatting, and greedy CPU-reference output against an external implementation. Latest baseline (April 24, 2026): minimal `5/5` pass.
 - [x] Run CPU vs GPU token-parity validation for the Luce default integration and source move.
-- [ ] Run prompt-length sweep benchmarks (short/medium/long) after each major optimization batch.
 - [x] Compare the integrated Luce default decode/prefill milestone against prior qwen35x, Luce harness, and saved llama.cpp benchmark artifacts.
