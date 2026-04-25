@@ -45,6 +45,7 @@ Current Qwen35x prefill behavior:
 
 Current decode control behavior:
 - The default Qwen35x CUDA path returns the selected token id each step and performs stop checks on the host.
+- `--gpu-decode-blocks <n>` can override decode grid size for tuning; the Qwen35x CUDA kernel clamps unsafe low values to one block per DeltaNet head and reports requested/effective block counts in profile JSON.
 - The legacy runtime backend buffers generated token ids on device when no stop tokens/sequences are configured.
 - If stop tokens/sequences are configured, decoding uses per-token host-visible checks to preserve immediate stop behavior.
 
@@ -86,19 +87,19 @@ Latest local long-context Qwen35x CUDA benchmark snapshot (April 25, 2026, Qwen3
 
 | Workload | qwen35x | llama.cpp | llama.cpp + FA | CSV |
 |---|---:|---:|---:|---|
-| 64k Wikipedia prompt prefill | `7,837.43 tok/s` (`8,345.21 ms`) | `5,369.00 tok/s` (`12,181.78 ms`) | `9,371.15 tok/s` (`6,979.29 ms`) | `benchmarks/qwen35x-wiki-ai-64k-gen128-qwen35x-prefill-single-path.csv` |
-| 64k Wikipedia prompt generation | `103.31 tok/s` (`1,239.05 ms`) | `139.88 tok/s` (`907.89 ms`) | `165.42 tok/s` (`767.73 ms`) | `benchmarks/qwen35x-wiki-ai-64k-gen128-qwen35x-prefill-single-path.csv` |
+| 64k Wikipedia prompt prefill | `7,870.08 tok/s` (`8,310.58 ms`) | `5,369.00 tok/s` (`12,181.78 ms`) | `9,371.15 tok/s` (`6,979.29 ms`) | `benchmarks/qwen35x-wiki-ai-64k-gen128-gqa-decode-default-profile.csv` |
+| 64k Wikipedia prompt generation | `201.18 tok/s` (`636.25 ms`) | `139.88 tok/s` (`907.89 ms`) | `165.42 tok/s` (`767.73 ms`) | `benchmarks/qwen35x-wiki-ai-64k-gen128-gqa-decode-default-profile.csv` |
 
-The current Qwen35x long-context prefill path is a single tiled full-attention implementation for all prompt lengths. It is now faster than llama.cpp without Flash Attention on 64k prefill, but still trails llama.cpp with Flash Attention; 64k decode remains behind both llama.cpp modes.
+The current Qwen35x long-context prefill path is a single tiled full-attention implementation for all prompt lengths. It is faster than llama.cpp without Flash Attention on 64k prefill, but still trails llama.cpp with Flash Attention. 64k decode now uses grouped-GQA full-attention decode and is ahead of the saved llama.cpp runs; the next decode bottleneck is LM head time.
 
 Full-attention prefill subphase split for the current 64k run:
 
 | Subphase | Time |
 |---|---:|
-| QK | `1,707.29 ms` |
-| Softmax | `1,676.92 ms` |
-| PV | `1,334.91 ms` |
-| Gate | `15.46 ms` |
+| QK | `1,693.86 ms` |
+| Softmax | `1,656.64 ms` |
+| PV | `1,322.32 ms` |
+| Gate | `15.38 ms` |
 
 Latest local short-context integrated Qwen35x CUDA benchmark snapshot (April 24-25, 2026, Qwen3.5-0.8B, RTX 5080 Laptop GPU):
 
@@ -141,12 +142,12 @@ It includes:
 Quick headline numbers from the latest comparison update:
 
 - Current qwen35x Qwen35x CUDA default: `300.46 tok/s` generation and `19,739.13 tok/s` `pp256` prefill
-- Current qwen35x 64k Wikipedia prompt: `7,837.43 tok/s` prefill and `103.31 tok/s` generation
+- Current qwen35x 64k Wikipedia prompt: `7,870.08 tok/s` prefill and `201.18 tok/s` generation
 - llama.cpp BF16 + FA saved run: `142.59 tok/s` generation and `13,681.26 tok/s` `pp256` prefill
 - llama.cpp BF16 + FA 64k Wikipedia prompt: `9,371.15 tok/s` prefill and `165.42 tok/s` generation
 - Historical standalone Qwen35x kernel bench harness decode: `267.45 tok/s`
 
-Parity status (April 24, 2026):
+Parity status (April 25, 2026):
 - CPU reference vs PyTorch/Transformers external oracle (`max_new_tokens=4`): `5/5` minimal prompts pass for both prompt token IDs and generated token IDs.
 - Default GPU path vs CPU reference (`--infer-gpu`, Qwen35x batched prefill, `gpu-f32`, `max_new_tokens=4`): `5/5` minimal prompts pass and `12/12` extended prompts pass.
 - The CPU reference remains the primary local oracle for GPU work. `scripts/benchmark-transformers-parity.ps1` cross-checks that oracle against PyTorch/Transformers.

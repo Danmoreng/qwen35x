@@ -29,6 +29,7 @@ constexpr int kFaNumQHeads = 8;
 constexpr int kFaNumKvHeads = 2;
 constexpr int kFaHeadDim = 256;
 constexpr int kFaRotDim = 64;
+constexpr int kFaGqaRatio = kFaNumQHeads / kFaNumKvHeads;
 constexpr int kFaQSize = kFaNumQHeads * kFaHeadDim;
 constexpr int kFaQprojSize = kFaQSize * 2;
 constexpr int kFaKvSize = kFaNumKvHeads * kFaHeadDim;
@@ -453,7 +454,7 @@ bool initialize_backend_state(
       !arena.alloc_bytes(std::max(kFaQprojSize, kDnConvChannels) * f32_bytes, state.g_qkv_scratch, error_message) ||
       !arena.alloc_bytes((kFaKvSize * 2) * f32_bytes, state.g_kv_scratch, error_message) ||
       !arena.alloc_bytes(std::max(kFaQSize, kDnVSize) * f32_bytes, state.g_attn_out, error_message) ||
-      !arena.alloc_bytes(static_cast<std::size_t>(kMaxDecodeBlocks) * (kFaHeadDim + 2) * f32_bytes, state.g_attn_partials, error_message) ||
+      !arena.alloc_bytes(static_cast<std::size_t>(kMaxDecodeBlocks) * kFaGqaRatio * (kFaHeadDim + 2) * f32_bytes, state.g_attn_partials, error_message) ||
       !arena.alloc_bytes(kIntermediateSize * f32_bytes, state.g_mlp_inter, error_message) ||
       !arena.alloc_bytes(kDnVSize * f32_bytes, state.g_z_scratch, error_message) ||
       !arena.alloc_bytes(kDnNumHeads * f32_bytes, state.g_beta_scratch, error_message) ||
@@ -821,9 +822,7 @@ bool Qwen35xCudaBackend::initialize(const Qwen35xCudaBackendConfig & config, std
 
   impl_ = std::make_unique<Impl>();
   impl_->config = config;
-  if (config.decode_blocks > 0) {
-    ::set_decode_blocks_override(config.decode_blocks);
-  }
+  ::set_decode_blocks_override(config.decode_blocks);
 
   if (!initialize_backend_state(config, impl_->arena, impl_->state, error_message)) {
     impl_ = std::make_unique<Impl>();

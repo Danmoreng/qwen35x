@@ -36,11 +36,12 @@ Current known constraints:
 
 Latest local benchmark snapshot (Qwen3.5-0.8B, same machine):
 - Long-context actual-prompt benchmark (April 25, 2026, Wikipedia prompt, ~65k prompt tokens, `MaxContext=65536`, `MaxNewTokens=128`):
-  - Current integrated Qwen35x CUDA path after profiling, split decode attention, and single-path tiled prefill tuning: prefill `8,345.21 ms` / `7,837.43 tok/s`; decode `1,239.05 ms` / `103.31 tok/s`, CSV `benchmarks/qwen35x-wiki-ai-64k-gen128-qwen35x-prefill-single-path.csv`.
-  - Full-attention prefill attention subphase split: total attention `4,740.27 ms`; QK `1,707.29 ms`, softmax `1,676.92 ms`, PV `1,334.91 ms`, gate `15.46 ms`.
+  - Current integrated Qwen35x CUDA path after profiling, split decode attention, grouped-GQA decode, decode-block clamp, and single-path tiled prefill tuning: prefill `8,310.58 ms` / `7,870.08 tok/s`; decode `636.25 ms` / `201.18 tok/s`, CSV `benchmarks/qwen35x-wiki-ai-64k-gen128-gqa-decode-default-profile.csv`.
+  - Full-attention prefill attention subphase split: total attention `4,694.03 ms`; QK `1,693.86 ms`, softmax `1,656.64 ms`, PV `1,322.32 ms`, gate `15.38 ms`.
+  - Decode profile for the same run: effective decode blocks `60/60`, decode kernel `516.41 ms`, LM head `115.30 ms`.
   - llama.cpp `llama-completion` without Flash Attention: prefill `12,181.78 ms` / `5,369.00 tok/s`; decode `907.89 ms` / `139.88 tok/s`, CSV `benchmarks/llama-cli/qwen35x-wiki-ai-64k-gen128.csv`.
   - llama.cpp `llama-completion` with Flash Attention: prefill `6,979.29 ms` / `9,371.15 tok/s`; decode `767.73 ms` / `165.42 tok/s`, CSV `benchmarks/llama-cli/qwen35x-wiki-ai-64k-gen128.csv`.
-  - Interpretation: Qwen35x long-context prefill is now faster than llama.cpp without Flash Attention but remains behind llama.cpp with Flash Attention; decode is still behind both llama.cpp modes at 64k.
+  - Interpretation: Qwen35x long-context prefill is faster than llama.cpp without Flash Attention but remains behind llama.cpp with Flash Attention; decode is now ahead of the saved llama.cpp runs, with LM head the next material decode bottleneck.
 - Current short-context gate after the single-path prefill cleanup (April 25, 2026, `Runs=3`, `WarmupRuns=1`, `MaxContext=256`, `MaxNewTokens=128`):
   - `chat_short_joke/gen128` generation avg `274.30 tok/s` (`275.22`, `268.66`, `279.03` samples), CSV `benchmarks/qwen35x-short-gen128-qwen35x-prefill-single-path.csv`.
 - Current integrated Qwen35x CUDA benchmark (April 24, 2026, `Runs=3`, `WarmupRuns=1`):
@@ -137,8 +138,8 @@ Milestone progress:
 This is the next work item and takes precedence over larger-model generalization and the remaining scaling roadmap.
 
 Rationale:
-- The 64k actual-prompt benchmark shows llama.cpp is substantially faster than the current Qwen35x CUDA path for both prefill and generation.
-- The bottlenecks are structural rather than specific to the 0.8B model size: the current materialized full-attention prefill path still spends seconds across QK/softmax/PV at 64k, long-context decode still trails llama.cpp, prefill beta/alpha projections remain inefficient, and the Qwen35x CUDA path still lacks compatible steady-state decode graph reuse.
+- The 64k actual-prompt benchmark now shows Qwen35x CUDA generation ahead of the saved llama.cpp runs after grouped-GQA decode, while prefill still trails llama.cpp with Flash Attention.
+- The remaining bottlenecks are structural rather than specific to the 0.8B model size: the current materialized full-attention prefill path still spends seconds across QK/softmax/PV at 64k, decode now spends a meaningful share in LM head, prefill beta/alpha projections remain inefficient, and the Qwen35x CUDA path still lacks compatible steady-state decode graph reuse.
 - Generalizing the current kernels to larger Qwen3.5 variants before fixing these issues would mostly generalize a long-context design that already fails the target performance shape.
 
 Required work before model-size generalization:
@@ -153,8 +154,9 @@ Required work before model-size generalization:
 - Continue benchmarking against llama.cpp with and without Flash Attention.
 
 3. Fix long-context decode attention
-- Current status: split-context full-attention decode is implemented and improves the 64k generation path materially from the initial long-context Qwen35x CUDA baseline.
-- Retune `decode_blocks` and reduction geometry after the next prefill changes stabilize.
+- Current status: split-context full-attention decode plus grouped-GQA KV sharing is implemented. The 64k generation path improved from `103.31 tok/s` to `201.18 tok/s` on the saved Wikipedia prompt, ahead of the saved llama.cpp runs.
+- Decode-block override and effective block reporting are wired into `scripts/benchmark-inference-seq.ps1`; unsafe low overrides are clamped to one block per DeltaNet head.
+- Next step: optimize LM head and preserve the current decode attention path as the baseline.
 - Keep short-context decode throughput from regressing.
 
 4. Replace inefficient long-prefill recurrent projections
@@ -203,7 +205,9 @@ Execution phases:
 
 2. Long-context decode optimization track
 - Split-context/split-K full-attention decode for long contexts has landed.
-- Retune decode occupancy controls (`decode_blocks`, launch geometry) per GPU profile after split-context decode lands.
+- Grouped-GQA decode sharing is implemented, so each KV segment feeds all query heads in its GQA group.
+- Decode occupancy controls are exposed and profiled; current default uses dynamic max-safe blocks with a minimum safety clamp.
+- Optimize LM head, which is now a visible share of long-context decode time.
 - Add compatible CUDA graph reuse for steady-state decode.
 - Keep short-prompt decode throughput as a non-regression gate.
 
@@ -302,6 +306,8 @@ Validation policy for each new size:
 - [x] Replace naive full-attention prefill with a single tiled full-attention path for all prompt lengths.
 - [ ] Replace the materialized tiled full-attention prefill path with a unified fused/flash-style implementation.
 - [x] Add split-context/split-K full-attention decode for long-context generation.
+- [x] Add grouped-GQA full-attention decode sharing plus decode-block profiling/clamping.
+- [ ] Optimize LM head for long-context token generation.
 - [ ] Replace prefill beta/alpha scalar matvec launches with packed GEMM or another batched tensor-core path.
 - [ ] Add compatible steady-state decode graph reuse for the Qwen35x CUDA path.
 - [ ] Run prompt-length sweep benchmarks (short/medium/long/64k) after each major long-context optimization batch.

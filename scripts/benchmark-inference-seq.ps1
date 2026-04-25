@@ -16,6 +16,7 @@ param(
     [int]$WarmupRuns = 1,
     [int]$MaxNewTokens = 128,
     [int]$MaxContext = 256,
+    [int]$GpuDecodeBlocks = 0,
     [double]$Temperature = 0.0,
     [double]$TopP = 0.8,
     [int]$TopK = 20,
@@ -120,6 +121,7 @@ function Invoke-BenchmarkRun {
         [Parameter(Mandatory = $false)][string]$PromptTokensCsv,
         [Parameter(Mandatory = $true)][int]$MaxNewTokens,
         [Parameter(Mandatory = $true)][int]$MaxContext,
+        [Parameter(Mandatory = $true)][int]$GpuDecodeBlocks,
         [Parameter(Mandatory = $true)][double]$Temperature,
         [Parameter(Mandatory = $true)][double]$TopP,
         [Parameter(Mandatory = $true)][int]$TopK,
@@ -182,6 +184,9 @@ function Invoke-BenchmarkRun {
     if ($Mode -ne "cpu-reference" -and $Qwen35xPrefillMode -ne "default") {
         $args += @("--qwen35x-prefill-mode", $Qwen35xPrefillMode)
     }
+    if ($Mode -ne "cpu-reference" -and $GpuDecodeBlocks -gt 0) {
+        $args += @("--gpu-decode-blocks", "$GpuDecodeBlocks")
+    }
 
     Write-Host ("Running mode={0} prompt={1}" -f $Mode, $PromptMode) -ForegroundColor Cyan
     $runOutput = & $ExePath @args 2>&1
@@ -227,6 +232,9 @@ if ($Runs -lt 1) {
 if ($WarmupRuns -lt 0) {
     throw "WarmupRuns must be >= 0."
 }
+if ($GpuDecodeBlocks -lt 0) {
+    throw "GpuDecodeBlocks must be >= 0."
+}
 if (($PromptMode -eq "chat-user" -or $PromptMode -eq "prompt-text") -and [string]::IsNullOrWhiteSpace($PromptText)) {
     throw "PromptText must be non-empty for prompt mode '$PromptMode'."
 }
@@ -266,6 +274,7 @@ foreach ($mode in $Modes) {
                 -PromptTokensCsv $PromptTokensCsv `
                 -MaxNewTokens $MaxNewTokens `
                 -MaxContext $MaxContext `
+                -GpuDecodeBlocks $GpuDecodeBlocks `
                 -Temperature $Temperature `
                 -TopP $TopP `
                 -TopK $TopK `
@@ -297,6 +306,7 @@ foreach ($mode in $Modes) {
                 -PromptTokensCsv $PromptTokensCsv `
                 -MaxNewTokens $MaxNewTokens `
                 -MaxContext $MaxContext `
+                -GpuDecodeBlocks $GpuDecodeBlocks `
                 -Temperature $Temperature `
                 -TopP $TopP `
                 -TopK $TopK `
@@ -332,6 +342,7 @@ foreach ($mode in $Modes) {
                 run_label        = $RunLabel
                 mode             = $mode
                 qwen35x_prefill_mode = $effectiveQwen35xPrefillMode
+                qwen35x_decode_blocks_requested = $GpuDecodeBlocks
                 prefill_only     = [bool]$profile.prefill_only
                 run_index        = $runIndex
                 prompt_name      = $PromptName
@@ -367,6 +378,8 @@ foreach ($mode in $Modes) {
                 qwen35x_prefill_full_attention_projection_ms = Measure-Qwen35xLayerMs -RuntimeProfile $qwen35xProfileJson -LayerType "full_attention" -Fields @("qkv_projection_ms", "kv_projection_ms", "out_projection_ms")
                 qwen35x_prefill_mlp_total_ms = Measure-Qwen35xLayerMs -RuntimeProfile $qwen35xProfileJson -LayerType "" -Fields @("mlp_norm_ms", "mlp_projection_ms", "mlp_activation_ms", "mlp_down_projection_ms", "mlp_residual_ms")
                 qwen35x_decode_steps = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xDecodeJson -Name "steps")
+                qwen35x_decode_blocks = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xDecodeJson -Name "decode_blocks")
+                qwen35x_decode_max_safe_blocks = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xDecodeJson -Name "max_safe_decode_blocks")
                 qwen35x_decode_host_total_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xDecodeJson -Name "host_total_ms")
                 qwen35x_decode_seen_token_upload_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xDecodeJson -Name "seen_token_upload_ms")
                 qwen35x_decode_launch_total_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xDecodeJson -Name "launch_total_ms")

@@ -57,10 +57,11 @@ constexpr int DN_CONV_CHANNELS = DN_QK_SIZE + DN_QK_SIZE + DN_V_SIZE;
 #endif
 
 constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
-constexpr int ATTENTION_WARP_SCRATCH = NUM_WARPS * FA_HEAD_DIM;
+constexpr int ATTENTION_WARP_SCRATCH = FA_GQA_RATIO * NUM_WARPS * FA_HEAD_DIM;
 constexpr int BASE_MAX_ACT_DIM = (HIDDEN_SIZE > INTERMEDIATE_SIZE) ? HIDDEN_SIZE : INTERMEDIATE_SIZE;
 constexpr int MAX_ACT_DIM = (BASE_MAX_ACT_DIM > ATTENTION_WARP_SCRATCH) ? BASE_MAX_ACT_DIM : ATTENTION_WARP_SCRATCH;
 constexpr int MAX_DECODE_BLOCKS = 1024;
+constexpr int MIN_DECODE_BLOCKS = DN_NUM_HEADS;
 
 #ifndef LM_NUM_BLOCKS
 #define LM_NUM_BLOCKS 512
@@ -443,7 +444,7 @@ __device__ void full_attention_layer(
     float *__restrict__ g_q,                  // [FA_QPROJ_SIZE] f32
     float *__restrict__ g_kv,                 // [FA_KV_SIZE*2] f32
     float *__restrict__ g_attn_out,           // [FA_Q_SIZE] f32
-    float *__restrict__ g_attn_partials,      // [gridDim.x * (2 + FA_HEAD_DIM)] f32
+    float *__restrict__ g_attn_partials,      // [gridDim.x * FA_GQA_RATIO * (2 + FA_HEAD_DIM)] f32
     float *__restrict__ g_mlp_inter,          // [INTER] f32
     __nv_bfloat16 *__restrict__ hidden_out,   // [HIDDEN] bf16
     int position, int max_seq_len,
@@ -518,68 +519,120 @@ __device__ void full_attention_layer(
     {
         int cache_len = position + 1;
         float attn_scale = 1.0f / sqrtf(float(FA_HEAD_DIM));
-        __shared__ float s_max_score[NUM_WARPS];
-        __shared__ float s_sum_exp[NUM_WARPS];
+        __shared__ float s_max_score[FA_GQA_RATIO * NUM_WARPS];
+        __shared__ float s_sum_exp[FA_GQA_RATIO * NUM_WARPS];
         float *s_warp_out = reinterpret_cast<float *>(shmem);
         constexpr int EPL = FA_HEAD_DIM / WARP_SIZE;
 
-        const int segments_per_head = num_blocks / FA_NUM_Q_HEADS;
-        if (segments_per_head >= 2 && g_attn_partials != nullptr) {
+        const int segments_per_kv = num_blocks / FA_NUM_KV_HEADS;
+        if (segments_per_kv >= 2 && g_attn_partials != nullptr) {
+            const int partial_slots = num_blocks * FA_GQA_RATIO;
             float *partial_max = g_attn_partials;
-            float *partial_sum = partial_max + num_blocks;
-            float *partial_out = partial_sum + num_blocks;
+            float *partial_sum = partial_max + partial_slots;
+            float *partial_out = partial_sum + partial_slots;
 
-            const int active_blocks = segments_per_head * FA_NUM_Q_HEADS;
+            const int active_blocks = segments_per_kv * FA_NUM_KV_HEADS;
             if (block_id < active_blocks) {
-                const int qh = block_id % FA_NUM_Q_HEADS;
-                const int segment_idx = block_id / FA_NUM_Q_HEADS;
-                const int kvh = qh / FA_GQA_RATIO;
-                const int segment_size = (cache_len + segments_per_head - 1) / segments_per_head;
+                const int kvh = block_id % FA_NUM_KV_HEADS;
+                const int segment_idx = block_id / FA_NUM_KV_HEADS;
+                const int segment_size = (cache_len + segments_per_kv - 1) / segments_per_kv;
                 const int segment_start = segment_idx * segment_size;
                 const int segment_end = min(cache_len, segment_start + segment_size);
+                const int qh_base = kvh * FA_GQA_RATIO;
 
-                float *q_head = g_q + qh * FA_HEAD_DIM * 2;
-                float max_score = -FLT_MAX;
-                float sum_exp = 0.0f;
-                float out_acc[EPL], q_local[EPL];
-                for (int e = 0; e < EPL; e++) { out_acc[e] = 0.0f; q_local[e] = q_head[lane_id*EPL+e]; }
+                float max_score[FA_GQA_RATIO];
+                float sum_exp[FA_GQA_RATIO];
+                float out_acc[FA_GQA_RATIO][EPL];
+                float q_local[FA_GQA_RATIO][EPL];
+
+#pragma unroll
+                for (int local_q = 0; local_q < FA_GQA_RATIO; ++local_q) {
+                    float *q_head = g_q + (qh_base + local_q) * FA_HEAD_DIM * 2;
+                    max_score[local_q] = -FLT_MAX;
+                    sum_exp[local_q] = 0.0f;
+#pragma unroll
+                    for (int e = 0; e < EPL; e++) {
+                        out_acc[local_q][e] = 0.0f;
+                        q_local[local_q][e] = q_head[lane_id*EPL+e];
+                    }
+                }
 
                 for (int pos = segment_start + warp_id; pos < segment_end; pos += NUM_WARPS) {
                     const __nv_bfloat16 *k_pos = k_cache + kvh*max_seq_len*FA_HEAD_DIM + pos*FA_HEAD_DIM;
                     const __nv_bfloat16 *v_pos = v_cache + kvh*max_seq_len*FA_HEAD_DIM + pos*FA_HEAD_DIM;
-                    float score = 0.0f;
-                    for (int e = 0; e < EPL; e++) score += q_local[e] * __bfloat162float(__ldg(k_pos + lane_id*EPL+e));
-                    score = warp_reduce_sum(score) * attn_scale;
-                    score = __shfl_sync(0xffffffff, score, 0);
-                    float old_max = max_score; max_score = fmaxf(max_score, score);
-                    float exp_diff = fast_exp(old_max - max_score);
-                    sum_exp = sum_exp * exp_diff + fast_exp(score - max_score);
-                    float wt = fast_exp(score - max_score);
-                    for (int e = 0; e < EPL; e++)
-                        out_acc[e] = out_acc[e]*exp_diff + wt*__bfloat162float(__ldg(v_pos + lane_id*EPL+e));
+                    float k_local[EPL], v_local[EPL];
+#pragma unroll
+                    for (int e = 0; e < EPL; e++) {
+                        const int d = lane_id*EPL + e;
+                        k_local[e] = __bfloat162float(__ldg(k_pos + d));
+                        v_local[e] = __bfloat162float(__ldg(v_pos + d));
+                    }
+
+                    float score[FA_GQA_RATIO];
+#pragma unroll
+                    for (int local_q = 0; local_q < FA_GQA_RATIO; ++local_q) {
+                        float dot = 0.0f;
+#pragma unroll
+                        for (int e = 0; e < EPL; e++) dot += q_local[local_q][e] * k_local[e];
+                        dot = warp_reduce_sum(dot) * attn_scale;
+                        score[local_q] = __shfl_sync(0xffffffff, dot, 0);
+                    }
+
+#pragma unroll
+                    for (int local_q = 0; local_q < FA_GQA_RATIO; ++local_q) {
+                        float old_max = max_score[local_q];
+                        max_score[local_q] = fmaxf(max_score[local_q], score[local_q]);
+                        float exp_diff = fast_exp(old_max - max_score[local_q]);
+                        float wt = fast_exp(score[local_q] - max_score[local_q]);
+                        sum_exp[local_q] = sum_exp[local_q] * exp_diff + wt;
+#pragma unroll
+                        for (int e = 0; e < EPL; e++)
+                            out_acc[local_q][e] = out_acc[local_q][e]*exp_diff + wt*v_local[e];
+                    }
                 }
-                if (lane_id == 0) { s_max_score[warp_id] = max_score; s_sum_exp[warp_id] = sum_exp; }
-                for (int e = 0; e < EPL; e++) s_warp_out[warp_id*FA_HEAD_DIM + lane_id*EPL+e] = out_acc[e];
+
+#pragma unroll
+                for (int local_q = 0; local_q < FA_GQA_RATIO; ++local_q) {
+                    const int warp_slot = local_q * NUM_WARPS + warp_id;
+                    if (lane_id == 0) {
+                        s_max_score[warp_slot] = max_score[local_q];
+                        s_sum_exp[warp_slot] = sum_exp[local_q];
+                    }
+#pragma unroll
+                    for (int e = 0; e < EPL; e++) {
+                        s_warp_out[warp_slot*FA_HEAD_DIM + lane_id*EPL+e] = out_acc[local_q][e];
+                    }
+                }
                 __syncthreads();
 
                 if (warp_id == 0) {
-                    float gm = -FLT_MAX;
-                    for (int ww = 0; ww < NUM_WARPS; ww++) {
-                        if (s_sum_exp[ww] > 0.0f) gm = fmaxf(gm, s_max_score[ww]);
-                    }
-                    float ts = 0.0f; float fo[EPL]; for (int e = 0; e < EPL; e++) fo[e] = 0.0f;
-                    for (int ww = 0; ww < NUM_WARPS; ww++) {
-                        if (s_sum_exp[ww] > 0.0f) {
-                            float s = fast_exp(s_max_score[ww] - gm); ts += s_sum_exp[ww] * s;
-                            for (int e = 0; e < EPL; e++) fo[e] += s_warp_out[ww*FA_HEAD_DIM+lane_id*EPL+e] * s;
+#pragma unroll
+                    for (int local_q = 0; local_q < FA_GQA_RATIO; ++local_q) {
+                        const int warp_base = local_q * NUM_WARPS;
+                        float gm = -FLT_MAX;
+                        for (int ww = 0; ww < NUM_WARPS; ww++) {
+                            if (s_sum_exp[warp_base + ww] > 0.0f) gm = fmaxf(gm, s_max_score[warp_base + ww]);
                         }
-                    }
-                    if (lane_id == 0) {
-                        partial_max[block_id] = gm;
-                        partial_sum[block_id] = ts;
-                    }
-                    for (int e = 0; e < EPL; e++) {
-                        partial_out[block_id*FA_HEAD_DIM + lane_id*EPL+e] = fo[e];
+                        float ts = 0.0f; float fo[EPL]; for (int e = 0; e < EPL; e++) fo[e] = 0.0f;
+                        for (int ww = 0; ww < NUM_WARPS; ww++) {
+                            if (s_sum_exp[warp_base + ww] > 0.0f) {
+                                float s = fast_exp(s_max_score[warp_base + ww] - gm);
+                                ts += s_sum_exp[warp_base + ww] * s;
+#pragma unroll
+                                for (int e = 0; e < EPL; e++) {
+                                    fo[e] += s_warp_out[(warp_base + ww)*FA_HEAD_DIM+lane_id*EPL+e] * s;
+                                }
+                            }
+                        }
+                        const int partial_slot = block_id * FA_GQA_RATIO + local_q;
+                        if (lane_id == 0) {
+                            partial_max[partial_slot] = gm;
+                            partial_sum[partial_slot] = ts;
+                        }
+#pragma unroll
+                        for (int e = 0; e < EPL; e++) {
+                            partial_out[partial_slot*FA_HEAD_DIM + lane_id*EPL+e] = fo[e];
+                        }
                     }
                 }
             }
@@ -587,21 +640,25 @@ __device__ void full_attention_layer(
 
             if (block_id < FA_NUM_Q_HEADS) {
                 const int qh = block_id;
+                const int kvh = qh / FA_GQA_RATIO;
+                const int local_q = qh - kvh * FA_GQA_RATIO;
                 float *q_head = g_q + qh * FA_HEAD_DIM * 2;
                 float *out_head = g_attn_out + qh * FA_HEAD_DIM;
                 if (threadIdx.x == 0) {
                     float gm = -FLT_MAX;
-                    for (int seg = 0; seg < segments_per_head; ++seg) {
-                        const int partial_block = seg * FA_NUM_Q_HEADS + qh;
-                        if (partial_sum[partial_block] > 0.0f) {
-                            gm = fmaxf(gm, partial_max[partial_block]);
+                    for (int seg = 0; seg < segments_per_kv; ++seg) {
+                        const int partial_block = seg * FA_NUM_KV_HEADS + kvh;
+                        const int partial_slot = partial_block * FA_GQA_RATIO + local_q;
+                        if (partial_sum[partial_slot] > 0.0f) {
+                            gm = fmaxf(gm, partial_max[partial_slot]);
                         }
                     }
                     float ts = 0.0f;
-                    for (int seg = 0; seg < segments_per_head; ++seg) {
-                        const int partial_block = seg * FA_NUM_Q_HEADS + qh;
-                        if (partial_sum[partial_block] > 0.0f) {
-                            ts += partial_sum[partial_block] * fast_exp(partial_max[partial_block] - gm);
+                    for (int seg = 0; seg < segments_per_kv; ++seg) {
+                        const int partial_block = seg * FA_NUM_KV_HEADS + kvh;
+                        const int partial_slot = partial_block * FA_GQA_RATIO + local_q;
+                        if (partial_sum[partial_slot] > 0.0f) {
+                            ts += partial_sum[partial_slot] * fast_exp(partial_max[partial_slot] - gm);
                         }
                     }
                     s_max_score[0] = gm;
@@ -614,10 +671,11 @@ __device__ void full_attention_layer(
                 float *gate_ptr = q_head + FA_HEAD_DIM;
                 for (int d = threadIdx.x; d < FA_HEAD_DIM; d += BLOCK_SIZE) {
                     float value = 0.0f;
-                    for (int seg = 0; seg < segments_per_head; ++seg) {
-                        const int partial_block = seg * FA_NUM_Q_HEADS + qh;
-                        if (partial_sum[partial_block] > 0.0f) {
-                            value += partial_out[partial_block*FA_HEAD_DIM + d] * fast_exp(partial_max[partial_block] - gm);
+                    for (int seg = 0; seg < segments_per_kv; ++seg) {
+                        const int partial_block = seg * FA_NUM_KV_HEADS + kvh;
+                        const int partial_slot = partial_block * FA_GQA_RATIO + local_q;
+                        if (partial_sum[partial_slot] > 0.0f) {
+                            value += partial_out[partial_slot*FA_HEAD_DIM + d] * fast_exp(partial_max[partial_slot] - gm);
                         }
                     }
                     out_head[d] = value * rcp * fast_sigmoid(gate_ptr[d]);
@@ -975,7 +1033,7 @@ decode_kernel(
 
     AtomicGridSync grid{barrier_counter, barrier_generation, (unsigned int)num_blocks, 0};
 
-    // Shared memory: large enough for max(HIDDEN_SIZE bf16, INTERMEDIATE_SIZE f32)
+    // Shared memory: large enough for activations and grouped attention warp scratch.
     __shared__ __align__(16) char shmem_raw[MAX_ACT_DIM * sizeof(float)];
     __nv_bfloat16 *shmem_bf16 = reinterpret_cast<__nv_bfloat16 *>(shmem_raw);
 
@@ -1075,13 +1133,17 @@ extern "C" void launch_decode(
 
     if (g_decode_blocks_override > 0) {
         decode_blocks = g_decode_blocks_override;
-        if (decode_blocks > max_safe_blocks) decode_blocks = max_safe_blocks;
     } else {
         decode_blocks = max_safe_blocks;
     }
 
-    if (decode_blocks < 1) decode_blocks = 1;
+    if (decode_blocks < MIN_DECODE_BLOCKS) decode_blocks = MIN_DECODE_BLOCKS;
+    if (decode_blocks > max_safe_blocks) decode_blocks = max_safe_blocks;
     if (decode_blocks > MAX_DECODE_BLOCKS) decode_blocks = MAX_DECODE_BLOCKS;
+    if (profile) {
+        profile->decode_blocks = decode_blocks;
+        profile->max_safe_decode_blocks = max_safe_blocks;
+    }
 
     cudaEvent_t profile_total_start = nullptr;
     cudaEvent_t profile_decode_end = nullptr;

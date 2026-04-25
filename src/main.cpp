@@ -127,6 +127,8 @@ void write_qwen35x_profile_json(std::ostream & out, const qwen35x::cuda_backend:
   out << "      \"enabled\": " << (profile.decode.enabled ? "true" : "false") << ",\n";
   out << "      \"steps\": " << profile.decode.steps << ",\n";
   out << "      \"last_position\": " << profile.decode.last_position << ",\n";
+  out << "      \"decode_blocks\": " << profile.decode.decode_blocks << ",\n";
+  out << "      \"max_safe_decode_blocks\": " << profile.decode.max_safe_decode_blocks << ",\n";
   out << "      \"host_total_ms\": " << profile.decode.host_total_ms << ",\n";
   out << "      \"seen_token_upload_ms\": " << profile.decode.seen_token_upload_ms << ",\n";
   out << "      \"launch_total_ms\": " << profile.decode.launch_total_ms << ",\n";

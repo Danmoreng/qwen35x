@@ -10,12 +10,12 @@ Progress snapshot (April 2026):
 - Legacy runtime BF16 CUDA decode matvec path is implemented.
 - Optional synchronized CUDA profiling mode is implemented (`--profile-sync`).
 - Full-attention packed projection (`q+gate+k+v`) is implemented to reduce decode matvec launches.
-- Full-attention decode now uses a streaming online-softmax/value kernel (single pass over sequence).
+- Full-attention decode uses streaming online-softmax/value reduction, split-context decode for long contexts, and grouped-GQA KV sharing.
 - `--infer-gpu` now defaults to the in-tree Qwen35x CUDA backend for Qwen3.5-0.8B.
 - The Qwen35x CUDA backend passes deterministic CPU parity on both minimal and extended prompt suites.
 - Legacy runtime measured transfer footprint is near control-path scale (`~3-4 bytes D2H per forward token`); Qwen35x CUDA backend transfer accounting is currently outside the shared CUDA stats path.
-- Current measured sequential benchmark (April 23, 2026, integrated Qwen35x CUDA default): `gpu-bf16` avg `289.43 tok/s`, `gpu-f32` avg `287.88 tok/s`.
-- Current open bottlenecks are greedy-only Qwen35x CUDA sampling support, prompt prefill replay, and batched/specialized prefill parity.
+- Current measured 64k long-context generation benchmark (April 25, 2026, integrated Qwen35x CUDA default): `201.18 tok/s` with effective decode blocks `60/60`.
+- Current open bottlenecks are greedy-only Qwen35x CUDA sampling support, long-context prefill behind llama.cpp Flash Attention, LM-head decode time, and larger-model generalization.
 
 Scope:
 - Model family: Qwen3.5 (current profile `qwen3_5_0_8b.profile.json`)
@@ -112,8 +112,8 @@ Exit criteria:
 
 ## 4. Implement GPU Full-Attention Decode Kernel (GQA)
 
-Current issue:
-- Full-attention math runs in CPU loops in `run_full_attention_step`.
+Current status:
+- Full-attention decode runs in the Qwen35x CUDA backend, including long-context split-context execution and grouped-GQA KV sharing.
 
 Tasks:
 - [x] Add real kernel replacing `qwen35x_full_decode_gqa_stub`
@@ -264,7 +264,7 @@ Tasks:
 - [x] Add script for throughput benchmarking with CSV output (`scripts/benchmark-inference-seq.ps1`)
 - [ ] Add CI-friendly smoke mode (short token count, fixed seed)
 
-Latest parity status (April 24, 2026):
+Latest parity status (April 25, 2026):
 - CPU reference vs PyTorch/Transformers external oracle (`scripts/benchmark-transformers-parity.ps1`, minimal prompt suite, `max_new_tokens=4`): pass `5/5` for prompt-token and generated-token parity.
 - Current default GPU path vs CPU reference (`scripts/benchmark-parity.ps1`, minimal prompt suite, `gpu-f32`, Qwen35x `batched`, `max_new_tokens=4`): pass `5/5`.
 - Extended CPU/GPU parity suite (`scripts/bench/parity_prompts.txt`, `max_new_tokens=4`, `gpu-f32`, Qwen35x `batched`, April 24, 2026): pass `12/12`.

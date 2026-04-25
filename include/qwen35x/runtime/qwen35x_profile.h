@@ -54,6 +54,8 @@ struct Qwen35xDecodeProfile {
   bool enabled = false;
   int steps = 0;
   int last_position = -1;
+  int decode_blocks = 0;
+  int max_safe_decode_blocks = 0;
   double host_total_ms = 0.0;
   double seen_token_upload_ms = 0.0;
   double launch_total_ms = 0.0;
