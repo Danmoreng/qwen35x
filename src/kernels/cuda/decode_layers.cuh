@@ -2,7 +2,7 @@
 
 #include "common.cuh"
 #include "decode_sync.cuh"
-#include "variant_0p8b.cuh"
+#include "variant.cuh"
 #include "weights.cuh"
 
 #include <cuda_bf16.h>
@@ -608,8 +608,21 @@ __device__ void deltanet_layer(
 
     matvec_bf16(s_norm, w.qkv_proj_weight, g_qkv, HIDDEN_SIZE, DN_CONV_CHANNELS, num_blocks);
     matvec_bf16(s_norm, w.z_proj_weight, g_z, HIDDEN_SIZE, DN_V_SIZE, num_blocks);
-    matvec_bf16(s_norm, w.beta_proj_weight, g_beta, HIDDEN_SIZE, DN_NUM_HEADS, num_blocks);
-    matvec_bf16(s_norm, w.alpha_proj_weight, g_alpha, HIDDEN_SIZE, DN_NUM_HEADS, num_blocks);
+    matvec_bf16(s_norm, w.beta_proj_weight, g_beta, HIDDEN_SIZE, DN_GATE_HEADS, num_blocks);
+    matvec_bf16(s_norm, w.alpha_proj_weight, g_alpha, HIDDEN_SIZE, DN_GATE_HEADS, num_blocks);
+    grid.sync();
+
+    if (block_id < DN_GATE_HEADS) {
+        int gh = block_id;
+        if (threadIdx.x == 0) {
+            g_beta[gh] = fast_sigmoid(g_beta[gh]);
+            float a_log_val = __bfloat162float(__ldg(w.a_log + gh));
+            float dt_b = __bfloat162float(__ldg(w.dt_bias + gh));
+            float x = g_alpha[gh] + dt_b;
+            float sp = (x > 20.0f) ? x : logf(1.0f + fast_exp(x));
+            g_alpha[gh] = fast_exp(-fast_exp(a_log_val) * sp);
+        }
+    }
     grid.sync();
 
     // Phase 2+3: Conv1d + recurrence (blocks 0-15 only)
@@ -635,17 +648,6 @@ __device__ void deltanet_layer(
             }
         }
 
-        // Beta/alpha activations
-        if (threadIdx.x == 0) {
-            g_beta[h] = fast_sigmoid(g_beta[h]);
-            float a_log_val = __bfloat162float(__ldg(w.a_log + h));
-            float dt_b = __bfloat162float(__ldg(w.dt_bias + h));
-            float x = g_alpha[h] + dt_b;
-            float sp = (x > 20.0f) ? x : logf(1.0f + fast_exp(x));
-            g_alpha[h] = fast_exp(-fast_exp(a_log_val) * sp);
-        }
-        __syncthreads();
-
         // L2 normalize Q, K
         constexpr float Q_SCALE = 1.0f / 11.313708498984761f;
         if (warp_id == 0) {
@@ -659,8 +661,6 @@ __device__ void deltanet_layer(
             n = __shfl_sync(0xffffffff,n,0); for (int i = lane_id; i < DN_KEY_DIM; i += WARP_SIZE) s_k[i] *= n;
         }
         __syncthreads();
-
-        float decay = g_alpha[h], beta = g_beta[h];
 
         // k·q dot
         __shared__ float s_kq;
@@ -690,6 +690,8 @@ __device__ void deltanet_layer(
             }
             stk = warp_reduce_sum(stk); sqv = warp_reduce_sum(sqv);
             stk = __shfl_sync(0xffffffff,stk,0); sqv = __shfl_sync(0xffffffff,sqv,0);
+            int gate_head = h * DN_VALUE_GROUPS + j / DN_VALUE_HEAD_DIM;
+            float decay = g_alpha[gate_head], beta = g_beta[gate_head];
             float error_j = (s_v[j] - decay * stk) * beta;
             float o_j = decay * sqv + error_j * kq;
             if (lane_id == 0) out_head[j] = o_j;
@@ -703,15 +705,32 @@ __device__ void deltanet_layer(
         // Gated RMSNorm
         __syncthreads();
         {
-            __shared__ float smem_gnorm[NUM_WARPS];
-            float sq = 0; for (int i = threadIdx.x; i < DN_VALUE_DIM; i += BLOCK_SIZE) sq += out_head[i]*out_head[i];
-            sq = warp_reduce_sum(sq); if (lane_id == 0) smem_gnorm[warp_id] = sq; __syncthreads();
-            if (warp_id == 0) { float v = (lane_id < NUM_WARPS) ? smem_gnorm[lane_id] : 0; v = warp_reduce_sum(v); if (lane_id == 0) smem_gnorm[0] = rsqrtf(v/DN_VALUE_DIM + RMS_EPS); }
-            __syncthreads(); float rstd = smem_gnorm[0];
-            for (int i = threadIdx.x; i < DN_VALUE_DIM; i += BLOCK_SIZE) {
-                float normed = out_head[i] * rstd * __bfloat162float(__ldg(w.norm_weight + i));
-                float gate = fast_silu(g_z[h*DN_VALUE_DIM+i]);
-                out_head[i] = normed * gate;
+            __shared__ float smem_gnorm[DN_VALUE_GROUPS][NUM_WARPS];
+            __shared__ float smem_rstd[DN_VALUE_GROUPS];
+            for (int group = 0; group < DN_VALUE_GROUPS; ++group) {
+                const int group_base = group * DN_VALUE_HEAD_DIM;
+                float sq = 0;
+                for (int i = threadIdx.x; i < DN_VALUE_HEAD_DIM; i += BLOCK_SIZE) {
+                    float v = out_head[group_base + i];
+                    sq += v * v;
+                }
+                sq = warp_reduce_sum(sq);
+                if (lane_id == 0) smem_gnorm[group][warp_id] = sq;
+                __syncthreads();
+                if (warp_id == 0) {
+                    float v = (lane_id < NUM_WARPS) ? smem_gnorm[group][lane_id] : 0;
+                    v = warp_reduce_sum(v);
+                    if (lane_id == 0) smem_rstd[group] = rsqrtf(v / DN_VALUE_HEAD_DIM + RMS_EPS);
+                }
+                __syncthreads();
+                float rstd = smem_rstd[group];
+                for (int i = threadIdx.x; i < DN_VALUE_HEAD_DIM; i += BLOCK_SIZE) {
+                    int value_idx = group_base + i;
+                    float normed = out_head[value_idx] * rstd * __bfloat162float(__ldg(w.norm_weight + i));
+                    float gate = fast_silu(g_z[h * DN_VALUE_DIM + value_idx]);
+                    out_head[value_idx] = normed * gate;
+                }
+                __syncthreads();
             }
         }
     } else {

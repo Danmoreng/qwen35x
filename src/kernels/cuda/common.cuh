@@ -1,6 +1,6 @@
 #pragma once
 
-#include "variant_0p8b.cuh"
+#include "variant.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>

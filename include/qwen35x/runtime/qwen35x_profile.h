@@ -2,7 +2,7 @@
 
 namespace qwen35x::cuda_backend {
 
-constexpr int kQwen35xProfileMaxLayers = 24;
+constexpr int kQwen35xProfileMaxLayers = 32;
 
 struct Qwen35xLayerProfile {
   int layer_index = -1;

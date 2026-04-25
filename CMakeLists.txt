@@ -9,6 +9,8 @@ option(QWEN35X_ENABLE_CUDA "Enable CUDA kernels when a CUDA compiler is availabl
 set(QWEN35X_CUDA_ARCHITECTURES "native" CACHE STRING "CUDA architectures passed to CMAKE_CUDA_ARCHITECTURES")
 set(QWEN35X_KERNEL_BENCH_BLOCK_SIZE "256" CACHE STRING "Compile-time BLOCK_SIZE for qwen35x kernel bench")
 set(QWEN35X_KERNEL_BENCH_NUM_BLOCKS "82" CACHE STRING "Compile-time NUM_BLOCKS default for qwen35x kernel bench")
+set(QWEN35X_CUDA_VARIANT "0p8b" CACHE STRING "Qwen3.5 CUDA kernel specialization: 0p8b or 4b")
+set_property(CACHE QWEN35X_CUDA_VARIANT PROPERTY STRINGS 0p8b 4b)
 
 include(CheckLanguage)
 if (QWEN35X_ENABLE_CUDA)
@@ -41,6 +43,10 @@ target_include_directories(qwen35x_core
 )
 
 if (CMAKE_CUDA_COMPILER)
+  if (NOT QWEN35X_CUDA_VARIANT STREQUAL "0p8b" AND NOT QWEN35X_CUDA_VARIANT STREQUAL "4b")
+    message(FATAL_ERROR "QWEN35X_CUDA_VARIANT must be one of: 0p8b, 4b")
+  endif ()
+
   target_sources(
     qwen35x_core
     PRIVATE
@@ -55,7 +61,13 @@ if (CMAKE_CUDA_COMPILER)
     PRIVATE
       BLOCK_SIZE=${QWEN35X_KERNEL_BENCH_BLOCK_SIZE}
       NUM_BLOCKS=${QWEN35X_KERNEL_BENCH_NUM_BLOCKS}
+      QWEN35X_CUDA_VARIANT_${QWEN35X_CUDA_VARIANT}=1
   )
+  if (QWEN35X_CUDA_VARIANT STREQUAL "4b")
+    target_compile_definitions(qwen35x_core PRIVATE QWEN35X_VARIANT_4B=1)
+  else ()
+    target_compile_definitions(qwen35x_core PRIVATE QWEN35X_VARIANT_0P8B=1)
+  endif ()
   target_link_libraries(qwen35x_core PRIVATE CUDA::cublasLt CUDA::cublas)
   target_compile_definitions(qwen35x_core PUBLIC QWEN35X_HAS_CUDA=1)
   set_target_properties(qwen35x_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
@@ -86,6 +98,7 @@ if (CMAKE_CUDA_COMPILER)
     PRIVATE
       BLOCK_SIZE=${QWEN35X_KERNEL_BENCH_BLOCK_SIZE}
       NUM_BLOCKS=${QWEN35X_KERNEL_BENCH_NUM_BLOCKS}
+      QWEN35X_CUDA_VARIANT_${QWEN35X_CUDA_VARIANT}=1
   )
   target_link_libraries(qwen35x_kernelbench PRIVATE qwen35x_core)
   set_target_properties(qwen35x_kernelbench PROPERTIES CUDA_SEPARABLE_COMPILATION ON)

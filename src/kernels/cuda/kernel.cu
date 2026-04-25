@@ -14,7 +14,7 @@
 
 #include "common.cuh"
 #include "decode_sync.cuh"
-#include "variant_0p8b.cuh"
+#include "variant.cuh"
 #include "weights.cuh"
 
 #include <cuda_bf16.h>
@@ -29,7 +29,7 @@
 static int g_decode_blocks_override = 0;
 
 __device__ __constant__ int LAYER_TYPE[NUM_LAYERS] = {
-    QWEN35X_0P8B_LAYER_TYPE_VALUES
+    QWEN35X_LAYER_TYPE_VALUES
 };
 
 #include "decode_layers.cuh"

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "decode_layers.cuh"
-#include "variant_0p8b.cuh"
+#include "variant.cuh"
 #include "weights.cuh"
 
 #include <cuda_bf16.h>

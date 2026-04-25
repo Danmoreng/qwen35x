@@ -9,7 +9,7 @@
 #include "qwen35x/runtime/qwen35x_profile.h"
 
 #include "common.cuh"
-#include "variant_0p8b.cuh"
+#include "variant.cuh"
 #include "weights.cuh"
 
 #include <cuda_bf16.h>
@@ -231,32 +231,34 @@ __global__ void pf_deltanet_prepare_norm_gate(
 {
     int idx = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
     int lid = threadIdx.x % 32;
-    if (idx >= S * DN_HEADS) return;
+    if (idx < S * DN_HEADS) {
+        int t = idx / DN_HEADS;
+        int h = idx % DN_HEADS;
+        float *q = qkv_f32 + t * DN_CONV_CH + h * DN_KEY;
+        float *k = qkv_f32 + t * DN_CONV_CH + DN_QK_SIZE + h * DN_KEY;
 
-    int t = idx / DN_HEADS;
-    int h = idx % DN_HEADS;
-    float *q = qkv_f32 + t * DN_CONV_CH + h * DN_KEY;
-    float *k = qkv_f32 + t * DN_CONV_CH + DN_QK_SIZE + h * DN_KEY;
-
-    float q_sq = 0.0f;
-    float k_sq = 0.0f;
-    for (int i = lid; i < DN_KEY; i += 32) {
-        const float qv = q[i];
-        const float kv = k[i];
-        q_sq += qv * qv;
-        k_sq += kv * kv;
+        float q_sq = 0.0f;
+        float k_sq = 0.0f;
+        for (int i = lid; i < DN_KEY; i += 32) {
+            const float qv = q[i];
+            const float kv = k[i];
+            q_sq += qv * qv;
+            k_sq += kv * kv;
+        }
+        q_sq = pf_warp_sum(q_sq);
+        k_sq = pf_warp_sum(k_sq);
+        const float q_norm = __shfl_sync(0xffffffff, rsqrtf(q_sq + 1e-6f) * (1.0f / 11.313708498984761f), 0);
+        const float k_norm = __shfl_sync(0xffffffff, rsqrtf(k_sq + 1e-6f), 0);
+        for (int i = lid; i < DN_KEY; i += 32) {
+            q[i] *= q_norm;
+            k[i] *= k_norm;
+        }
     }
-    q_sq = pf_warp_sum(q_sq);
-    k_sq = pf_warp_sum(k_sq);
-    const float q_norm = __shfl_sync(0xffffffff, rsqrtf(q_sq + 1e-6f) * (1.0f / 11.313708498984761f), 0);
-    const float k_norm = __shfl_sync(0xffffffff, rsqrtf(k_sq + 1e-6f), 0);
-    for (int i = lid; i < DN_KEY; i += 32) {
-        q[i] *= q_norm;
-        k[i] *= k_norm;
-    }
 
-    if (lid == 0) {
-        const int off = t * DN_HEADS + h;
+    if (idx < S * DN_GATE && lid == 0) {
+        int t = idx / DN_GATE;
+        int h = idx % DN_GATE;
+        const int off = t * DN_GATE + h;
         const float beta = beta_buf[off];
         beta_buf[off] = 1.0f / (1.0f + expf(-beta));
         const float x = alpha_buf[off] + __bfloat162float(dt_bias[h]);
@@ -288,7 +290,7 @@ pf_deltanet_recurrence_cols(
         const float *q = qkv_f32 + t * DN_CONV_CH + h * DN_KEY;
         const float *k = qkv_f32 + t * DN_CONV_CH + DN_QK_SIZE + h * DN_KEY;
         const float *v = qkv_f32 + t * DN_CONV_CH + 2 * DN_QK_SIZE + h * DN_VAL;
-        const int gate_off = t * DN_HEADS + h;
+        const int gate_off = t * DN_GATE + h * DN_VAL_GROUPS + col / DN_VAL_HEAD_DIM;
         const float beta = beta_buf[gate_off];
         const float decay = alpha_buf[gate_off];
 
@@ -329,20 +331,22 @@ __global__ void pf_deltanet_post_norm_gate(
     const __nv_bfloat16 *norm_w, __nv_bfloat16 *output, int S)
 {
     int idx = blockIdx.x;
-    if (idx >= S * DN_HEADS) return;
-    int t = idx / DN_HEADS;
-    int h = idx % DN_HEADS;
+    if (idx >= S * DN_GATE) return;
+    int t = idx / DN_GATE;
+    int gh = idx % DN_GATE;
+    int h = gh / DN_VAL_GROUPS;
+    int group = gh % DN_VAL_GROUPS;
     int tid = threadIdx.x;
     int wid = tid / 32;
     int lid = tid % 32;
     __shared__ float smem[8];
 
-    const float *in = input + t * DN_V_SIZE + h * DN_VAL;
-    const __nv_bfloat16 *z = z_proj + t * DN_V_SIZE + h * DN_VAL;
-    __nv_bfloat16 *out = output + t * DN_V_SIZE + h * DN_VAL;
+    const float *in = input + t * DN_V_SIZE + h * DN_VAL + group * DN_VAL_HEAD_DIM;
+    const __nv_bfloat16 *z = z_proj + t * DN_V_SIZE + h * DN_VAL + group * DN_VAL_HEAD_DIM;
+    __nv_bfloat16 *out = output + t * DN_V_SIZE + h * DN_VAL + group * DN_VAL_HEAD_DIM;
 
     float sq = 0.0f;
-    for (int i = tid; i < DN_VAL; i += blockDim.x) {
+    for (int i = tid; i < DN_VAL_HEAD_DIM; i += blockDim.x) {
         const float v = in[i];
         sq += v * v;
     }
@@ -352,12 +356,12 @@ __global__ void pf_deltanet_post_norm_gate(
     if (wid == 0) {
         float v = (lid < blockDim.x / 32) ? smem[lid] : 0.0f;
         v = pf_warp_sum(v);
-        if (lid == 0) smem[0] = rsqrtf(v / DN_VAL + RMS_EPS);
+        if (lid == 0) smem[0] = rsqrtf(v / DN_VAL_HEAD_DIM + RMS_EPS);
     }
     __syncthreads();
     const float rstd = smem[0];
 
-    for (int i = tid; i < DN_VAL; i += blockDim.x) {
+    for (int i = tid; i < DN_VAL_HEAD_DIM; i += blockDim.x) {
         const float n = in[i] * rstd * __bfloat162float(norm_w[i]);
         out[i] = __float2bfloat16(n * pf_silu(__bfloat162float(z[i])));
     }
@@ -825,8 +829,8 @@ extern "C" void launch_prefill_bf16(
                 cublas_bf16_gemm(cublas, normalized, z_w, proj_buf2, S, DN_V_SIZE, HIDDEN);
             });
             profile_phase(layer_profile ? &layer_profile->beta_alpha_projection_ms : nullptr, [&]() {
-                pf_bf16_matvec<<<S*DN_HEADS, 32, 0, stream>>>(normalized, beta_w, beta_buf, S, HIDDEN, DN_HEADS);
-                pf_bf16_matvec<<<S*DN_HEADS, 32, 0, stream>>>(normalized, alpha_w, alpha_buf, S, HIDDEN, DN_HEADS);
+                pf_bf16_matvec<<<S*DN_GATE, 32, 0, stream>>>(normalized, beta_w, beta_buf, S, HIDDEN, DN_GATE);
+                pf_bf16_matvec<<<S*DN_GATE, 32, 0, stream>>>(normalized, alpha_w, alpha_buf, S, HIDDEN, DN_GATE);
             });
 
             profile_phase(layer_profile ? &layer_profile->conv_ms : nullptr, [&]() {
@@ -834,7 +838,8 @@ extern "C" void launch_prefill_bf16(
                     proj_buf, dn_qkv_f32, conv_w, conv_bufs + dn_idx*DN_CONV_CH*DN_CONV_K, S);
             });
             profile_phase(layer_profile ? &layer_profile->gate_ms : nullptr, [&]() {
-                pf_deltanet_prepare_norm_gate<<<(S*DN_HEADS + 15) / 16, 512, 0, stream>>>(
+                constexpr int kNormGateItems = (DN_GATE > DN_HEADS) ? DN_GATE : DN_HEADS;
+                pf_deltanet_prepare_norm_gate<<<(S*kNormGateItems + 15) / 16, 512, 0, stream>>>(
                     dn_qkv_f32, beta_buf, alpha_buf, a_log, dt_bias, S);
             });
             profile_phase(layer_profile ? &layer_profile->recurrence_ms : nullptr, [&]() {
@@ -842,7 +847,7 @@ extern "C" void launch_prefill_bf16(
                     dn_qkv_f32, beta_buf, alpha_buf, dn_states + dn_idx*dn_stride, dn_out_f32, S);
             });
             profile_phase(layer_profile ? &layer_profile->post_norm_gate_ms : nullptr, [&]() {
-                pf_deltanet_post_norm_gate<<<S*DN_HEADS, 256, 0, stream>>>(
+                pf_deltanet_post_norm_gate<<<S*DN_GATE, 256, 0, stream>>>(
                     dn_out_f32, proj_buf2, dn_norm, dn_out_buf, S);
             });
 

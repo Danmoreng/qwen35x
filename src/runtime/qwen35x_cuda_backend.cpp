@@ -1,5 +1,6 @@
 #include "qwen35x/runtime/qwen35x_cuda_backend.h"
 
+#include "qwen35x/compiler/compiler.h"
 #include "qwen35x/weights/safetensors.h"
 
 #if QWEN35X_HAS_CUDA
@@ -21,6 +22,29 @@ namespace qwen35x::cuda_backend {
 
 namespace {
 
+constexpr int kMaxDecodeBlocks = 1024;
+
+#if defined(QWEN35X_CUDA_VARIANT_4b)
+constexpr const char * kCompiledVariant = "4b";
+constexpr int kNumLayers = 32;
+constexpr int kHiddenSize = 2560;
+constexpr int kIntermediateSize = 9216;
+constexpr int kVocabSize = 248320;
+constexpr int kFaNumQHeads = 16;
+constexpr int kFaNumKvHeads = 4;
+constexpr int kFaHeadDim = 256;
+constexpr int kFaRotDim = 64;
+constexpr int kDnNumHeads = 16;
+constexpr int kDnGateHeads = 32;
+constexpr int kDnKeyDim = 128;
+constexpr int kDnValueDim = 256;
+constexpr int kDnConvKernel = 4;
+constexpr int kLayerType[kNumLayers] = {
+  0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1,
+  0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1
+};
+#else
+constexpr const char * kCompiledVariant = "0.8b";
 constexpr int kNumLayers = 24;
 constexpr int kHiddenSize = 1024;
 constexpr int kIntermediateSize = 3584;
@@ -29,21 +53,23 @@ constexpr int kFaNumQHeads = 8;
 constexpr int kFaNumKvHeads = 2;
 constexpr int kFaHeadDim = 256;
 constexpr int kFaRotDim = 64;
+constexpr int kDnNumHeads = 16;
+constexpr int kDnGateHeads = 16;
+constexpr int kDnKeyDim = 128;
+constexpr int kDnValueDim = 128;
+constexpr int kDnConvKernel = 4;
+constexpr int kLayerType[kNumLayers] = {
+  0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1
+};
+#endif
+
 constexpr int kFaGqaRatio = kFaNumQHeads / kFaNumKvHeads;
 constexpr int kFaQSize = kFaNumQHeads * kFaHeadDim;
 constexpr int kFaQprojSize = kFaQSize * 2;
 constexpr int kFaKvSize = kFaNumKvHeads * kFaHeadDim;
-constexpr int kDnNumHeads = 16;
-constexpr int kDnKeyDim = 128;
-constexpr int kDnValueDim = 128;
 constexpr int kDnQkSize = kDnNumHeads * kDnKeyDim;
 constexpr int kDnVSize = kDnNumHeads * kDnValueDim;
 constexpr int kDnConvChannels = kDnQkSize * 2 + kDnVSize;
-constexpr int kDnConvKernel = 4;
-constexpr int kMaxDecodeBlocks = 1024;
-constexpr int kLayerType[kNumLayers] = {
-  0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1
-};
 
 struct PackedLayerWeights {
   int layer_type = 0;
@@ -293,6 +319,56 @@ bool alloc_and_zero(DeviceArena & arena, std::size_t bytes, void *& out_ptr, con
   return check_cuda(cudaMemset(out_ptr, 0, bytes), "cudaMemset(" + label + ")", error_message);
 }
 
+bool validate_compiled_variant(const Qwen35xCudaBackendConfig & config, std::string & error_message) {
+  std::string profile_error;
+  const auto profile = qwen35x::ProfileLoader::load_from_hf_directory(config.model_dir, profile_error);
+  if (!profile) {
+    error_message = "failed to load model profile for CUDA variant validation: " + profile_error;
+    return false;
+  }
+
+  const bool dimensions_match =
+    profile->text.num_hidden_layers == kNumLayers &&
+    profile->text.hidden_size == kHiddenSize &&
+    profile->text.intermediate_size == kIntermediateSize &&
+    profile->text.vocab_size == kVocabSize &&
+    profile->text.num_attention_heads == kFaNumQHeads &&
+    profile->text.num_key_value_heads == kFaNumKvHeads &&
+    profile->text.head_dim == kFaHeadDim &&
+    profile->text.linear_num_key_heads == kDnNumHeads &&
+    profile->text.linear_num_value_heads == kDnGateHeads &&
+    profile->text.linear_key_head_dim == kDnKeyDim &&
+    profile->text.linear_conv_kernel_dim == kDnConvKernel;
+
+  if (!dimensions_match) {
+    error_message =
+      "Qwen35x CUDA backend was compiled for qwen3.5-" + std::string(kCompiledVariant) +
+      ", but model profile is variant=" + profile->variant +
+      " layers=" + std::to_string(profile->text.num_hidden_layers) +
+      " hidden=" + std::to_string(profile->text.hidden_size) +
+      " intermediate=" + std::to_string(profile->text.intermediate_size) +
+      " q_heads=" + std::to_string(profile->text.num_attention_heads) +
+      " kv_heads=" + std::to_string(profile->text.num_key_value_heads) +
+      " linear_key_heads=" + std::to_string(profile->text.linear_num_key_heads) +
+      " linear_value_heads=" + std::to_string(profile->text.linear_num_value_heads) + ".";
+    return false;
+  }
+
+  if (static_cast<int>(profile->fingerprint.attention_schedule.size()) != kNumLayers) {
+    error_message = "model attention schedule length does not match compiled CUDA variant.";
+    return false;
+  }
+  for (int i = 0; i < kNumLayers; ++i) {
+    const int expected = profile->fingerprint.attention_schedule[static_cast<std::size_t>(i)] == qwen35x::AttentionBlock::full ? 1 : 0;
+    if (expected != kLayerType[i]) {
+      error_message = "model attention schedule differs from compiled CUDA variant at layer " + std::to_string(i) + ".";
+      return false;
+    }
+  }
+
+  return true;
+}
+
 bool initialize_backend_state(
   const Qwen35xCudaBackendConfig & config,
   DeviceArena & arena,
@@ -457,8 +533,8 @@ bool initialize_backend_state(
       !arena.alloc_bytes(static_cast<std::size_t>(kMaxDecodeBlocks) * kFaGqaRatio * (kFaHeadDim + 2) * f32_bytes, state.g_attn_partials, error_message) ||
       !arena.alloc_bytes(kIntermediateSize * f32_bytes, state.g_mlp_inter, error_message) ||
       !arena.alloc_bytes(kDnVSize * f32_bytes, state.g_z_scratch, error_message) ||
-      !arena.alloc_bytes(kDnNumHeads * f32_bytes, state.g_beta_scratch, error_message) ||
-      !arena.alloc_bytes(kDnNumHeads * f32_bytes, state.g_alpha_scratch, error_message) ||
+      !arena.alloc_bytes(kDnGateHeads * f32_bytes, state.g_beta_scratch, error_message) ||
+      !arena.alloc_bytes(kDnGateHeads * f32_bytes, state.g_alpha_scratch, error_message) ||
       !arena.alloc_bytes(kHiddenSize * f32_bytes, state.g_normalized, error_message) ||
       !arena.alloc_bytes(sizeof(unsigned int), reinterpret_cast<void *&>(state.barrier_counter), error_message) ||
       !arena.alloc_bytes(sizeof(unsigned int), reinterpret_cast<void *&>(state.barrier_generation), error_message) ||
@@ -518,8 +594,8 @@ bool initialize_backend_state(
       !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * kDnVSize * bf16_bytes, state.pf_dn_out_buf, error_message) ||
       !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * kDnConvChannels * sizeof(float), reinterpret_cast<void *&>(state.pf_dn_qkv_f32), error_message) ||
       !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * kDnVSize * sizeof(float), reinterpret_cast<void *&>(state.pf_dn_out_f32), error_message) ||
-      !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * kDnNumHeads * sizeof(float), reinterpret_cast<void *&>(state.pf_beta_buf), error_message) ||
-      !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * kDnNumHeads * sizeof(float), reinterpret_cast<void *&>(state.pf_alpha_buf), error_message) ||
+      !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * kDnGateHeads * sizeof(float), reinterpret_cast<void *&>(state.pf_beta_buf), error_message) ||
+      !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * kDnGateHeads * sizeof(float), reinterpret_cast<void *&>(state.pf_alpha_buf), error_message) ||
       !arena.alloc_bytes(kHiddenSize * f32_bytes, state.pf_final_normed, error_message) ||
       !arena.alloc_bytes(kHiddenSize * bf16_bytes, state.pf_hidden_bf16_out, error_message) ||
       !arena.alloc_bytes(1024 * sizeof(float), reinterpret_cast<void *&>(state.pf_lm_bmv), error_message) ||
@@ -817,6 +893,9 @@ bool Qwen35xCudaBackend::initialize(const Qwen35xCudaBackendConfig & config, std
   }
   if (config.repetition_penalty < 1.0f) {
     error_message = "repetition_penalty must be >= 1.0.";
+    return false;
+  }
+  if (!validate_compiled_variant(config, error_message)) {
     return false;
   }
 
