@@ -119,10 +119,10 @@ Latest local long-context Qwen35x CUDA benchmark snapshot (April 25, 2026, RTX 5
 
 | Workload | qwen35x | llama.cpp | llama.cpp + FA |
 |---|---:|---:|---:|
-| 0.8B 64k Wikipedia prompt prefill | `8,144.61 tok/s` (`8,030.47 ms`) | `5,369.00 tok/s` (`12,181.78 ms`) | `9,371.15 tok/s` (`6,979.29 ms`) |
-| 0.8B 64k Wikipedia prompt generation | `198.24 tok/s` (`645.69 ms`) | `139.88 tok/s` (`907.89 ms`) | `165.42 tok/s` (`767.73 ms`) |
-| 4B 64k Wikipedia prompt prefill | `2,170.42 tok/s` (`30,134.70 ms`) | `1,795.70 tok/s` (`36,422.64 ms`) | `2,894.05 tok/s` (`22,599.51 ms`) |
-| 4B 64k Wikipedia prompt generation | `48.29 tok/s` (`2,650.58 ms`) | `38.23 tok/s` (`3,322.16 ms`) | `43.87 tok/s` (`2,894.71 ms`) |
+| 0.8B 64k Wikipedia prompt prefill | `8,144.61 tok/s` | `5,369.00 tok/s` | `9,371.15 tok/s` |
+| 0.8B 64k Wikipedia prompt generation | `198.24 tok/s` | `139.88 tok/s` | `165.42 tok/s` |
+| 4B 64k Wikipedia prompt prefill | `2,170.42 tok/s` | `1,795.70 tok/s` | `2,894.05 tok/s` |
+| 4B 64k Wikipedia prompt generation | `48.29 tok/s` | `38.23 tok/s` | `43.87 tok/s` |
 
 The current Qwen35x long-context prefill path still uses materialized tiled full attention, but its scratch allocation is now chunked for MLP/DeltaNet and uses variant-aware attention query tiling. This keeps the 0.8B 64k prefill path near the previous throughput while allowing the 4B 64k Wikipedia benchmark to complete without the prior VRAM spill collapse. The 0.8B path remains faster than llama.cpp without Flash Attention on 64k prefill, but still trails llama.cpp with Flash Attention.
 
