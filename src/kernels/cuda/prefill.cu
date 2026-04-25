@@ -8,6 +8,10 @@
 
 #include "qwen35x/runtime/qwen35x_profile.h"
 
+#include "common.cuh"
+#include "variant_0p8b.cuh"
+#include "weights.cuh"
+
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
@@ -15,46 +19,11 @@
 #include <cfloat>
 #include <vector>
 
-constexpr int HIDDEN = 1024;
-constexpr int INTER = 3584;
-constexpr int VOCAB = 248320;
-constexpr float RMS_EPS = 1e-6f;
-
-constexpr int FA_Q_HEADS = 8;
-constexpr int FA_KV_HEADS = 2;
-constexpr int FA_HEAD_DIM = 256;
-constexpr int FA_GQA = FA_Q_HEADS / FA_KV_HEADS;
-constexpr int FA_Q_SIZE = FA_Q_HEADS * FA_HEAD_DIM;
-constexpr int FA_QPROJ_SIZE = FA_Q_SIZE * 2;
-constexpr int FA_KV_SIZE = FA_KV_HEADS * FA_HEAD_DIM;
-constexpr int FA_ROT_DIM = 64;
-
-constexpr int DN_HEADS = 16;
-constexpr int DN_KEY = 128;
-constexpr int DN_VAL = 128;
-constexpr int DN_CONV_K = 4;
-constexpr int DN_QK_SIZE = DN_HEADS * DN_KEY;
-constexpr int DN_V_SIZE = DN_HEADS * DN_VAL;
-constexpr int DN_CONV_CH = DN_QK_SIZE * 2 + DN_V_SIZE;
-
-constexpr int NUM_LAYERS = 24;
-constexpr int LAYER_TYPE[24] = {0,0,0,1,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0,1};
-
-struct PFLayerWeights { int layer_type; int _pad[3]; void *ptrs[14]; };
-
 struct ProfileEvent {
     cudaEvent_t start = nullptr;
     cudaEvent_t stop = nullptr;
     double *dst = nullptr;
 };
-
-__device__ __forceinline__ float pf_warp_sum(float v) {
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffff, v, o); return v;
-}
-__device__ __forceinline__ float pf_warp_max(float v) {
-    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_down_sync(0xffffffff, v, o)); return v;
-}
-__device__ __forceinline__ float pf_silu(float x) { return x / (1.0f + expf(-x)); }
 
 // Embedding
 __global__ void pf_embed(const int *ids, const __nv_bfloat16 *embed, __nv_bfloat16 *out, int S) {
@@ -745,7 +714,7 @@ extern "C" void launch_prefill_bf16(
         profile->layer_count = NUM_LAYERS;
         for (int li = 0; li < NUM_LAYERS; ++li) {
             profile->layers[li].layer_index = li;
-            profile->layers[li].layer_type = LAYER_TYPE[li];
+            profile->layers[li].layer_type = QWEN35X_LAYER_TYPE_HOST[li];
         }
         cudaEventCreate(&profile_total_start);
         cudaEventCreate(&profile_total_stop);
@@ -824,7 +793,7 @@ extern "C" void launch_prefill_bf16(
 
     for (int li = 0; li < NUM_LAYERS; li++) {
         const PFLayerWeights &lw = hl[li];
-        int lt = LAYER_TYPE[li];
+        int lt = QWEN35X_LAYER_TYPE_HOST[li];
         auto *layer_profile = profile ? &profile->layers[li] : nullptr;
 
         const __nv_bfloat16 *norm_w = (const __nv_bfloat16 *)lw.ptrs[0];

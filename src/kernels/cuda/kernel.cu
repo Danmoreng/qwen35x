@@ -12,186 +12,25 @@
 
 #include "qwen35x/runtime/qwen35x_profile.h"
 
+#include "common.cuh"
+#include "decode_sync.cuh"
+#include "variant_0p8b.cuh"
+#include "weights.cuh"
+
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <cfloat>
 
 // =============================================================================
-// Model constants
+// Decode variant state
 // =============================================================================
-
-constexpr int WARP_SIZE = 32;
-constexpr int HIDDEN_SIZE = 1024;
-constexpr int INTERMEDIATE_SIZE = 3584;
-constexpr int NUM_LAYERS = 24;
-constexpr float RMS_EPS = 1e-6f;
-constexpr int VOCAB_SIZE = 248320;
-
-// Full Attention
-constexpr int FA_NUM_Q_HEADS = 8;
-constexpr int FA_NUM_KV_HEADS = 2;
-constexpr int FA_HEAD_DIM = 256;
-constexpr int FA_GQA_RATIO = FA_NUM_Q_HEADS / FA_NUM_KV_HEADS;
-constexpr int FA_Q_SIZE = FA_NUM_Q_HEADS * FA_HEAD_DIM;
-constexpr int FA_GATE_SIZE = FA_Q_SIZE;
-constexpr int FA_QPROJ_SIZE = FA_Q_SIZE + FA_GATE_SIZE;
-constexpr int FA_KV_SIZE = FA_NUM_KV_HEADS * FA_HEAD_DIM;
-constexpr int FA_ROTARY_DIM = 64;
-constexpr float FA_ROPE_THETA = 10000000.0f;
-
-// DeltaNet
-constexpr int DN_NUM_HEADS = 16;
-constexpr int DN_KEY_DIM = 128;
-constexpr int DN_VALUE_DIM = 128;
-constexpr int DN_CONV_KERNEL = 4;
-constexpr int DN_QK_SIZE = DN_NUM_HEADS * DN_KEY_DIM;
-constexpr int DN_V_SIZE = DN_NUM_HEADS * DN_VALUE_DIM;
-constexpr int DN_CONV_CHANNELS = DN_QK_SIZE + DN_QK_SIZE + DN_V_SIZE;
-
-#ifndef NUM_BLOCKS
-#define NUM_BLOCKS 82
-#endif
-#ifndef BLOCK_SIZE
-#define BLOCK_SIZE 512
-#endif
-
-constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
-constexpr int ATTENTION_WARP_SCRATCH = FA_GQA_RATIO * NUM_WARPS * FA_HEAD_DIM;
-constexpr int BASE_MAX_ACT_DIM = (HIDDEN_SIZE > INTERMEDIATE_SIZE) ? HIDDEN_SIZE : INTERMEDIATE_SIZE;
-constexpr int MAX_ACT_DIM = (BASE_MAX_ACT_DIM > ATTENTION_WARP_SCRATCH) ? BASE_MAX_ACT_DIM : ATTENTION_WARP_SCRATCH;
-constexpr int MAX_DECODE_BLOCKS = 1024;
-constexpr int MIN_DECODE_BLOCKS = DN_NUM_HEADS;
-
-#ifndef LM_NUM_BLOCKS
-#define LM_NUM_BLOCKS 512
-#endif
-#ifndef LM_BLOCK_SIZE
-#define LM_BLOCK_SIZE 256
-#endif
 
 static int g_decode_blocks_override = 0;
 
 __device__ __constant__ int LAYER_TYPE[NUM_LAYERS] = {
-    0,0,0,1, 0,0,0,1, 0,0,0,1, 0,0,0,1, 0,0,0,1, 0,0,0,1
+    QWEN35X_0P8B_LAYER_TYPE_VALUES
 };
-
-// =============================================================================
-// Weight structs — ALL BF16
-// =============================================================================
-
-struct FullAttnWeights {
-    const __nv_bfloat16 *input_layernorm_weight;   // [1024]
-    const __nv_bfloat16 *q_proj_weight;             // [4096, 1024]
-    const __nv_bfloat16 *k_proj_weight;             // [512, 1024]
-    const __nv_bfloat16 *v_proj_weight;             // [512, 1024]
-    const __nv_bfloat16 *q_norm_weight;              // [256]
-    const __nv_bfloat16 *k_norm_weight;              // [256]
-    const __nv_bfloat16 *o_proj_weight;             // [1024, 2048]
-    const __nv_bfloat16 *post_attn_layernorm_weight;
-    const __nv_bfloat16 *gate_proj_weight;          // [3584, 1024]
-    const __nv_bfloat16 *up_proj_weight;            // [3584, 1024]
-    const __nv_bfloat16 *down_proj_weight;          // [1024, 3584]
-};
-
-struct DeltaNetWeights {
-    const __nv_bfloat16 *input_layernorm_weight;
-    const __nv_bfloat16 *qkv_proj_weight;           // [6144, 1024]
-    const __nv_bfloat16 *z_proj_weight;             // [2048, 1024]
-    const __nv_bfloat16 *beta_proj_weight;          // [16, 1024]
-    const __nv_bfloat16 *alpha_proj_weight;         // [16, 1024]
-    const __nv_bfloat16 *conv1d_weight;             // [6144, 1, 4]
-    const __nv_bfloat16 *a_log;                     // [16]
-    const __nv_bfloat16 *dt_bias;                   // [16]
-    const __nv_bfloat16 *norm_weight;               // [128]
-    const __nv_bfloat16 *out_proj_weight;           // [1024, 2048]
-    const __nv_bfloat16 *post_attn_layernorm_weight;
-    const __nv_bfloat16 *gate_proj_weight;
-    const __nv_bfloat16 *up_proj_weight;
-    const __nv_bfloat16 *down_proj_weight;
-};
-
-struct LayerWeights {
-    int layer_type;
-    int _pad[3];
-    union {
-        DeltaNetWeights dn;
-        FullAttnWeights fa;
-    };
-};
-
-// =============================================================================
-// Atomic barrier
-// =============================================================================
-
-struct AtomicGridSync {
-    unsigned int *counter;
-    unsigned int *generation;
-    unsigned int nblocks;
-    unsigned int local_gen;
-
-    __device__ void sync() {
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            unsigned int my_gen = local_gen;
-            asm volatile("fence.acq_rel.gpu;" ::: "memory");
-            unsigned int arrived = atomicAdd(counter, 1);
-            if (arrived == nblocks - 1) {
-                *counter = 0;
-                asm volatile("fence.acq_rel.gpu;" ::: "memory");
-                atomicAdd(generation, 1);
-            } else {
-                volatile unsigned int *vgen = (volatile unsigned int *)generation;
-                while (*vgen <= my_gen) {}
-            }
-            local_gen = my_gen + 1;
-        }
-        __syncthreads();
-    }
-};
-
-// =============================================================================
-// Helpers
-// =============================================================================
-
-__device__ __forceinline__ float warp_reduce_sum(float val) {
-    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2)
-        val += __shfl_down_sync(0xffffffff, val, offset);
-    return val;
-}
-
-__device__ __forceinline__ float warp_reduce_max(float val) {
-    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2)
-        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
-    return val;
-}
-
-__device__ __forceinline__ float fast_exp(float x) {
-    float y; asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x * 1.44269504088896340736f)); return y;
-}
-
-__device__ __forceinline__ float fast_sigmoid(float x) {
-    float y; asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(1.0f + fast_exp(-x))); return y;
-}
-
-__device__ __forceinline__ float fast_silu(float x) { return x * fast_sigmoid(x); }
-
-__device__ __forceinline__ uint4 load_128bit(const uint4 *ptr) {
-    uint4 out;
-    asm volatile("ld.global.L1::no_allocate.v4.b32 {%0, %1, %2, %3}, [%4];"
-                 : "=r"(out.x), "=r"(out.y), "=r"(out.z), "=r"(out.w) : "l"(ptr));
-    return out;
-}
-
-// BF16 dot product: 8 bf16 weights × 8 bf16 activations → f32
-__device__ __forceinline__ float dot8_bf16(const uint4 &w_u4, const __nv_bfloat16 *act) {
-    const __nv_bfloat16 *w = reinterpret_cast<const __nv_bfloat16 *>(&w_u4);
-    float sum = 0.0f;
-#pragma unroll
-    for (int i = 0; i < 8; i++)
-        sum += __bfloat162float(w[i]) * __bfloat162float(act[i]);
-    return sum;
-}
 
 // =============================================================================
 // RMSNorm — reads bf16 input, writes bf16 output
