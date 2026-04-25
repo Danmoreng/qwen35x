@@ -19,6 +19,10 @@ struct LuceLayerProfile {
   double post_norm_gate_ms = 0.0;
   double qk_norm_rope_ms = 0.0;
   double attention_ms = 0.0;
+  double attention_qk_ms = 0.0;
+  double attention_softmax_ms = 0.0;
+  double attention_pv_ms = 0.0;
+  double attention_gate_ms = 0.0;
   double out_projection_ms = 0.0;
   double residual_ms = 0.0;
   double mlp_norm_ms = 0.0;

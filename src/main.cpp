@@ -83,6 +83,10 @@ void write_luce_layer_profile_json(std::ostream & out, const qwen35x::luce::Luce
   out << "        \"post_norm_gate_ms\": " << layer.post_norm_gate_ms << ",\n";
   out << "        \"qk_norm_rope_ms\": " << layer.qk_norm_rope_ms << ",\n";
   out << "        \"attention_ms\": " << layer.attention_ms << ",\n";
+  out << "        \"attention_qk_ms\": " << layer.attention_qk_ms << ",\n";
+  out << "        \"attention_softmax_ms\": " << layer.attention_softmax_ms << ",\n";
+  out << "        \"attention_pv_ms\": " << layer.attention_pv_ms << ",\n";
+  out << "        \"attention_gate_ms\": " << layer.attention_gate_ms << ",\n";
   out << "        \"out_projection_ms\": " << layer.out_projection_ms << ",\n";
   out << "        \"residual_ms\": " << layer.residual_ms << ",\n";
   out << "        \"mlp_norm_ms\": " << layer.mlp_norm_ms << ",\n";

@@ -439,33 +439,7 @@ __global__ void pf_qk_norm_rope(
     }
 }
 
-// ===== Causal attention (bf16 Q/K/V, f32 accumulation, bf16 output) =====
-__global__ void pf_causal_attn(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
-    const __nv_bfloat16 *v, __nv_bfloat16 *out, int S)
-{
-    int idx = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
-    int lid = threadIdx.x % 32;
-    if (idx >= S * FA_Q_HEADS) return;
-    int pos = idx / FA_Q_HEADS, qh = idx % FA_Q_HEADS, kvh = qh / FA_GQA;
-    float scale = 1.0f / sqrtf(float(FA_HEAD_DIM));
-    constexpr int EPL = FA_HEAD_DIM / 32;
-    const __nv_bfloat16 *qv = q + pos*FA_QPROJ_SIZE + qh*FA_HEAD_DIM*2;
-    const __nv_bfloat16 *gv = qv + FA_HEAD_DIM;
-    __nv_bfloat16 *ov = out + pos*FA_Q_SIZE + qh*FA_HEAD_DIM;
-    float ql[EPL]; for(int e=0;e<EPL;e++) ql[e]=__bfloat162float(qv[lid*EPL+e]);
-    float oa[EPL]={}; float mx=-1e30f, se=0;
-    for (int kp = 0; kp <= pos; kp++) {
-        const __nv_bfloat16 *kv=k+kp*FA_KV_SIZE+kvh*FA_HEAD_DIM;
-        const __nv_bfloat16 *vv=v+kp*FA_KV_SIZE+kvh*FA_HEAD_DIM;
-        float sc=0; for(int e=0;e<EPL;e++) sc+=ql[e]*__bfloat162float(kv[lid*EPL+e]);
-        sc=pf_warp_sum(sc)*scale; sc=__shfl_sync(0xffffffff,sc,0);
-        float om=mx; mx=fmaxf(mx,sc); float ed=expf(om-mx); se=se*ed+expf(sc-mx);
-        float wt=expf(sc-mx); for(int e=0;e<EPL;e++) oa[e]=oa[e]*ed+wt*__bfloat162float(vv[lid*EPL+e]);
-    }
-    float rs=1.f/se;
-    for(int e=0;e<EPL;e++){int i=lid*EPL+e;float g=1.f/(1.f+expf(-__bfloat162float(gv[i])));ov[i]=__float2bfloat16(oa[e]*rs*g);}
-}
-
+// ===== Causal attention helpers =====
 __global__ void pf_causal_softmax_to_bf16(
     const float *scores,
     __nv_bfloat16 *probs,
@@ -505,7 +479,7 @@ __global__ void pf_causal_softmax_to_bf16(
     float local_sum = 0.0f;
     for (int k = tid; k < key_count; k += blockDim.x) {
         if (k <= q_pos) {
-            local_sum += expf(score_row[k] * scale - row_max);
+            local_sum += __expf(score_row[k] * scale - row_max);
         }
     }
     local_sum = pf_warp_sum(local_sum);
@@ -524,7 +498,7 @@ __global__ void pf_causal_softmax_to_bf16(
     for (int k = tid; k < key_count; k += blockDim.x) {
         float p = 0.0f;
         if (k <= q_pos) {
-            p = expf(score_row[k] * scale - row_max) * inv_sum;
+            p = __expf(score_row[k] * scale - row_max) * inv_sum;
         }
         prob_row[k] = __float2bfloat16(p);
     }
@@ -645,6 +619,7 @@ static void cublas_bf16_probs_v(
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 }
 
+template <typename ProfilePhase>
 static void pf_causal_attn_tiled_cublas(
     cublasHandle_t h,
     const __nv_bfloat16 *q,
@@ -655,16 +630,16 @@ static void pf_causal_attn_tiled_cublas(
     float *attn_scratch,
     __nv_bfloat16 *out,
     int S,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    qwen35x::luce::LuceLayerProfile *profile,
+    ProfilePhase &profile_phase)
 {
-    constexpr int kQueryBlock = 2048;
-    constexpr int kSoftmaxThreads = 256;
+    // Keep the tile as large as the existing scratch buffers allow. prob_scratch
+    // aliases the MLP buffer (INTER x S bf16), while score_scratch has
+    // DN_CONV_CH x S f32 capacity, so INTER rows is the limiting dimension.
+    constexpr int kQueryBlock = INTER;
+    constexpr int kSoftmaxThreads = 512;
     constexpr int kGateThreads = 256;
-
-    if (S < 1024) {
-        pf_causal_attn<<<(S * FA_Q_HEADS + 15) / 16, 512, 0, stream>>>(q, k, v, out, S);
-        return;
-    }
 
     for (int qh = 0; qh < FA_Q_HEADS; ++qh) {
         const int kvh = qh / FA_GQA;
@@ -676,43 +651,51 @@ static void pf_causal_attn_tiled_cublas(
             const int key_count = q0 + rows;
             const __nv_bfloat16 *q_head = q + q0 * FA_QPROJ_SIZE + qh * FA_HEAD_DIM * 2;
 
-            cublas_bf16_qk_scores(
-                h,
-                q_head,
-                FA_QPROJ_SIZE,
-                k_head,
-                FA_KV_SIZE,
-                score_scratch,
-                rows,
-                key_count,
-                FA_HEAD_DIM);
+            profile_phase(profile ? &profile->attention_qk_ms : nullptr, [&]() {
+                cublas_bf16_qk_scores(
+                    h,
+                    q_head,
+                    FA_QPROJ_SIZE,
+                    k_head,
+                    FA_KV_SIZE,
+                    score_scratch,
+                    rows,
+                    key_count,
+                    FA_HEAD_DIM);
+            });
 
-            pf_causal_softmax_to_bf16<<<rows, kSoftmaxThreads, 0, stream>>>(
-                score_scratch,
-                prob_scratch,
-                q0,
-                rows,
-                key_count,
-                key_count);
+            profile_phase(profile ? &profile->attention_softmax_ms : nullptr, [&]() {
+                pf_causal_softmax_to_bf16<<<rows, kSoftmaxThreads, 0, stream>>>(
+                    score_scratch,
+                    prob_scratch,
+                    q0,
+                    rows,
+                    key_count,
+                    key_count);
+            });
 
-            cublas_bf16_probs_v(
-                h,
-                prob_scratch,
-                key_count,
-                v_head,
-                FA_KV_SIZE,
-                attn_scratch,
-                rows,
-                key_count,
-                FA_HEAD_DIM);
+            profile_phase(profile ? &profile->attention_pv_ms : nullptr, [&]() {
+                cublas_bf16_probs_v(
+                    h,
+                    prob_scratch,
+                    key_count,
+                    v_head,
+                    FA_KV_SIZE,
+                    attn_scratch,
+                    rows,
+                    key_count,
+                    FA_HEAD_DIM);
+            });
 
-            pf_apply_attention_gate_bf16<<<(rows * FA_HEAD_DIM + kGateThreads - 1) / kGateThreads, kGateThreads, 0, stream>>>(
-                attn_scratch,
-                q,
-                out,
-                q0,
-                rows,
-                qh);
+            profile_phase(profile ? &profile->attention_gate_ms : nullptr, [&]() {
+                pf_apply_attention_gate_bf16<<<(rows * FA_HEAD_DIM + kGateThreads - 1) / kGateThreads, kGateThreads, 0, stream>>>(
+                    attn_scratch,
+                    q,
+                    out,
+                    q0,
+                    rows,
+                    qh);
+            });
         }
     }
 }
@@ -962,7 +945,9 @@ extern "C" void launch_prefill_bf16(
                     dn_out_f32,
                     dn_out_buf,
                     S,
-                    stream);
+                    stream,
+                    layer_profile,
+                    profile_phase);
             });
 
             profile_phase(layer_profile ? &layer_profile->out_projection_ms : nullptr, [&]() {
