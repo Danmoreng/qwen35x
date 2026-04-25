@@ -10,7 +10,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <utility>
 
 extern "C" void set_decode_blocks_override(int blocks);
@@ -145,6 +147,8 @@ extern "C" void launch_prefill_bf16(
   const float * rope_cos,
   const float * rope_sin,
   int max_seq_len,
+  int mlp_chunk_tokens,
+  int attention_query_tokens,
   int compute_logits,
   Qwen35xPrefillProfile * profile,
   cudaStream_t stream);
@@ -223,6 +227,8 @@ struct BackendState {
   int * pf_lm_bmi = nullptr;
   float * pf_rope_cos = nullptr;
   float * pf_rope_sin = nullptr;
+  int prefill_mlp_chunk_tokens = 0;
+  int prefill_attention_query_tokens = 0;
 };
 
 bool check_cuda(cudaError_t status, const std::string & label, std::string & error_message) {
@@ -235,6 +241,42 @@ bool check_cuda(cudaError_t status, const std::string & label, std::string & err
 
 double elapsed_ms_since(const std::chrono::steady_clock::time_point start) {
   return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
+int get_prefill_mlp_chunk_tokens(const int max_context) {
+  constexpr int kDefaultChunkTokens = 4096;
+  int chunk_tokens = std::min(max_context, kDefaultChunkTokens);
+  if (const char *env = std::getenv("QWEN35X_PREFILL_MLP_CHUNK_TOKENS")) {
+    try {
+      const int requested = std::stoi(env);
+      if (requested > 0) {
+        chunk_tokens = std::min(max_context, requested);
+      }
+    } catch (...) {
+      // Ignore invalid tuning overrides and keep the conservative default.
+    }
+  }
+  return std::max(1, chunk_tokens);
+}
+
+int get_prefill_attention_query_tokens(const int max_context) {
+#if defined(QWEN35X_CUDA_VARIANT_4b)
+  constexpr int kDefaultQueryTokens = 64;
+#else
+  constexpr int kDefaultQueryTokens = kIntermediateSize;
+#endif
+  int query_tokens = std::min(max_context, kDefaultQueryTokens);
+  if (const char *env = std::getenv("QWEN35X_PREFILL_ATTENTION_QUERY_TOKENS")) {
+    try {
+      const int requested = std::stoi(env);
+      if (requested > 0) {
+        query_tokens = std::min(max_context, requested);
+      }
+    } catch (...) {
+      // Ignore invalid tuning overrides and keep the variant default.
+    }
+  }
+  return std::max(1, query_tokens);
 }
 
 bool load_bf16_tensor_to_device(
@@ -582,26 +624,53 @@ bool initialize_backend_state(
   }
 
   const int prefill_s = config.max_context;
-  const int mx = std::max({kDnConvChannels, kFaQprojSize, kIntermediateSize});
+  const int prefill_mlp_chunk_tokens = get_prefill_mlp_chunk_tokens(config.max_context);
+  const int prefill_attention_query_tokens = get_prefill_attention_query_tokens(config.max_context);
+  const std::size_t full_projection_elems =
+    static_cast<std::size_t>(prefill_s) * static_cast<std::size_t>(std::max(kDnConvChannels, kFaQprojSize));
+  const std::size_t chunked_mlp_elems =
+    static_cast<std::size_t>(prefill_mlp_chunk_tokens) * static_cast<std::size_t>(kIntermediateSize);
+  const std::size_t attention_prob_elems =
+    static_cast<std::size_t>(prefill_attention_query_tokens) * static_cast<std::size_t>(prefill_s);
+  const std::size_t proj_buf_elems = std::max(full_projection_elems, chunked_mlp_elems);
+  const std::size_t proj_buf2_elems =
+    std::max(
+      static_cast<std::size_t>(prefill_s) * static_cast<std::size_t>(std::max(kDnVSize, kFaKvSize)),
+      chunked_mlp_elems);
+  const std::size_t mlp_buf_elems = std::max(chunked_mlp_elems, attention_prob_elems);
+  const std::size_t attention_score_elems =
+    static_cast<std::size_t>(prefill_attention_query_tokens) * static_cast<std::size_t>(prefill_s);
+  const std::size_t attention_accum_elems =
+    static_cast<std::size_t>(prefill_attention_query_tokens) * static_cast<std::size_t>(kFaHeadDim);
+  const std::size_t dn_qkv_f32_elems =
+    std::max(
+      static_cast<std::size_t>(prefill_mlp_chunk_tokens) * static_cast<std::size_t>(kDnConvChannels),
+      attention_score_elems);
+  const std::size_t dn_out_f32_elems =
+    std::max(
+      static_cast<std::size_t>(prefill_mlp_chunk_tokens) * static_cast<std::size_t>(kDnVSize),
+      attention_accum_elems);
 
   if (!arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * kHiddenSize * bf16_bytes, state.pf_hidden, error_message) ||
       !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * kHiddenSize * bf16_bytes, state.pf_residual, error_message) ||
       !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * kHiddenSize * bf16_bytes, state.pf_normalized, error_message) ||
-      !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * mx * bf16_bytes, state.pf_proj_buf, error_message) ||
-      !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * mx * bf16_bytes, state.pf_proj_buf2, error_message) ||
+      !arena.alloc_bytes(proj_buf_elems * bf16_bytes, state.pf_proj_buf, error_message) ||
+      !arena.alloc_bytes(proj_buf2_elems * bf16_bytes, state.pf_proj_buf2, error_message) ||
       !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * std::max(kFaQSize, kFaKvSize) * bf16_bytes, state.pf_attn_buf, error_message) ||
-      !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * kIntermediateSize * bf16_bytes, state.pf_mlp_buf, error_message) ||
+      !arena.alloc_bytes(mlp_buf_elems * bf16_bytes, state.pf_mlp_buf, error_message) ||
       !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * kDnVSize * bf16_bytes, state.pf_dn_out_buf, error_message) ||
-      !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * kDnConvChannels * sizeof(float), reinterpret_cast<void *&>(state.pf_dn_qkv_f32), error_message) ||
-      !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * kDnVSize * sizeof(float), reinterpret_cast<void *&>(state.pf_dn_out_f32), error_message) ||
-      !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * kDnGateHeads * sizeof(float), reinterpret_cast<void *&>(state.pf_beta_buf), error_message) ||
-      !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * kDnGateHeads * sizeof(float), reinterpret_cast<void *&>(state.pf_alpha_buf), error_message) ||
+      !arena.alloc_bytes(dn_qkv_f32_elems * sizeof(float), reinterpret_cast<void *&>(state.pf_dn_qkv_f32), error_message) ||
+      !arena.alloc_bytes(dn_out_f32_elems * sizeof(float), reinterpret_cast<void *&>(state.pf_dn_out_f32), error_message) ||
+      !arena.alloc_bytes(static_cast<std::size_t>(prefill_mlp_chunk_tokens) * kDnGateHeads * sizeof(float), reinterpret_cast<void *&>(state.pf_beta_buf), error_message) ||
+      !arena.alloc_bytes(static_cast<std::size_t>(prefill_mlp_chunk_tokens) * kDnGateHeads * sizeof(float), reinterpret_cast<void *&>(state.pf_alpha_buf), error_message) ||
       !arena.alloc_bytes(kHiddenSize * f32_bytes, state.pf_final_normed, error_message) ||
       !arena.alloc_bytes(kHiddenSize * bf16_bytes, state.pf_hidden_bf16_out, error_message) ||
       !arena.alloc_bytes(1024 * sizeof(float), reinterpret_cast<void *&>(state.pf_lm_bmv), error_message) ||
       !arena.alloc_bytes(1024 * sizeof(int), reinterpret_cast<void *&>(state.pf_lm_bmi), error_message)) {
     return false;
   }
+  state.prefill_mlp_chunk_tokens = prefill_mlp_chunk_tokens;
+  state.prefill_attention_query_tokens = prefill_attention_query_tokens;
 
   return true;
 }
@@ -669,6 +738,8 @@ void launch_prefill_for_state(
     state.pf_rope_cos,
     state.pf_rope_sin,
     config.max_context,
+    state.prefill_mlp_chunk_tokens,
+    state.prefill_attention_query_tokens,
     compute_first_token ? 1 : 0,
     profile,
     stream);

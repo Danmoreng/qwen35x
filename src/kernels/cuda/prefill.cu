@@ -556,6 +556,107 @@ static void cublas_bf16_gemm(cublasHandle_t h,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 }
 
+static void pf_mlp_chunked(
+    cublasHandle_t h,
+    const __nv_bfloat16 *normalized,
+    const __nv_bfloat16 *residual,
+    __nv_bfloat16 *hidden,
+    const __nv_bfloat16 *gate_w,
+    const __nv_bfloat16 *up_w,
+    const __nv_bfloat16 *down_w,
+    __nv_bfloat16 *gate_buf,
+    __nv_bfloat16 *up_buf,
+    __nv_bfloat16 *mlp_buf,
+    int S,
+    int chunk_tokens,
+    cudaStream_t stream)
+{
+    for (int offset = 0; offset < S; offset += chunk_tokens) {
+        const int rows = min(chunk_tokens, S - offset);
+        const __nv_bfloat16 *norm_chunk = normalized + static_cast<size_t>(offset) * HIDDEN;
+        const __nv_bfloat16 *residual_chunk = residual + static_cast<size_t>(offset) * HIDDEN;
+        __nv_bfloat16 *hidden_chunk = hidden + static_cast<size_t>(offset) * HIDDEN;
+
+        cublas_bf16_gemm(h, norm_chunk, gate_w, gate_buf, rows, INTER, HIDDEN);
+        cublas_bf16_gemm(h, norm_chunk, up_w, up_buf, rows, INTER, HIDDEN);
+        pf_silu_mul_bf16<<<(rows * INTER + 255) / 256, 256, 0, stream>>>(gate_buf, up_buf, mlp_buf, rows * INTER);
+        cublas_bf16_gemm(h, mlp_buf, down_w, gate_buf, rows, HIDDEN, INTER);
+        pf_add_residual_bf16<<<(rows * HIDDEN + 255) / 256, 256, 0, stream>>>(gate_buf, residual_chunk, hidden_chunk, rows * HIDDEN);
+    }
+}
+
+template <typename ProfilePhase>
+static void pf_deltanet_chunked(
+    cublasHandle_t h,
+    const __nv_bfloat16 *normalized,
+    const __nv_bfloat16 *residual,
+    __nv_bfloat16 *hidden,
+    const __nv_bfloat16 *qkv_w,
+    const __nv_bfloat16 *z_w,
+    const __nv_bfloat16 *beta_w,
+    const __nv_bfloat16 *alpha_w,
+    const __nv_bfloat16 *conv_w,
+    const __nv_bfloat16 *a_log,
+    const __nv_bfloat16 *dt_bias,
+    const __nv_bfloat16 *dn_norm,
+    const __nv_bfloat16 *out_w,
+    float *dn_state,
+    float *conv_state,
+    __nv_bfloat16 *proj_buf,
+    __nv_bfloat16 *proj_buf2,
+    __nv_bfloat16 *dn_out_buf,
+    float *dn_qkv_f32,
+    float *dn_out_f32,
+    float *beta_buf,
+    float *alpha_buf,
+    int S,
+    int chunk_tokens,
+    cudaStream_t stream,
+    qwen35x::cuda_backend::Qwen35xLayerProfile *profile,
+    ProfilePhase &profile_phase)
+{
+    for (int offset = 0; offset < S; offset += chunk_tokens) {
+        const int rows = min(chunk_tokens, S - offset);
+        const __nv_bfloat16 *norm_chunk = normalized + static_cast<size_t>(offset) * HIDDEN;
+        const __nv_bfloat16 *residual_chunk = residual + static_cast<size_t>(offset) * HIDDEN;
+        __nv_bfloat16 *hidden_chunk = hidden + static_cast<size_t>(offset) * HIDDEN;
+
+        profile_phase(profile ? &profile->qkv_projection_ms : nullptr, [&]() {
+            cublas_bf16_gemm(h, norm_chunk, qkv_w, proj_buf, rows, DN_CONV_CH, HIDDEN);
+        });
+        profile_phase(profile ? &profile->z_projection_ms : nullptr, [&]() {
+            cublas_bf16_gemm(h, norm_chunk, z_w, proj_buf2, rows, DN_V_SIZE, HIDDEN);
+        });
+        profile_phase(profile ? &profile->beta_alpha_projection_ms : nullptr, [&]() {
+            pf_bf16_matvec<<<rows * DN_GATE, 32, 0, stream>>>(norm_chunk, beta_w, beta_buf, rows, HIDDEN, DN_GATE);
+            pf_bf16_matvec<<<rows * DN_GATE, 32, 0, stream>>>(norm_chunk, alpha_w, alpha_buf, rows, HIDDEN, DN_GATE);
+        });
+        profile_phase(profile ? &profile->conv_ms : nullptr, [&]() {
+            pf_deltanet_conv_prepare<<<(DN_CONV_CH + 255) / 256, 256, 0, stream>>>(
+                proj_buf, dn_qkv_f32, conv_w, conv_state, rows);
+        });
+        profile_phase(profile ? &profile->gate_ms : nullptr, [&]() {
+            constexpr int kNormGateItems = (DN_GATE > DN_HEADS) ? DN_GATE : DN_HEADS;
+            pf_deltanet_prepare_norm_gate<<<(rows * kNormGateItems + 15) / 16, 512, 0, stream>>>(
+                dn_qkv_f32, beta_buf, alpha_buf, a_log, dt_bias, rows);
+        });
+        profile_phase(profile ? &profile->recurrence_ms : nullptr, [&]() {
+            pf_deltanet_recurrence_cols<<<dim3(DN_HEADS, (DN_VAL + 3) / 4), dim3(32, 4), 0, stream>>>(
+                dn_qkv_f32, beta_buf, alpha_buf, dn_state, dn_out_f32, rows);
+        });
+        profile_phase(profile ? &profile->post_norm_gate_ms : nullptr, [&]() {
+            pf_deltanet_post_norm_gate<<<rows * DN_GATE, 256, 0, stream>>>(
+                dn_out_f32, proj_buf2, dn_norm, dn_out_buf, rows);
+        });
+        profile_phase(profile ? &profile->out_projection_ms : nullptr, [&]() {
+            cublas_bf16_gemm(h, dn_out_buf, out_w, proj_buf, rows, HIDDEN, DN_V_SIZE);
+        });
+        profile_phase(profile ? &profile->residual_ms : nullptr, [&]() {
+            pf_add_residual_bf16<<<(rows * HIDDEN + 255) / 256, 256, 0, stream>>>(proj_buf, residual_chunk, hidden_chunk, rows * HIDDEN);
+        });
+    }
+}
+
 static void cublas_bf16_qk_scores(
     cublasHandle_t h,
     const __nv_bfloat16 *q,
@@ -603,14 +704,12 @@ static void pf_causal_attn_tiled_cublas(
     float *attn_scratch,
     __nv_bfloat16 *out,
     int S,
+    int query_block_tokens,
     cudaStream_t stream,
     qwen35x::cuda_backend::Qwen35xLayerProfile *profile,
     ProfilePhase &profile_phase)
 {
-    // Keep the tile as large as the existing scratch buffers allow. prob_scratch
-    // aliases the MLP buffer (INTER x S bf16), while score_scratch has
-    // DN_CONV_CH x S f32 capacity, so INTER rows is the limiting dimension.
-    constexpr int kQueryBlock = INTER;
+    query_block_tokens = max(1, min(query_block_tokens, S));
     constexpr int kSoftmaxThreads = 512;
     constexpr int kGateThreads = 256;
 
@@ -619,8 +718,8 @@ static void pf_causal_attn_tiled_cublas(
         const __nv_bfloat16 *k_head = k + kvh * FA_HEAD_DIM;
         const __nv_bfloat16 *v_head = v + kvh * FA_HEAD_DIM;
 
-        for (int q0 = 0; q0 < S; q0 += kQueryBlock) {
-            const int rows = min(kQueryBlock, S - q0);
+        for (int q0 = 0; q0 < S; q0 += query_block_tokens) {
+            const int rows = min(query_block_tokens, S - q0);
             const int key_count = q0 + rows;
             const __nv_bfloat16 *q_head = q + q0 * FA_QPROJ_SIZE + qh * FA_HEAD_DIM * 2;
 
@@ -692,6 +791,8 @@ extern "C" void launch_prefill_bf16(
     float *seen_token_mask, float repetition_penalty,
     const float *rope_cos, const float *rope_sin,
     int max_seq_len,
+    int mlp_chunk_tokens,
+    int attention_query_tokens,
     int compute_logits,
     qwen35x::cuda_backend::Qwen35xPrefillProfile *profile,
     cudaStream_t stream)
@@ -705,6 +806,8 @@ extern "C" void launch_prefill_bf16(
     if (!copied) { cudaMemcpy(hl, layers, NUM_LAYERS*sizeof(PFLayerWeights), cudaMemcpyDeviceToHost); copied = true; }
 
     int S = seq_len;
+    mlp_chunk_tokens = max(1, min(mlp_chunk_tokens, S));
+    attention_query_tokens = max(1, min(attention_query_tokens, S));
     int bk = (S*HIDDEN+255)/256;
 
     std::vector<ProfileEvent> profile_events;
@@ -821,61 +924,54 @@ extern "C" void launch_prefill_bf16(
             const __nv_bfloat16 *up_w=(const __nv_bfloat16*)lw.ptrs[12];
             const __nv_bfloat16 *down_w=(const __nv_bfloat16*)lw.ptrs[13];
 
-            // cuBLAS projections — direct bf16, no conversion!
-            profile_phase(layer_profile ? &layer_profile->qkv_projection_ms : nullptr, [&]() {
-                cublas_bf16_gemm(cublas, normalized, qkv_w, proj_buf, S, DN_CONV_CH, HIDDEN);
-            });
-            profile_phase(layer_profile ? &layer_profile->z_projection_ms : nullptr, [&]() {
-                cublas_bf16_gemm(cublas, normalized, z_w, proj_buf2, S, DN_V_SIZE, HIDDEN);
-            });
-            profile_phase(layer_profile ? &layer_profile->beta_alpha_projection_ms : nullptr, [&]() {
-                pf_bf16_matvec<<<S*DN_GATE, 32, 0, stream>>>(normalized, beta_w, beta_buf, S, HIDDEN, DN_GATE);
-                pf_bf16_matvec<<<S*DN_GATE, 32, 0, stream>>>(normalized, alpha_w, alpha_buf, S, HIDDEN, DN_GATE);
-            });
-
-            profile_phase(layer_profile ? &layer_profile->conv_ms : nullptr, [&]() {
-                pf_deltanet_conv_prepare<<<(DN_CONV_CH + 255) / 256, 256, 0, stream>>>(
-                    proj_buf, dn_qkv_f32, conv_w, conv_bufs + dn_idx*DN_CONV_CH*DN_CONV_K, S);
-            });
-            profile_phase(layer_profile ? &layer_profile->gate_ms : nullptr, [&]() {
-                constexpr int kNormGateItems = (DN_GATE > DN_HEADS) ? DN_GATE : DN_HEADS;
-                pf_deltanet_prepare_norm_gate<<<(S*kNormGateItems + 15) / 16, 512, 0, stream>>>(
-                    dn_qkv_f32, beta_buf, alpha_buf, a_log, dt_bias, S);
-            });
-            profile_phase(layer_profile ? &layer_profile->recurrence_ms : nullptr, [&]() {
-                pf_deltanet_recurrence_cols<<<dim3(DN_HEADS, (DN_VAL + 3) / 4), dim3(32, 4), 0, stream>>>(
-                    dn_qkv_f32, beta_buf, alpha_buf, dn_states + dn_idx*dn_stride, dn_out_f32, S);
-            });
-            profile_phase(layer_profile ? &layer_profile->post_norm_gate_ms : nullptr, [&]() {
-                pf_deltanet_post_norm_gate<<<S*DN_GATE, 256, 0, stream>>>(
-                    dn_out_f32, proj_buf2, dn_norm, dn_out_buf, S);
-            });
-
-            // Out projection + residual
-            profile_phase(layer_profile ? &layer_profile->out_projection_ms : nullptr, [&]() {
-                cublas_bf16_gemm(cublas, dn_out_buf, out_w, proj_buf, S, HIDDEN, DN_V_SIZE);
-            });
-            profile_phase(layer_profile ? &layer_profile->residual_ms : nullptr, [&]() {
-                pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
-            });
+            pf_deltanet_chunked(
+                cublas,
+                normalized,
+                residual,
+                hidden,
+                qkv_w,
+                z_w,
+                beta_w,
+                alpha_w,
+                conv_w,
+                a_log,
+                dt_bias,
+                dn_norm,
+                out_w,
+                dn_states + dn_idx*dn_stride,
+                conv_bufs + dn_idx*DN_CONV_CH*DN_CONV_K,
+                proj_buf,
+                proj_buf2,
+                dn_out_buf,
+                dn_qkv_f32,
+                dn_out_f32,
+                beta_buf,
+                alpha_buf,
+                S,
+                mlp_chunk_tokens,
+                stream,
+                layer_profile,
+                profile_phase);
 
             // MLP
             profile_phase(layer_profile ? &layer_profile->mlp_norm_ms : nullptr, [&]() {
                 pf_rmsnorm<<<S, 512, 0, stream>>>(hidden, post_norm, normalized, residual, S, HIDDEN);
             });
             profile_phase(layer_profile ? &layer_profile->mlp_projection_ms : nullptr, [&]() {
-                cublas_bf16_gemm(cublas, normalized, gate_w, proj_buf, S, INTER, HIDDEN);
-                cublas_bf16_gemm(cublas, normalized, up_w, proj_buf2, S, INTER, HIDDEN);
-            });
-            int mlp_bk = (S*INTER+255)/256;
-            profile_phase(layer_profile ? &layer_profile->mlp_activation_ms : nullptr, [&]() {
-                pf_silu_mul_bf16<<<mlp_bk, 256, 0, stream>>>(proj_buf, proj_buf2, mlp_buf, S*INTER);
-            });
-            profile_phase(layer_profile ? &layer_profile->mlp_down_projection_ms : nullptr, [&]() {
-                cublas_bf16_gemm(cublas, mlp_buf, down_w, proj_buf, S, HIDDEN, INTER);
-            });
-            profile_phase(layer_profile ? &layer_profile->mlp_residual_ms : nullptr, [&]() {
-                pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
+                pf_mlp_chunked(
+                    cublas,
+                    normalized,
+                    residual,
+                    hidden,
+                    gate_w,
+                    up_w,
+                    down_w,
+                    proj_buf,
+                    proj_buf2,
+                    mlp_buf,
+                    S,
+                    mlp_chunk_tokens,
+                    stream);
             });
 
             dn_idx++;
@@ -919,6 +1015,7 @@ extern "C" void launch_prefill_bf16(
                     dn_out_f32,
                     dn_out_buf,
                     S,
+                    attention_query_tokens,
                     stream,
                     layer_profile,
                     profile_phase);
@@ -936,18 +1033,20 @@ extern "C" void launch_prefill_bf16(
                 pf_rmsnorm<<<S, 512, 0, stream>>>(hidden, post_norm, normalized, residual, S, HIDDEN);
             });
             profile_phase(layer_profile ? &layer_profile->mlp_projection_ms : nullptr, [&]() {
-                cublas_bf16_gemm(cublas, normalized, gate_w, proj_buf, S, INTER, HIDDEN);
-                cublas_bf16_gemm(cublas, normalized, up_w, proj_buf2, S, INTER, HIDDEN);
-            });
-            int mlp_bk = (S*INTER+255)/256;
-            profile_phase(layer_profile ? &layer_profile->mlp_activation_ms : nullptr, [&]() {
-                pf_silu_mul_bf16<<<mlp_bk, 256, 0, stream>>>(proj_buf, proj_buf2, mlp_buf, S*INTER);
-            });
-            profile_phase(layer_profile ? &layer_profile->mlp_down_projection_ms : nullptr, [&]() {
-                cublas_bf16_gemm(cublas, mlp_buf, down_w, proj_buf, S, HIDDEN, INTER);
-            });
-            profile_phase(layer_profile ? &layer_profile->mlp_residual_ms : nullptr, [&]() {
-                pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
+                pf_mlp_chunked(
+                    cublas,
+                    normalized,
+                    residual,
+                    hidden,
+                    gate_w,
+                    up_w,
+                    down_w,
+                    proj_buf,
+                    proj_buf2,
+                    mlp_buf,
+                    S,
+                    mlp_chunk_tokens,
+                    stream);
             });
 
             fa_idx++;

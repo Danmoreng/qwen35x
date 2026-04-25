@@ -42,6 +42,9 @@ Current Qwen35x prefill behavior:
 - `--qwen35x-prefill-mode batched` is the default path.
 - `--qwen35x-prefill-mode replay` remains available as a conservative fallback.
 - The default backend performs a one-token prefill warmup during initialization, then resets recurrent/cache state before real inference. This keeps one-time cuBLAS/kernel setup outside timed prefill and decode paths.
+- Prefill scratch is chunked for MLP and DeltaNet work so 4B long-context runs do not allocate all large intermediates at `max_context` size.
+- `QWEN35X_PREFILL_MLP_CHUNK_TOKENS` overrides the MLP/DeltaNet chunk size. The default is `4096`.
+- `QWEN35X_PREFILL_ATTENTION_QUERY_TOKENS` overrides the materialized full-attention query tile. Defaults are variant-aware: large tile for 0.8B throughput, 64-token tile for 4B VRAM safety.
 
 Current decode control behavior:
 - The default Qwen35x CUDA path returns the selected token id each step and performs stop checks on the host.
@@ -134,10 +137,12 @@ Latest local long-context Qwen35x CUDA benchmark snapshot (April 25, 2026, Qwen3
 
 | Workload | qwen35x | llama.cpp | llama.cpp + FA | CSV |
 |---|---:|---:|---:|---|
-| 64k Wikipedia prompt prefill | `7,870.08 tok/s` (`8,310.58 ms`) | `5,369.00 tok/s` (`12,181.78 ms`) | `9,371.15 tok/s` (`6,979.29 ms`) | `benchmarks/qwen35x-wiki-ai-64k-gen128-gqa-decode-default-profile.csv` |
-| 64k Wikipedia prompt generation | `201.18 tok/s` (`636.25 ms`) | `139.88 tok/s` (`907.89 ms`) | `165.42 tok/s` (`767.73 ms`) | `benchmarks/qwen35x-wiki-ai-64k-gen128-gqa-decode-default-profile.csv` |
+| 0.8B 64k Wikipedia prompt prefill | `8,144.61 tok/s` (`8,030.47 ms`) | `5,369.00 tok/s` (`12,181.78 ms`) | `9,371.15 tok/s` (`6,979.29 ms`) | `benchmarks/qwen35x-0p8b-wiki-ai-64k-gen128-chunked-variant-tile.csv` |
+| 0.8B 64k Wikipedia prompt generation | `198.24 tok/s` (`645.69 ms`) | `139.88 tok/s` (`907.89 ms`) | `165.42 tok/s` (`767.73 ms`) | `benchmarks/qwen35x-0p8b-wiki-ai-64k-gen128-chunked-variant-tile.csv` |
+| 4B 64k Wikipedia prompt prefill | `2,170.42 tok/s` (`30,134.70 ms`) | not rerun | not rerun | `benchmarks/qwen35x-4b-wiki-ai-64k-gen128-chunked-prefill.csv` |
+| 4B 64k Wikipedia prompt generation | `48.29 tok/s` (`2,650.58 ms`) | not rerun | not rerun | `benchmarks/qwen35x-4b-wiki-ai-64k-gen128-chunked-prefill.csv` |
 
-The current Qwen35x long-context prefill path is a single tiled full-attention implementation for all prompt lengths. It is faster than llama.cpp without Flash Attention on 64k prefill, but still trails llama.cpp with Flash Attention. 64k decode now uses grouped-GQA full-attention decode and is ahead of the saved llama.cpp runs; the next decode bottleneck is LM head time.
+The current Qwen35x long-context prefill path still uses materialized tiled full attention, but its scratch allocation is now chunked for MLP/DeltaNet and uses variant-aware attention query tiling. This keeps the 0.8B 64k prefill path near the previous throughput while allowing the 4B 64k Wikipedia benchmark to complete without the prior VRAM spill collapse. The 0.8B path remains faster than llama.cpp without Flash Attention on 64k prefill, but still trails llama.cpp with Flash Attention.
 
 Full-attention prefill subphase split for the current 64k run:
 

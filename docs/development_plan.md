@@ -23,6 +23,7 @@ Completed:
 - Qwen35x prefill/decode phase profiling, including per-layer full-attention QK/softmax/PV/gate timing
 - Long-context full-attention decode split across context blocks
 - Single-path tiled full-attention prefill using the existing canonical cache/state layout
+- Chunked MLP/DeltaNet prefill scratch plus variant-aware full-attention query tiling, preserving 0.8B throughput while making 4B 64k runs fit without VRAM spill collapse
 - Deterministic CPU/GPU parity harness with minimal and extended prompt suites
 - Optional PyTorch/Transformers parity harness for checking the CPU reference against an external implementation
 - Actual-prompt benchmark matrix comparing qwen35x against llama.cpp with and without Flash Attention for 0.8B and 4B
@@ -34,6 +35,7 @@ Current known constraints:
 - Main Qwen35x CUDA inference path defaults to batched prefill for prompt processing.
 - Token replay prefill remains selectable with `--qwen35x-prefill-mode replay` as a conservative fallback.
 - Qwen35x CUDA backend initialization includes a dummy one-token prefill warmup and state reset; benchmark load time includes this warmup.
+- Prefill chunk/tile tuning is controlled by `QWEN35X_PREFILL_MLP_CHUNK_TOKENS` and `QWEN35X_PREFILL_ATTENTION_QUERY_TOKENS`; defaults are chosen per compiled variant.
 - The PyTorch/Transformers comparison environment is optional and kept outside the C++ build in `.venv-hf-parity`; it is a correctness oracle, not a performance benchmark.
 
 Latest local benchmark snapshot (same machine):
@@ -44,7 +46,9 @@ Latest local benchmark snapshot (same machine):
   - 4B llama.cpp + Flash Attention generation for the same contexts: `48.96`, `49.40`, `47.39`, `46.45`, `49.39 tok/s`.
   - qwen35x prefill is ahead of llama.cpp for these prompt lengths in this matrix; the separate 64k run remains the main long-context prefill stress case.
 - Long-context actual-prompt benchmark (April 25, 2026, Wikipedia prompt, ~65k prompt tokens, `MaxContext=65536`, `MaxNewTokens=128`):
-  - Current integrated Qwen35x CUDA path after profiling, split decode attention, grouped-GQA decode, decode-block clamp, and single-path tiled prefill tuning: prefill `8,310.58 ms` / `7,870.08 tok/s`; decode `636.25 ms` / `201.18 tok/s`, CSV `benchmarks/qwen35x-wiki-ai-64k-gen128-gqa-decode-default-profile.csv`.
+  - Current integrated Qwen35x CUDA 0.8B path after chunked MLP/DeltaNet scratch and variant-aware attention tiling: prefill `8,030.47 ms` / `8,144.61 tok/s`; decode `645.69 ms` / `198.24 tok/s`, CSV `benchmarks/qwen35x-0p8b-wiki-ai-64k-gen128-chunked-variant-tile.csv`.
+  - Current integrated Qwen35x CUDA 4B path with memory-safe attention query tiling: prefill `30,134.70 ms` / `2,170.42 tok/s`; decode `2,650.58 ms` / `48.29 tok/s`, CSV `benchmarks/qwen35x-4b-wiki-ai-64k-gen128-chunked-prefill.csv`.
+  - The first MLP-only chunking pass made 4B 64k fit but still showed likely VRAM spill behavior: prefill `108,558 ms` / `602.49 tok/s`. DeltaNet scratch chunking plus bounded attention score scratch improved the same prefill to roughly `30.18 s` / `2,167 tok/s`.
   - Full-attention prefill attention subphase split: total attention `4,694.03 ms`; QK `1,693.86 ms`, softmax `1,656.64 ms`, PV `1,322.32 ms`, gate `15.38 ms`.
   - Decode profile for the same run: effective decode blocks `60/60`, decode kernel `516.41 ms`, LM head `115.30 ms`.
   - llama.cpp `llama-completion` without Flash Attention: prefill `12,181.78 ms` / `5,369.00 tok/s`; decode `907.89 ms` / `139.88 tok/s`, CSV `benchmarks/llama-cli/qwen35x-wiki-ai-64k-gen128.csv`.
@@ -173,6 +177,7 @@ Active work for model-size generalization:
 
 Deferred performance backlog:
 - Replace the materialized tiled full-attention prefill path with a real fused/flash-style implementation.
+- Continue reducing 4B long-context prefill memory and launch overhead; current chunking avoids VRAM spill but remains much slower than an eventual flash-style implementation.
 - Optimize LM head for long-context token generation.
 - Replace prefill beta/alpha scalar matvec launches with packed GEMM or another batched tensor-core path.
 - Add compatible steady-state decode graph reuse for the Qwen35x CUDA path.
@@ -229,7 +234,8 @@ Execution phases:
 - Keep short-prompt decode throughput as a non-regression gate.
 
 4. Long-context prefill optimization track
-- The current full-attention prefill path is a single tiled cuBLAS-backed implementation for all prompt lengths.
+- The current full-attention prefill path is a materialized tiled cuBLAS-backed implementation with variant-aware query tile size.
+- MLP and DeltaNet prefill scratch are chunked to avoid allocating the largest intermediates at full `max_context` size.
 - Deferred: replace the materialized score/probability path with one unified fused/flash-style block implementation.
 - Deferred: replace beta/alpha per-token scalar matvec launches with packed GEMM or a comparable batched path.
 - Deferred: continue reducing linear-attention recurrence overhead and prefill kernel launch count.
@@ -321,6 +327,7 @@ Validation policy for each new size:
 - [x] Warm the Qwen35x prefill backend during initialization and reset state before real inference, keeping one-time cuBLAS/kernel setup out of timed prefill.
 - [x] Add detailed Qwen35x phase profiling for prefill and decode, including long-context 64k runs.
 - [x] Replace naive full-attention prefill with a single tiled full-attention path for all prompt lengths.
+- [x] Chunk MLP and DeltaNet prefill scratch and add variant-aware full-attention query tiling so 4B 64k can run without VRAM spill collapse.
 - [ ] Replace the materialized tiled full-attention prefill path with a unified fused/flash-style implementation.
 - [x] Add split-context/split-K full-attention decode for long-context generation.
 - [x] Add grouped-GQA full-attention decode sharing plus decode-block profiling/clamping.
@@ -335,7 +342,8 @@ Validation policy for each new size:
 - [x] Split megakernel compile-time constants into per-variant configured values for `0.8B` and `4B`.
 - [ ] Extend per-variant generated/configured values to `9B` and `27B`.
 - [ ] Refactor shared-memory and LM-head assumptions that scale with hidden/intermediate size before enabling larger variants.
-- [ ] Add prefill chunking and descriptor-driven GEMM dimensions for larger prompt/model shapes.
+- [x] Add first-pass prefill chunking for larger prompt/model shapes while preserving the canonical prefill/decode cache layout.
+- [ ] Make prefill chunking descriptor-driven and move tuning defaults into per-model/per-GPU profiles.
 - [ ] Add per-model/per-GPU autotune profiles (decode blocks, block size, LM head tiling, chunk sizes, graph boundaries).
 - [x] Establish deterministic CPU vs GPU parity harness + fixed prompt suites (`scripts/benchmark-parity.ps1`, minimal + extended prompt sets). Latest baseline (April 24, 2026): batched Qwen35x prefill passes minimal `5/5` and extended `12/12`.
 - [x] Add optional PyTorch/Transformers parity harness (`scripts/benchmark-transformers-parity.ps1`) to validate tokenizer, prompt formatting, and greedy CPU-reference output against an external implementation. Latest baseline (April 24, 2026): minimal `5/5` pass.
