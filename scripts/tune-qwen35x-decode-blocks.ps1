@@ -1,9 +1,9 @@
 [CmdletBinding()]
 param(
-    [string]$Executable = "build/qwen35x_lucebench.exe",
+    [string]$Executable = "build/qwen35x_kernelbench.exe",
     [string]$HFModelDir = "models/qwen3.5-0.8b",
-    [string]$SweepCsvOut = "benchmarks/luce-decode-blocks-sweep.csv",
-    [string]$FinalCsvOut = "benchmarks/luce-decode-blocks-final.csv",
+    [string]$SweepCsvOut = "benchmarks/qwen35x-decode-blocks-sweep.csv",
+    [string]$FinalCsvOut = "benchmarks/qwen35x-decode-blocks-final.csv",
     [int]$MaxNewTokens = 128,
     [int]$MaxContext = 256
 )
@@ -67,7 +67,7 @@ $candidates = @($candidateSet) | Sort-Object
 Write-Host ("Tuning decode blocks: max_safe={0}, candidates={1}" -f $maxSafe, ($candidates -join ",")) -ForegroundColor Cyan
 
 foreach ($b in $candidates) {
-    & (Join-Path $scriptDir "benchmark-luce-megakernel-seq.ps1") `
+    & (Join-Path $scriptDir "benchmark-qwen35x-kernel-seq.ps1") `
         -Executable $resolvedExe `
         -HFModelDir $resolvedModelDir `
         -CsvOut $resolvedSweepCsv `
@@ -96,7 +96,7 @@ $top | Format-Table decode_blocks, tokens_per_second, pp_tokens_per_second -Auto
 
 foreach ($row in $top) {
     $b = [int]$row.decode_blocks
-    & (Join-Path $scriptDir "benchmark-luce-megakernel-seq.ps1") `
+    & (Join-Path $scriptDir "benchmark-qwen35x-kernel-seq.ps1") `
         -Executable $resolvedExe `
         -HFModelDir $resolvedModelDir `
         -CsvOut $resolvedFinalCsv `

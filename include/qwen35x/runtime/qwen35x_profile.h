@@ -1,10 +1,10 @@
 #pragma once
 
-namespace qwen35x::luce {
+namespace qwen35x::cuda_backend {
 
-constexpr int kLuceProfileMaxLayers = 24;
+constexpr int kQwen35xProfileMaxLayers = 24;
 
-struct LuceLayerProfile {
+struct Qwen35xLayerProfile {
   int layer_index = -1;
   int layer_type = -1; // 0 = DeltaNet, 1 = full attention
   double total_ms = 0.0;
@@ -32,7 +32,7 @@ struct LuceLayerProfile {
   double mlp_residual_ms = 0.0;
 };
 
-struct LucePrefillProfile {
+struct Qwen35xPrefillProfile {
   bool enabled = false;
   int seq_len = 0;
   bool compute_logits = false;
@@ -47,10 +47,10 @@ struct LucePrefillProfile {
   double lm_reduce_ms = 0.0;
   double hidden_handoff_ms = 0.0;
   double output_token_download_ms = 0.0;
-  LuceLayerProfile layers[kLuceProfileMaxLayers] = {};
+  Qwen35xLayerProfile layers[kQwen35xProfileMaxLayers] = {};
 };
 
-struct LuceDecodeProfile {
+struct Qwen35xDecodeProfile {
   bool enabled = false;
   int steps = 0;
   int last_position = -1;
@@ -62,11 +62,11 @@ struct LuceDecodeProfile {
   double output_token_download_ms = 0.0;
 };
 
-struct LuceRuntimeProfile {
+struct Qwen35xRuntimeProfile {
   bool enabled = false;
   int prefill_runs = 0;
-  LucePrefillProfile prefill;
-  LuceDecodeProfile decode;
+  Qwen35xPrefillProfile prefill;
+  Qwen35xDecodeProfile decode;
 };
 
-} // namespace qwen35x::luce
+} // namespace qwen35x::cuda_backend

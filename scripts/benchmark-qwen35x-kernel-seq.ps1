@@ -1,8 +1,8 @@
 [CmdletBinding()]
 param(
-    [string]$Executable = "build/qwen35x_lucebench.exe",
+    [string]$Executable = "build/qwen35x_kernelbench.exe",
     [string]$HFModelDir = "models/qwen3.5-0.8b",
-    [string]$CsvOut = "benchmarks/luce-megakernel-seq.csv",
+    [string]$CsvOut = "benchmarks/qwen35x-kernel-seq.csv",
     [string]$RunLabel = "",
     [string]$PromptText = "Hello",
     [string]$LongPromptText = "Explain in great detail the history of artificial intelligence, machine learning, deep learning, and neural networks. ",
@@ -33,7 +33,7 @@ function To-InvariantString {
     return [System.Convert]::ToString($Value, [System.Globalization.CultureInfo]::InvariantCulture)
 }
 
-function Invoke-LuceRun {
+function Invoke-Qwen35xKernelRun {
     param(
         [Parameter(Mandatory = $true)][string]$ExePath,
         [Parameter(Mandatory = $true)][string]$ModelDir,
@@ -61,13 +61,13 @@ function Invoke-LuceRun {
         $args += @("--decode-blocks", "$DecodeBlocks")
     }
 
-    Write-Host "Running luce megakernel benchmark..." -ForegroundColor Cyan
+    Write-Host "Running qwen35x kernel benchmark..." -ForegroundColor Cyan
     $runOutput = & $ExePath @args 2>&1
     foreach ($line in $runOutput) {
         Write-Host $line
     }
     if ($LASTEXITCODE -ne 0) {
-        throw "Luce benchmark run failed (exit_code=$LASTEXITCODE)."
+        throw "Qwen35x kernel benchmark run failed (exit_code=$LASTEXITCODE)."
     }
 
     if (-not (Test-Path $ProfileJsonPath)) {
@@ -110,13 +110,13 @@ if ($DecodeBlocks -lt 0) {
 New-Item -ItemType Directory -Path (Split-Path -Parent $resolvedCsvOut) -Force | Out-Null
 New-Item -ItemType Directory -Path $profileTmpDir -Force | Out-Null
 
-Write-Host ("Sequential luce benchmark start: warmup={0}, runs={1}" -f $WarmupRuns, $Runs) -ForegroundColor Green
+Write-Host ("Sequential qwen35x kernel benchmark start: warmup={0}, runs={1}" -f $WarmupRuns, $Runs) -ForegroundColor Green
 Write-Host ("CSV output: {0}" -f $resolvedCsvOut) -ForegroundColor Green
 
 for ($runIndex = 1; $runIndex -le $Runs; ++$runIndex) {
-    $profilePath = Join-Path $profileTmpDir ("luce_run_{0}_{1}.json" -f $runIndex, [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
+    $profilePath = Join-Path $profileTmpDir ("qwen35x_kernel_run_{0}_{1}.json" -f $runIndex, [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
     try {
-        $profile = Invoke-LuceRun `
+        $profile = Invoke-Qwen35xKernelRun `
             -ExePath $resolvedExe `
             -ModelDir $resolvedModelDir `
             -PromptText $PromptText `
@@ -131,7 +131,7 @@ for ($runIndex = 1; $runIndex -le $Runs; ++$runIndex) {
         $row = [PSCustomObject]@{
             timestamp_utc         = [DateTime]::UtcNow.ToString("o")
             run_label             = $RunLabel
-            mode                  = "luce-megakernel-cuda"
+            mode                  = "qwen35x-kernel-cuda"
             run_index             = $runIndex
             prompt_tokens         = [int]$profile.prompt_tokens
             prefill_prompt_tokens = [int]$profile.prefill_prompt_tokens
@@ -158,5 +158,5 @@ for ($runIndex = 1; $runIndex -le $Runs; ++$runIndex) {
     }
 }
 
-Write-Host "Luce benchmark complete." -ForegroundColor Green
+Write-Host "Qwen35x kernel benchmark complete." -ForegroundColor Green
 Write-Host ("CSV written to: {0}" -f $resolvedCsvOut) -ForegroundColor Green

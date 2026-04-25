@@ -6,7 +6,7 @@
  * Weights bf16, activations bf16, state f32. No quantization, no conversion.
  */
 
-#include "qwen35x/runtime/luce_profile.h"
+#include "qwen35x/runtime/qwen35x_profile.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -631,7 +631,7 @@ static void pf_causal_attn_tiled_cublas(
     __nv_bfloat16 *out,
     int S,
     cudaStream_t stream,
-    qwen35x::luce::LuceLayerProfile *profile,
+    qwen35x::cuda_backend::Qwen35xLayerProfile *profile,
     ProfilePhase &profile_phase)
 {
     // Keep the tile as large as the existing scratch buffers allow. prob_scratch
@@ -720,7 +720,7 @@ extern "C" void launch_prefill_bf16(
     const float *rope_cos, const float *rope_sin,
     int max_seq_len,
     int compute_logits,
-    qwen35x::luce::LucePrefillProfile *profile,
+    qwen35x::cuda_backend::Qwen35xPrefillProfile *profile,
     cudaStream_t stream)
 {
     static cublasHandle_t cublas = nullptr;
@@ -738,7 +738,7 @@ extern "C" void launch_prefill_bf16(
     cudaEvent_t profile_total_start = nullptr;
     cudaEvent_t profile_total_stop = nullptr;
     if (profile) {
-        *profile = qwen35x::luce::LucePrefillProfile{};
+        *profile = qwen35x::cuda_backend::Qwen35xPrefillProfile{};
         profile->enabled = true;
         profile->seq_len = S;
         profile->compute_logits = compute_logits != 0;

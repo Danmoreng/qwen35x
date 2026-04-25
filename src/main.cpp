@@ -45,32 +45,32 @@ const char * gpu_decode_backend_name(const qwen35x::GpuDecodeBackend backend) {
   switch (backend) {
     case qwen35x::GpuDecodeBackend::runtime_default:
       return "runtime_default";
-    case qwen35x::GpuDecodeBackend::luce:
-      return "luce";
+    case qwen35x::GpuDecodeBackend::qwen35x_cuda:
+      return "qwen35x";
     default:
       return "unknown";
   }
 }
 
-const char * luce_prefill_mode_name(const qwen35x::LucePrefillMode mode) {
+const char * qwen35x_prefill_mode_name(const qwen35x::Qwen35xPrefillMode mode) {
   switch (mode) {
-    case qwen35x::LucePrefillMode::replay:
+    case qwen35x::Qwen35xPrefillMode::replay:
       return "replay";
-    case qwen35x::LucePrefillMode::batched:
+    case qwen35x::Qwen35xPrefillMode::batched:
       return "batched";
     default:
       return "unknown";
   }
 }
 
-const char * luce_layer_type_name(const int layer_type) {
+const char * qwen35x_layer_type_name(const int layer_type) {
   return layer_type == 0 ? "deltanet" : "full_attention";
 }
 
-void write_luce_layer_profile_json(std::ostream & out, const qwen35x::luce::LuceLayerProfile & layer) {
+void write_qwen35x_layer_profile_json(std::ostream & out, const qwen35x::cuda_backend::Qwen35xLayerProfile & layer) {
   out << "      {\n";
   out << "        \"layer_index\": " << layer.layer_index << ",\n";
-  out << "        \"layer_type\": \"" << luce_layer_type_name(layer.layer_type) << "\",\n";
+  out << "        \"layer_type\": \"" << qwen35x_layer_type_name(layer.layer_type) << "\",\n";
   out << "        \"total_ms\": " << layer.total_ms << ",\n";
   out << "        \"rms_norm_ms\": " << layer.rms_norm_ms << ",\n";
   out << "        \"qkv_projection_ms\": " << layer.qkv_projection_ms << ",\n";
@@ -97,8 +97,8 @@ void write_luce_layer_profile_json(std::ostream & out, const qwen35x::luce::Luce
   out << "      }";
 }
 
-void write_luce_profile_json(std::ostream & out, const qwen35x::luce::LuceRuntimeProfile & profile) {
-  out << "  \"luce_profile\": {\n";
+void write_qwen35x_profile_json(std::ostream & out, const qwen35x::cuda_backend::Qwen35xRuntimeProfile & profile) {
+  out << "  \"qwen35x_profile\": {\n";
   out << "    \"enabled\": " << (profile.enabled ? "true" : "false") << ",\n";
   out << "    \"prefill_runs\": " << profile.prefill_runs << ",\n";
   out << "    \"prefill\": {\n";
@@ -116,9 +116,9 @@ void write_luce_profile_json(std::ostream & out, const qwen35x::luce::LuceRuntim
   out << "      \"hidden_handoff_ms\": " << profile.prefill.hidden_handoff_ms << ",\n";
   out << "      \"output_token_download_ms\": " << profile.prefill.output_token_download_ms << ",\n";
   out << "      \"layers\": [\n";
-  const int layer_count = std::min(profile.prefill.layer_count, qwen35x::luce::kLuceProfileMaxLayers);
+  const int layer_count = std::min(profile.prefill.layer_count, qwen35x::cuda_backend::kQwen35xProfileMaxLayers);
   for (int i = 0; i < layer_count; ++i) {
-    write_luce_layer_profile_json(out, profile.prefill.layers[i]);
+    write_qwen35x_layer_profile_json(out, profile.prefill.layers[i]);
     out << (i + 1 < layer_count ? ",\n" : "\n");
   }
   out << "      ]\n";
@@ -155,7 +155,7 @@ bool write_profile_json(
   out << "{\n";
   out << "  \"backend\": \"" << json_escape(backend) << "\",\n";
   out << "  \"decode_backend\": \"" << json_escape(decode_backend) << "\",\n";
-  out << "  \"luce_prefill_mode\": \"" << json_escape(luce_prefill_mode_name(options.luce_prefill_mode)) << "\",\n";
+  out << "  \"qwen35x_prefill_mode\": \"" << json_escape(qwen35x_prefill_mode_name(options.qwen35x_prefill_mode)) << "\",\n";
   out << "  \"prefill_only\": " << (options.prefill_only ? "true" : "false") << ",\n";
   out << "  \"prompt_tokens\": " << options.prompt_tokens.size() << ",\n";
   out << "  \"prompt_token_ids\": [";
@@ -200,8 +200,8 @@ bool write_profile_json(
   out << "    \"host_to_device_bytes_per_forward_token\": " << result.host_to_device_bytes_per_forward_token << ",\n";
   out << "    \"device_to_host_bytes_per_forward_token\": " << result.device_to_host_bytes_per_forward_token << "\n";
   out << "  },\n";
-  if (result.luce_profile.enabled) {
-    write_luce_profile_json(out, result.luce_profile);
+  if (result.qwen35x_profile.enabled) {
+    write_qwen35x_profile_json(out, result.qwen35x_profile);
     out << ",\n";
   }
   out << "  \"output_token_ids\": [";
@@ -312,28 +312,28 @@ int main(int argc, char ** argv) {
       gpu_decode_backend_explicit = true;
       if (backend == "default") {
         infer_options.gpu_decode_backend = qwen35x::GpuDecodeBackend::runtime_default;
-      } else if (backend == "luce") {
-        infer_options.gpu_decode_backend = qwen35x::GpuDecodeBackend::luce;
+      } else if (backend == "qwen35x" || backend == "luce") {
+        infer_options.gpu_decode_backend = qwen35x::GpuDecodeBackend::qwen35x_cuda;
       } else {
-        std::cerr << "unknown --gpu-decode-backend value: " << backend << " (expected: default|luce)\n";
+        std::cerr << "unknown --gpu-decode-backend value: " << backend << " (expected: default|qwen35x)\n";
         return 11;
       }
     } else if (arg == "--gpu-decode-blocks" && i + 1 < argc) {
       infer_options.gpu_decode_blocks = std::stoi(argv[++i]);
-    } else if (arg == "--luce-prefill-mode" && i + 1 < argc) {
+    } else if ((arg == "--qwen35x-prefill-mode" || arg == "--luce-prefill-mode") && i + 1 < argc) {
       const std::string mode = argv[++i];
       if (mode == "replay") {
-        infer_options.luce_prefill_mode = qwen35x::LucePrefillMode::replay;
+        infer_options.qwen35x_prefill_mode = qwen35x::Qwen35xPrefillMode::replay;
       } else if (mode == "batched") {
-        infer_options.luce_prefill_mode = qwen35x::LucePrefillMode::batched;
+        infer_options.qwen35x_prefill_mode = qwen35x::Qwen35xPrefillMode::batched;
       } else {
-        std::cerr << "unknown --luce-prefill-mode value: " << mode << " (expected: replay|batched)\n";
+        std::cerr << "unknown " << arg << " value: " << mode << " (expected: replay|batched)\n";
         return 11;
       }
     } else if (arg == "--profile-sync") {
       infer_options.profile_cuda_sync = true;
-    } else if (arg == "--luce-profile") {
-      infer_options.profile_luce = true;
+    } else if (arg == "--qwen35x-profile" || arg == "--luce-profile") {
+      infer_options.profile_qwen35x = true;
     } else if (arg == "--prefill-only") {
       infer_options.prefill_only = true;
     } else if (arg == "--stop-token" && i + 1 < argc) {
@@ -357,14 +357,14 @@ int main(int argc, char ** argv) {
       std::cout << "       qwen35x --infer-reference --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "       qwen35x --infer-gpu --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "               [--temperature <float>] [--top-p <float>] [--top-k <int>] [--repeat-penalty <float>] [--seed <int64>]\n";
-      std::cout << "               [--gpu-bf16|--gpu-f32-matvec] [--gpu-decode-backend <default|luce>] [--gpu-decode-blocks <n>] [--luce-prefill-mode <replay|batched>] [--profile-sync] [--luce-profile] [--prefill-only]\n";
+      std::cout << "               [--gpu-bf16|--gpu-f32-matvec] [--gpu-decode-backend <default|qwen35x>] [--gpu-decode-blocks <n>] [--qwen35x-prefill-mode <replay|batched>] [--profile-sync] [--qwen35x-profile] [--prefill-only]\n";
       std::cout << "               [--stop-token <csv>] [--stop-text <text>] [--stop-on-im-end] [--profile-json <path>]\n";
       return 0;
     }
   }
 
   if (infer_gpu && !gpu_decode_backend_explicit) {
-    infer_options.gpu_decode_backend = qwen35x::GpuDecodeBackend::luce;
+    infer_options.gpu_decode_backend = qwen35x::GpuDecodeBackend::qwen35x_cuda;
   }
 
   if (bench_bf16) {
@@ -507,7 +507,7 @@ int main(int argc, char ** argv) {
     std::cout << "reference inference\n";
     std::cout << "  backend: " << (infer_options.use_cuda ? "cuda-hybrid" : "cpu-reference") << "\n";
     std::cout << "  decode_backend: " << gpu_decode_backend_name(infer_options.gpu_decode_backend) << "\n";
-    std::cout << "  luce_prefill_mode: " << luce_prefill_mode_name(infer_options.luce_prefill_mode) << "\n";
+    std::cout << "  qwen35x_prefill_mode: " << qwen35x_prefill_mode_name(infer_options.qwen35x_prefill_mode) << "\n";
     std::cout << "  prefill_only: " << (infer_options.prefill_only ? "on" : "off") << "\n";
     std::cout << "  prompt_tokens: " << infer_options.prompt_tokens.size() << "\n";
     std::cout << "  generated_tokens: " << infer_result.generated_tokens.size() << "\n";

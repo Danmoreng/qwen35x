@@ -21,11 +21,13 @@ param(
     [int]$TopK = 20,
     [double]$RepeatPenalty = 1.05,
     [int64]$Seed = 123,
+    [Alias("LucePrefillMode")]
     [ValidateSet("default", "replay", "batched")]
-    [string]$LucePrefillMode = "default",
+    [string]$Qwen35xPrefillMode = "default",
     [switch]$PrefillOnly,
     [switch]$ProfileSync,
-    [switch]$LuceProfile,
+    [Alias("LuceProfile")]
+    [switch]$Qwen35xProfile,
     [switch]$KeepProfiles,
     [string]$ProfileDir = ""
 )
@@ -76,7 +78,7 @@ function Get-JsonProperty {
     return $property.Value
 }
 
-function Measure-LuceLayerMs {
+function Measure-Qwen35xLayerMs {
     param(
         $RuntimeProfile,
         [string]$LayerType,
@@ -123,10 +125,10 @@ function Invoke-BenchmarkRun {
         [Parameter(Mandatory = $true)][int]$TopK,
         [Parameter(Mandatory = $true)][double]$RepeatPenalty,
         [Parameter(Mandatory = $true)][int64]$Seed,
-        [Parameter(Mandatory = $true)][string]$LucePrefillMode,
+        [Parameter(Mandatory = $true)][string]$Qwen35xPrefillMode,
         [Parameter(Mandatory = $true)][bool]$PrefillOnlyEnabled,
         [Parameter(Mandatory = $true)][bool]$ProfileSyncEnabled,
-        [Parameter(Mandatory = $true)][bool]$LuceProfileEnabled,
+        [Parameter(Mandatory = $true)][bool]$Qwen35xProfileEnabled,
         [Parameter(Mandatory = $true)][string]$ProfileJsonPath
     )
 
@@ -171,14 +173,14 @@ function Invoke-BenchmarkRun {
     if ($ProfileSyncEnabled -and $Mode -ne "cpu-reference") {
         $args += @("--profile-sync")
     }
-    if ($LuceProfileEnabled -and $Mode -ne "cpu-reference") {
-        $args += @("--luce-profile")
+    if ($Qwen35xProfileEnabled -and $Mode -ne "cpu-reference") {
+        $args += @("--qwen35x-profile")
     }
     if ($PrefillOnlyEnabled) {
         $args += @("--prefill-only")
     }
-    if ($Mode -ne "cpu-reference" -and $LucePrefillMode -ne "default") {
-        $args += @("--luce-prefill-mode", $LucePrefillMode)
+    if ($Mode -ne "cpu-reference" -and $Qwen35xPrefillMode -ne "default") {
+        $args += @("--qwen35x-prefill-mode", $Qwen35xPrefillMode)
     }
 
     Write-Host ("Running mode={0} prompt={1}" -f $Mode, $PromptMode) -ForegroundColor Cyan
@@ -237,8 +239,8 @@ if ($PromptMode -eq "prompt-file" -and -not (Test-Path -LiteralPath $resolvedPro
 if ($PromptMode -eq "prompt-tokens" -and [string]::IsNullOrWhiteSpace($PromptTokensCsv)) {
     throw "PromptTokensCsv must be non-empty when PromptMode is 'prompt-tokens'."
 }
-if ($LuceProfile.IsPresent -and $Modes -contains "cpu-reference") {
-    Write-Warning "LuceProfile is ignored for cpu-reference mode."
+if ($Qwen35xProfile.IsPresent -and $Modes -contains "cpu-reference") {
+    Write-Warning "Qwen35xProfile is ignored for cpu-reference mode."
 }
 
 New-Item -ItemType Directory -Path (Split-Path -Parent $resolvedCsvOut) -Force | Out-Null
@@ -246,7 +248,7 @@ New-Item -ItemType Directory -Path $profileTmpDir -Force | Out-Null
 
 Write-Host ("Sequential benchmark start: modes={0}, warmup={1}, runs={2}" -f ($Modes -join ","), $WarmupRuns, $Runs) -ForegroundColor Green
 Write-Host ("CSV output: {0}" -f $resolvedCsvOut) -ForegroundColor Green
-if ($KeepProfiles.IsPresent -or $LuceProfile.IsPresent) {
+if ($KeepProfiles.IsPresent -or $Qwen35xProfile.IsPresent) {
     Write-Host ("Profile JSON output: {0}" -f $profileTmpDir) -ForegroundColor Green
 }
 
@@ -269,10 +271,10 @@ foreach ($mode in $Modes) {
                 -TopK $TopK `
                 -RepeatPenalty $RepeatPenalty `
                 -Seed $Seed `
-                -LucePrefillMode $LucePrefillMode `
+                -Qwen35xPrefillMode $Qwen35xPrefillMode `
                 -PrefillOnlyEnabled $PrefillOnly.IsPresent `
                 -ProfileSyncEnabled $ProfileSync.IsPresent `
-                -LuceProfileEnabled $LuceProfile.IsPresent `
+                -Qwen35xProfileEnabled $Qwen35xProfile.IsPresent `
                 -ProfileJsonPath $warmProfile
             Write-Host ("Warmup completed: mode={0} run={1}/{2}" -f $mode, $warm, $WarmupRuns) -ForegroundColor DarkGray
         } finally {
@@ -300,30 +302,36 @@ foreach ($mode in $Modes) {
                 -TopK $TopK `
                 -RepeatPenalty $RepeatPenalty `
                 -Seed $Seed `
-                -LucePrefillMode $LucePrefillMode `
+                -Qwen35xPrefillMode $Qwen35xPrefillMode `
                 -PrefillOnlyEnabled $PrefillOnly.IsPresent `
                 -ProfileSyncEnabled $ProfileSync.IsPresent `
-                -LuceProfileEnabled $LuceProfile.IsPresent `
+                -Qwen35xProfileEnabled $Qwen35xProfile.IsPresent `
                 -ProfileJsonPath $profilePath
 
-            $luceProfileJson = Get-JsonProperty -Object $profile -Name "luce_profile"
-            $lucePrefillJson = Get-JsonProperty -Object $luceProfileJson -Name "prefill"
-            $luceDecodeJson = Get-JsonProperty -Object $luceProfileJson -Name "decode"
-            $luceProfileEnabledValue = Get-JsonProperty -Object $luceProfileJson -Name "enabled"
+            $qwen35xProfileJson = Get-JsonProperty -Object $profile -Name "qwen35x_profile"
+            if ($null -eq $qwen35xProfileJson) {
+                $qwen35xProfileJson = Get-JsonProperty -Object $profile -Name "luce_profile"
+            }
+            $qwen35xPrefillJson = Get-JsonProperty -Object $qwen35xProfileJson -Name "prefill"
+            $qwen35xDecodeJson = Get-JsonProperty -Object $qwen35xProfileJson -Name "decode"
+            $qwen35xProfileEnabledValue = Get-JsonProperty -Object $qwen35xProfileJson -Name "enabled"
             $profilePathForCsv = ""
-            if ($KeepProfiles.IsPresent -or $LuceProfile.IsPresent) {
+            if ($KeepProfiles.IsPresent -or $Qwen35xProfile.IsPresent) {
                 $profilePathForCsv = $profilePath
             }
-            $effectiveLucePrefillMode = [string](Get-JsonProperty -Object $profile -Name "luce_prefill_mode")
-            if ([string]::IsNullOrWhiteSpace($effectiveLucePrefillMode)) {
-                $effectiveLucePrefillMode = $LucePrefillMode
+            $effectiveQwen35xPrefillMode = [string](Get-JsonProperty -Object $profile -Name "qwen35x_prefill_mode")
+            if ([string]::IsNullOrWhiteSpace($effectiveQwen35xPrefillMode)) {
+                $effectiveQwen35xPrefillMode = [string](Get-JsonProperty -Object $profile -Name "luce_prefill_mode")
+            }
+            if ([string]::IsNullOrWhiteSpace($effectiveQwen35xPrefillMode)) {
+                $effectiveQwen35xPrefillMode = $Qwen35xPrefillMode
             }
 
             $row = [PSCustomObject]@{
                 timestamp_utc    = [DateTime]::UtcNow.ToString("o")
                 run_label        = $RunLabel
                 mode             = $mode
-                luce_prefill_mode = $effectiveLucePrefillMode
+                qwen35x_prefill_mode = $effectiveQwen35xPrefillMode
                 prefill_only     = [bool]$profile.prefill_only
                 run_index        = $runIndex
                 prompt_name      = $PromptName
@@ -335,36 +343,36 @@ foreach ($mode in $Modes) {
                 decode_time_ms   = To-InvariantString $profile.decode_time_ms
                 tokens_per_second = To-InvariantString $profile.tokens_per_second
                 profile_json     = $profilePathForCsv
-                luce_profile_enabled = [bool]$luceProfileEnabledValue
-                luce_prefill_host_total_ms = To-OptionalInvariantString (Get-JsonProperty -Object $lucePrefillJson -Name "host_total_ms")
-                luce_prefill_gpu_total_ms = To-OptionalInvariantString (Get-JsonProperty -Object $lucePrefillJson -Name "gpu_total_ms")
-                luce_prefill_token_upload_ms = To-OptionalInvariantString (Get-JsonProperty -Object $lucePrefillJson -Name "token_upload_ms")
-                luce_prefill_embed_ms = To-OptionalInvariantString (Get-JsonProperty -Object $lucePrefillJson -Name "embed_ms")
-                luce_prefill_mark_seen_ms = To-OptionalInvariantString (Get-JsonProperty -Object $lucePrefillJson -Name "mark_seen_ms")
-                luce_prefill_final_norm_ms = To-OptionalInvariantString (Get-JsonProperty -Object $lucePrefillJson -Name "final_norm_ms")
-                luce_prefill_lm_head_ms = To-OptionalInvariantString (Get-JsonProperty -Object $lucePrefillJson -Name "lm_head_ms")
-                luce_prefill_lm_reduce_ms = To-OptionalInvariantString (Get-JsonProperty -Object $lucePrefillJson -Name "lm_reduce_ms")
-                luce_prefill_hidden_handoff_ms = To-OptionalInvariantString (Get-JsonProperty -Object $lucePrefillJson -Name "hidden_handoff_ms")
-                luce_prefill_output_token_download_ms = To-OptionalInvariantString (Get-JsonProperty -Object $lucePrefillJson -Name "output_token_download_ms")
-                luce_prefill_deltanet_total_ms = Measure-LuceLayerMs -RuntimeProfile $luceProfileJson -LayerType "deltanet" -Fields @("total_ms")
-                luce_prefill_deltanet_recurrence_ms = Measure-LuceLayerMs -RuntimeProfile $luceProfileJson -LayerType "deltanet" -Fields @("recurrence_ms")
-                luce_prefill_deltanet_projection_ms = Measure-LuceLayerMs -RuntimeProfile $luceProfileJson -LayerType "deltanet" -Fields @("qkv_projection_ms", "z_projection_ms", "beta_alpha_projection_ms", "out_projection_ms")
-                luce_prefill_full_attention_total_ms = Measure-LuceLayerMs -RuntimeProfile $luceProfileJson -LayerType "full_attention" -Fields @("total_ms")
-                luce_prefill_full_attention_attention_ms = Measure-LuceLayerMs -RuntimeProfile $luceProfileJson -LayerType "full_attention" -Fields @("attention_ms")
-                luce_prefill_full_attention_qk_ms = Measure-LuceLayerMs -RuntimeProfile $luceProfileJson -LayerType "full_attention" -Fields @("attention_qk_ms")
-                luce_prefill_full_attention_softmax_ms = Measure-LuceLayerMs -RuntimeProfile $luceProfileJson -LayerType "full_attention" -Fields @("attention_softmax_ms")
-                luce_prefill_full_attention_pv_ms = Measure-LuceLayerMs -RuntimeProfile $luceProfileJson -LayerType "full_attention" -Fields @("attention_pv_ms")
-                luce_prefill_full_attention_gate_ms = Measure-LuceLayerMs -RuntimeProfile $luceProfileJson -LayerType "full_attention" -Fields @("attention_gate_ms")
-                luce_prefill_full_attention_qk_norm_rope_ms = Measure-LuceLayerMs -RuntimeProfile $luceProfileJson -LayerType "full_attention" -Fields @("qk_norm_rope_ms")
-                luce_prefill_full_attention_projection_ms = Measure-LuceLayerMs -RuntimeProfile $luceProfileJson -LayerType "full_attention" -Fields @("qkv_projection_ms", "kv_projection_ms", "out_projection_ms")
-                luce_prefill_mlp_total_ms = Measure-LuceLayerMs -RuntimeProfile $luceProfileJson -LayerType "" -Fields @("mlp_norm_ms", "mlp_projection_ms", "mlp_activation_ms", "mlp_down_projection_ms", "mlp_residual_ms")
-                luce_decode_steps = To-OptionalInvariantString (Get-JsonProperty -Object $luceDecodeJson -Name "steps")
-                luce_decode_host_total_ms = To-OptionalInvariantString (Get-JsonProperty -Object $luceDecodeJson -Name "host_total_ms")
-                luce_decode_seen_token_upload_ms = To-OptionalInvariantString (Get-JsonProperty -Object $luceDecodeJson -Name "seen_token_upload_ms")
-                luce_decode_launch_total_ms = To-OptionalInvariantString (Get-JsonProperty -Object $luceDecodeJson -Name "launch_total_ms")
-                luce_decode_kernel_ms = To-OptionalInvariantString (Get-JsonProperty -Object $luceDecodeJson -Name "decode_kernel_ms")
-                luce_decode_lm_head_ms = To-OptionalInvariantString (Get-JsonProperty -Object $luceDecodeJson -Name "lm_head_ms")
-                luce_decode_output_token_download_ms = To-OptionalInvariantString (Get-JsonProperty -Object $luceDecodeJson -Name "output_token_download_ms")
+                qwen35x_profile_enabled = [bool]$qwen35xProfileEnabledValue
+                qwen35x_prefill_host_total_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xPrefillJson -Name "host_total_ms")
+                qwen35x_prefill_gpu_total_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xPrefillJson -Name "gpu_total_ms")
+                qwen35x_prefill_token_upload_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xPrefillJson -Name "token_upload_ms")
+                qwen35x_prefill_embed_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xPrefillJson -Name "embed_ms")
+                qwen35x_prefill_mark_seen_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xPrefillJson -Name "mark_seen_ms")
+                qwen35x_prefill_final_norm_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xPrefillJson -Name "final_norm_ms")
+                qwen35x_prefill_lm_head_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xPrefillJson -Name "lm_head_ms")
+                qwen35x_prefill_lm_reduce_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xPrefillJson -Name "lm_reduce_ms")
+                qwen35x_prefill_hidden_handoff_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xPrefillJson -Name "hidden_handoff_ms")
+                qwen35x_prefill_output_token_download_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xPrefillJson -Name "output_token_download_ms")
+                qwen35x_prefill_deltanet_total_ms = Measure-Qwen35xLayerMs -RuntimeProfile $qwen35xProfileJson -LayerType "deltanet" -Fields @("total_ms")
+                qwen35x_prefill_deltanet_recurrence_ms = Measure-Qwen35xLayerMs -RuntimeProfile $qwen35xProfileJson -LayerType "deltanet" -Fields @("recurrence_ms")
+                qwen35x_prefill_deltanet_projection_ms = Measure-Qwen35xLayerMs -RuntimeProfile $qwen35xProfileJson -LayerType "deltanet" -Fields @("qkv_projection_ms", "z_projection_ms", "beta_alpha_projection_ms", "out_projection_ms")
+                qwen35x_prefill_full_attention_total_ms = Measure-Qwen35xLayerMs -RuntimeProfile $qwen35xProfileJson -LayerType "full_attention" -Fields @("total_ms")
+                qwen35x_prefill_full_attention_attention_ms = Measure-Qwen35xLayerMs -RuntimeProfile $qwen35xProfileJson -LayerType "full_attention" -Fields @("attention_ms")
+                qwen35x_prefill_full_attention_qk_ms = Measure-Qwen35xLayerMs -RuntimeProfile $qwen35xProfileJson -LayerType "full_attention" -Fields @("attention_qk_ms")
+                qwen35x_prefill_full_attention_softmax_ms = Measure-Qwen35xLayerMs -RuntimeProfile $qwen35xProfileJson -LayerType "full_attention" -Fields @("attention_softmax_ms")
+                qwen35x_prefill_full_attention_pv_ms = Measure-Qwen35xLayerMs -RuntimeProfile $qwen35xProfileJson -LayerType "full_attention" -Fields @("attention_pv_ms")
+                qwen35x_prefill_full_attention_gate_ms = Measure-Qwen35xLayerMs -RuntimeProfile $qwen35xProfileJson -LayerType "full_attention" -Fields @("attention_gate_ms")
+                qwen35x_prefill_full_attention_qk_norm_rope_ms = Measure-Qwen35xLayerMs -RuntimeProfile $qwen35xProfileJson -LayerType "full_attention" -Fields @("qk_norm_rope_ms")
+                qwen35x_prefill_full_attention_projection_ms = Measure-Qwen35xLayerMs -RuntimeProfile $qwen35xProfileJson -LayerType "full_attention" -Fields @("qkv_projection_ms", "kv_projection_ms", "out_projection_ms")
+                qwen35x_prefill_mlp_total_ms = Measure-Qwen35xLayerMs -RuntimeProfile $qwen35xProfileJson -LayerType "" -Fields @("mlp_norm_ms", "mlp_projection_ms", "mlp_activation_ms", "mlp_down_projection_ms", "mlp_residual_ms")
+                qwen35x_decode_steps = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xDecodeJson -Name "steps")
+                qwen35x_decode_host_total_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xDecodeJson -Name "host_total_ms")
+                qwen35x_decode_seen_token_upload_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xDecodeJson -Name "seen_token_upload_ms")
+                qwen35x_decode_launch_total_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xDecodeJson -Name "launch_total_ms")
+                qwen35x_decode_kernel_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xDecodeJson -Name "decode_kernel_ms")
+                qwen35x_decode_lm_head_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xDecodeJson -Name "lm_head_ms")
+                qwen35x_decode_output_token_download_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xDecodeJson -Name "output_token_download_ms")
             }
 
             if (Test-Path $resolvedCsvOut) {
@@ -378,7 +386,7 @@ foreach ($mode in $Modes) {
                 Write-Host ("Profile JSON kept: {0}" -f $profilePathForCsv) -ForegroundColor DarkGray
             }
         } finally {
-            if ((Test-Path $profilePath) -and -not $KeepProfiles.IsPresent -and -not $LuceProfile.IsPresent) {
+            if ((Test-Path $profilePath) -and -not $KeepProfiles.IsPresent -and -not $Qwen35xProfile.IsPresent) {
                 Remove-Item -LiteralPath $profilePath -Force
             }
         }

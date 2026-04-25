@@ -34,12 +34,12 @@ bool parse_token_list_csv(
   return true;
 }
 
-bool run_luce_qwen35_inference(
+bool run_qwen35x_cuda_inference(
   const ReferenceInferenceOptions & options,
   ReferenceInferenceResult & result,
   std::string & error_message) {
   if (options.sampling.temperature > 0.0f) {
-    error_message = "Luce decode backend currently supports only greedy decode (temperature <= 0).";
+    error_message = "Qwen35x CUDA backend currently supports only greedy decode (temperature <= 0).";
     return false;
   }
   if (options.gpu_decode_blocks < 0) {
@@ -48,13 +48,13 @@ bool run_luce_qwen35_inference(
   }
 
   const auto load_start = std::chrono::steady_clock::now();
-  luce::LuceDecodeBackend backend;
-  luce::LuceDecodeBackendConfig config;
+  cuda_backend::Qwen35xCudaBackend backend;
+  cuda_backend::Qwen35xCudaBackendConfig config;
   config.model_dir = options.model_dir;
   config.max_context = options.max_context;
   config.decode_blocks = options.gpu_decode_blocks;
   config.repetition_penalty = options.sampling.repetition_penalty;
-  config.profile_enabled = options.profile_luce;
+  config.profile_enabled = options.profile_qwen35x;
   if (!backend.initialize(config, error_message)) {
     return false;
   }
@@ -75,7 +75,7 @@ bool run_luce_qwen35_inference(
 
   int first_token = 0;
   const auto prefill_start = std::chrono::steady_clock::now();
-  if (options.luce_prefill_mode == LucePrefillMode::batched) {
+  if (options.qwen35x_prefill_mode == Qwen35xPrefillMode::batched) {
     if (options.prefill_only) {
       if (!backend.run_prefill_only(options.prompt_tokens, error_message)) {
         return false;
@@ -85,7 +85,7 @@ bool run_luce_qwen35_inference(
     }
   } else {
     if (options.prefill_only) {
-      error_message = "prefill_only is only supported with Luce batched prefill.";
+      error_message = "prefill_only is only supported with Qwen35x batched prefill.";
       return false;
     }
     int prefill_position = 0;
@@ -108,7 +108,7 @@ bool run_luce_qwen35_inference(
     result.decode_time_ms = 0.0;
     result.tokens_per_second = 0.0;
     result.forward_pass_tokens = profiling.forward_pass_tokens;
-    result.luce_profile = backend.profile();
+    result.qwen35x_profile = backend.profile();
     return true;
   }
 
@@ -162,7 +162,7 @@ bool run_luce_qwen35_inference(
       : 0.0;
   result.forward_pass_tokens = profiling.forward_pass_tokens;
   result.timing_breakdown.stop_checks_ms = profiling.stop_checks_ms;
-  result.luce_profile = backend.profile();
+  result.qwen35x_profile = backend.profile();
   return true;
 }
 
@@ -233,8 +233,8 @@ bool run_reference_qwen35_inference(
     return false;
   }
 
-  if (options.use_cuda && options.gpu_decode_backend == GpuDecodeBackend::luce) {
-    return run_luce_qwen35_inference(options, result, error_message);
+  if (options.use_cuda && options.gpu_decode_backend == GpuDecodeBackend::qwen35x_cuda) {
+    return run_qwen35x_cuda_inference(options, result, error_message);
   }
 
   const auto load_start = std::chrono::steady_clock::now();

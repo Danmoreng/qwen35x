@@ -6,7 +6,7 @@ The scaffold follows the public project roadmap in `docs/development_plan.md`.
 
 - CPU reference path remains the local correctness oracle for GPU work.
 - Optional PyTorch/Transformers tooling can cross-check the CPU reference against an external implementation.
-- `--infer-gpu` defaults to the in-tree Luce megakernel decode backend for Qwen3.5-0.8B.
+- `--infer-gpu` defaults to the in-tree Qwen35x CUDA backend for Qwen3.5-0.8B.
 - The legacy CUDA runtime decode backend remains selectable with `--gpu-decode-backend default`.
 - CUDA decode paths use device-resident layer math across hidden/residual/norm/attention/MLP work.
 - Device-token GPU decode loop is implemented for the no-stop-controls path.
@@ -30,7 +30,7 @@ The scaffold follows the public project roadmap in `docs/development_plan.md`.
   - Input: key `(op, mode, dtype, layout, sm)`
   - Output: callable kernel symbol
   - Responsibility: architecture-specific CUDA fast paths and reference fallbacks
-  - In-tree Luce CUDA sources live under `src/kernels/cuda/luce_megakernel/`
+  - In-tree Qwen35x CUDA kernel sources live under `src/kernels/cuda/qwen35x_megakernel/`
 
 ## Initial scope
 

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "qwen35x/common/model_profile.h"
-#include "qwen35x/runtime/luce_profile.h"
+#include "qwen35x/runtime/qwen35x_profile.h"
 
 #include <cstdint>
 #include <string>
@@ -19,10 +19,10 @@ struct SamplingOptions {
 
 enum class GpuDecodeBackend {
   runtime_default = 0,
-  luce = 1
+  qwen35x_cuda = 1
 };
 
-enum class LucePrefillMode {
+enum class Qwen35xPrefillMode {
   replay = 0,
   batched = 1
 };
@@ -35,10 +35,10 @@ struct ReferenceInferenceOptions {
   bool use_cuda = false;
   bool use_cuda_matvec_bf16 = false;
   GpuDecodeBackend gpu_decode_backend = GpuDecodeBackend::runtime_default;
-  LucePrefillMode luce_prefill_mode = LucePrefillMode::batched;
+  Qwen35xPrefillMode qwen35x_prefill_mode = Qwen35xPrefillMode::batched;
   int gpu_decode_blocks = 0;
   bool profile_cuda_sync = false;
-  bool profile_luce = false;
+  bool profile_qwen35x = false;
   bool prefill_only = false;
   SamplingOptions sampling;
   std::vector<std::int32_t> stop_token_ids;
@@ -73,7 +73,7 @@ struct ReferenceInferenceResult {
   double device_to_host_bytes_per_forward_token = 0.0;
   ReferenceTimingBreakdown timing_breakdown;
   ReferenceTransferBreakdown transfer_breakdown;
-  luce::LuceRuntimeProfile luce_profile;
+  cuda_backend::Qwen35xRuntimeProfile qwen35x_profile;
 };
 
 bool parse_token_list_csv(

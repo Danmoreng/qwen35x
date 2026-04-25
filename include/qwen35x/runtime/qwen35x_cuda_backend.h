@@ -1,15 +1,15 @@
 #pragma once
 
-#include "qwen35x/runtime/luce_profile.h"
+#include "qwen35x/runtime/qwen35x_profile.h"
 
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
-namespace qwen35x::luce {
+namespace qwen35x::cuda_backend {
 
-struct LuceDecodeBackendConfig {
+struct Qwen35xCudaBackendConfig {
   std::string model_dir = "models/qwen3.5-0.8b";
   int max_context = 256;
   int decode_blocks = 0;
@@ -17,17 +17,17 @@ struct LuceDecodeBackendConfig {
   bool profile_enabled = false;
 };
 
-class LuceDecodeBackend {
+class Qwen35xCudaBackend {
 public:
-  LuceDecodeBackend();
-  ~LuceDecodeBackend();
+  Qwen35xCudaBackend();
+  ~Qwen35xCudaBackend();
 
-  LuceDecodeBackend(const LuceDecodeBackend &) = delete;
-  LuceDecodeBackend & operator=(const LuceDecodeBackend &) = delete;
-  LuceDecodeBackend(LuceDecodeBackend &&) noexcept;
-  LuceDecodeBackend & operator=(LuceDecodeBackend &&) noexcept;
+  Qwen35xCudaBackend(const Qwen35xCudaBackend &) = delete;
+  Qwen35xCudaBackend & operator=(const Qwen35xCudaBackend &) = delete;
+  Qwen35xCudaBackend(Qwen35xCudaBackend &&) noexcept;
+  Qwen35xCudaBackend & operator=(Qwen35xCudaBackend &&) noexcept;
 
-  bool initialize(const LuceDecodeBackendConfig & config, std::string & error_message);
+  bool initialize(const Qwen35xCudaBackendConfig & config, std::string & error_message);
   bool reset(std::string & error_message);
   bool run_prefill(
     const std::vector<std::int32_t> & tokens,
@@ -45,7 +45,7 @@ public:
 
   bool is_initialized() const;
   int max_context() const;
-  LuceRuntimeProfile profile() const;
+  Qwen35xRuntimeProfile profile() const;
 
 private:
   struct Impl;
@@ -55,4 +55,4 @@ private:
 int query_max_safe_decode_blocks();
 void set_decode_blocks_override(int blocks);
 
-} // namespace qwen35x::luce
+} // namespace qwen35x::cuda_backend

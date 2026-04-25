@@ -7,8 +7,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(QWEN35X_ENABLE_CUDA "Enable CUDA kernels when a CUDA compiler is available" ON)
 set(QWEN35X_CUDA_ARCHITECTURES "native" CACHE STRING "CUDA architectures passed to CMAKE_CUDA_ARCHITECTURES")
-set(QWEN35X_LUCE_BENCH_BLOCK_SIZE "256" CACHE STRING "Compile-time BLOCK_SIZE for luce megakernel bench kernel")
-set(QWEN35X_LUCE_BENCH_NUM_BLOCKS "82" CACHE STRING "Compile-time NUM_BLOCKS default for luce megakernel bench kernel")
+set(QWEN35X_KERNEL_BENCH_BLOCK_SIZE "256" CACHE STRING "Compile-time BLOCK_SIZE for qwen35x kernel bench")
+set(QWEN35X_KERNEL_BENCH_NUM_BLOCKS "82" CACHE STRING "Compile-time NUM_BLOCKS default for qwen35x kernel bench")
 
 include(CheckLanguage)
 if (QWEN35X_ENABLE_CUDA)
@@ -28,7 +28,7 @@ add_library(qwen35x_core
   src/kernels/kernel_registry.cpp
   src/runtime/cuda_bench_stub.cpp
   src/runtime/cuda_inference_stub.cpp
-  src/runtime/luce_decode_backend.cpp
+  src/runtime/qwen35x_cuda_backend.cpp
   src/runtime/reference_inference.cpp
   src/runtime/runtime.cpp
   src/tokenizer/tokenizer.cpp
@@ -45,16 +45,16 @@ if (CMAKE_CUDA_COMPILER)
     qwen35x_core
     PRIVATE
       src/kernels/cuda/qwen35x_decode_stub.cu
-      src/kernels/cuda/luce_megakernel/kernel.cu
-      src/kernels/cuda/luce_megakernel/prefill.cu
+      src/kernels/cuda/qwen35x_megakernel/kernel.cu
+      src/kernels/cuda/qwen35x_megakernel/prefill.cu
       src/runtime/cuda_bench.cu
       src/runtime/cuda_inference.cu
   )
   target_compile_definitions(
     qwen35x_core
     PRIVATE
-      BLOCK_SIZE=${QWEN35X_LUCE_BENCH_BLOCK_SIZE}
-      NUM_BLOCKS=${QWEN35X_LUCE_BENCH_NUM_BLOCKS}
+      BLOCK_SIZE=${QWEN35X_KERNEL_BENCH_BLOCK_SIZE}
+      NUM_BLOCKS=${QWEN35X_KERNEL_BENCH_NUM_BLOCKS}
   )
   target_link_libraries(qwen35x_core PRIVATE CUDA::cublasLt CUDA::cublas)
   target_compile_definitions(qwen35x_core PUBLIC QWEN35X_HAS_CUDA=1)
@@ -68,25 +68,25 @@ target_link_libraries(qwen35x PRIVATE qwen35x_core)
 
 if (CMAKE_CUDA_COMPILER)
   add_executable(
-    qwen35x_lucebench
-    src/luce_bench_main.cpp
+    qwen35x_kernelbench
+    src/qwen35x_kernel_bench_main.cpp
   )
   target_include_directories(
-    qwen35x_lucebench
+    qwen35x_kernelbench
     PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
   target_compile_options(
-    qwen35x_lucebench
+    qwen35x_kernelbench
     PRIVATE
       $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
   )
   target_compile_definitions(
-    qwen35x_lucebench
+    qwen35x_kernelbench
     PRIVATE
-      BLOCK_SIZE=${QWEN35X_LUCE_BENCH_BLOCK_SIZE}
-      NUM_BLOCKS=${QWEN35X_LUCE_BENCH_NUM_BLOCKS}
+      BLOCK_SIZE=${QWEN35X_KERNEL_BENCH_BLOCK_SIZE}
+      NUM_BLOCKS=${QWEN35X_KERNEL_BENCH_NUM_BLOCKS}
   )
-  target_link_libraries(qwen35x_lucebench PRIVATE qwen35x_core)
-  set_target_properties(qwen35x_lucebench PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+  target_link_libraries(qwen35x_kernelbench PRIVATE qwen35x_core)
+  set_target_properties(qwen35x_kernelbench PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif ()

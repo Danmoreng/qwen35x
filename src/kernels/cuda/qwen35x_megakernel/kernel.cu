@@ -10,7 +10,7 @@
  * Model:         Qwen/Qwen3.5-0.8B (bf16 weights)
  */
 
-#include "qwen35x/runtime/luce_profile.h"
+#include "qwen35x/runtime/qwen35x_profile.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -1049,7 +1049,7 @@ extern "C" void launch_decode(
     float *seen_token_mask,
     float repetition_penalty,
     int position, int max_seq_len,
-    qwen35x::luce::LuceDecodeProfile *profile,
+    qwen35x::cuda_backend::Qwen35xDecodeProfile *profile,
     cudaStream_t stream)
 {
     int device_id = 0;

@@ -15,9 +15,9 @@ The goal is not a generic multi-model runtime. The goal is a small, hardware-awa
 - Load Qwen3.5 profile/config from Hugging Face model folders
 - Native tokenizer (`vocab.json` + `merges.txt` + added tokens)
 - Reference generation via `--infer-reference` (CPU) and `--infer-gpu` (CUDA)
-- `--infer-gpu` defaults to the in-tree Luce megakernel decode backend for Qwen3.5-0.8B
+- `--infer-gpu` defaults to the in-tree Qwen35x CUDA backend for Qwen3.5-0.8B
 - Legacy CUDA runtime decode backend remains available with `--gpu-decode-backend default`
-- Batched Luce prefill is the default prompt-processing path and warms the prefill backend during initialization
+- Batched Qwen35x prefill is the default prompt-processing path and warms the prefill backend during initialization
 - Device-resident decode path for per-layer hidden/residual/norm/attention/MLP math in `--infer-gpu`
 - GPU logits + GPU sampling path in the legacy runtime decode backend
 - Device-token decode loop path in the legacy runtime decode backend (sampled token stays on GPU for next-step embedding gather)
@@ -31,20 +31,20 @@ The goal is not a generic multi-model runtime. The goal is a small, hardware-awa
 - BF16 tensor benchmark path (`--bench-bf16`)
 - Profiling output via `--profile-json` (stage timings + H2D/D2H transfer stats)
 - Optional synchronized CUDA stage timing via `--profile-sync`
-- Optional Luce phase profiling via `--luce-profile`, including full-attention prefill QK/softmax/PV/gate timing
+- Optional Qwen35x phase profiling via `--qwen35x-profile`, including full-attention prefill QK/softmax/PV/gate timing
 - Optional PyTorch/Transformers parity oracle for checking the local CPU reference against an external implementation
 
 Current GPU sampling constraint:
-- The default Luce backend currently supports greedy decode only (`--temperature 0`) and applies repetition penalty during argmax.
+- The default Qwen35x CUDA backend currently supports greedy decode only (`--temperature 0`) and applies repetition penalty during argmax.
 - For `temperature > 0`, use `--gpu-decode-backend default`; that GPU sampling path currently supports `top_k` in `[1, 64]`.
 
-Current Luce prefill behavior:
-- `--luce-prefill-mode batched` is the default path.
-- `--luce-prefill-mode replay` remains available as a conservative fallback.
+Current Qwen35x prefill behavior:
+- `--qwen35x-prefill-mode batched` is the default path.
+- `--qwen35x-prefill-mode replay` remains available as a conservative fallback.
 - The default backend performs a one-token prefill warmup during initialization, then resets recurrent/cache state before real inference. This keeps one-time cuBLAS/kernel setup outside timed prefill and decode paths.
 
 Current decode control behavior:
-- The default Luce path returns the selected token id each step and performs stop checks on the host.
+- The default Qwen35x CUDA path returns the selected token id each step and performs stop checks on the host.
 - The legacy runtime backend buffers generated token ids on device when no stop tokens/sequences are configured.
 - If stop tokens/sequences are configured, decoding uses per-token host-visible checks to preserve immediate stop behavior.
 
@@ -68,7 +68,7 @@ Current decode control behavior:
 .\build\qwen35x.exe --infer-reference --hf-model-dir models/qwen3.5-0.8b --chat-user "Tell me a short joke." --max-new-tokens 64 --max-context 256 --stop-on-im-end
 ```
 
-4. Run chat inference (CUDA / Luce default)
+4. Run chat inference (CUDA / Qwen35x CUDA default)
 
 ```powershell
 .\build\qwen35x.exe --infer-gpu --hf-model-dir models/qwen3.5-0.8b --chat-user "Tell me a short joke." --max-new-tokens 64 --max-context 256 --temperature 0 --stop-on-im-end
@@ -82,14 +82,14 @@ Current decode control behavior:
 
 ## Performance Snapshot
 
-Latest local long-context Luce benchmark snapshot (April 25, 2026, Qwen3.5-0.8B, RTX 5080 Laptop GPU):
+Latest local long-context Qwen35x CUDA benchmark snapshot (April 25, 2026, Qwen3.5-0.8B, RTX 5080 Laptop GPU):
 
 | Workload | qwen35x | llama.cpp | llama.cpp + FA | CSV |
 |---|---:|---:|---:|---|
-| 64k Wikipedia prompt prefill | `7,837.43 tok/s` (`8,345.21 ms`) | `5,369.00 tok/s` (`12,181.78 ms`) | `9,371.15 tok/s` (`6,979.29 ms`) | `benchmarks/qwen35x-wiki-ai-64k-gen128-luce-prefill-single-path.csv` |
-| 64k Wikipedia prompt generation | `103.31 tok/s` (`1,239.05 ms`) | `139.88 tok/s` (`907.89 ms`) | `165.42 tok/s` (`767.73 ms`) | `benchmarks/qwen35x-wiki-ai-64k-gen128-luce-prefill-single-path.csv` |
+| 64k Wikipedia prompt prefill | `7,837.43 tok/s` (`8,345.21 ms`) | `5,369.00 tok/s` (`12,181.78 ms`) | `9,371.15 tok/s` (`6,979.29 ms`) | `benchmarks/qwen35x-wiki-ai-64k-gen128-qwen35x-prefill-single-path.csv` |
+| 64k Wikipedia prompt generation | `103.31 tok/s` (`1,239.05 ms`) | `139.88 tok/s` (`907.89 ms`) | `165.42 tok/s` (`767.73 ms`) | `benchmarks/qwen35x-wiki-ai-64k-gen128-qwen35x-prefill-single-path.csv` |
 
-The current Luce long-context prefill path is a single tiled full-attention implementation for all prompt lengths. It is now faster than llama.cpp without Flash Attention on 64k prefill, but still trails llama.cpp with Flash Attention; 64k decode remains behind both llama.cpp modes.
+The current Qwen35x long-context prefill path is a single tiled full-attention implementation for all prompt lengths. It is now faster than llama.cpp without Flash Attention on 64k prefill, but still trails llama.cpp with Flash Attention; 64k decode remains behind both llama.cpp modes.
 
 Full-attention prefill subphase split for the current 64k run:
 
@@ -100,7 +100,7 @@ Full-attention prefill subphase split for the current 64k run:
 | PV | `1,334.91 ms` |
 | Gate | `15.46 ms` |
 
-Latest local short-context integrated Luce benchmark snapshot (April 24-25, 2026, Qwen3.5-0.8B, RTX 5080 Laptop GPU):
+Latest local short-context integrated Qwen35x CUDA benchmark snapshot (April 24-25, 2026, Qwen3.5-0.8B, RTX 5080 Laptop GPU):
 
 | Workload | qwen35x avg | Samples | CSV |
 |---|---:|---|---|
@@ -108,7 +108,7 @@ Latest local short-context integrated Luce benchmark snapshot (April 24-25, 2026
 | `prompt1/gen128` generation | `300.46 tok/s` | `317.89`, `312.77`, `270.72` | `benchmarks/qwen35x-tg-prompt1-current-rerun.csv` |
 | `pp256/gen128`, `MaxContext=384`, prefill | `18,915.00 tok/s` | end-to-end run | `benchmarks/qwen35x-full-pp256-gen128-current-ctx384.csv` |
 | `pp256/gen128`, `MaxContext=384`, generation | `302.38 tok/s` | end-to-end run | `benchmarks/qwen35x-full-pp256-gen128-current-ctx384.csv` |
-| `chat_short_joke/gen128`, single-path prefill cleanup | `274.30 tok/s` | `275.22`, `268.66`, `279.03` | `benchmarks/qwen35x-short-gen128-luce-prefill-single-path.csv` |
+| `chat_short_joke/gen128`, single-path prefill cleanup | `274.30 tok/s` | `275.22`, `268.66`, `279.03` | `benchmarks/qwen35x-short-gen128-qwen35x-prefill-single-path.csv` |
 
 Comparison against saved llama.cpp BF16 CUDA artifacts from the earlier local run:
 
@@ -125,7 +125,7 @@ $tokens = (1..256 | ForEach-Object { "198" }) -join ","
 .\scripts\benchmark-inference-seq.ps1 -Modes gpu-f32 -PromptMode prompt-tokens -PromptName tg_prompt1_current_rerun -PromptTokensCsv "198" -Runs 3 -WarmupRuns 1 -MaxNewTokens 128 -MaxContext 256 -CsvOut benchmarks\qwen35x-tg-prompt1-current-rerun.csv -RunLabel qwen35x-tg-prompt1-current-rerun
 ```
 
-With the default Luce backend, the `gpu-bf16`/`gpu-f32` labels are legacy benchmark modes; both exercise the same Luce decode path.
+With the default Qwen35x CUDA backend, the `gpu-bf16`/`gpu-f32` labels are legacy benchmark modes; both exercise the same Qwen35x CUDA decode path.
 
 Benchmark comparison history is documented here:
 
@@ -133,25 +133,25 @@ Benchmark comparison history is documented here:
 
 It includes:
 
-- qwen35x vs Luce vs llama.cpp (with/without FlashAttention)
+- qwen35x vs the historical kernel harness vs llama.cpp (with/without FlashAttention)
 - decode + prefill numbers
-- Luce block-size/decode-block tuning results
+- Qwen35x kernel block-size/decode-block tuning results
 - CSV source file references for reproducibility
 
 Quick headline numbers from the latest comparison update:
 
-- Current qwen35x Luce default: `300.46 tok/s` generation and `19,739.13 tok/s` `pp256` prefill
-- Current qwen35x Luce 64k Wikipedia prompt: `7,837.43 tok/s` prefill and `103.31 tok/s` generation
+- Current qwen35x Qwen35x CUDA default: `300.46 tok/s` generation and `19,739.13 tok/s` `pp256` prefill
+- Current qwen35x 64k Wikipedia prompt: `7,837.43 tok/s` prefill and `103.31 tok/s` generation
 - llama.cpp BF16 + FA saved run: `142.59 tok/s` generation and `13,681.26 tok/s` `pp256` prefill
 - llama.cpp BF16 + FA 64k Wikipedia prompt: `9,371.15 tok/s` prefill and `165.42 tok/s` generation
-- Historical standalone Luce harness decode: `267.45 tok/s`
+- Historical standalone Qwen35x kernel bench harness decode: `267.45 tok/s`
 
 Parity status (April 24, 2026):
 - CPU reference vs PyTorch/Transformers external oracle (`max_new_tokens=4`): `5/5` minimal prompts pass for both prompt token IDs and generated token IDs.
-- Default GPU path vs CPU reference (`--infer-gpu`, Luce batched prefill, `gpu-f32`, `max_new_tokens=4`): `5/5` minimal prompts pass and `12/12` extended prompts pass.
+- Default GPU path vs CPU reference (`--infer-gpu`, Qwen35x batched prefill, `gpu-f32`, `max_new_tokens=4`): `5/5` minimal prompts pass and `12/12` extended prompts pass.
 - The CPU reference remains the primary local oracle for GPU work. `scripts/benchmark-transformers-parity.ps1` cross-checks that oracle against PyTorch/Transformers.
 
-Historical pre-Luce local sequential benchmark command (kept for reference):
+Historical pre-default-kernel local sequential benchmark command (kept for reference):
 
 Command:
 
@@ -229,7 +229,7 @@ This path is for correctness only; the local validation used the torch fallback 
 ## Project Layout
 
 - `src/`, `include/`: engine implementation
-- `src/kernels/cuda/luce_megakernel/`: in-tree MIT-licensed Luce CUDA sources used by the build
+- `src/kernels/cuda/qwen35x_megakernel/`: in-tree MIT-licensed Qwen35x CUDA kernel sources used by the build
 - `configs/`: model profile(s)
 - `scripts/`: build/download/benchmark utilities
 - `scripts/hf/`: optional PyTorch/Transformers comparison tooling
@@ -248,4 +248,5 @@ See [docs/references.md](docs/references.md) for submodule provenance and refere
 ## License
 
 - Project code: MIT ([LICENSE](LICENSE))
+- The in-tree Qwen35x CUDA kernels are adapted from Lucebox MIT sources; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 - Third-party attribution: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)

@@ -1,12 +1,12 @@
 [CmdletBinding()]
 param(
-    [string]$Executable = "build/qwen35x_lucebench.exe",
+    [string]$Executable = "build/qwen35x_kernelbench.exe",
     [string]$HFModelDir = "models/qwen3.5-0.8b",
     [int[]]$BlockSizes = @(256, 384, 512),
     [int]$MaxNewTokens = 128,
     [int]$MaxContext = 256,
-    [string]$SweepDir = "benchmarks/luce-tuning",
-    [string]$SummaryCsvOut = "benchmarks/luce-tuning-summary.csv"
+    [string]$SweepDir = "benchmarks/qwen35x-kernel-tuning",
+    [string]$SummaryCsvOut = "benchmarks/qwen35x-kernel-tuning-summary.csv"
 )
 
 Set-StrictMode -Version Latest
@@ -58,8 +58,8 @@ foreach ($bs in $BlockSizes) {
         -UseNinja `
         -EnableCuda `
         -Configuration Release `
-        -Target qwen35x_lucebench `
-        -LuceBlockSize $bs
+        -Target qwen35x_kernelbench `
+        -KernelBlockSize $bs
     if ($LASTEXITCODE -ne 0) {
         throw "Build failed for BLOCK_SIZE=$bs"
     }
@@ -69,7 +69,7 @@ foreach ($bs in $BlockSizes) {
     if (Test-Path $sweepCsv) { Remove-Item -LiteralPath $sweepCsv -Force }
     if (Test-Path $finalCsv) { Remove-Item -LiteralPath $finalCsv -Force }
 
-    & (Join-Path $scriptDir "tune-luce-decode-blocks.ps1") `
+    & (Join-Path $scriptDir "tune-qwen35x-decode-blocks.ps1") `
         -Executable $resolvedExe `
         -HFModelDir $resolvedModelDir `
         -SweepCsvOut $sweepCsv `

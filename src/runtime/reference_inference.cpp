@@ -1,7 +1,7 @@
 #include "qwen35x/runtime/reference_inference.h"
 
 #include "qwen35x/runtime/cuda_inference.h"
-#include "qwen35x/runtime/luce_decode_backend.h"
+#include "qwen35x/runtime/qwen35x_cuda_backend.h"
 #include "qwen35x/weights/safetensors.h"
 
 #include <algorithm>

@@ -22,16 +22,16 @@ Usage in this repo: reference-only submodule (not linked into `qwen35x` build)
 Upstream: https://github.com/Luce-Org/lucebox-hub  
 License: MIT  
 Local license file: `third_party/reference/lucebox-hub/LICENSE`  
-Usage in this repo: reference submodule; source provenance for the in-tree Luce CUDA kernels
+Usage in this repo: reference submodule; source provenance for the in-tree Qwen35x CUDA kernels
 
 ## Vendored Third-Party Sources
 
-1. `src/kernels/cuda/luce_megakernel/kernel.cu` and `src/kernels/cuda/luce_megakernel/prefill.cu`
+1. `src/kernels/cuda/qwen35x_megakernel/kernel.cu` and `src/kernels/cuda/qwen35x_megakernel/prefill.cu`
 Source provenance: adapted from `third_party/reference/lucebox-hub/megakernel/kernel.cu` and `third_party/reference/lucebox-hub/megakernel/prefill.cu`
 Upstream: https://github.com/Luce-Org/lucebox-hub
 License: MIT
-Local license file: `src/kernels/cuda/luce_megakernel/LICENSE.Lucebox`
-Usage in this repo: compiled into `qwen35x_core` as the default Luce decode backend for `--infer-gpu`
+Local license file: `src/kernels/cuda/qwen35x_megakernel/LICENSE.Lucebox`
+Usage in this repo: compiled into `qwen35x_core` as the default Qwen35x CUDA backend for `--infer-gpu`
 
 2. `third_party/vendor/luce_megakernel/kernel.cu`
 Source provenance: adapted from `third_party/reference/lucebox-hub/megakernel/kernel.cu`  

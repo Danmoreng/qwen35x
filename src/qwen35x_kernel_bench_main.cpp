@@ -1,4 +1,4 @@
-#include "qwen35x/runtime/luce_decode_backend.h"
+#include "qwen35x/runtime/qwen35x_cuda_backend.h"
 #include "qwen35x/tokenizer/tokenizer.h"
 
 #include <algorithm>
@@ -82,7 +82,7 @@ bool write_profile_json(
 
   out << std::fixed << std::setprecision(6);
   out << "{\n";
-  out << "  \"backend\": \"luce-megakernel-cuda\",\n";
+  out << "  \"backend\": \"qwen35x-kernel-cuda\",\n";
   out << "  \"prompt_tokens\": " << result.prompt_tokens << ",\n";
   out << "  \"prefill_prompt_tokens\": " << result.prefill_prompt_tokens << ",\n";
   out << "  \"generated_tokens\": " << result.generated_tokens << ",\n";
@@ -138,7 +138,7 @@ bool parse_args(int argc, char ** argv, BenchmarkOptions & options, std::string 
     } else if (arg == "--profile-json" && i + 1 < argc) {
       options.profile_json_path = argv[++i];
     } else if (arg == "--help") {
-      std::cout << "usage: qwen35x_lucebench [--hf-model-dir <path>] [--prompt-text <text>]\n";
+      std::cout << "usage: qwen35x_kernelbench [--hf-model-dir <path>] [--prompt-text <text>]\n";
       std::cout << "                       [--long-prompt-text <text>] [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "                       [--warmup-runs <n>] [--runs <n>] [--decode-blocks <n>] [--profile-json <path>]\n";
       std::cout << "                       [--query-decode-blocks]\n";
@@ -216,7 +216,7 @@ int main(int argc, char ** argv) {
     return 0;
   }
 
-  const int max_safe_decode_blocks = qwen35x::luce::query_max_safe_decode_blocks();
+  const int max_safe_decode_blocks = qwen35x::cuda_backend::query_max_safe_decode_blocks();
   if (options.query_decode_blocks_only) {
     std::cout << "max_safe_decode_blocks: " << max_safe_decode_blocks << "\n";
     return 0;
@@ -255,13 +255,13 @@ int main(int argc, char ** argv) {
     return 4;
   }
 
-  qwen35x::luce::LuceDecodeBackend backend;
-  qwen35x::luce::LuceDecodeBackendConfig backend_config;
+  qwen35x::cuda_backend::Qwen35xCudaBackend backend;
+  qwen35x::cuda_backend::Qwen35xCudaBackendConfig backend_config;
   backend_config.model_dir = options.model_dir;
   backend_config.max_context = options.max_context;
   backend_config.decode_blocks = options.decode_blocks;
   if (!backend.initialize(backend_config, error_message)) {
-    std::cerr << "luce backend init failed: " << error_message << "\n";
+    std::cerr << "qwen35x backend init failed: " << error_message << "\n";
     return 5;
   }
 
@@ -410,7 +410,7 @@ int main(int argc, char ** argv) {
   }
 
   const int effective_decode_blocks = options.decode_blocks > 0 ? options.decode_blocks : max_safe_decode_blocks;
-  std::cout << "luce megakernel benchmark\n";
+  std::cout << "qwen35x kernel benchmark\n";
   std::cout << "  model_dir: " << options.model_dir << "\n";
   std::cout << "  prompt_tokens: " << result.prompt_tokens << "\n";
   std::cout << "  prefill_prompt_tokens: " << result.prefill_prompt_tokens << "\n";

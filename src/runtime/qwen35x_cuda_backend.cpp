@@ -1,4 +1,4 @@
-#include "qwen35x/runtime/luce_decode_backend.h"
+#include "qwen35x/runtime/qwen35x_cuda_backend.h"
 
 #include "qwen35x/weights/safetensors.h"
 
@@ -15,7 +15,7 @@
 extern "C" void set_decode_blocks_override(int blocks);
 extern "C" int query_max_safe_decode_blocks();
 
-namespace qwen35x::luce {
+namespace qwen35x::cuda_backend {
 
 #if QWEN35X_HAS_CUDA
 
@@ -82,7 +82,7 @@ extern "C" void launch_decode(
   float repetition_penalty,
   int position,
   int max_seq_len,
-  LuceDecodeProfile * profile,
+  Qwen35xDecodeProfile * profile,
   cudaStream_t stream);
 
 extern "C" void launch_prefill_bf16(
@@ -119,7 +119,7 @@ extern "C" void launch_prefill_bf16(
   const float * rope_sin,
   int max_seq_len,
   int compute_logits,
-  LucePrefillProfile * profile,
+  Qwen35xPrefillProfile * profile,
   cudaStream_t stream);
 
 struct DeviceArena {
@@ -293,7 +293,7 @@ bool alloc_and_zero(DeviceArena & arena, std::size_t bytes, void *& out_ptr, con
 }
 
 bool initialize_backend_state(
-  const LuceDecodeBackendConfig & config,
+  const Qwen35xCudaBackendConfig & config,
   DeviceArena & arena,
   BackendState & state,
   std::string & error_message) {
@@ -554,10 +554,10 @@ bool reset_state(const BackendState & state, int max_seq_len, std::string & erro
 
 void launch_prefill_for_state(
   const BackendState & state,
-  const LuceDecodeBackendConfig & config,
+  const Qwen35xCudaBackendConfig & config,
   int seq_len,
   bool compute_first_token,
-  LucePrefillProfile * profile,
+  Qwen35xPrefillProfile * profile,
   cudaStream_t stream) {
   launch_prefill_bf16(
     state.token_ids,
@@ -597,7 +597,7 @@ void launch_prefill_for_state(
     stream);
 }
 
-bool warmup_prefill_backend(BackendState & state, const LuceDecodeBackendConfig & config, std::string & error_message) {
+bool warmup_prefill_backend(BackendState & state, const Qwen35xCudaBackendConfig & config, std::string & error_message) {
   if (!check_cuda(
         cudaMemset(state.token_ids, 0, static_cast<std::size_t>(config.max_context) * sizeof(int)),
         "cudaMemset(prefill warmup token_ids)",
@@ -616,15 +616,15 @@ bool warmup_prefill_backend(BackendState & state, const LuceDecodeBackendConfig 
 
 bool run_prefill_impl(
   BackendState & state,
-  const LuceDecodeBackendConfig & config,
+  const Qwen35xCudaBackendConfig & config,
   const std::vector<std::int32_t> & tokens,
   int & out_first_token,
   bool compute_first_token,
-  LucePrefillProfile * profile,
+  Qwen35xPrefillProfile * profile,
   std::string & error_message) {
   const auto host_start = std::chrono::steady_clock::now();
   if (profile != nullptr) {
-    *profile = LucePrefillProfile{};
+    *profile = Qwen35xPrefillProfile{};
     profile->enabled = true;
   }
 
@@ -700,7 +700,7 @@ bool run_decode_step_impl(
   int position,
   int max_seq_len,
   float repetition_penalty,
-  LuceDecodeProfile * profile,
+  Qwen35xDecodeProfile * profile,
   int & out_next_token,
   std::string & error_message) {
   const auto host_start = std::chrono::steady_clock::now();
@@ -789,23 +789,23 @@ bool run_decode_step_impl(
 
 } // namespace
 
-struct LuceDecodeBackend::Impl {
-  LuceDecodeBackendConfig config;
+struct Qwen35xCudaBackend::Impl {
+  Qwen35xCudaBackendConfig config;
   DeviceArena arena;
   BackendState state;
-  LuceRuntimeProfile profile;
+  Qwen35xRuntimeProfile profile;
   bool initialized = false;
 };
 
-LuceDecodeBackend::LuceDecodeBackend() : impl_(std::make_unique<Impl>()) {
+Qwen35xCudaBackend::Qwen35xCudaBackend() : impl_(std::make_unique<Impl>()) {
 }
 
-LuceDecodeBackend::~LuceDecodeBackend() = default;
+Qwen35xCudaBackend::~Qwen35xCudaBackend() = default;
 
-LuceDecodeBackend::LuceDecodeBackend(LuceDecodeBackend &&) noexcept = default;
-LuceDecodeBackend & LuceDecodeBackend::operator=(LuceDecodeBackend &&) noexcept = default;
+Qwen35xCudaBackend::Qwen35xCudaBackend(Qwen35xCudaBackend &&) noexcept = default;
+Qwen35xCudaBackend & Qwen35xCudaBackend::operator=(Qwen35xCudaBackend &&) noexcept = default;
 
-bool LuceDecodeBackend::initialize(const LuceDecodeBackendConfig & config, std::string & error_message) {
+bool Qwen35xCudaBackend::initialize(const Qwen35xCudaBackendConfig & config, std::string & error_message) {
   if (config.max_context <= 0) {
     error_message = "max_context must be > 0.";
     return false;
@@ -833,33 +833,33 @@ bool LuceDecodeBackend::initialize(const LuceDecodeBackendConfig & config, std::
     impl_ = std::make_unique<Impl>();
     return false;
   }
-  impl_->profile = LuceRuntimeProfile{};
+  impl_->profile = Qwen35xRuntimeProfile{};
   impl_->profile.enabled = config.profile_enabled;
   impl_->initialized = true;
   return true;
 }
 
-bool LuceDecodeBackend::reset(std::string & error_message) {
+bool Qwen35xCudaBackend::reset(std::string & error_message) {
   if (!is_initialized()) {
-    error_message = "Luce backend reset requested before initialize.";
+    error_message = "Qwen35x CUDA backend reset requested before initialize.";
     return false;
   }
   return reset_state(impl_->state, impl_->config.max_context, error_message);
 }
 
-bool LuceDecodeBackend::run_prefill(
+bool Qwen35xCudaBackend::run_prefill(
   const std::vector<std::int32_t> & tokens,
   int & out_first_token,
   std::string & error_message) {
   if (!is_initialized()) {
-    error_message = "Luce backend prefill requested before initialize.";
+    error_message = "Qwen35x CUDA backend prefill requested before initialize.";
     return false;
   }
   if (static_cast<int>(tokens.size()) > impl_->config.max_context) {
     error_message = "Prefill token count exceeds configured max_context.";
     return false;
   }
-  LucePrefillProfile * profile = impl_->config.profile_enabled ? &impl_->profile.prefill : nullptr;
+  Qwen35xPrefillProfile * profile = impl_->config.profile_enabled ? &impl_->profile.prefill : nullptr;
   const bool ok = run_prefill_impl(impl_->state, impl_->config, tokens, out_first_token, true, profile, error_message);
   if (ok && profile != nullptr) {
     impl_->profile.enabled = true;
@@ -868,11 +868,11 @@ bool LuceDecodeBackend::run_prefill(
   return ok;
 }
 
-bool LuceDecodeBackend::run_prefill_only(
+bool Qwen35xCudaBackend::run_prefill_only(
   const std::vector<std::int32_t> & tokens,
   std::string & error_message) {
   if (!is_initialized()) {
-    error_message = "Luce backend prefill_only requested before initialize.";
+    error_message = "Qwen35x CUDA backend prefill_only requested before initialize.";
     return false;
   }
   if (static_cast<int>(tokens.size()) > impl_->config.max_context) {
@@ -880,7 +880,7 @@ bool LuceDecodeBackend::run_prefill_only(
     return false;
   }
   int ignored_first_token = 0;
-  LucePrefillProfile * profile = impl_->config.profile_enabled ? &impl_->profile.prefill : nullptr;
+  Qwen35xPrefillProfile * profile = impl_->config.profile_enabled ? &impl_->profile.prefill : nullptr;
   const bool ok = run_prefill_impl(impl_->state, impl_->config, tokens, ignored_first_token, false, profile, error_message);
   if (ok && profile != nullptr) {
     impl_->profile.enabled = true;
@@ -889,13 +889,13 @@ bool LuceDecodeBackend::run_prefill_only(
   return ok;
 }
 
-bool LuceDecodeBackend::run_decode_step(
+bool Qwen35xCudaBackend::run_decode_step(
   int input_token,
   int position,
   int & out_next_token,
   std::string & error_message) {
   if (!is_initialized()) {
-    error_message = "Luce backend decode_step requested before initialize.";
+    error_message = "Qwen35x CUDA backend decode_step requested before initialize.";
     return false;
   }
   return run_decode_step_impl(
@@ -909,28 +909,28 @@ bool LuceDecodeBackend::run_decode_step(
     error_message);
 }
 
-bool LuceDecodeBackend::synchronize(std::string & error_message) {
+bool Qwen35xCudaBackend::synchronize(std::string & error_message) {
   if (!is_initialized()) {
-    error_message = "Luce backend synchronize requested before initialize.";
+    error_message = "Qwen35x CUDA backend synchronize requested before initialize.";
     return false;
   }
   return check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize", error_message);
 }
 
-bool LuceDecodeBackend::is_initialized() const {
+bool Qwen35xCudaBackend::is_initialized() const {
   return impl_ != nullptr && impl_->initialized;
 }
 
-int LuceDecodeBackend::max_context() const {
+int Qwen35xCudaBackend::max_context() const {
   if (impl_ == nullptr) {
     return 0;
   }
   return impl_->config.max_context;
 }
 
-LuceRuntimeProfile LuceDecodeBackend::profile() const {
+Qwen35xRuntimeProfile Qwen35xCudaBackend::profile() const {
   if (impl_ == nullptr) {
-    return LuceRuntimeProfile{};
+    return Qwen35xRuntimeProfile{};
   }
   return impl_->profile;
 }
@@ -945,31 +945,31 @@ void set_decode_blocks_override(int blocks) {
 
 #else
 
-struct LuceDecodeBackend::Impl {
-  LuceDecodeBackendConfig config;
+struct Qwen35xCudaBackend::Impl {
+  Qwen35xCudaBackendConfig config;
   bool initialized = false;
 };
 
-LuceDecodeBackend::LuceDecodeBackend() : impl_(std::make_unique<Impl>()) {
+Qwen35xCudaBackend::Qwen35xCudaBackend() : impl_(std::make_unique<Impl>()) {
 }
 
-LuceDecodeBackend::~LuceDecodeBackend() = default;
+Qwen35xCudaBackend::~Qwen35xCudaBackend() = default;
 
-LuceDecodeBackend::LuceDecodeBackend(LuceDecodeBackend &&) noexcept = default;
-LuceDecodeBackend & LuceDecodeBackend::operator=(LuceDecodeBackend &&) noexcept = default;
+Qwen35xCudaBackend::Qwen35xCudaBackend(Qwen35xCudaBackend &&) noexcept = default;
+Qwen35xCudaBackend & Qwen35xCudaBackend::operator=(Qwen35xCudaBackend &&) noexcept = default;
 
-bool LuceDecodeBackend::initialize(const LuceDecodeBackendConfig &, std::string & error_message) {
+bool Qwen35xCudaBackend::initialize(const Qwen35xCudaBackendConfig &, std::string & error_message) {
   error_message = "CUDA is not enabled in this build.";
   impl_->initialized = false;
   return false;
 }
 
-bool LuceDecodeBackend::reset(std::string & error_message) {
+bool Qwen35xCudaBackend::reset(std::string & error_message) {
   error_message = "CUDA is not enabled in this build.";
   return false;
 }
 
-bool LuceDecodeBackend::run_prefill(
+bool Qwen35xCudaBackend::run_prefill(
   const std::vector<std::int32_t> &,
   int &,
   std::string & error_message) {
@@ -977,14 +977,14 @@ bool LuceDecodeBackend::run_prefill(
   return false;
 }
 
-bool LuceDecodeBackend::run_prefill_only(
+bool Qwen35xCudaBackend::run_prefill_only(
   const std::vector<std::int32_t> &,
   std::string & error_message) {
   error_message = "CUDA is not enabled in this build.";
   return false;
 }
 
-bool LuceDecodeBackend::run_decode_step(
+bool Qwen35xCudaBackend::run_decode_step(
   int,
   int,
   int &,
@@ -993,21 +993,21 @@ bool LuceDecodeBackend::run_decode_step(
   return false;
 }
 
-bool LuceDecodeBackend::synchronize(std::string & error_message) {
+bool Qwen35xCudaBackend::synchronize(std::string & error_message) {
   error_message = "CUDA is not enabled in this build.";
   return false;
 }
 
-bool LuceDecodeBackend::is_initialized() const {
+bool Qwen35xCudaBackend::is_initialized() const {
   return false;
 }
 
-int LuceDecodeBackend::max_context() const {
+int Qwen35xCudaBackend::max_context() const {
   return 0;
 }
 
-LuceRuntimeProfile LuceDecodeBackend::profile() const {
-  return LuceRuntimeProfile{};
+Qwen35xRuntimeProfile Qwen35xCudaBackend::profile() const {
+  return Qwen35xRuntimeProfile{};
 }
 
 int query_max_safe_decode_blocks() {
@@ -1019,4 +1019,4 @@ void set_decode_blocks_override(int) {
 
 #endif
 
-} // namespace qwen35x::luce
+} // namespace qwen35x::cuda_backend

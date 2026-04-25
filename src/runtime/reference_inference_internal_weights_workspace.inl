@@ -153,12 +153,12 @@ struct DecodeProfilingAccumulator {
 
 enum class RuntimeDecodeBackendKind {
   runtime_default = 0,
-  luce = 1
+  qwen35x_cuda = 1
 };
 
 struct RuntimeDecodeBackend {
   RuntimeDecodeBackendKind kind = RuntimeDecodeBackendKind::runtime_default;
-  luce::LuceDecodeBackend luce_backend;
+  cuda_backend::Qwen35xCudaBackend qwen35x_backend;
   bool initialized = false;
 };
 

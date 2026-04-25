@@ -11,8 +11,10 @@ param (
     [string]$Target = "qwen35x",
     [string]$Profile = "configs/qwen3_5_0_8b.profile.json",
     [int]$SmVersion = 120,
-    [int]$LuceBlockSize = 256,
-    [int]$LuceNumBlocks = 82
+    [Alias("LuceBlockSize")]
+    [int]$KernelBlockSize = 256,
+    [Alias("LuceNumBlocks")]
+    [int]$KernelNumBlocks = 82
 )
 
 Set-StrictMode -Version Latest
@@ -122,8 +124,8 @@ $configureArgs = @(
 ) + $GeneratorArgs + @(
     "-DCMAKE_CXX_STANDARD=20",
     "-DQWEN35X_ENABLE_CUDA=$cudaFlag",
-    "-DQWEN35X_LUCE_BENCH_BLOCK_SIZE=$LuceBlockSize",
-    "-DQWEN35X_LUCE_BENCH_NUM_BLOCKS=$LuceNumBlocks"
+    "-DQWEN35X_KERNEL_BENCH_BLOCK_SIZE=$KernelBlockSize",
+    "-DQWEN35X_KERNEL_BENCH_NUM_BLOCKS=$KernelNumBlocks"
 )
 
 if ($isNinja) {

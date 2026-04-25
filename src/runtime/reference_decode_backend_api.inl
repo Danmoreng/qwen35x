@@ -4,22 +4,22 @@ bool init_runtime_decode_backend(
   std::string & error_message) {
   backend = RuntimeDecodeBackend{};
   backend.kind = RuntimeDecodeBackendKind::runtime_default;
-  if (options.use_cuda && options.gpu_decode_backend == GpuDecodeBackend::luce) {
-    backend.kind = RuntimeDecodeBackendKind::luce;
+  if (options.use_cuda && options.gpu_decode_backend == GpuDecodeBackend::qwen35x_cuda) {
+    backend.kind = RuntimeDecodeBackendKind::qwen35x_cuda;
     if (options.sampling.temperature > 0.0f) {
-      error_message = "Luce decode backend currently supports only greedy decode (temperature <= 0).";
+      error_message = "Qwen35x CUDA backend currently supports only greedy decode (temperature <= 0).";
       return false;
     }
     if (options.gpu_decode_blocks < 0) {
       error_message = "gpu_decode_blocks must be >= 0.";
       return false;
     }
-    luce::LuceDecodeBackendConfig config;
+    cuda_backend::Qwen35xCudaBackendConfig config;
     config.model_dir = options.model_dir;
     config.max_context = options.max_context;
     config.decode_blocks = options.gpu_decode_blocks;
     config.repetition_penalty = options.sampling.repetition_penalty;
-    if (!backend.luce_backend.initialize(config, error_message)) {
+    if (!backend.qwen35x_backend.initialize(config, error_message)) {
       return false;
     }
   }
@@ -37,8 +37,8 @@ bool reset_runtime_decode_backend(
   switch (backend.kind) {
     case RuntimeDecodeBackendKind::runtime_default:
       return true;
-    case RuntimeDecodeBackendKind::luce:
-      return backend.luce_backend.reset(error_message);
+    case RuntimeDecodeBackendKind::qwen35x_cuda:
+      return backend.qwen35x_backend.reset(error_message);
     default:
       error_message = "Unsupported runtime decode backend kind.";
       return false;
@@ -85,14 +85,14 @@ bool decode_step_with_runtime_backend(
         cuda_workspace,
         profiling,
         error_message);
-    case RuntimeDecodeBackendKind::luce: {
+    case RuntimeDecodeBackendKind::qwen35x_cuda: {
       int next_token = 0;
-      if (!backend.luce_backend.run_decode_step(token_id, position, next_token, error_message)) {
+      if (!backend.qwen35x_backend.run_decode_step(token_id, position, next_token, error_message)) {
         return false;
       }
       if (compute_next_logits) {
         if (next_token < 0 || next_token >= dims.vocab_size) {
-          error_message = "Luce decode backend produced an out-of-range token id.";
+          error_message = "Qwen35x CUDA backend produced an out-of-range token id.";
           return false;
         }
         next_logits.assign(static_cast<std::size_t>(dims.vocab_size), 0.0f);
@@ -145,8 +145,8 @@ bool decode_step_with_runtime_backend_from_device_token(
         next_logits,
         profiling,
         error_message);
-    case RuntimeDecodeBackendKind::luce:
-      error_message = "Luce decode backend does not support device-token decode path.";
+    case RuntimeDecodeBackendKind::qwen35x_cuda:
+      error_message = "Qwen35x CUDA backend does not support device-token decode path.";
       return false;
     default:
       error_message = "Unsupported runtime decode backend kind.";
