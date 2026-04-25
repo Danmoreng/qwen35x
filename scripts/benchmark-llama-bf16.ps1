@@ -21,7 +21,8 @@ param (
     [int]$NGpuLayers = 99,
     [int]$BatchSize = 2048,
     [int]$UBatchSize = 512,
-    [switch]$FlashAttention
+    [switch]$FlashAttention,
+    [string[]]$BuildTargets = @("llama-bench")
 )
 
 Set-StrictMode -Version Latest
@@ -172,15 +173,19 @@ if (-not $SkipBuild) {
         throw "llama.cpp CMake configuration failed."
     }
 
-    $BuildArgs = @("--build", $ResolvedBuildDir, "--target", "llama-bench", "--parallel")
+    $BuildArgs = @("--build", $ResolvedBuildDir)
+    foreach ($target in $BuildTargets) {
+        $BuildArgs += @("--target", $target)
+    }
+    $BuildArgs += "--parallel"
     if (-not $isNinja) {
         $BuildArgs += @("--config", $Configuration)
     }
 
-    Write-Host "Building target: llama-bench ($Configuration)" -ForegroundColor Cyan
+    Write-Host ("Building target(s): {0} ({1})" -f ($BuildTargets -join ", "), $Configuration) -ForegroundColor Cyan
     & cmake @BuildArgs
     if ($LASTEXITCODE -ne 0) {
-        throw "llama-bench build failed."
+        throw "llama.cpp build failed."
     }
 }
 

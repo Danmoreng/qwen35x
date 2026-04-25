@@ -16,7 +16,8 @@ Completed:
 - Optional synchronized CUDA stage timing mode (`--profile-sync`)
 - Packed full-attention projection (`q+gate+k+v`) to reduce full-attention decode matvec launches
 - Streaming full-attention decode kernel with online softmax/value accumulation
-- Qwen35x CUDA backend integrated into `--infer-gpu` as the default Qwen3.5-0.8B decode path
+- Qwen35x CUDA backend integrated into `--infer-gpu` as the default decode path for compiled 0.8B/4B variants
+- Qwen3.5-4B CUDA variant added as a compiled specialization alongside the 0.8B variant
 - Qwen35x CUDA kernel sources used by the build live directly under `src/kernels/cuda/` with local correctness fixes and MIT attribution
 - Batched Qwen35x prefill integrated as the default prompt-processing path, including a backend warmup during initialization to remove one-time CUDA/cuBLAS setup from timed inference
 - Qwen35x prefill/decode phase profiling, including per-layer full-attention QK/softmax/PV/gate timing
@@ -24,6 +25,7 @@ Completed:
 - Single-path tiled full-attention prefill using the existing canonical cache/state layout
 - Deterministic CPU/GPU parity harness with minimal and extended prompt suites
 - Optional PyTorch/Transformers parity harness for checking the CPU reference against an external implementation
+- Actual-prompt benchmark matrix comparing qwen35x against llama.cpp with and without Flash Attention for 0.8B and 4B
 
 Current known constraints:
 - Default Qwen35x CUDA backend currently supports greedy decode only (`temperature <= 0`)
@@ -34,7 +36,13 @@ Current known constraints:
 - Qwen35x CUDA backend initialization includes a dummy one-token prefill warmup and state reset; benchmark load time includes this warmup.
 - The PyTorch/Transformers comparison environment is optional and kept outside the C++ build in `.venv-hf-parity`; it is a correctness oracle, not a performance benchmark.
 
-Latest local benchmark snapshot (Qwen3.5-0.8B, same machine):
+Latest local benchmark snapshot (same machine):
+- Actual-prompt model matrix (April 25, 2026, RTX 5080 Laptop GPU, `MaxNewTokens=128`, CSV `benchmarks/model-matrix/qwen35x-vs-llama-matrix-summary.csv`):
+  - 0.8B qwen35x generation is ahead of llama.cpp actual-run generation across 256-4096 context: `325.97`, `331.72`, `312.55`, `316.40`, `306.01 tok/s`.
+  - 0.8B llama.cpp + Flash Attention generation for the same contexts: `242.01`, `240.64`, `236.67`, `236.13`, `207.91 tok/s`.
+  - 4B qwen35x generation is ahead of or near llama.cpp across 256-4096 context: `61.31`, `61.24`, `57.89`, `58.14`, `55.24 tok/s`.
+  - 4B llama.cpp + Flash Attention generation for the same contexts: `48.96`, `49.40`, `47.39`, `46.45`, `49.39 tok/s`.
+  - qwen35x prefill is ahead of llama.cpp for these prompt lengths in this matrix; the separate 64k run remains the main long-context prefill stress case.
 - Long-context actual-prompt benchmark (April 25, 2026, Wikipedia prompt, ~65k prompt tokens, `MaxContext=65536`, `MaxNewTokens=128`):
   - Current integrated Qwen35x CUDA path after profiling, split decode attention, grouped-GQA decode, decode-block clamp, and single-path tiled prefill tuning: prefill `8,310.58 ms` / `7,870.08 tok/s`; decode `636.25 ms` / `201.18 tok/s`, CSV `benchmarks/qwen35x-wiki-ai-64k-gen128-gqa-decode-default-profile.csv`.
   - Full-attention prefill attention subphase split: total attention `4,694.03 ms`; QK `1,693.86 ms`, softmax `1,656.64 ms`, PV `1,322.32 ms`, gate `15.38 ms`.
@@ -135,7 +143,7 @@ Milestone progress:
 
 ## Immediate Priority: Model Generalization
 
-This is the next work item. The current Qwen3.5-0.8B CUDA performance is accepted as good enough for now, so larger-model descriptor and variant work should resume before further long-context performance tuning.
+This remains the next work item. The current Qwen3.5-0.8B and 4B CUDA performance is accepted as good enough for now, so descriptor cleanup and larger-model variant work should resume before further long-context performance tuning.
 
 Rationale:
 - The 64k actual-prompt benchmark after the grouped-GQA decode work is stable enough for the current target: prefill `8,218.60 ms` / `7,958.17 tok/s`; decode `632.65 ms` / `202.33 tok/s`, CSV `benchmarks/qwen35x-wiki-ai-64k-gen128-baseline-after-reboot.csv`.
@@ -150,12 +158,12 @@ Active work for model-size generalization:
 
 2. Make allocation and validation descriptor-driven
 - Replace hard-coded 0.8B allocation sizes in `src/runtime/qwen35x_cuda_backend.cpp` with descriptor-derived sizes.
-- Keep the current 0.8B compiled kernels as the only enabled fast variant until additional variants have explicit kernels and parity gates.
+- Keep the current 0.8B and 4B compiled kernels as the enabled fast variants until additional variants have explicit kernels and parity gates.
 - Add precise unsupported-variant errors for model shapes that do not yet have a compiled kernel variant.
 
 3. Split compile-time kernel constants into per-variant configuration
 - Start by preserving the existing `0.8B/sm120` kernel behavior exactly.
-- Prepare configured/generated values for `4B`, `9B`, and `27B` only after descriptor validation is in place.
+- Prepare configured/generated values for `9B` and `27B` after descriptor validation is in place.
 - Dispatch through the compiler/runtime/kernel-registry direction instead of adding ad-hoc model checks in launch code.
 
 4. Keep cache/state ABI stable
@@ -171,7 +179,7 @@ Deferred performance backlog:
 - Reduce prefill kernel launch count and recurrent overhead beyond warmup effects.
 
 Exit criteria for the first generalization phase:
-- The current 0.8B path remains behaviorally and performance compatible with the accepted baseline.
+- The current 0.8B and 4B paths remain behaviorally and performance compatible with the accepted baseline.
 - Unsupported larger variants fail with clear descriptor/variant diagnostics instead of silent shape misuse.
 - Descriptor-derived allocation and shape validation are wired through the Qwen35x CUDA backend.
 - CPU/GPU parity still passes the minimal and extended suites for the enabled 0.8B variant.
@@ -209,7 +217,7 @@ Execution phases:
 2. Model descriptor and variant enablement track
 - Add a Qwen35x CUDA model descriptor derived from `ModelProfile` / HF config.
 - Use descriptor-derived allocation and shape validation in the Qwen35x CUDA backend.
-- Keep the existing 0.8B kernel variant as the only enabled compiled variant until larger variants are explicitly added.
+- Keep the existing 0.8B and 4B kernel variants as the enabled compiled variants until larger variants are explicitly added.
 - Add clear unsupported-variant errors for shapes without a matching compiled kernel.
 
 3. Long-context decode optimization track
@@ -245,10 +253,10 @@ Benchmark gates:
 Scaling work is now the active priority. Long-context performance remains tracked, but it no longer blocks descriptor and larger-model work.
 
 Model progression:
-- Start from `Qwen3.5-0.8B`, then adapt to `4B`, `9B`, and `27B`.
+- Start from `Qwen3.5-0.8B` and `4B`, then adapt to `9B` and `27B`.
 
 Current scaling constraint:
-- The default Qwen35x CUDA path is still specialized for `Qwen3.5-0.8B`.
+- The default Qwen35x CUDA path is compiled as a specialization for either `Qwen3.5-0.8B` or `Qwen3.5-4B`.
 - Hard-coded model dimensions currently live in `src/runtime/qwen35x_cuda_backend.cpp`, `src/kernels/cuda/kernel.cu`, and `src/kernels/cuda/prefill.cu`.
 - The hard-coded values include layer count, hidden size, intermediate size, vocab size, full-attention head counts, DeltaNet dimensions, layer schedule, and maximum sequence length.
 - The legacy runtime path already uses `ModelProfile`/`RuntimeDims` more broadly and should be used as the descriptor model for generalizing the Qwen35x CUDA path.
@@ -268,7 +276,7 @@ Adaptation approach:
 3. Preserve specialized decode variants
 - Do not make the megakernel fully runtime-dynamic if that sacrifices the optimization value.
 - Compile or generate decode variants keyed by `(model_variant, sm)` where dimensions affect shared memory, register layout, unrolling, or occupancy.
-- Start with the current `0.8B/sm120` variant, then add `4B/sm120`, `9B/sm120`, and `27B/sm120` only after descriptor validation and parity gates pass.
+- Preserve the current `0.8B/sm120` and `4B/sm120` variants, then add `9B/sm120` and `27B/sm120` only after descriptor validation and parity gates pass.
 - Dispatch through the existing compiler/runtime/kernel-registry direction rather than embedding model selection inside ad-hoc launch code.
 
 4. Refactor scaling-sensitive kernel assumptions
@@ -322,9 +330,10 @@ Validation policy for each new size:
 - [ ] Run prompt-length sweep benchmarks (short/medium/long/64k) after each major long-context optimization batch.
 - [ ] Reduce actual prefill kernel launch count and recurrence overhead beyond warmup effects.
 - [ ] Add a Qwen35x CUDA model descriptor derived from `ModelProfile`/HF config and pass it through `Qwen35xCudaBackendConfig`.
-- [ ] Replace Qwen35x CUDA-side 0.8B allocation sizes with descriptor-derived sizes while keeping the current 0.8B kernel as the only enabled compiled variant.
+- [ ] Replace Qwen35x CUDA-side variant allocation sizes with descriptor-derived sizes while keeping the current 0.8B and 4B kernels as the enabled compiled variants.
 - [ ] Add descriptor validation and clear unsupported-variant errors for larger models until their kernel variants exist.
-- [ ] Split megakernel compile-time constants into per-variant generated/configured values for `0.8B`, `4B`, `9B`, and `27B`.
+- [x] Split megakernel compile-time constants into per-variant configured values for `0.8B` and `4B`.
+- [ ] Extend per-variant generated/configured values to `9B` and `27B`.
 - [ ] Refactor shared-memory and LM-head assumptions that scale with hidden/intermediate size before enabling larger variants.
 - [ ] Add prefill chunking and descriptor-driven GEMM dimensions for larger prompt/model shapes.
 - [ ] Add per-model/per-GPU autotune profiles (decode blocks, block size, LM head tiling, chunk sizes, graph boundaries).
@@ -332,3 +341,4 @@ Validation policy for each new size:
 - [x] Add optional PyTorch/Transformers parity harness (`scripts/benchmark-transformers-parity.ps1`) to validate tokenizer, prompt formatting, and greedy CPU-reference output against an external implementation. Latest baseline (April 24, 2026): minimal `5/5` pass.
 - [x] Run CPU vs GPU token-parity validation for the Qwen35x CUDA default integration and source move.
 - [x] Compare the integrated Qwen35x CUDA default decode/prefill milestone against prior qwen35x, Qwen35x kernel bench harness, and saved llama.cpp benchmark artifacts.
+- [x] Add the actual-prompt qwen35x vs llama.cpp matrix benchmark script for 0.8B and 4B (`scripts/benchmark-qwen35x-vs-llama-matrix.ps1`).

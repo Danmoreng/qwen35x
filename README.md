@@ -15,7 +15,7 @@ The goal is not a generic multi-model runtime. The goal is a small, hardware-awa
 - Load Qwen3.5 profile/config from Hugging Face model folders
 - Native tokenizer (`vocab.json` + `merges.txt` + added tokens)
 - Reference generation via `--infer-reference` (CPU) and `--infer-gpu` (CUDA)
-- `--infer-gpu` defaults to the in-tree Qwen35x CUDA backend for Qwen3.5-0.8B
+- `--infer-gpu` defaults to the in-tree Qwen35x CUDA backend for the compiled Qwen3.5 variant (`0p8b` or `4b`)
 - Legacy CUDA runtime decode backend remains available with `--gpu-decode-backend default`
 - Batched Qwen35x prefill is the default prompt-processing path and warms the prefill backend during initialization
 - Device-resident decode path for per-layer hidden/residual/norm/attention/MLP math in `--infer-gpu`
@@ -63,6 +63,12 @@ Current decode control behavior:
 .\scripts\build.ps1 -UseNinja -EnableCuda -Configuration Release
 ```
 
+Build the 4B CUDA variant:
+
+```powershell
+.\scripts\build.ps1 -UseNinja -EnableCuda -Configuration Release -BuildDir build-4b -CudaVariant 4b
+```
+
 3. Run chat inference (CPU reference)
 
 ```powershell
@@ -82,6 +88,47 @@ Current decode control behavior:
 ```
 
 ## Performance Snapshot
+
+Latest local actual-prompt matrix benchmark (April 25, 2026, RTX 5080 Laptop GPU, `MaxNewTokens=128`):
+
+| Model | Implementation | Ctx | Prefill tok/s | Generation tok/s |
+|---|---|---:|---:|---:|
+| 0.8B | llama.cpp + FA | 256 | 2,273.65 | 242.01 |
+| 0.8B | llama.cpp | 256 | 1,690.94 | 250.39 |
+| 0.8B | qwen35x | 256 | 17,544.39 | 325.97 |
+| 4B | llama.cpp + FA | 256 | 1,683.33 | 48.96 |
+| 4B | llama.cpp | 256 | 1,380.84 | 48.15 |
+| 4B | qwen35x | 256 | 4,660.76 | 61.31 |
+| 0.8B | llama.cpp + FA | 512 | 4,847.56 | 240.64 |
+| 0.8B | llama.cpp | 512 | 3,581.55 | 232.55 |
+| 0.8B | qwen35x | 512 | 21,726.28 | 331.72 |
+| 4B | llama.cpp + FA | 512 | 2,479.89 | 49.40 |
+| 4B | llama.cpp | 512 | 2,094.46 | 48.71 |
+| 4B | qwen35x | 512 | 4,915.72 | 61.24 |
+| 0.8B | llama.cpp + FA | 1024 | 6,907.04 | 236.67 |
+| 0.8B | llama.cpp | 1024 | 5,805.89 | 234.93 |
+| 0.8B | qwen35x | 1024 | 22,783.52 | 312.55 |
+| 4B | llama.cpp + FA | 1024 | 3,045.82 | 47.39 |
+| 4B | llama.cpp | 1024 | 2,805.96 | 48.49 |
+| 4B | qwen35x | 1024 | 4,844.64 | 57.89 |
+| 0.8B | llama.cpp + FA | 2048 | 9,948.61 | 236.13 |
+| 0.8B | llama.cpp | 2048 | 8,272.06 | 233.20 |
+| 0.8B | qwen35x | 2048 | 20,562.67 | 316.40 |
+| 4B | llama.cpp + FA | 2048 | 3,401.26 | 46.45 |
+| 4B | llama.cpp | 2048 | 3,168.92 | 46.84 |
+| 4B | qwen35x | 2048 | 4,716.04 | 58.14 |
+| 0.8B | llama.cpp + FA | 4096 | 11,698.09 | 207.91 |
+| 0.8B | llama.cpp | 4096 | 9,852.25 | 202.25 |
+| 0.8B | qwen35x | 4096 | 18,446.63 | 306.01 |
+| 4B | llama.cpp + FA | 4096 | 3,196.20 | 49.39 |
+| 4B | llama.cpp | 4096 | 2,970.99 | 51.99 |
+| 4B | qwen35x | 4096 | 4,010.30 | 55.24 |
+
+Source: `benchmarks/model-matrix/qwen35x-vs-llama-matrix-summary.csv`. qwen35x uses the sequential inference harness with real prompt files; llama.cpp uses `llama-completion` actual prompt/eval timings. Reproduce with:
+
+```powershell
+.\scripts\benchmark-qwen35x-vs-llama-matrix.ps1
+```
 
 Latest local long-context Qwen35x CUDA benchmark snapshot (April 25, 2026, Qwen3.5-0.8B, RTX 5080 Laptop GPU):
 

@@ -26,7 +26,7 @@ git submodule update --remote third_party/reference/llama.cpp
 
 ### Current pin
 
-- `cf8b0dbda9ac0eac30ee33f87bc6702ead1c4664`
+- `98dc1418ea0491d62948f712ed534ece3b773564`
 
 ## tinygrad
 
