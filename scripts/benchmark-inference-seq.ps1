@@ -6,10 +6,11 @@ param(
     [string]$RunLabel = "",
     [ValidateSet("gpu-bf16", "gpu-f32", "cpu-reference")]
     [string[]]$Modes = @("gpu-bf16", "gpu-f32"),
-    [ValidateSet("chat-user", "prompt-text", "prompt-tokens")]
+    [ValidateSet("chat-user", "prompt-text", "prompt-file", "prompt-tokens")]
     [string]$PromptMode = "chat-user",
     [string]$PromptName = "chat_short_joke",
     [string]$PromptText = "Tell me a short joke.",
+    [string]$PromptFile = "",
     [string]$PromptTokensCsv = "",
     [int]$Runs = 3,
     [int]$WarmupRuns = 1,
@@ -53,6 +54,7 @@ function Invoke-BenchmarkRun {
         [Parameter(Mandatory = $true)][string]$ModelDir,
         [Parameter(Mandatory = $true)][string]$PromptMode,
         [Parameter(Mandatory = $true)][string]$PromptText,
+        [Parameter(Mandatory = $false)][string]$PromptFile,
         [Parameter(Mandatory = $false)][string]$PromptTokensCsv,
         [Parameter(Mandatory = $true)][int]$MaxNewTokens,
         [Parameter(Mandatory = $true)][int]$MaxContext,
@@ -99,6 +101,8 @@ function Invoke-BenchmarkRun {
         $args += @("--chat-user", $PromptText)
     } elseif ($PromptMode -eq "prompt-text") {
         $args += @("--prompt-text", $PromptText)
+    } elseif ($PromptMode -eq "prompt-file") {
+        $args += @("--prompt-file", $PromptFile)
     } else {
         $args += @("--prompt-tokens", $PromptTokensCsv)
     }
@@ -135,6 +139,10 @@ $repoRoot = Split-Path -Parent $scriptDir
 $resolvedExe = Resolve-RepoPath -Path $Executable -RepoRoot $repoRoot
 $resolvedModelDir = Resolve-RepoPath -Path $HFModelDir -RepoRoot $repoRoot
 $resolvedCsvOut = Resolve-RepoPath -Path $CsvOut -RepoRoot $repoRoot
+$resolvedPromptFile = ""
+if ($PromptMode -eq "prompt-file") {
+    $resolvedPromptFile = Resolve-RepoPath -Path $PromptFile -RepoRoot $repoRoot
+}
 $profileTmpDir = Join-Path $repoRoot "build\bench-profiles"
 
 if (-not (Test-Path $resolvedExe)) {
@@ -151,6 +159,12 @@ if ($WarmupRuns -lt 0) {
 }
 if (($PromptMode -eq "chat-user" -or $PromptMode -eq "prompt-text") -and [string]::IsNullOrWhiteSpace($PromptText)) {
     throw "PromptText must be non-empty for prompt mode '$PromptMode'."
+}
+if ($PromptMode -eq "prompt-file" -and [string]::IsNullOrWhiteSpace($PromptFile)) {
+    throw "PromptFile must be non-empty when PromptMode is 'prompt-file'."
+}
+if ($PromptMode -eq "prompt-file" -and -not (Test-Path -LiteralPath $resolvedPromptFile)) {
+    throw "PromptFile not found: $resolvedPromptFile"
 }
 if ($PromptMode -eq "prompt-tokens" -and [string]::IsNullOrWhiteSpace($PromptTokensCsv)) {
     throw "PromptTokensCsv must be non-empty when PromptMode is 'prompt-tokens'."
@@ -172,6 +186,7 @@ foreach ($mode in $Modes) {
                 -ModelDir $resolvedModelDir `
                 -PromptMode $PromptMode `
                 -PromptText $PromptText `
+                -PromptFile $resolvedPromptFile `
                 -PromptTokensCsv $PromptTokensCsv `
                 -MaxNewTokens $MaxNewTokens `
                 -MaxContext $MaxContext `
@@ -201,6 +216,7 @@ foreach ($mode in $Modes) {
                 -ModelDir $resolvedModelDir `
                 -PromptMode $PromptMode `
                 -PromptText $PromptText `
+                -PromptFile $resolvedPromptFile `
                 -PromptTokensCsv $PromptTokensCsv `
                 -MaxNewTokens $MaxNewTokens `
                 -MaxContext $MaxContext `

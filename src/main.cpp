@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -65,6 +66,7 @@ bool write_profile_json(
   const std::string & output_path,
   const qwen35x::ReferenceInferenceOptions & options,
   const qwen35x::ReferenceInferenceResult & result,
+  const std::string & generated_text,
   const std::string & backend,
   const std::string & decode_backend,
   std::string & error_message) {
@@ -130,13 +132,30 @@ bool write_profile_json(
     }
     out << result.generated_tokens[i];
   }
-  out << "]\n";
+  out << "],\n";
+  out << "  \"generated_text\": \"" << json_escape(generated_text) << "\"\n";
   out << "}\n";
   if (!out.good()) {
     error_message = "Failed to write profile JSON: " + output_path;
     return false;
   }
 
+  return true;
+}
+
+bool read_text_file(const std::string & path, std::string & out_text, std::string & error_message) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in.is_open()) {
+    error_message = "Failed to open prompt file: " + path;
+    return false;
+  }
+  std::ostringstream buffer;
+  buffer << in.rdbuf();
+  out_text = buffer.str();
+  if (!in.good() && !in.eof()) {
+    error_message = "Failed to read prompt file: " + path;
+    return false;
+  }
   return true;
 }
 
@@ -147,6 +166,7 @@ int main(int argc, char ** argv) {
   std::string hf_model_dir;
   std::string prompt_tokens_csv;
   std::string prompt_text;
+  std::string prompt_file_path;
   std::string chat_user_text;
   std::string stop_tokens_csv;
   std::vector<std::string> stop_texts;
@@ -186,6 +206,8 @@ int main(int argc, char ** argv) {
       prompt_tokens_csv = argv[++i];
     } else if (arg == "--prompt-text" && i + 1 < argc) {
       prompt_text = argv[++i];
+    } else if (arg == "--prompt-file" && i + 1 < argc) {
+      prompt_file_path = argv[++i];
     } else if (arg == "--chat-user" && i + 1 < argc) {
       chat_user_text = argv[++i];
     } else if (arg == "--max-new-tokens" && i + 1 < argc) {
@@ -251,8 +273,8 @@ int main(int argc, char ** argv) {
     } else if (arg == "--help") {
       std::cout << "usage: qwen35x [--profile <json>] [--hf-model-dir <path>] [--sm <int>] [--cpu]\n";
       std::cout << "       qwen35x --bench-bf16 --hf-model-dir <path> [--bench-tensor <name>] [--bench-warmup <n>] [--bench-iters <n>]\n";
-      std::cout << "       qwen35x --infer-reference --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
-      std::cout << "       qwen35x --infer-gpu --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
+      std::cout << "       qwen35x --infer-reference --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
+      std::cout << "       qwen35x --infer-gpu --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "               [--temperature <float>] [--top-p <float>] [--top-k <int>] [--repeat-penalty <float>] [--seed <int64>]\n";
       std::cout << "               [--gpu-bf16|--gpu-f32-matvec] [--gpu-decode-backend <default|luce>] [--gpu-decode-blocks <n>] [--luce-prefill-mode <replay|batched>] [--profile-sync] [--prefill-only]\n";
       std::cout << "               [--stop-token <csv>] [--stop-text <text>] [--stop-on-im-end] [--profile-json <path>]\n";
@@ -304,7 +326,7 @@ int main(int argc, char ** argv) {
     qwen35x::QwenTokenizer tokenizer;
     bool has_tokenizer = false;
     const bool need_tokenizer =
-      !prompt_text.empty() || !chat_user_text.empty() || !stop_texts.empty() || stop_on_im_end;
+      !prompt_text.empty() || !prompt_file_path.empty() || !chat_user_text.empty() || !stop_texts.empty() || stop_on_im_end;
     if (need_tokenizer) {
       if (!qwen35x::QwenTokenizer::load_from_hf_directory(hf_model_dir, tokenizer, error_message)) {
         std::cerr << "tokenizer load failed: " << error_message << "\n";
@@ -348,10 +370,22 @@ int main(int argc, char ** argv) {
       infer_options.stop_token_ids.push_back(im_end_id);
     }
 
-    const int prompt_modes = (!prompt_tokens_csv.empty() ? 1 : 0) + (!prompt_text.empty() ? 1 : 0) + (!chat_user_text.empty() ? 1 : 0);
+    const int prompt_modes =
+      (!prompt_tokens_csv.empty() ? 1 : 0) + (!prompt_text.empty() ? 1 : 0) + (!prompt_file_path.empty() ? 1 : 0) +
+      (!chat_user_text.empty() ? 1 : 0);
     if (prompt_modes > 1) {
-      std::cerr << "prompt parse failed: provide only one of --prompt-tokens, --prompt-text, or --chat-user.\n";
+      std::cerr << "prompt parse failed: provide only one of --prompt-tokens, --prompt-text, --prompt-file, or --chat-user.\n";
       return 11;
+    }
+    if (!prompt_file_path.empty()) {
+      if (!read_text_file(prompt_file_path, prompt_text, error_message)) {
+        std::cerr << "prompt file read failed: " << error_message << "\n";
+        return 11;
+      }
+      if (prompt_text.empty()) {
+        std::cerr << "prompt file read failed: prompt file is empty.\n";
+        return 11;
+      }
     }
     if (!chat_user_text.empty()) {
       prompt_text = "<|im_start|>user\n" + chat_user_text + "<|im_end|>\n<|im_start|>assistant\n";
@@ -427,8 +461,8 @@ int main(int argc, char ** argv) {
     }
     std::cout << "\n";
 
+    std::string generated_text;
     if (has_tokenizer) {
-      std::string generated_text;
       if (tokenizer.decode(infer_result.generated_tokens, generated_text, error_message)) {
         std::cout << "  generated_text: " << generated_text << "\n";
       } else {
@@ -440,6 +474,7 @@ int main(int argc, char ** argv) {
             profile_json_path,
             infer_options,
             infer_result,
+            generated_text,
             infer_options.use_cuda ? "cuda-hybrid" : "cpu-reference",
             gpu_decode_backend_name(infer_options.gpu_decode_backend),
             error_message)) {

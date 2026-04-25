@@ -72,8 +72,6 @@ bool run_luce_qwen35_inference(
   DecodeProfilingAccumulator profiling;
   profiling.forward_pass_tokens = static_cast<int>(options.prompt_tokens.size());
 
-  const auto decode_start = std::chrono::steady_clock::now();
-
   int first_token = 0;
   const auto prefill_start = std::chrono::steady_clock::now();
   if (options.luce_prefill_mode == LucePrefillMode::batched) {
@@ -114,6 +112,7 @@ bool run_luce_qwen35_inference(
 
   result.generated_tokens.reserve(static_cast<std::size_t>(options.max_new_tokens));
 
+  const auto decode_start = std::chrono::steady_clock::now();
   int current = first_token;
   int position = static_cast<int>(options.prompt_tokens.size());
   for (int i = 0; i < options.max_new_tokens; ++i) {
@@ -349,7 +348,6 @@ bool run_reference_qwen35_inference(
   const auto load_end = std::chrono::steady_clock::now();
   result.load_time_ms = std::chrono::duration<double, std::milli>(load_end - load_start).count();
 
-  const auto decode_start = std::chrono::steady_clock::now();
   if (options.use_cuda) {
     cuda::reset_transfer_stats();
   }
@@ -474,6 +472,7 @@ bool run_reference_qwen35_inference(
   }
 
   result.generated_tokens.reserve(static_cast<std::size_t>(options.max_new_tokens));
+  const auto decode_start = std::chrono::steady_clock::now();
   if (use_cuda_gpu_sampling) {
     const bool defer_stop_checks = stop_token_set.empty() && options.stop_token_sequences.empty();
     if (defer_stop_checks) {
