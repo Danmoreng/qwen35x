@@ -12,6 +12,7 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
+#include <cfloat>
 #include <vector>
 
 constexpr int HIDDEN = 1024;
@@ -49,6 +50,9 @@ struct ProfileEvent {
 
 __device__ __forceinline__ float pf_warp_sum(float v) {
     for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffff, v, o); return v;
+}
+__device__ __forceinline__ float pf_warp_max(float v) {
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_down_sync(0xffffffff, v, o)); return v;
 }
 __device__ __forceinline__ float pf_silu(float x) { return x / (1.0f + expf(-x)); }
 
@@ -462,6 +466,89 @@ __global__ void pf_causal_attn(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
     for(int e=0;e<EPL;e++){int i=lid*EPL+e;float g=1.f/(1.f+expf(-__bfloat162float(gv[i])));ov[i]=__float2bfloat16(oa[e]*rs*g);}
 }
 
+__global__ void pf_causal_softmax_to_bf16(
+    const float *scores,
+    __nv_bfloat16 *probs,
+    int q_start,
+    int rows,
+    int key_count,
+    int stride)
+{
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    int tid = threadIdx.x;
+    int wid = tid / 32;
+    int lid = tid % 32;
+    int q_pos = q_start + row;
+    const float scale = 1.0f / sqrtf(float(FA_HEAD_DIM));
+    const float *score_row = scores + row * stride;
+    __nv_bfloat16 *prob_row = probs + row * stride;
+
+    float local_max = -FLT_MAX;
+    for (int k = tid; k < key_count; k += blockDim.x) {
+        const float score = (k <= q_pos) ? (score_row[k] * scale) : -FLT_MAX;
+        local_max = fmaxf(local_max, score);
+    }
+    local_max = pf_warp_max(local_max);
+    __shared__ float warp_vals[32];
+    if (lid == 0) warp_vals[wid] = local_max;
+    __syncthreads();
+    float row_max = -FLT_MAX;
+    if (wid == 0) {
+        row_max = (lid < blockDim.x / 32) ? warp_vals[lid] : -FLT_MAX;
+        row_max = pf_warp_max(row_max);
+        if (lid == 0) warp_vals[0] = row_max;
+    }
+    __syncthreads();
+    row_max = warp_vals[0];
+
+    float local_sum = 0.0f;
+    for (int k = tid; k < key_count; k += blockDim.x) {
+        if (k <= q_pos) {
+            local_sum += expf(score_row[k] * scale - row_max);
+        }
+    }
+    local_sum = pf_warp_sum(local_sum);
+    if (lid == 0) warp_vals[wid] = local_sum;
+    __syncthreads();
+    float row_sum = 0.0f;
+    if (wid == 0) {
+        row_sum = (lid < blockDim.x / 32) ? warp_vals[lid] : 0.0f;
+        row_sum = pf_warp_sum(row_sum);
+        if (lid == 0) warp_vals[0] = row_sum;
+    }
+    __syncthreads();
+    row_sum = warp_vals[0];
+    const float inv_sum = row_sum > 0.0f ? (1.0f / row_sum) : 0.0f;
+
+    for (int k = tid; k < key_count; k += blockDim.x) {
+        float p = 0.0f;
+        if (k <= q_pos) {
+            p = expf(score_row[k] * scale - row_max) * inv_sum;
+        }
+        prob_row[k] = __float2bfloat16(p);
+    }
+}
+
+__global__ void pf_apply_attention_gate_bf16(
+    const float *attn,
+    const __nv_bfloat16 *q,
+    __nv_bfloat16 *out,
+    int q_start,
+    int rows,
+    int q_head)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * FA_HEAD_DIM;
+    if (idx >= total) return;
+    int row = idx / FA_HEAD_DIM;
+    int d = idx % FA_HEAD_DIM;
+    const __nv_bfloat16 *gate = q + (q_start + row) * FA_QPROJ_SIZE + q_head * FA_HEAD_DIM * 2 + FA_HEAD_DIM;
+    __nv_bfloat16 *out_row = out + (q_start + row) * FA_Q_SIZE + q_head * FA_HEAD_DIM;
+    float g = 1.0f / (1.0f + expf(-__bfloat162float(gate[d])));
+    out_row[d] = __float2bfloat16(attn[row * FA_HEAD_DIM + d] * g);
+}
+
 // Final norm
 __global__ void pf_final_norm(const __nv_bfloat16 *hidden, const __nv_bfloat16 *w,
     float *normed, __nv_bfloat16 *hidden_out, int S) {
@@ -520,6 +607,114 @@ static void cublas_bf16_gemm(cublasHandle_t h,
         &alpha, B, CUDA_R_16BF, K, A, CUDA_R_16BF, K,
         &beta_val, C, CUDA_R_16BF, N,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
+
+static void cublas_bf16_qk_scores(
+    cublasHandle_t h,
+    const __nv_bfloat16 *q,
+    int q_stride,
+    const __nv_bfloat16 *k,
+    int k_stride,
+    float *scores,
+    int rows,
+    int key_count,
+    int dim)
+{
+    float alpha = 1.0f, beta_val = 0.0f;
+    cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, key_count, rows, dim,
+        &alpha, k, CUDA_R_16BF, k_stride, q, CUDA_R_16BF, q_stride,
+        &beta_val, scores, CUDA_R_32F, key_count,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
+
+static void cublas_bf16_probs_v(
+    cublasHandle_t h,
+    const __nv_bfloat16 *probs,
+    int prob_stride,
+    const __nv_bfloat16 *v,
+    int v_stride,
+    float *out,
+    int rows,
+    int key_count,
+    int dim)
+{
+    float alpha = 1.0f, beta_val = 0.0f;
+    cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, dim, rows, key_count,
+        &alpha, v, CUDA_R_16BF, v_stride, probs, CUDA_R_16BF, prob_stride,
+        &beta_val, out, CUDA_R_32F, dim,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
+
+static void pf_causal_attn_tiled_cublas(
+    cublasHandle_t h,
+    const __nv_bfloat16 *q,
+    const __nv_bfloat16 *k,
+    const __nv_bfloat16 *v,
+    __nv_bfloat16 *prob_scratch,
+    float *score_scratch,
+    float *attn_scratch,
+    __nv_bfloat16 *out,
+    int S,
+    cudaStream_t stream)
+{
+    constexpr int kQueryBlock = 2048;
+    constexpr int kSoftmaxThreads = 256;
+    constexpr int kGateThreads = 256;
+
+    if (S < 1024) {
+        pf_causal_attn<<<(S * FA_Q_HEADS + 15) / 16, 512, 0, stream>>>(q, k, v, out, S);
+        return;
+    }
+
+    for (int qh = 0; qh < FA_Q_HEADS; ++qh) {
+        const int kvh = qh / FA_GQA;
+        const __nv_bfloat16 *k_head = k + kvh * FA_HEAD_DIM;
+        const __nv_bfloat16 *v_head = v + kvh * FA_HEAD_DIM;
+
+        for (int q0 = 0; q0 < S; q0 += kQueryBlock) {
+            const int rows = min(kQueryBlock, S - q0);
+            const int key_count = q0 + rows;
+            const __nv_bfloat16 *q_head = q + q0 * FA_QPROJ_SIZE + qh * FA_HEAD_DIM * 2;
+
+            cublas_bf16_qk_scores(
+                h,
+                q_head,
+                FA_QPROJ_SIZE,
+                k_head,
+                FA_KV_SIZE,
+                score_scratch,
+                rows,
+                key_count,
+                FA_HEAD_DIM);
+
+            pf_causal_softmax_to_bf16<<<rows, kSoftmaxThreads, 0, stream>>>(
+                score_scratch,
+                prob_scratch,
+                q0,
+                rows,
+                key_count,
+                key_count);
+
+            cublas_bf16_probs_v(
+                h,
+                prob_scratch,
+                key_count,
+                v_head,
+                FA_KV_SIZE,
+                attn_scratch,
+                rows,
+                key_count,
+                FA_HEAD_DIM);
+
+            pf_apply_attention_gate_bf16<<<(rows * FA_HEAD_DIM + kGateThreads - 1) / kGateThreads, kGateThreads, 0, stream>>>(
+                attn_scratch,
+                q,
+                out,
+                q0,
+                rows,
+                qh);
+        }
+    }
 }
 
 // ===== Main orchestrator =====
@@ -757,8 +952,17 @@ extern "C" void launch_prefill_bf16(
             });
 
             profile_phase(layer_profile ? &layer_profile->attention_ms : nullptr, [&]() {
-                pf_causal_attn<<<(S*FA_Q_HEADS+15)/16, 512, 0, stream>>>(
-                    proj_buf, proj_buf2, attn_buf, dn_out_buf, S);
+                pf_causal_attn_tiled_cublas(
+                    cublas,
+                    proj_buf,
+                    proj_buf2,
+                    attn_buf,
+                    mlp_buf,
+                    dn_qkv_f32,
+                    dn_out_f32,
+                    dn_out_buf,
+                    S,
+                    stream);
             });
 
             profile_phase(layer_profile ? &layer_profile->out_projection_ms : nullptr, [&]() {
