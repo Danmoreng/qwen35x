@@ -19,6 +19,9 @@ Completed:
 - Luce megakernel decode backend integrated into `--infer-gpu` as the default Qwen3.5-0.8B decode path
 - Luce CUDA sources used by the build moved into `src/kernels/cuda/luce_megakernel/` with local correctness fixes and MIT attribution
 - Batched Luce prefill integrated as the default prompt-processing path, including a backend warmup during initialization to remove one-time CUDA/cuBLAS setup from timed inference
+- Luce prefill/decode phase profiling, including per-layer full-attention QK/softmax/PV/gate timing
+- Long-context full-attention decode split across context blocks
+- Single-path tiled full-attention prefill using the existing canonical cache/state layout
 - Deterministic CPU/GPU parity harness with minimal and extended prompt suites
 - Optional PyTorch/Transformers parity harness for checking the CPU reference against an external implementation
 
@@ -33,10 +36,13 @@ Current known constraints:
 
 Latest local benchmark snapshot (Qwen3.5-0.8B, same machine):
 - Long-context actual-prompt benchmark (April 25, 2026, Wikipedia prompt, ~65k prompt tokens, `MaxContext=65536`, `MaxNewTokens=128`):
-  - Current integrated Luce path: prefill `64,195.49 ms` / `1,018.84 tok/s`; decode `5,956.93 ms` / reported `21.49 tok/s`, CSV `benchmarks/qwen35x-wiki-ai-64k-gen128-rerun.csv`.
+  - Current integrated Luce path after profiling, split decode attention, and single-path tiled prefill tuning: prefill `8,345.21 ms` / `7,837.43 tok/s`; decode `1,239.05 ms` / `103.31 tok/s`, CSV `benchmarks/qwen35x-wiki-ai-64k-gen128-luce-prefill-single-path.csv`.
+  - Full-attention prefill attention subphase split: total attention `4,740.27 ms`; QK `1,707.29 ms`, softmax `1,676.92 ms`, PV `1,334.91 ms`, gate `15.46 ms`.
   - llama.cpp `llama-completion` without Flash Attention: prefill `12,181.78 ms` / `5,369.00 tok/s`; decode `907.89 ms` / `139.88 tok/s`, CSV `benchmarks/llama-cli/qwen35x-wiki-ai-64k-gen128.csv`.
   - llama.cpp `llama-completion` with Flash Attention: prefill `6,979.29 ms` / `9,371.15 tok/s`; decode `767.73 ms` / `165.42 tok/s`, CSV `benchmarks/llama-cli/qwen35x-wiki-ai-64k-gen128.csv`.
-  - Interpretation: the current Luce path remains strong at short context, but its long-context kernels are now the highest-priority bottleneck.
+  - Interpretation: Luce long-context prefill is now faster than llama.cpp without Flash Attention but remains behind llama.cpp with Flash Attention; decode is still behind both llama.cpp modes at 64k.
+- Current short-context gate after the single-path prefill cleanup (April 25, 2026, `Runs=3`, `WarmupRuns=1`, `MaxContext=256`, `MaxNewTokens=128`):
+  - `chat_short_joke/gen128` generation avg `274.30 tok/s` (`275.22`, `268.66`, `279.03` samples), CSV `benchmarks/qwen35x-short-gen128-luce-prefill-single-path.csv`.
 - Current integrated Luce benchmark (April 24, 2026, `Runs=3`, `WarmupRuns=1`):
   - `pp256` prefill-only: avg `19,739.13 tok/s` (`20,112.19`, `18,994.76`, `20,110.50` samples), CSV `benchmarks/qwen35x-pp256-prefill-only-current-rerun.csv`
   - `prompt1/gen128` generation: avg `300.46 tok/s` (`317.89`, `312.77`, `270.72` samples), CSV `benchmarks/qwen35x-tg-prompt1-current-rerun.csv`
@@ -132,22 +138,23 @@ This is the next work item and takes precedence over larger-model generalization
 
 Rationale:
 - The 64k actual-prompt benchmark shows llama.cpp is substantially faster than the current Luce path for both prefill and generation.
-- The bottlenecks are structural rather than specific to the 0.8B model size: naive full-attention prefill, under-parallelized long-context decode attention, inefficient small recurrent projections during prefill, and missing decode graph reuse in the Luce path.
+- The bottlenecks are structural rather than specific to the 0.8B model size: the current materialized full-attention prefill path still spends seconds across QK/softmax/PV at 64k, long-context decode still trails llama.cpp, prefill beta/alpha projections remain inefficient, and the Luce path still lacks compatible steady-state decode graph reuse.
 - Generalizing the current kernels to larger Qwen3.5 variants before fixing these issues would mostly generalize a long-context design that already fails the target performance shape.
 
 Required work before model-size generalization:
 1. Add Luce phase profiling for prefill and decode
 - Capture per-layer and per-phase timings for projection, DeltaNet recurrence, full-attention QKV/cache work, attention scan, MLP, LM head, sampling, synchronization, and host/device transfers.
-- Make the profiler usable on both short-context progress gates and 64k actual-prompt runs.
+- Current status: implemented for Luce prefill/decode and used on both short-context progress gates and 64k actual-prompt runs.
 
 2. Fix long-context full-attention prefill
-- Replace the current naive causal full-attention prefill kernel with a tiled/flash-style implementation for the six full-attention layers.
+- Current status: replaced the naive causal full-attention prefill fallback with one tiled cuBLAS-backed path for all prompt lengths, using larger scratch-safe tiles, 512-thread softmax, fast exponentials, and full QK/softmax/PV/gate profiling.
+- Next step: replace the materialized score/probability tiled path with one unified fused/flash-style implementation; do not add prompt-length-specific kernel dispatch.
 - Preserve the existing canonical KV cache layout so prefill still hands off directly to decode.
-- Benchmark both Flash-Attention-like and non-FA comparison modes against llama.cpp.
+- Continue benchmarking against llama.cpp with and without Flash Attention.
 
 3. Fix long-context decode attention
-- Split full-attention decode work across context blocks and reduce partial results per query head, instead of assigning only a small number of blocks to scan the whole KV cache.
-- Retune `decode_blocks` after split-context decode is available.
+- Current status: split-context full-attention decode is implemented and improves the 64k generation path materially from the initial long-context Luce baseline.
+- Retune `decode_blocks` and reduction geometry after the next prefill changes stabilize.
 - Keep short-context decode throughput from regressing.
 
 4. Replace inefficient long-prefill recurrent projections
@@ -192,16 +199,17 @@ Execution phases:
 1. Stabilize and instrument runtime baseline
 - Keep persistent, device-resident decode flow as the default path.
 - Preserve deterministic correctness against CPU reference for fixed prompts/seeds.
-- Add detailed Luce phase profiling before making further long-context kernel changes.
+- Detailed Luce phase profiling is available and should remain enabled for long-context performance work.
 
 2. Long-context decode optimization track
-- Add split-context/split-K full-attention decode for long contexts.
+- Split-context/split-K full-attention decode for long contexts has landed.
 - Retune decode occupancy controls (`decode_blocks`, launch geometry) per GPU profile after split-context decode lands.
 - Add compatible CUDA graph reuse for steady-state decode.
 - Keep short-prompt decode throughput as a non-regression gate.
 
 3. Long-context prefill optimization track
-- Replace naive full-attention prefill with tiled/flash-style block processing.
+- The current full-attention prefill path is a single tiled cuBLAS-backed implementation for all prompt lengths.
+- Replace the materialized score/probability path with one unified fused/flash-style block implementation.
 - Replace beta/alpha per-token scalar matvec launches with packed GEMM or a comparable batched path.
 - Continue reducing linear-attention recurrence overhead and prefill kernel launch count.
 - Minimize copy traffic and avoid any prompt replay or prefill/decode state conversion.
@@ -211,7 +219,7 @@ Execution phases:
 - Keep sampling fully device-resident and remove avoidable host-side sync points.
 
 5. Unified scheduler and fallback policy
-- Use one scheduler that chooses optimized paths by workload shape (prompt length, batch shape, model size, GPU profile).
+- Keep the Luce default path free of prompt-length-specific kernel dispatch; use specialized variants by model/GPU capability only when they preserve the same execution policy.
 - Keep safe fallback paths for short prompts and unsupported configurations.
 
 Benchmark gates:
@@ -259,7 +267,7 @@ Adaptation approach:
 5. Make prefill descriptor-driven first
 - Prefill should lean on cuBLAS/cuBLASLt GEMM with descriptor-driven `M/N/K` dimensions.
 - Custom prefill kernels should specialize mostly on head dimension, RoPE layout, and DeltaNet state shape.
-- Add flash-style block full-attention prefill before promoting long-context larger-model support.
+- Replace the current materialized full-attention prefill path with a unified fused/flash-style implementation before promoting long-context larger-model support.
 - Chunk prefill scratch by prompt length and available VRAM instead of allocating all scratch from `max_context * largest_dim`.
 
 6. Expand memory strategy for larger models
@@ -290,9 +298,10 @@ Validation policy for each new size:
   Current status: `--luce-prefill-mode batched` is the default after sampler/cache-stride fixes, batched recurrence work, and CPU/GPU parity validation.
 - [x] Remove prompt-replay and token-wise projection/copy overhead in prefill; use batched projection execution with direct state/cache handoff.
 - [x] Warm the Luce prefill backend during initialization and reset state before real inference, keeping one-time cuBLAS/kernel setup out of timed prefill.
-- [ ] Add detailed Luce phase profiling for prefill and decode, including long-context 64k runs.
-- [ ] Replace naive full-attention prefill with tiled/flash-style block attention for long prompts.
-- [ ] Add split-context/split-K full-attention decode for long-context generation.
+- [x] Add detailed Luce phase profiling for prefill and decode, including long-context 64k runs.
+- [x] Replace naive full-attention prefill with a single tiled full-attention path for all prompt lengths.
+- [ ] Replace the materialized tiled full-attention prefill path with a unified fused/flash-style implementation.
+- [x] Add split-context/split-K full-attention decode for long-context generation.
 - [ ] Replace prefill beta/alpha scalar matvec launches with packed GEMM or another batched tensor-core path.
 - [ ] Add compatible steady-state decode graph reuse for the Luce path.
 - [ ] Run prompt-length sweep benchmarks (short/medium/long/64k) after each major long-context optimization batch.

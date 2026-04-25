@@ -31,6 +31,7 @@ The goal is not a generic multi-model runtime. The goal is a small, hardware-awa
 - BF16 tensor benchmark path (`--bench-bf16`)
 - Profiling output via `--profile-json` (stage timings + H2D/D2H transfer stats)
 - Optional synchronized CUDA stage timing via `--profile-sync`
+- Optional Luce phase profiling via `--luce-profile`, including full-attention prefill QK/softmax/PV/gate timing
 - Optional PyTorch/Transformers parity oracle for checking the local CPU reference against an external implementation
 
 Current GPU sampling constraint:
@@ -81,7 +82,25 @@ Current decode control behavior:
 
 ## Performance Snapshot
 
-Latest local integrated Luce benchmark snapshot (April 24, 2026, Qwen3.5-0.8B, RTX 5080 Laptop GPU):
+Latest local long-context Luce benchmark snapshot (April 25, 2026, Qwen3.5-0.8B, RTX 5080 Laptop GPU):
+
+| Workload | qwen35x | llama.cpp | llama.cpp + FA | CSV |
+|---|---:|---:|---:|---|
+| 64k Wikipedia prompt prefill | `7,837.43 tok/s` (`8,345.21 ms`) | `5,369.00 tok/s` (`12,181.78 ms`) | `9,371.15 tok/s` (`6,979.29 ms`) | `benchmarks/qwen35x-wiki-ai-64k-gen128-luce-prefill-single-path.csv` |
+| 64k Wikipedia prompt generation | `103.31 tok/s` (`1,239.05 ms`) | `139.88 tok/s` (`907.89 ms`) | `165.42 tok/s` (`767.73 ms`) | `benchmarks/qwen35x-wiki-ai-64k-gen128-luce-prefill-single-path.csv` |
+
+The current Luce long-context prefill path is a single tiled full-attention implementation for all prompt lengths. It is now faster than llama.cpp without Flash Attention on 64k prefill, but still trails llama.cpp with Flash Attention; 64k decode remains behind both llama.cpp modes.
+
+Full-attention prefill subphase split for the current 64k run:
+
+| Subphase | Time |
+|---|---:|
+| QK | `1,707.29 ms` |
+| Softmax | `1,676.92 ms` |
+| PV | `1,334.91 ms` |
+| Gate | `15.46 ms` |
+
+Latest local short-context integrated Luce benchmark snapshot (April 24-25, 2026, Qwen3.5-0.8B, RTX 5080 Laptop GPU):
 
 | Workload | qwen35x avg | Samples | CSV |
 |---|---:|---|---|
@@ -89,6 +108,7 @@ Latest local integrated Luce benchmark snapshot (April 24, 2026, Qwen3.5-0.8B, R
 | `prompt1/gen128` generation | `300.46 tok/s` | `317.89`, `312.77`, `270.72` | `benchmarks/qwen35x-tg-prompt1-current-rerun.csv` |
 | `pp256/gen128`, `MaxContext=384`, prefill | `18,915.00 tok/s` | end-to-end run | `benchmarks/qwen35x-full-pp256-gen128-current-ctx384.csv` |
 | `pp256/gen128`, `MaxContext=384`, generation | `302.38 tok/s` | end-to-end run | `benchmarks/qwen35x-full-pp256-gen128-current-ctx384.csv` |
+| `chat_short_joke/gen128`, single-path prefill cleanup | `274.30 tok/s` | `275.22`, `268.66`, `279.03` | `benchmarks/qwen35x-short-gen128-luce-prefill-single-path.csv` |
 
 Comparison against saved llama.cpp BF16 CUDA artifacts from the earlier local run:
 
@@ -121,7 +141,9 @@ It includes:
 Quick headline numbers from the latest comparison update:
 
 - Current qwen35x Luce default: `300.46 tok/s` generation and `19,739.13 tok/s` `pp256` prefill
+- Current qwen35x Luce 64k Wikipedia prompt: `7,837.43 tok/s` prefill and `103.31 tok/s` generation
 - llama.cpp BF16 + FA saved run: `142.59 tok/s` generation and `13,681.26 tok/s` `pp256` prefill
+- llama.cpp BF16 + FA 64k Wikipedia prompt: `9,371.15 tok/s` prefill and `165.42 tok/s` generation
 - Historical standalone Luce harness decode: `267.45 tok/s`
 
 Parity status (April 24, 2026):
