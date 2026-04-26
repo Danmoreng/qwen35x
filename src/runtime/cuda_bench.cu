@@ -374,6 +374,72 @@ __global__ void nvfp4_mma_sync_mxf4nvf4_projection_kernel(
 #endif
 }
 
+__global__ void nvfp4_sm120_pack_activation_fragments_kernel(
+  const float * input,
+  float input_scale,
+  std::uint32_t * a_fragments,
+  std::uint32_t * a_scales,
+  int cols,
+  int k_blocks) {
+  const int kb = blockIdx.x;
+  const int lane = threadIdx.x & 31;
+  if (kb >= k_blocks) {
+    return;
+  }
+
+  const int lane_in_quad = lane & 3;
+  float group_max[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  for (int group = 0; group < 4; ++group) {
+    float local = 0.0f;
+    const int group_base = kb * 64 + group * 16;
+    for (int i = lane; i < 16; i += 32) {
+      const int col = group_base + i;
+      if (col < cols) {
+        local = fmaxf(local, fabsf(input[col] * input_scale));
+      }
+    }
+    if (lane >= 16) {
+      local = 0.0f;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      local = fmaxf(local, __shfl_down_sync(0xffffffffu, local, offset));
+    }
+    group_max[group] = __shfl_sync(0xffffffffu, local, 0);
+  }
+
+  std::uint8_t scale_bytes[4];
+  float decoded_scales[4];
+#pragma unroll
+  for (int group = 0; group < 4; ++group) {
+    const float scale = fmaxf(group_max[group] / 6.0f, 1.0e-8f);
+    scale_bytes[group] = encode_ue4m3_scale_device(scale);
+    decoded_scales[group] = fmaxf(decode_e4m3_device(scale_bytes[group]), 1.0e-8f);
+  }
+  a_scales[static_cast<std::size_t>(kb) * 32 + lane] =
+    static_cast<std::uint32_t>(scale_bytes[0]) |
+    (static_cast<std::uint32_t>(scale_bytes[1]) << 8u) |
+    (static_cast<std::uint32_t>(scale_bytes[2]) << 16u) |
+    (static_cast<std::uint32_t>(scale_bytes[3]) << 24u);
+
+  std::uint32_t regs[4] = {0, 0, 0, 0};
+  for (int i = 0; i < 32; ++i) {
+    const int col_offset = lane_in_quad * 8 + (i & 7) + (i >= 16 ? 32 : 0);
+    const int group = col_offset / 16;
+    const int col = kb * 64 + col_offset;
+    float value = 0.0f;
+    if (col < cols) {
+      value = input[col] * input_scale;
+    }
+    const std::uint8_t nibble = encode_nvfp4_e2m1_device(value / decoded_scales[group]);
+    regs[i / 8] |= static_cast<std::uint32_t>(nibble & 0xfu) << ((i & 7) * 4);
+  }
+  std::uint32_t * out = a_fragments + (static_cast<std::size_t>(kb) * 32 + lane) * 4;
+  out[0] = regs[0];
+  out[1] = regs[1];
+  out[2] = regs[2];
+  out[3] = regs[3];
+}
+
 bool check_cuda(cudaError_t status, const char * step, std::string & error_message) {
   if (status == cudaSuccess) {
     return true;
@@ -586,104 +652,94 @@ bool run_nvfp4_blackwell_fp4_projection_benchmark(
   std::uint32_t * device_b_fragments = nullptr;
   std::uint32_t * device_a_scales = nullptr;
   std::uint32_t * device_b_scales = nullptr;
+  float * device_input = nullptr;
   float * device_output = nullptr;
   if (!check_cuda(cudaMalloc(&device_a_fragments, host_a_fragments.size() * sizeof(std::uint32_t)), "cudaMalloc SM120 FP4 A fragments", error_message) ||
       !check_cuda(cudaMalloc(&device_b_fragments, host_b_fragments.size() * sizeof(std::uint32_t)), "cudaMalloc SM120 FP4 B fragments", error_message) ||
       !check_cuda(cudaMalloc(&device_a_scales, host_a_scales.size() * sizeof(std::uint32_t)), "cudaMalloc SM120 FP4 A scales", error_message) ||
       !check_cuda(cudaMalloc(&device_b_scales, host_b_scales.size() * sizeof(std::uint32_t)), "cudaMalloc SM120 FP4 B scales", error_message) ||
+      !check_cuda(cudaMalloc(&device_input, input.size() * sizeof(float)), "cudaMalloc SM120 FP4 input", error_message) ||
       !check_cuda(cudaMalloc(&device_output, static_cast<std::size_t>(rows) * sizeof(float)), "cudaMalloc SM120 FP4 projection output", error_message)) {
     cudaFree(device_a_fragments);
     cudaFree(device_b_fragments);
     cudaFree(device_a_scales);
     cudaFree(device_b_scales);
+    cudaFree(device_input);
     cudaFree(device_output);
     return false;
   }
   if (!check_cuda(cudaMemcpy(device_a_fragments, host_a_fragments.data(), host_a_fragments.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice), "cudaMemcpy SM120 FP4 A fragments", error_message) ||
       !check_cuda(cudaMemcpy(device_b_fragments, host_b_fragments.data(), host_b_fragments.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice), "cudaMemcpy SM120 FP4 B fragments", error_message) ||
       !check_cuda(cudaMemcpy(device_a_scales, host_a_scales.data(), host_a_scales.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice), "cudaMemcpy SM120 FP4 A scales", error_message) ||
-      !check_cuda(cudaMemcpy(device_b_scales, host_b_scales.data(), host_b_scales.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice), "cudaMemcpy SM120 FP4 B scales", error_message)) {
+      !check_cuda(cudaMemcpy(device_b_scales, host_b_scales.data(), host_b_scales.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice), "cudaMemcpy SM120 FP4 B scales", error_message) ||
+      !check_cuda(cudaMemcpy(device_input, input.data(), input.size() * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy SM120 FP4 input", error_message)) {
     cudaFree(device_a_fragments);
     cudaFree(device_b_fragments);
     cudaFree(device_a_scales);
     cudaFree(device_b_scales);
+    cudaFree(device_input);
     cudaFree(device_output);
     return false;
   }
-
   auto cleanup = [&]() {
     cudaFree(device_a_fragments);
     cudaFree(device_b_fragments);
     cudaFree(device_a_scales);
     cudaFree(device_b_scales);
+    cudaFree(device_input);
     if (device_output != nullptr) {
       cudaFree(device_output);
     }
   };
 
-  cudaEvent_t start = nullptr;
-  cudaEvent_t stop = nullptr;
-  if (!check_cuda(cudaEventCreate(&start), "cudaEventCreate start", error_message) ||
-      !check_cuda(cudaEventCreate(&stop), "cudaEventCreate stop", error_message)) {
-    if (start != nullptr) {
-      cudaEventDestroy(start);
-    }
-    if (stop != nullptr) {
-      cudaEventDestroy(stop);
-    }
-    cleanup();
-    return false;
-  }
-
   for (int i = 0; i < warmup_iterations; ++i) {
-    nvfp4_mma_sync_mxf4nvf4_projection_kernel<<<row_tiles, 32>>>(
-      device_a_fragments, device_b_fragments, device_a_scales, device_b_scales, device_output, rows, k_blocks);
+    if (!run_nvfp4_sm120_projection_device(
+          device_input,
+          device_b_fragments,
+          device_b_scales,
+          input_scale,
+          rows,
+          cols,
+          row_tiles,
+          k_blocks,
+          device_a_fragments,
+          device_a_scales,
+          device_output,
+          nullptr,
+          error_message)) {
+      cleanup();
+      return false;
+    }
   }
-  if (!check_cuda(cudaGetLastError(), "launch synthetic SM120 FP4 warmup probe", error_message) ||
-      !check_cuda(cudaDeviceSynchronize(), "synchronize synthetic SM120 FP4 warmup probe", error_message)) {
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-    cleanup();
-    return false;
-  }
-
-  if (!check_cuda(cudaEventRecord(start), "cudaEventRecord start", error_message)) {
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-    cleanup();
-    return false;
-  }
+  double total_ms = 0.0;
   for (int i = 0; i < benchmark_iterations; ++i) {
-    nvfp4_mma_sync_mxf4nvf4_projection_kernel<<<row_tiles, 32>>>(
-      device_a_fragments, device_b_fragments, device_a_scales, device_b_scales, device_output, rows, k_blocks);
-  }
-  if (!check_cuda(cudaGetLastError(), "launch synthetic SM120 FP4 benchmark probe", error_message) ||
-      !check_cuda(cudaEventRecord(stop), "cudaEventRecord stop", error_message) ||
-      !check_cuda(cudaEventSynchronize(stop), "cudaEventSynchronize stop", error_message)) {
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-    cleanup();
-    return false;
-  }
-
-  float elapsed_ms = 0.0f;
-  if (!check_cuda(cudaEventElapsedTime(&elapsed_ms, start, stop), "cudaEventElapsedTime", error_message)) {
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-    cleanup();
-    return false;
+    double elapsed = 0.0;
+    if (!run_nvfp4_sm120_projection_device(
+          device_input,
+          device_b_fragments,
+          device_b_scales,
+          input_scale,
+          rows,
+          cols,
+          row_tiles,
+          k_blocks,
+          device_a_fragments,
+          device_a_scales,
+          device_output,
+          &elapsed,
+          error_message)) {
+      cleanup();
+      return false;
+    }
+    total_ms += elapsed;
   }
 
   std::vector<float> host_output(static_cast<std::size_t>(rows), 0.0f);
   if (!check_cuda(cudaMemcpy(host_output.data(), device_output, host_output.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy synthetic SM120 FP4 probe output", error_message)) {
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
     cleanup();
     return false;
   }
 
-  cudaEventDestroy(start);
-  cudaEventDestroy(stop);
   cleanup();
 
   if (host_output[0] < 0.0f) {
@@ -692,7 +748,7 @@ bool run_nvfp4_blackwell_fp4_projection_benchmark(
     return false;
   }
 
-  avg_iteration_ms = static_cast<double>(elapsed_ms) / static_cast<double>(benchmark_iterations);
+  avg_iteration_ms = total_ms / static_cast<double>(benchmark_iterations);
   max_abs_error = 0.0;
   const int check_rows = std::min(rows, 64);
   for (int row = 0; row < check_rows; ++row) {
@@ -782,8 +838,12 @@ bool run_cublaslt_fp4_projection(
   cudaEvent_t start_event = nullptr;
   cudaEvent_t stop_event = nullptr;
   auto cleanup_events = [&]() {
-    cudaEventDestroy(start_event);
-    cudaEventDestroy(stop_event);
+    if (start_event != nullptr) {
+      cudaEventDestroy(start_event);
+    }
+    if (stop_event != nullptr) {
+      cudaEventDestroy(stop_event);
+    }
   };
 
   if (!plan.initialized || plan.rows != rows || plan.cols != cols) {
@@ -910,6 +970,94 @@ std::vector<std::uint8_t> swap_fp4_nibbles(const std::uint8_t * data, const std:
 }
 
 } // namespace
+
+bool run_nvfp4_sm120_projection_device(
+  const float * input_f32,
+  const std::uint32_t * packed_weight_fragments,
+  const std::uint32_t * weight_scale_fragments,
+  float input_scale,
+  int rows,
+  int cols,
+  int row_tiles,
+  int k_blocks,
+  std::uint32_t * activation_fragment_scratch,
+  std::uint32_t * activation_scale_scratch,
+  float * output_f32,
+  double * elapsed_ms,
+  std::string & error_message) {
+  if (input_f32 == nullptr || packed_weight_fragments == nullptr || weight_scale_fragments == nullptr ||
+      activation_fragment_scratch == nullptr || activation_scale_scratch == nullptr || output_f32 == nullptr) {
+    error_message = "SM120 FP4 projection received a null device pointer.";
+    return false;
+  }
+  if (rows <= 0 || cols <= 0 || (cols % 64) != 0 || row_tiles != (rows + 7) / 8 || k_blocks != cols / 64) {
+    error_message = "Invalid SM120 FP4 projection dimensions.";
+    return false;
+  }
+  int major = 0;
+  int minor = 0;
+  if (!query_device_compute_capability(major, minor, error_message)) {
+    return false;
+  }
+  if (!device_supports_sm120_mma_mxf4nvf4(major, minor)) {
+    error_message =
+      "SM120 FP4 projection requires the mma.sync.aligned kind::mxf4nvf4.block_scale path; current device is sm_" +
+      std::to_string(major) + std::to_string(minor) + ".";
+    return false;
+  }
+
+  cudaEvent_t start_event = nullptr;
+  cudaEvent_t stop_event = nullptr;
+  auto cleanup_events = [&]() {
+    cudaEventDestroy(start_event);
+    cudaEventDestroy(stop_event);
+  };
+  if (elapsed_ms != nullptr &&
+      (!check_cuda(cudaEventCreate(&start_event), "cudaEventCreate(sm120 start)", error_message) ||
+       !check_cuda(cudaEventCreate(&stop_event), "cudaEventCreate(sm120 stop)", error_message) ||
+       !check_cuda(cudaEventRecord(start_event), "cudaEventRecord(sm120 start)", error_message))) {
+    cleanup_events();
+    return false;
+  }
+
+  cudaGetLastError();
+  nvfp4_sm120_pack_activation_fragments_kernel<<<k_blocks, 32>>>(
+    input_f32,
+    input_scale,
+    activation_fragment_scratch,
+    activation_scale_scratch,
+    cols,
+    k_blocks);
+  if (!check_cuda(cudaGetLastError(), "launch SM120 FP4 activation fragment packing", error_message)) {
+    cleanup_events();
+    return false;
+  }
+  nvfp4_mma_sync_mxf4nvf4_projection_kernel<<<row_tiles, 32>>>(
+    activation_fragment_scratch,
+    packed_weight_fragments,
+    activation_scale_scratch,
+    weight_scale_fragments,
+    output_f32,
+    rows,
+    k_blocks);
+  if (!check_cuda(cudaGetLastError(), "launch SM120 FP4 projection", error_message) ||
+      !check_cuda(cudaDeviceSynchronize(), "synchronize SM120 FP4 projection", error_message)) {
+    cleanup_events();
+    return false;
+  }
+  if (elapsed_ms != nullptr) {
+    float elapsed = 0.0f;
+    if (!check_cuda(cudaEventRecord(stop_event), "cudaEventRecord(sm120 stop)", error_message) ||
+        !check_cuda(cudaEventSynchronize(stop_event), "cudaEventSynchronize(sm120 stop)", error_message) ||
+        !check_cuda(cudaEventElapsedTime(&elapsed, start_event, stop_event), "cudaEventElapsedTime(sm120)", error_message)) {
+      cleanup_events();
+      return false;
+    }
+    *elapsed_ms = static_cast<double>(elapsed);
+  }
+  cleanup_events();
+  return true;
+}
 
 bool run_bf16_matvec_benchmark(
   const std::vector<std::uint16_t> & weights,

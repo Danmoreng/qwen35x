@@ -66,6 +66,21 @@ bool run_nvfp4_cublaslt_projection_device(
   double * elapsed_ms,
   std::string & error_message);
 
+bool run_nvfp4_sm120_projection_device(
+  const float * input_f32,
+  const std::uint32_t * packed_weight_fragments,
+  const std::uint32_t * weight_scale_fragments,
+  float input_scale,
+  int rows,
+  int cols,
+  int row_tiles,
+  int k_blocks,
+  std::uint32_t * activation_fragment_scratch,
+  std::uint32_t * activation_scale_scratch,
+  float * output_f32,
+  double * elapsed_ms,
+  std::string & error_message);
+
 bool run_nvfp4_cublaslt_gate_up_silu_device(
   const float * input_f32,
   const std::uint8_t * gate_packed_weights_cublaslt,

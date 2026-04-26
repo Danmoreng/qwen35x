@@ -196,11 +196,15 @@ struct PackedNvfp4Weight {
   void * tc_packed_weight = nullptr;
   void * tc_weight_scale = nullptr;
   float * tc_alpha = nullptr;
+  void * sm120_packed_weight_fragments = nullptr;
+  void * sm120_weight_scale_fragments = nullptr;
   int output_size = 0;
   int input_size = 0;
   int padded_output_size = 0;
   int padded_scale_cols = 0;
   int weight_padding_cols = 0;
+  int sm120_row_tiles = 0;
+  int sm120_k_blocks = 0;
 };
 
 struct PackedLayerNvfp4Weights {
@@ -430,11 +434,15 @@ struct Nvfp4TensorDevice {
   void * tc_packed_weight = nullptr;
   void * tc_weight_scale = nullptr;
   float * tc_alpha = nullptr;
+  void * sm120_packed_weight_fragments = nullptr;
+  void * sm120_weight_scale_fragments = nullptr;
   int output_size = 0;
   int input_size = 0;
   int padded_output_size = 0;
   int padded_scale_cols = 0;
   int weight_padding_cols = 0;
+  int sm120_row_tiles = 0;
+  int sm120_k_blocks = 0;
 };
 
 struct Nvfp4BackendState {
@@ -753,6 +761,22 @@ bool upload_bytes_to_device(
     error_message);
 }
 
+bool upload_u32_to_device(
+  const std::vector<std::uint32_t> & host_data,
+  const std::string & label,
+  DeviceArena & arena,
+  void *& out_device_ptr,
+  std::string & error_message) {
+  const std::size_t bytes = host_data.size() * sizeof(std::uint32_t);
+  if (!arena.alloc_bytes(bytes, out_device_ptr, error_message)) {
+    return false;
+  }
+  return check_cuda(
+    cudaMemcpy(out_device_ptr, host_data.data(), bytes, cudaMemcpyHostToDevice),
+    "cudaMemcpy(H2D " + label + ")",
+    error_message);
+}
+
 bool upload_scalar_to_device(
   const float value,
   const std::string & label,
@@ -876,6 +900,71 @@ std::vector<std::uint8_t> swizzle_nvfp4_block_scale_for_tensor_core(
     }
   }
   return swizzled;
+}
+
+void set_packed_u4(std::uint32_t & word, const int nibble_index, const std::uint8_t nibble) {
+  const int shift = nibble_index * 4;
+  word = static_cast<std::uint32_t>((word & ~(0xfu << shift)) | ((static_cast<std::uint32_t>(nibble) & 0xfu) << shift));
+}
+
+std::vector<std::uint32_t> pack_nvfp4_weight_for_sm120_mma(
+  const std::vector<std::uint8_t> & packed_weight,
+  const int rows,
+  const int cols,
+  int & row_tiles,
+  int & k_blocks) {
+  row_tiles = (rows + 7) / 8;
+  k_blocks = cols / 64;
+  const int packed_cols = cols / 2;
+  std::vector<std::uint32_t> fragments(static_cast<std::size_t>(row_tiles) * k_blocks * 32 * 2, 0);
+  for (int row_tile = 0; row_tile < row_tiles; ++row_tile) {
+    for (int kb = 0; kb < k_blocks; ++kb) {
+      for (int lane = 0; lane < 32; ++lane) {
+        const int group_id = lane >> 2;
+        const int thread_id_in_group = lane & 3;
+        const int out_row = row_tile * 8 + group_id;
+        for (int i = 0; i < 16; ++i) {
+          const int k = kb * 64 + thread_id_in_group * 8 + (i & 7) + (i >= 8 ? 32 : 0);
+          std::uint8_t nibble = 0;
+          if (out_row < rows) {
+            const std::uint8_t packed = packed_weight[static_cast<std::size_t>(out_row) * packed_cols + k / 2];
+            nibble = (k & 1) == 0 ? (packed & 0x0fu) : (packed >> 4u);
+          }
+          set_packed_u4(
+            fragments[((static_cast<std::size_t>(row_tile) * k_blocks + kb) * 32 + lane) * 2 + i / 8],
+            i & 7,
+            nibble);
+        }
+      }
+    }
+  }
+  return fragments;
+}
+
+std::vector<std::uint32_t> pack_nvfp4_weight_scales_for_sm120_mma(
+  const std::vector<std::uint8_t> & weight_scale,
+  const int rows,
+  const int scale_cols,
+  const int row_tiles,
+  const int k_blocks) {
+  std::vector<std::uint32_t> fragments(static_cast<std::size_t>(row_tiles) * k_blocks * 32, 0);
+  for (int row_tile = 0; row_tile < row_tiles; ++row_tile) {
+    for (int kb = 0; kb < k_blocks; ++kb) {
+      for (int lane = 0; lane < 32; ++lane) {
+        const int group_id = lane >> 2;
+        const int out_row = row_tile * 8 + group_id;
+        std::uint32_t packed_scales = 0;
+        if (out_row < rows) {
+          for (int group = 0; group < 4; ++group) {
+            packed_scales |= static_cast<std::uint32_t>(
+              weight_scale[static_cast<std::size_t>(out_row) * scale_cols + kb * 4 + group]) << (group * 8u);
+          }
+        }
+        fragments[(static_cast<std::size_t>(row_tile) * k_blocks + kb) * 32 + lane] = packed_scales;
+      }
+    }
+  }
+  return fragments;
 }
 
 bool load_raw_tensor_to_device(
@@ -1410,6 +1499,21 @@ bool load_modelopt_nvfp4_state(
       padded_scale_cols);
     (void)padded_scale_rows;
 
+    int sm120_row_tiles = 0;
+    int sm120_k_blocks = 0;
+    std::vector<std::uint32_t> sm120_packed_weight_fragments = pack_nvfp4_weight_for_sm120_mma(
+      packed_weight,
+      static_cast<int>(source_shape[0]),
+      static_cast<int>(source_shape[1]),
+      sm120_row_tiles,
+      sm120_k_blocks);
+    std::vector<std::uint32_t> sm120_weight_scale_fragments = pack_nvfp4_weight_scales_for_sm120_mma(
+      weight_scale,
+      static_cast<int>(source_shape[0]),
+      static_cast<int>(source_shape[1] / group_size),
+      sm120_row_tiles,
+      sm120_k_blocks);
+
     const float alpha = input_scale * weight_scale_2;
     if (!upload_bytes_to_device(packed_weight, "raw " + base_name + ".weight", arena, device_tensor.packed_weight, error_message) ||
         !upload_bytes_to_device(weight_scale, "raw " + base_name + ".weight_scale", arena, device_tensor.weight_scale, error_message) ||
@@ -1417,7 +1521,9 @@ bool load_modelopt_nvfp4_state(
         !upload_scalar_to_device(weight_scale_2, "scalar " + base_name + ".weight_scale_2", arena, device_tensor.weight_scale_2, error_message) ||
         !upload_bytes_to_device(tc_packed_weight, "tensor-core " + base_name + ".weight", arena, device_tensor.tc_packed_weight, error_message) ||
         !upload_bytes_to_device(tc_weight_scale, "tensor-core " + base_name + ".weight_scale", arena, device_tensor.tc_weight_scale, error_message) ||
-        !upload_scalar_to_device(alpha, "tensor-core " + base_name + ".alpha", arena, device_tensor.tc_alpha, error_message)) {
+        !upload_scalar_to_device(alpha, "tensor-core " + base_name + ".alpha", arena, device_tensor.tc_alpha, error_message) ||
+        !upload_u32_to_device(sm120_packed_weight_fragments, "sm120 " + base_name + ".weight_fragments", arena, device_tensor.sm120_packed_weight_fragments, error_message) ||
+        !upload_u32_to_device(sm120_weight_scale_fragments, "sm120 " + base_name + ".weight_scale_fragments", arena, device_tensor.sm120_weight_scale_fragments, error_message)) {
       error_message = "ModelOpt NVFP4 load failed for '" + base_name + "': " + error_message;
       return false;
     }
@@ -1426,6 +1532,8 @@ bool load_modelopt_nvfp4_state(
     device_tensor.padded_output_size = padded_weight_rows;
     device_tensor.padded_scale_cols = padded_scale_cols;
     device_tensor.weight_padding_cols = weight_padding_cols;
+    device_tensor.sm120_row_tiles = sm120_row_tiles;
+    device_tensor.sm120_k_blocks = sm120_k_blocks;
     state.tensors.push_back(device_tensor);
   }
 
@@ -1458,11 +1566,15 @@ bool initialize_nvfp4_layer_weights(
     layer.ptrs[ptr_idx].tc_packed_weight = tensor.tc_packed_weight;
     layer.ptrs[ptr_idx].tc_weight_scale = tensor.tc_weight_scale;
     layer.ptrs[ptr_idx].tc_alpha = tensor.tc_alpha;
+    layer.ptrs[ptr_idx].sm120_packed_weight_fragments = tensor.sm120_packed_weight_fragments;
+    layer.ptrs[ptr_idx].sm120_weight_scale_fragments = tensor.sm120_weight_scale_fragments;
     layer.ptrs[ptr_idx].output_size = tensor.output_size;
     layer.ptrs[ptr_idx].input_size = tensor.input_size;
     layer.ptrs[ptr_idx].padded_output_size = tensor.padded_output_size;
     layer.ptrs[ptr_idx].padded_scale_cols = tensor.padded_scale_cols;
     layer.ptrs[ptr_idx].weight_padding_cols = tensor.weight_padding_cols;
+    layer.ptrs[ptr_idx].sm120_row_tiles = tensor.sm120_row_tiles;
+    layer.ptrs[ptr_idx].sm120_k_blocks = tensor.sm120_k_blocks;
     return true;
   };
 

@@ -10,11 +10,15 @@ struct Nvfp4Weight {
     const std::uint8_t *tc_packed_weight;
     const std::uint8_t *tc_weight_scale;
     const float *tc_alpha;
+    const std::uint32_t *sm120_packed_weight_fragments;
+    const std::uint32_t *sm120_weight_scale_fragments;
     int output_size;
     int input_size;
     int padded_output_size;
     int padded_scale_cols;
     int weight_padding_cols;
+    int sm120_row_tiles;
+    int sm120_k_blocks;
 };
 
 struct LayerNvfp4Weights {

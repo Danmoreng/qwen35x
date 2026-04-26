@@ -62,6 +62,24 @@ bool run_nvfp4_cublaslt_projection_device(
   return false;
 }
 
+bool run_nvfp4_sm120_projection_device(
+  const float *,
+  const std::uint32_t *,
+  const std::uint32_t *,
+  float,
+  int,
+  int,
+  int,
+  int,
+  std::uint32_t *,
+  std::uint32_t *,
+  float *,
+  double *,
+  std::string & error_message) {
+  error_message = "CUDA is not enabled in this build.";
+  return false;
+}
+
 bool run_nvfp4_custom_projection_benchmark(
   const std::vector<std::uint8_t> &,
   const std::vector<std::uint8_t> &,
