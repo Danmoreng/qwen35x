@@ -156,12 +156,13 @@ Rationale:
 
 Active work for model-size generalization:
 1. Add a Qwen35x CUDA model descriptor
-- Derive descriptor values from `ModelProfile` / HF config instead of Qwen35x CUDA-local constants.
-- Include layer count, hidden size, intermediate size, vocab size, attention heads/KV heads/head dim, RoPE dim/theta, DeltaNet dimensions, conv settings, and exact layer schedule.
+- A first-class descriptor is now derived from `ModelProfile` / HF config and can be passed through `Qwen35xCudaBackendConfig`.
+- It includes layer count, hidden size, intermediate size, vocab size, attention heads/KV heads/head dim, RoPE dim/theta, DeltaNet dimensions including grouped value dimension, conv settings, and exact layer schedule.
 - Validate safetensor shapes against the descriptor before allocating or uploading device weights.
 
 2. Make allocation and validation descriptor-driven
-- Replace hard-coded 0.8B allocation sizes in `src/runtime/qwen35x_cuda_backend.cpp` with descriptor-derived sizes.
+- Runtime cache/state, RoPE table, decode scratch, and prefill scratch allocation in `src/runtime/qwen35x_cuda_backend.cpp` now use descriptor-derived sizes, with a descriptor/compiled-variant consistency check before allocation.
+- Continue moving tensor shape validation onto the descriptor before upload.
 - Keep the current 0.8B and 4B compiled kernels as the enabled fast variants in the single main binary until additional variants have explicit kernels and parity gates.
 - Add precise unsupported-variant errors for model shapes that do not yet have a compiled kernel variant.
 
@@ -263,7 +264,7 @@ Model progression:
 
 Current scaling constraint:
 - The default Qwen35x CUDA path is compiled with both `Qwen3.5-0.8B` and `Qwen3.5-4B` specializations in the main binary, then dispatches by validated model descriptor.
-- Hard-coded model dimensions currently live in `src/runtime/qwen35x_cuda_backend.cpp`, `src/kernels/cuda/kernel.cu`, and `src/kernels/cuda/prefill.cu`.
+- Runtime allocation sizes in `src/runtime/qwen35x_cuda_backend.cpp` are now descriptor-derived; compiled kernel dimensions still live in `src/kernels/cuda/kernel.cu`, `src/kernels/cuda/prefill.cu`, and the per-variant headers.
 - The hard-coded values include layer count, hidden size, intermediate size, vocab size, full-attention head counts, DeltaNet dimensions, layer schedule, and maximum sequence length.
 - The legacy runtime path already uses `ModelProfile`/`RuntimeDims` more broadly and should be used as the descriptor model for generalizing the Qwen35x CUDA path.
 
@@ -336,10 +337,11 @@ Validation policy for each new size:
 - [ ] Add compatible steady-state decode graph reuse for the Qwen35x CUDA path.
 - [ ] Run prompt-length sweep benchmarks (short/medium/long/64k) after each major long-context optimization batch.
 - [ ] Reduce actual prefill kernel launch count and recurrence overhead beyond warmup effects.
-- [ ] Add a Qwen35x CUDA model descriptor derived from `ModelProfile`/HF config and pass it through `Qwen35xCudaBackendConfig`.
+- [x] Add a Qwen35x CUDA model descriptor derived from `ModelProfile`/HF config and pass it through `Qwen35xCudaBackendConfig`.
 - [x] Add descriptor validation and clear unsupported-variant errors for model shapes without a matching compiled kernel.
 - [x] Build the main `qwen35x` executable with both 0.8B and 4B CUDA variants and dispatch to the matching launchers at runtime.
-- [ ] Continue replacing Qwen35x CUDA-side variant allocation sizes with descriptor-derived sizes while keeping the current 0.8B and 4B kernels as the enabled compiled variants.
+- [x] Replace Qwen35x CUDA-side runtime allocation/reset sizes with descriptor-derived sizes while keeping the current 0.8B and 4B kernels as the enabled compiled variants.
+- [ ] Validate safetensor tensor shapes against the Qwen35x CUDA descriptor before allocating or uploading device weights.
 - [x] Split megakernel compile-time constants into per-variant configured values for `0.8B` and `4B`.
 - [ ] Extend per-variant generated/configured values to `9B` and `27B`.
 - [ ] Refactor shared-memory and LM-head assumptions that scale with hidden/intermediate size before enabling larger variants.

@@ -108,6 +108,42 @@ bool build_model_descriptor(
   return true;
 }
 
+int descriptor_full_layer_count(const Qwen35xModelDescriptor & descriptor) {
+  return static_cast<int>(std::count(descriptor.layer_type.begin(), descriptor.layer_type.end(), 1));
+}
+
+int descriptor_delta_layer_count(const Qwen35xModelDescriptor & descriptor) {
+  return descriptor.num_layers - descriptor_full_layer_count(descriptor);
+}
+
+int descriptor_fa_gqa_ratio(const Qwen35xModelDescriptor & descriptor) {
+  return descriptor.fa_num_q_heads / descriptor.fa_num_kv_heads;
+}
+
+int descriptor_fa_q_size(const Qwen35xModelDescriptor & descriptor) {
+  return descriptor.fa_num_q_heads * descriptor.fa_head_dim;
+}
+
+int descriptor_fa_qproj_size(const Qwen35xModelDescriptor & descriptor) {
+  return descriptor_fa_q_size(descriptor) * 2;
+}
+
+int descriptor_fa_kv_size(const Qwen35xModelDescriptor & descriptor) {
+  return descriptor.fa_num_kv_heads * descriptor.fa_head_dim;
+}
+
+int descriptor_dn_qk_size(const Qwen35xModelDescriptor & descriptor) {
+  return descriptor.dn_num_heads * descriptor.dn_key_dim;
+}
+
+int descriptor_dn_v_size(const Qwen35xModelDescriptor & descriptor) {
+  return descriptor.dn_num_heads * descriptor.dn_value_dim;
+}
+
+int descriptor_dn_conv_channels(const Qwen35xModelDescriptor & descriptor) {
+  return descriptor_dn_qk_size(descriptor) * 2 + descriptor_dn_v_size(descriptor);
+}
+
 #if QWEN35X_HAS_CUDA
 
 namespace {
@@ -460,6 +496,11 @@ bool alloc_and_zero(DeviceArena & arena, std::size_t bytes, void *& out_ptr, con
   return check_cuda(cudaMemset(out_ptr, 0, bytes), "cudaMemset(" + label + ")", error_message);
 }
 
+bool resolve_model_descriptor(
+  const Qwen35xCudaBackendConfig & config,
+  Qwen35xModelDescriptor & descriptor,
+  std::string & error_message);
+
 const VariantDescriptor * select_variant_for_descriptor(
   const Qwen35xModelDescriptor & descriptor,
   std::string & error_message) {
@@ -518,30 +559,47 @@ const VariantDescriptor * select_variant_for_descriptor(
   return nullptr;
 }
 
-const VariantDescriptor * select_variant_for_config(const Qwen35xCudaBackendConfig & config, std::string & error_message) {
+bool resolve_model_descriptor(
+  const Qwen35xCudaBackendConfig & config,
+  Qwen35xModelDescriptor & descriptor,
+  std::string & error_message) {
   if (config.model_descriptor.has_value()) {
-    return select_variant_for_descriptor(*config.model_descriptor, error_message);
+    descriptor = *config.model_descriptor;
+    return validate_descriptor(descriptor, error_message);
   }
 
   std::string profile_error;
   const auto profile = qwen35x::ProfileLoader::load_from_hf_directory(config.model_dir, profile_error);
   if (!profile) {
     error_message = "failed to load model profile for CUDA descriptor construction: " + profile_error;
-    return nullptr;
+    return false;
   }
-  Qwen35xModelDescriptor descriptor;
-  if (!build_model_descriptor(*profile, descriptor, error_message)) {
-    return nullptr;
+  return build_model_descriptor(*profile, descriptor, error_message);
+}
+
+bool validate_descriptor_matches_variant(
+  const Qwen35xModelDescriptor & descriptor,
+  const VariantDescriptor & variant,
+  std::string & error_message) {
+  std::string select_error;
+  const VariantDescriptor * selected = select_variant_for_descriptor(descriptor, select_error);
+  if (selected == &variant) {
+    return true;
   }
-  return select_variant_for_descriptor(descriptor, error_message);
+  error_message = "Qwen35x CUDA descriptor/compiled variant mismatch: " + select_error;
+  return false;
 }
 
 bool initialize_backend_state(
+  const Qwen35xModelDescriptor & descriptor,
   const VariantDescriptor & variant,
   const Qwen35xCudaBackendConfig & config,
   DeviceArena & arena,
   BackendState & state,
   std::string & error_message) {
+  if (!validate_descriptor_matches_variant(descriptor, variant, error_message)) {
+    return false;
+  }
   {
     std::string used_name;
     if (!load_bf16_tensor_to_device(
@@ -581,10 +639,10 @@ bool initialize_backend_state(
     }
   }
 
-  std::vector<PackedLayerWeights> host_layers(static_cast<std::size_t>(variant.num_layers));
-  for (int layer_idx = 0; layer_idx < variant.num_layers; ++layer_idx) {
+  std::vector<PackedLayerWeights> host_layers(static_cast<std::size_t>(descriptor.num_layers));
+  for (int layer_idx = 0; layer_idx < descriptor.num_layers; ++layer_idx) {
     auto & layer = host_layers[static_cast<std::size_t>(layer_idx)];
-    layer.layer_type = variant.layer_type[layer_idx];
+    layer.layer_type = descriptor.layer_type[static_cast<std::size_t>(layer_idx)];
     const std::string base = "model.language_model.layers." + std::to_string(layer_idx) + ".";
 
     auto load_ptr = [&](int ptr_idx, const std::vector<std::string> & suffixes) -> bool {
@@ -651,16 +709,8 @@ bool initialize_backend_state(
     return false;
   }
 
-  int n_full_layers = 0;
-  int n_delta_layers = 0;
-  for (int i = 0; i < variant.num_layers; ++i) {
-    const int layer_type = variant.layer_type[i];
-    if (layer_type == 0) {
-      ++n_delta_layers;
-    } else {
-      ++n_full_layers;
-    }
-  }
+  const int n_full_layers = descriptor_full_layer_count(descriptor);
+  const int n_delta_layers = descriptor_delta_layer_count(descriptor);
 
   const std::size_t bf16_bytes = sizeof(std::uint16_t);
   const std::size_t f32_bytes = sizeof(float);
@@ -668,43 +718,43 @@ bool initialize_backend_state(
 
   if (!alloc_and_zero(
         arena,
-        static_cast<std::size_t>(n_full_layers) * variant.fa_num_kv_heads * max_seq_len * variant.fa_head_dim * bf16_bytes,
+        static_cast<std::size_t>(n_full_layers) * descriptor.fa_num_kv_heads * max_seq_len * descriptor.fa_head_dim * bf16_bytes,
         state.fa_k_cache,
         "fa_k_cache",
         error_message) ||
       !alloc_and_zero(
         arena,
-        static_cast<std::size_t>(n_full_layers) * variant.fa_num_kv_heads * max_seq_len * variant.fa_head_dim * bf16_bytes,
+        static_cast<std::size_t>(n_full_layers) * descriptor.fa_num_kv_heads * max_seq_len * descriptor.fa_head_dim * bf16_bytes,
         state.fa_v_cache,
         "fa_v_cache",
         error_message) ||
       !alloc_and_zero(
         arena,
-        static_cast<std::size_t>(n_delta_layers) * variant.dn_num_heads * variant.dn_key_dim * variant.dn_value_dim * f32_bytes,
+        static_cast<std::size_t>(n_delta_layers) * descriptor.dn_num_heads * descriptor.dn_key_dim * descriptor.dn_value_dim * f32_bytes,
         state.dn_states,
         "dn_states",
         error_message) ||
       !alloc_and_zero(
         arena,
-        static_cast<std::size_t>(n_delta_layers) * variant.dn_conv_channels() * variant.dn_conv_kernel * f32_bytes,
+        static_cast<std::size_t>(n_delta_layers) * descriptor_dn_conv_channels(descriptor) * descriptor.dn_conv_kernel * f32_bytes,
         state.conv_bufs,
         "conv_bufs",
         error_message)) {
     return false;
   }
 
-  if (!arena.alloc_bytes(variant.hidden_size * bf16_bytes, state.hidden_buffer, error_message) ||
-      !arena.alloc_bytes(std::max({variant.fa_qproj_size(), variant.dn_conv_channels(), (variant.hidden_size * 8 + variant.intermediate_size)}) * f32_bytes, state.g_activations, error_message) ||
-      !arena.alloc_bytes(variant.hidden_size * bf16_bytes, state.g_residual, error_message) ||
-      !arena.alloc_bytes(std::max(variant.fa_qproj_size(), variant.dn_conv_channels()) * f32_bytes, state.g_qkv_scratch, error_message) ||
-      !arena.alloc_bytes((variant.fa_kv_size() * 2) * f32_bytes, state.g_kv_scratch, error_message) ||
-      !arena.alloc_bytes(std::max(variant.fa_q_size(), variant.dn_v_size()) * f32_bytes, state.g_attn_out, error_message) ||
-      !arena.alloc_bytes(static_cast<std::size_t>(kMaxDecodeBlocks) * variant.fa_gqa_ratio() * (variant.fa_head_dim + 2) * f32_bytes, state.g_attn_partials, error_message) ||
-      !arena.alloc_bytes(variant.intermediate_size * f32_bytes, state.g_mlp_inter, error_message) ||
-      !arena.alloc_bytes(variant.dn_v_size() * f32_bytes, state.g_z_scratch, error_message) ||
-      !arena.alloc_bytes(variant.dn_gate_heads * f32_bytes, state.g_beta_scratch, error_message) ||
-      !arena.alloc_bytes(variant.dn_gate_heads * f32_bytes, state.g_alpha_scratch, error_message) ||
-      !arena.alloc_bytes(variant.hidden_size * f32_bytes, state.g_normalized, error_message) ||
+  if (!arena.alloc_bytes(descriptor.hidden_size * bf16_bytes, state.hidden_buffer, error_message) ||
+      !arena.alloc_bytes(std::max({descriptor_fa_qproj_size(descriptor), descriptor_dn_conv_channels(descriptor), (descriptor.hidden_size * 8 + descriptor.intermediate_size)}) * f32_bytes, state.g_activations, error_message) ||
+      !arena.alloc_bytes(descriptor.hidden_size * bf16_bytes, state.g_residual, error_message) ||
+      !arena.alloc_bytes(std::max(descriptor_fa_qproj_size(descriptor), descriptor_dn_conv_channels(descriptor)) * f32_bytes, state.g_qkv_scratch, error_message) ||
+      !arena.alloc_bytes((descriptor_fa_kv_size(descriptor) * 2) * f32_bytes, state.g_kv_scratch, error_message) ||
+      !arena.alloc_bytes(std::max(descriptor_fa_q_size(descriptor), descriptor_dn_v_size(descriptor)) * f32_bytes, state.g_attn_out, error_message) ||
+      !arena.alloc_bytes(static_cast<std::size_t>(kMaxDecodeBlocks) * descriptor_fa_gqa_ratio(descriptor) * (descriptor.fa_head_dim + 2) * f32_bytes, state.g_attn_partials, error_message) ||
+      !arena.alloc_bytes(descriptor.intermediate_size * f32_bytes, state.g_mlp_inter, error_message) ||
+      !arena.alloc_bytes(descriptor_dn_v_size(descriptor) * f32_bytes, state.g_z_scratch, error_message) ||
+      !arena.alloc_bytes(descriptor.dn_gate_heads * f32_bytes, state.g_beta_scratch, error_message) ||
+      !arena.alloc_bytes(descriptor.dn_gate_heads * f32_bytes, state.g_alpha_scratch, error_message) ||
+      !arena.alloc_bytes(descriptor.hidden_size * f32_bytes, state.g_normalized, error_message) ||
       !arena.alloc_bytes(sizeof(unsigned int), reinterpret_cast<void *&>(state.barrier_counter), error_message) ||
       !arena.alloc_bytes(sizeof(unsigned int), reinterpret_cast<void *&>(state.barrier_generation), error_message) ||
       !arena.alloc_bytes(1024 * sizeof(float), reinterpret_cast<void *&>(state.block_max_vals), error_message) ||
@@ -712,7 +762,7 @@ bool initialize_backend_state(
       !arena.alloc_bytes(sizeof(unsigned int), reinterpret_cast<void *&>(state.lm_sync_counter), error_message) ||
       !alloc_and_zero(
         arena,
-        static_cast<std::size_t>(variant.vocab_size) * f32_bytes,
+        static_cast<std::size_t>(descriptor.vocab_size) * f32_bytes,
         reinterpret_cast<void *&>(state.seen_token_mask),
         "seen_token_mask",
         error_message) ||
@@ -724,7 +774,7 @@ bool initialize_backend_state(
     return false;
   }
 
-  const std::size_t rope_elems = static_cast<std::size_t>(config.max_context) * variant.fa_rot_dim;
+  const std::size_t rope_elems = static_cast<std::size_t>(config.max_context) * descriptor.fa_rot_dim;
   if (!arena.alloc_bytes(rope_elems * sizeof(float), reinterpret_cast<void *&>(state.pf_rope_cos), error_message) ||
       !arena.alloc_bytes(rope_elems * sizeof(float), reinterpret_cast<void *&>(state.pf_rope_sin), error_message)) {
     return false;
@@ -732,11 +782,11 @@ bool initialize_backend_state(
   std::vector<float> host_rope_cos(rope_elems);
   std::vector<float> host_rope_sin(rope_elems);
   for (int pos = 0; pos < config.max_context; ++pos) {
-    for (int i = 0; i < variant.fa_rot_dim; ++i) {
-      const float exponent = static_cast<float>(2 * (i % (variant.fa_rot_dim / 2))) / static_cast<float>(variant.fa_rot_dim);
-      const float freq = static_cast<float>(pos) / std::pow(10000000.0f, exponent);
-      host_rope_cos[static_cast<std::size_t>(pos) * variant.fa_rot_dim + i] = std::cos(freq);
-      host_rope_sin[static_cast<std::size_t>(pos) * variant.fa_rot_dim + i] = std::sin(freq);
+    for (int i = 0; i < descriptor.fa_rot_dim; ++i) {
+      const float exponent = static_cast<float>(2 * (i % (descriptor.fa_rot_dim / 2))) / static_cast<float>(descriptor.fa_rot_dim);
+      const float freq = static_cast<float>(pos) / std::pow(descriptor.rope_theta, exponent);
+      host_rope_cos[static_cast<std::size_t>(pos) * descriptor.fa_rot_dim + i] = std::cos(freq);
+      host_rope_sin[static_cast<std::size_t>(pos) * descriptor.fa_rot_dim + i] = std::sin(freq);
     }
   }
   if (!check_cuda(
@@ -754,44 +804,44 @@ bool initialize_backend_state(
   const int prefill_mlp_chunk_tokens = get_prefill_mlp_chunk_tokens(config.max_context);
   const int prefill_attention_query_tokens = get_prefill_attention_query_tokens(variant, config.max_context);
   const std::size_t full_projection_elems =
-    static_cast<std::size_t>(prefill_s) * static_cast<std::size_t>(std::max(variant.dn_conv_channels(), variant.fa_qproj_size()));
+    static_cast<std::size_t>(prefill_s) * static_cast<std::size_t>(std::max(descriptor_dn_conv_channels(descriptor), descriptor_fa_qproj_size(descriptor)));
   const std::size_t chunked_mlp_elems =
-    static_cast<std::size_t>(prefill_mlp_chunk_tokens) * static_cast<std::size_t>(variant.intermediate_size);
+    static_cast<std::size_t>(prefill_mlp_chunk_tokens) * static_cast<std::size_t>(descriptor.intermediate_size);
   const std::size_t attention_prob_elems =
     static_cast<std::size_t>(prefill_attention_query_tokens) * static_cast<std::size_t>(prefill_s);
   const std::size_t proj_buf_elems = std::max(full_projection_elems, chunked_mlp_elems);
   const std::size_t proj_buf2_elems =
     std::max(
-      static_cast<std::size_t>(prefill_s) * static_cast<std::size_t>(std::max(variant.dn_v_size(), variant.fa_kv_size())),
+      static_cast<std::size_t>(prefill_s) * static_cast<std::size_t>(std::max(descriptor_dn_v_size(descriptor), descriptor_fa_kv_size(descriptor))),
       chunked_mlp_elems);
   const std::size_t mlp_buf_elems = std::max(chunked_mlp_elems, attention_prob_elems);
   const std::size_t attention_score_elems =
     static_cast<std::size_t>(prefill_attention_query_tokens) * static_cast<std::size_t>(prefill_s);
   const std::size_t attention_accum_elems =
-    static_cast<std::size_t>(prefill_attention_query_tokens) * static_cast<std::size_t>(variant.fa_head_dim);
+    static_cast<std::size_t>(prefill_attention_query_tokens) * static_cast<std::size_t>(descriptor.fa_head_dim);
   const std::size_t dn_qkv_f32_elems =
     std::max(
-      static_cast<std::size_t>(prefill_mlp_chunk_tokens) * static_cast<std::size_t>(variant.dn_conv_channels()),
+      static_cast<std::size_t>(prefill_mlp_chunk_tokens) * static_cast<std::size_t>(descriptor_dn_conv_channels(descriptor)),
       attention_score_elems);
   const std::size_t dn_out_f32_elems =
     std::max(
-      static_cast<std::size_t>(prefill_mlp_chunk_tokens) * static_cast<std::size_t>(variant.dn_v_size()),
+      static_cast<std::size_t>(prefill_mlp_chunk_tokens) * static_cast<std::size_t>(descriptor_dn_v_size(descriptor)),
       attention_accum_elems);
 
-  if (!arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * variant.hidden_size * bf16_bytes, state.pf_hidden, error_message) ||
-      !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * variant.hidden_size * bf16_bytes, state.pf_residual, error_message) ||
-      !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * variant.hidden_size * bf16_bytes, state.pf_normalized, error_message) ||
+  if (!arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * descriptor.hidden_size * bf16_bytes, state.pf_hidden, error_message) ||
+      !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * descriptor.hidden_size * bf16_bytes, state.pf_residual, error_message) ||
+      !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * descriptor.hidden_size * bf16_bytes, state.pf_normalized, error_message) ||
       !arena.alloc_bytes(proj_buf_elems * bf16_bytes, state.pf_proj_buf, error_message) ||
       !arena.alloc_bytes(proj_buf2_elems * bf16_bytes, state.pf_proj_buf2, error_message) ||
-      !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * std::max(variant.fa_q_size(), variant.fa_kv_size()) * bf16_bytes, state.pf_attn_buf, error_message) ||
+      !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * std::max(descriptor_fa_q_size(descriptor), descriptor_fa_kv_size(descriptor)) * bf16_bytes, state.pf_attn_buf, error_message) ||
       !arena.alloc_bytes(mlp_buf_elems * bf16_bytes, state.pf_mlp_buf, error_message) ||
-      !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * variant.dn_v_size() * bf16_bytes, state.pf_dn_out_buf, error_message) ||
+      !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * descriptor_dn_v_size(descriptor) * bf16_bytes, state.pf_dn_out_buf, error_message) ||
       !arena.alloc_bytes(dn_qkv_f32_elems * sizeof(float), reinterpret_cast<void *&>(state.pf_dn_qkv_f32), error_message) ||
       !arena.alloc_bytes(dn_out_f32_elems * sizeof(float), reinterpret_cast<void *&>(state.pf_dn_out_f32), error_message) ||
-      !arena.alloc_bytes(static_cast<std::size_t>(prefill_mlp_chunk_tokens) * variant.dn_gate_heads * sizeof(float), reinterpret_cast<void *&>(state.pf_beta_buf), error_message) ||
-      !arena.alloc_bytes(static_cast<std::size_t>(prefill_mlp_chunk_tokens) * variant.dn_gate_heads * sizeof(float), reinterpret_cast<void *&>(state.pf_alpha_buf), error_message) ||
-      !arena.alloc_bytes(variant.hidden_size * f32_bytes, state.pf_final_normed, error_message) ||
-      !arena.alloc_bytes(variant.hidden_size * bf16_bytes, state.pf_hidden_bf16_out, error_message) ||
+      !arena.alloc_bytes(static_cast<std::size_t>(prefill_mlp_chunk_tokens) * descriptor.dn_gate_heads * sizeof(float), reinterpret_cast<void *&>(state.pf_beta_buf), error_message) ||
+      !arena.alloc_bytes(static_cast<std::size_t>(prefill_mlp_chunk_tokens) * descriptor.dn_gate_heads * sizeof(float), reinterpret_cast<void *&>(state.pf_alpha_buf), error_message) ||
+      !arena.alloc_bytes(descriptor.hidden_size * f32_bytes, state.pf_final_normed, error_message) ||
+      !arena.alloc_bytes(descriptor.hidden_size * bf16_bytes, state.pf_hidden_bf16_out, error_message) ||
       !arena.alloc_bytes(1024 * sizeof(float), reinterpret_cast<void *&>(state.pf_lm_bmv), error_message) ||
       !arena.alloc_bytes(1024 * sizeof(int), reinterpret_cast<void *&>(state.pf_lm_bmi), error_message)) {
     return false;
@@ -802,22 +852,14 @@ bool initialize_backend_state(
   return true;
 }
 
-bool reset_state(const VariantDescriptor & variant, const BackendState & state, int max_seq_len, std::string & error_message) {
-  int n_full_layers = 0;
-  int n_delta_layers = 0;
-  for (int i = 0; i < variant.num_layers; ++i) {
-    const int layer_type = variant.layer_type[i];
-    if (layer_type == 0) {
-      ++n_delta_layers;
-    } else {
-      ++n_full_layers;
-    }
-  }
+bool reset_state(const Qwen35xModelDescriptor & descriptor, const BackendState & state, int max_seq_len, std::string & error_message) {
+  const int n_full_layers = descriptor_full_layer_count(descriptor);
+  const int n_delta_layers = descriptor_delta_layer_count(descriptor);
 
-  const std::size_t fa_bytes = static_cast<std::size_t>(n_full_layers) * variant.fa_num_kv_heads * max_seq_len * variant.fa_head_dim * sizeof(std::uint16_t);
-  const std::size_t dn_bytes = static_cast<std::size_t>(n_delta_layers) * variant.dn_num_heads * variant.dn_key_dim * variant.dn_value_dim * sizeof(float);
-  const std::size_t conv_bytes = static_cast<std::size_t>(n_delta_layers) * variant.dn_conv_channels() * variant.dn_conv_kernel * sizeof(float);
-  const std::size_t seen_bytes = static_cast<std::size_t>(variant.vocab_size) * sizeof(float);
+  const std::size_t fa_bytes = static_cast<std::size_t>(n_full_layers) * descriptor.fa_num_kv_heads * max_seq_len * descriptor.fa_head_dim * sizeof(std::uint16_t);
+  const std::size_t dn_bytes = static_cast<std::size_t>(n_delta_layers) * descriptor.dn_num_heads * descriptor.dn_key_dim * descriptor.dn_value_dim * sizeof(float);
+  const std::size_t conv_bytes = static_cast<std::size_t>(n_delta_layers) * descriptor_dn_conv_channels(descriptor) * descriptor.dn_conv_kernel * sizeof(float);
+  const std::size_t seen_bytes = static_cast<std::size_t>(descriptor.vocab_size) * sizeof(float);
 
   return check_cuda(cudaMemset(state.fa_k_cache, 0, fa_bytes), "cudaMemset(fa_k_cache)", error_message) &&
          check_cuda(cudaMemset(state.fa_v_cache, 0, fa_bytes), "cudaMemset(fa_v_cache)", error_message) &&
@@ -875,6 +917,7 @@ void launch_prefill_for_state(
 }
 
 bool warmup_prefill_backend(
+  const Qwen35xModelDescriptor & descriptor,
   const VariantDescriptor & variant,
   BackendState & state,
   const Qwen35xCudaBackendConfig & config,
@@ -892,10 +935,11 @@ bool warmup_prefill_backend(
     return false;
   }
 
-  return reset_state(variant, state, config.max_context, error_message);
+  return reset_state(descriptor, state, config.max_context, error_message);
 }
 
 bool run_prefill_impl(
+  const Qwen35xModelDescriptor & descriptor,
   const VariantDescriptor & variant,
   BackendState & state,
   const Qwen35xCudaBackendConfig & config,
@@ -952,7 +996,7 @@ bool run_prefill_impl(
 
   const auto handoff_start = std::chrono::steady_clock::now();
   if (!check_cuda(
-        cudaMemcpy(state.hidden_buffer, state.pf_hidden_bf16_out, variant.hidden_size * sizeof(std::uint16_t), cudaMemcpyDeviceToDevice),
+        cudaMemcpy(state.hidden_buffer, state.pf_hidden_bf16_out, descriptor.hidden_size * sizeof(std::uint16_t), cudaMemcpyDeviceToDevice),
         "cudaMemcpy(D2D hidden handoff)",
         error_message)) {
     return false;
@@ -977,6 +1021,7 @@ bool run_prefill_impl(
 }
 
 bool run_decode_step_impl(
+  const Qwen35xModelDescriptor & descriptor,
   const VariantDescriptor & variant,
   const BackendState & state,
   int input_token,
@@ -999,7 +1044,7 @@ bool run_decode_step_impl(
     return false;
   }
 
-  if (repetition_penalty > 1.0f && input_token >= 0 && input_token < variant.vocab_size) {
+  if (repetition_penalty > 1.0f && input_token >= 0 && input_token < descriptor.vocab_size) {
     const float seen = 1.0f;
     const auto seen_upload_start = std::chrono::steady_clock::now();
     if (!check_cuda(
@@ -1074,6 +1119,7 @@ bool run_decode_step_impl(
 
 struct Qwen35xCudaBackend::Impl {
   Qwen35xCudaBackendConfig config;
+  Qwen35xModelDescriptor descriptor;
   const VariantDescriptor * variant = nullptr;
   DeviceArena arena;
   BackendState state;
@@ -1102,21 +1148,26 @@ bool Qwen35xCudaBackend::initialize(const Qwen35xCudaBackendConfig & config, std
     error_message = "repetition_penalty must be >= 1.0.";
     return false;
   }
-  const VariantDescriptor * variant = select_variant_for_config(config, error_message);
+  Qwen35xModelDescriptor descriptor;
+  if (!resolve_model_descriptor(config, descriptor, error_message)) {
+    return false;
+  }
+  const VariantDescriptor * variant = select_variant_for_descriptor(descriptor, error_message);
   if (variant == nullptr) {
     return false;
   }
 
   impl_ = std::make_unique<Impl>();
   impl_->config = config;
+  impl_->descriptor = descriptor;
   impl_->variant = variant;
   variant->set_decode_blocks_override(config.decode_blocks);
 
-  if (!initialize_backend_state(*variant, config, impl_->arena, impl_->state, error_message)) {
+  if (!initialize_backend_state(impl_->descriptor, *variant, config, impl_->arena, impl_->state, error_message)) {
     impl_ = std::make_unique<Impl>();
     return false;
   }
-  if (!warmup_prefill_backend(*variant, impl_->state, config, error_message)) {
+  if (!warmup_prefill_backend(impl_->descriptor, *variant, impl_->state, config, error_message)) {
     impl_ = std::make_unique<Impl>();
     return false;
   }
@@ -1131,7 +1182,7 @@ bool Qwen35xCudaBackend::reset(std::string & error_message) {
     error_message = "Qwen35x CUDA backend reset requested before initialize.";
     return false;
   }
-  return reset_state(*impl_->variant, impl_->state, impl_->config.max_context, error_message);
+  return reset_state(impl_->descriptor, impl_->state, impl_->config.max_context, error_message);
 }
 
 bool Qwen35xCudaBackend::run_prefill(
@@ -1147,7 +1198,7 @@ bool Qwen35xCudaBackend::run_prefill(
     return false;
   }
   Qwen35xPrefillProfile * profile = impl_->config.profile_enabled ? &impl_->profile.prefill : nullptr;
-  const bool ok = run_prefill_impl(*impl_->variant, impl_->state, impl_->config, tokens, out_first_token, true, profile, error_message);
+  const bool ok = run_prefill_impl(impl_->descriptor, *impl_->variant, impl_->state, impl_->config, tokens, out_first_token, true, profile, error_message);
   if (ok && profile != nullptr) {
     impl_->profile.enabled = true;
     impl_->profile.prefill_runs += 1;
@@ -1168,7 +1219,7 @@ bool Qwen35xCudaBackend::run_prefill_only(
   }
   int ignored_first_token = 0;
   Qwen35xPrefillProfile * profile = impl_->config.profile_enabled ? &impl_->profile.prefill : nullptr;
-  const bool ok = run_prefill_impl(*impl_->variant, impl_->state, impl_->config, tokens, ignored_first_token, false, profile, error_message);
+  const bool ok = run_prefill_impl(impl_->descriptor, *impl_->variant, impl_->state, impl_->config, tokens, ignored_first_token, false, profile, error_message);
   if (ok && profile != nullptr) {
     impl_->profile.enabled = true;
     impl_->profile.prefill_runs += 1;
@@ -1186,6 +1237,7 @@ bool Qwen35xCudaBackend::run_decode_step(
     return false;
   }
   return run_decode_step_impl(
+    impl_->descriptor,
     *impl_->variant,
     impl_->state,
     input_token,
