@@ -1023,6 +1023,24 @@ bool run_nvfp4_sm120_projection_device(
     return false;
   }
 
+  auto launch_projection = [&](
+    const std::uint32_t * local_weight_fragments,
+    const std::uint32_t * local_weight_scales,
+    float local_alpha,
+    float * local_output,
+    const char * step) -> bool {
+    nvfp4_mma_sync_mxf4nvf4_projection_kernel<<<row_tiles, 32>>>(
+      activation_fragment_scratch,
+      local_weight_fragments,
+      activation_scale_scratch,
+      local_weight_scales,
+      local_alpha,
+      local_output,
+      rows,
+      k_blocks);
+    return check_cuda(cudaGetLastError(), step, error_message);
+  };
+
   cudaEvent_t start_event = nullptr;
   cudaEvent_t stop_event = nullptr;
   auto cleanup_events = [&]() {
@@ -1052,16 +1070,12 @@ bool run_nvfp4_sm120_projection_device(
     cleanup_events();
     return false;
   }
-  nvfp4_mma_sync_mxf4nvf4_projection_kernel<<<row_tiles, 32>>>(
-    activation_fragment_scratch,
-    packed_weight_fragments,
-    activation_scale_scratch,
-    weight_scale_fragments,
-    input_scale * weight_scale_2,
-    output_f32,
-    rows,
-    k_blocks);
-  if (!check_cuda(cudaGetLastError(), "launch SM120 FP4 projection", error_message) ||
+  if (!launch_projection(
+        packed_weight_fragments,
+        weight_scale_fragments,
+        input_scale * weight_scale_2,
+        output_f32,
+        "launch SM120 FP4 projection") ||
       (elapsed_ms != nullptr && !check_cuda(cudaEventRecord(stop_event), "cudaEventRecord(sm120 stop)", error_message))) {
     cleanup_events();
     return false;
@@ -1076,6 +1090,208 @@ bool run_nvfp4_sm120_projection_device(
     *elapsed_ms = static_cast<double>(elapsed);
   }
   cleanup_events();
+  return true;
+}
+
+bool run_nvfp4_sm120_gate_up_silu_device(
+  const float * input_f32,
+  const std::uint32_t * gate_packed_weight_fragments,
+  const std::uint32_t * gate_weight_scale_fragments,
+  float gate_input_scale,
+  float gate_weight_scale_2,
+  const std::uint32_t * up_packed_weight_fragments,
+  const std::uint32_t * up_weight_scale_fragments,
+  float up_input_scale,
+  float up_weight_scale_2,
+  int rows,
+  int cols,
+  int row_tiles,
+  int k_blocks,
+  std::uint32_t * activation_fragment_scratch,
+  std::uint32_t * activation_scale_scratch,
+  float * gate_output_f32,
+  float * up_output_f32,
+  double * elapsed_ms,
+  std::string & error_message) {
+  if (gate_output_f32 == nullptr || up_output_f32 == nullptr) {
+    error_message = "SM120 FP4 gate/up projection received a null output buffer.";
+    return false;
+  }
+  if (input_f32 == nullptr || gate_packed_weight_fragments == nullptr || gate_weight_scale_fragments == nullptr ||
+      up_packed_weight_fragments == nullptr || up_weight_scale_fragments == nullptr ||
+      activation_fragment_scratch == nullptr || activation_scale_scratch == nullptr) {
+    error_message = "SM120 FP4 gate/up projection received a null device pointer.";
+    return false;
+  }
+  if (rows <= 0 || cols <= 0 || (cols % 64) != 0 || row_tiles != (rows + 7) / 8 || k_blocks != cols / 64) {
+    error_message = "Invalid SM120 FP4 gate/up projection dimensions.";
+    return false;
+  }
+  static int cached_major = -1;
+  static int cached_minor = -1;
+  if (cached_major < 0 || cached_minor < 0) {
+    if (!query_device_compute_capability(cached_major, cached_minor, error_message)) {
+      return false;
+    }
+  }
+  if (!device_supports_sm120_mma_mxf4nvf4(cached_major, cached_minor)) {
+    error_message =
+      "SM120 FP4 gate/up projection requires the mma.sync.aligned kind::mxf4nvf4.block_scale path; current device is sm_" +
+      std::to_string(cached_major) + std::to_string(cached_minor) + ".";
+    return false;
+  }
+
+  cudaEvent_t start_event = nullptr;
+  cudaEvent_t stop_event = nullptr;
+  auto cleanup_events = [&]() {
+    if (start_event != nullptr) {
+      cudaEventDestroy(start_event);
+    }
+    if (stop_event != nullptr) {
+      cudaEventDestroy(stop_event);
+    }
+  };
+  if (elapsed_ms != nullptr &&
+      (!check_cuda(cudaEventCreate(&start_event), "cudaEventCreate(sm120 gate/up start)", error_message) ||
+       !check_cuda(cudaEventCreate(&stop_event), "cudaEventCreate(sm120 gate/up stop)", error_message) ||
+       !check_cuda(cudaEventRecord(start_event), "cudaEventRecord(sm120 gate/up start)", error_message))) {
+    cleanup_events();
+    return false;
+  }
+
+  cudaGetLastError();
+  nvfp4_sm120_pack_activation_fragments_kernel<<<k_blocks, 32>>>(
+    input_f32,
+    activation_fragment_scratch,
+    activation_scale_scratch,
+    cols,
+    k_blocks);
+  if (!check_cuda(cudaGetLastError(), "launch SM120 FP4 gate/up activation fragment packing", error_message)) {
+    cleanup_events();
+    return false;
+  }
+
+  nvfp4_mma_sync_mxf4nvf4_projection_kernel<<<row_tiles, 32>>>(
+    activation_fragment_scratch,
+    gate_packed_weight_fragments,
+    activation_scale_scratch,
+    gate_weight_scale_fragments,
+    gate_input_scale * gate_weight_scale_2,
+    gate_output_f32,
+    rows,
+    k_blocks);
+  if (!check_cuda(cudaGetLastError(), "launch SM120 FP4 gate projection", error_message)) {
+    cleanup_events();
+    return false;
+  }
+
+  nvfp4_mma_sync_mxf4nvf4_projection_kernel<<<row_tiles, 32>>>(
+    activation_fragment_scratch,
+    up_packed_weight_fragments,
+    activation_scale_scratch,
+    up_weight_scale_fragments,
+    up_input_scale * up_weight_scale_2,
+    up_output_f32,
+    rows,
+    k_blocks);
+  if (!check_cuda(cudaGetLastError(), "launch SM120 FP4 up projection", error_message)) {
+    cleanup_events();
+    return false;
+  }
+
+  constexpr int block_size = 256;
+  const int grid_size = (rows + block_size - 1) / block_size;
+  silu_multiply_kernel<<<grid_size, block_size>>>(gate_output_f32, up_output_f32, gate_output_f32, rows);
+  if (!check_cuda(cudaGetLastError(), "silu_multiply_kernel(sm120 gate/up)", error_message) ||
+      (elapsed_ms != nullptr &&
+       !check_cuda(cudaEventRecord(stop_event), "cudaEventRecord(sm120 gate/up stop)", error_message))) {
+    cleanup_events();
+    return false;
+  }
+  if (elapsed_ms != nullptr) {
+    float elapsed = 0.0f;
+    if (!check_cuda(cudaEventSynchronize(stop_event), "cudaEventSynchronize(sm120 gate/up stop)", error_message) ||
+        !check_cuda(cudaEventElapsedTime(&elapsed, start_event, stop_event), "cudaEventElapsedTime(sm120 gate/up)", error_message)) {
+      cleanup_events();
+      return false;
+    }
+    *elapsed_ms = static_cast<double>(elapsed);
+  }
+  cleanup_events();
+  return true;
+}
+
+bool run_nvfp4_sm120_mlp_device(
+  const float * input_f32,
+  const std::uint32_t * gate_packed_weight_fragments,
+  const std::uint32_t * gate_weight_scale_fragments,
+  float gate_input_scale,
+  float gate_weight_scale_2,
+  const std::uint32_t * up_packed_weight_fragments,
+  const std::uint32_t * up_weight_scale_fragments,
+  float up_input_scale,
+  float up_weight_scale_2,
+  const std::uint32_t * down_packed_weight_fragments,
+  const std::uint32_t * down_weight_scale_fragments,
+  float down_input_scale,
+  float down_weight_scale_2,
+  int intermediate_rows,
+  int hidden_cols,
+  int gate_up_row_tiles,
+  int gate_up_k_blocks,
+  int down_rows,
+  int down_cols,
+  int down_row_tiles,
+  int down_k_blocks,
+  std::uint32_t * activation_fragment_scratch,
+  std::uint32_t * activation_scale_scratch,
+  float * gate_silu_output_f32,
+  float * up_output_f32,
+  float * down_output_f32,
+  double * elapsed_ms,
+  std::string & error_message) {
+  double gate_up_ms = 0.0;
+  double down_ms = 0.0;
+  if (!run_nvfp4_sm120_gate_up_silu_device(
+        input_f32,
+        gate_packed_weight_fragments,
+        gate_weight_scale_fragments,
+        gate_input_scale,
+        gate_weight_scale_2,
+        up_packed_weight_fragments,
+        up_weight_scale_fragments,
+        up_input_scale,
+        up_weight_scale_2,
+        intermediate_rows,
+        hidden_cols,
+        gate_up_row_tiles,
+        gate_up_k_blocks,
+        activation_fragment_scratch,
+        activation_scale_scratch,
+        gate_silu_output_f32,
+        up_output_f32,
+        elapsed_ms == nullptr ? nullptr : &gate_up_ms,
+        error_message) ||
+      !run_nvfp4_sm120_projection_device(
+        gate_silu_output_f32,
+        down_packed_weight_fragments,
+        down_weight_scale_fragments,
+        down_input_scale,
+        down_weight_scale_2,
+        down_rows,
+        down_cols,
+        down_row_tiles,
+        down_k_blocks,
+        activation_fragment_scratch,
+        activation_scale_scratch,
+        down_output_f32,
+        elapsed_ms == nullptr ? nullptr : &down_ms,
+        error_message)) {
+    return false;
+  }
+  if (elapsed_ms != nullptr) {
+    *elapsed_ms = gate_up_ms + down_ms;
+  }
   return true;
 }
 

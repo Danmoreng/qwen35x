@@ -2017,6 +2017,110 @@ bool run_decode_step_impl(
     }
   }
 
+  if (std::getenv("QWEN35X_DRY_RUN_FP4_DECODE_GATE_UP") != nullptr &&
+      nvfp4_state != nullptr &&
+      nvfp4_state->tensors.size() >= 2) {
+    const auto & gate = nvfp4_state->tensors[0];
+    const auto & up = nvfp4_state->tensors[1];
+    float gate_input_scale = 0.0f;
+    float gate_weight_scale_2 = 0.0f;
+    float up_input_scale = 0.0f;
+    float up_weight_scale_2 = 0.0f;
+    double elapsed_ms = 0.0;
+    if (!check_cuda(
+          cudaMemcpy(&gate_input_scale, gate.input_scale, sizeof(float), cudaMemcpyDeviceToHost),
+          "cudaMemcpy(D2H dry-run sm120 gate input_scale)",
+          error_message) ||
+        !check_cuda(
+          cudaMemcpy(&gate_weight_scale_2, gate.weight_scale_2, sizeof(float), cudaMemcpyDeviceToHost),
+          "cudaMemcpy(D2H dry-run sm120 gate weight_scale_2)",
+          error_message) ||
+        !check_cuda(
+          cudaMemcpy(&up_input_scale, up.input_scale, sizeof(float), cudaMemcpyDeviceToHost),
+          "cudaMemcpy(D2H dry-run sm120 up input_scale)",
+          error_message) ||
+        !check_cuda(
+          cudaMemcpy(&up_weight_scale_2, up.weight_scale_2, sizeof(float), cudaMemcpyDeviceToHost),
+          "cudaMemcpy(D2H dry-run sm120 up weight_scale_2)",
+          error_message) ||
+        !qwen35x::cuda::run_nvfp4_sm120_gate_up_silu_device(
+          static_cast<const float *>(state.g_normalized),
+          static_cast<const std::uint32_t *>(gate.sm120_packed_weight_fragments),
+          static_cast<const std::uint32_t *>(gate.sm120_weight_scale_fragments),
+          gate_input_scale,
+          gate_weight_scale_2,
+          static_cast<const std::uint32_t *>(up.sm120_packed_weight_fragments),
+          static_cast<const std::uint32_t *>(up.sm120_weight_scale_fragments),
+          up_input_scale,
+          up_weight_scale_2,
+          gate.output_size,
+          gate.input_size,
+          gate.sm120_row_tiles,
+          gate.sm120_k_blocks,
+          state.sm120_activation_fragments,
+          state.sm120_activation_scales,
+          state.fp4_projection_output_f32,
+          static_cast<float *>(state.g_mlp_inter),
+          &elapsed_ms,
+          error_message)) {
+      error_message = "dry-run decode SM120 FP4 gate/up failed: " + error_message;
+      return false;
+    }
+  }
+
+  if (std::getenv("QWEN35X_DRY_RUN_FP4_DECODE_MLP") != nullptr &&
+      nvfp4_state != nullptr &&
+      nvfp4_state->tensors.size() >= 3) {
+    const auto & gate = nvfp4_state->tensors[0];
+    const auto & up = nvfp4_state->tensors[1];
+    const auto & down = nvfp4_state->tensors[2];
+    float gate_input_scale = 0.0f;
+    float gate_weight_scale_2 = 0.0f;
+    float up_input_scale = 0.0f;
+    float up_weight_scale_2 = 0.0f;
+    float down_input_scale = 0.0f;
+    float down_weight_scale_2 = 0.0f;
+    double elapsed_ms = 0.0;
+    if (!check_cuda(cudaMemcpy(&gate_input_scale, gate.input_scale, sizeof(float), cudaMemcpyDeviceToHost), "cudaMemcpy(D2H dry-run sm120 mlp gate input_scale)", error_message) ||
+        !check_cuda(cudaMemcpy(&gate_weight_scale_2, gate.weight_scale_2, sizeof(float), cudaMemcpyDeviceToHost), "cudaMemcpy(D2H dry-run sm120 mlp gate weight_scale_2)", error_message) ||
+        !check_cuda(cudaMemcpy(&up_input_scale, up.input_scale, sizeof(float), cudaMemcpyDeviceToHost), "cudaMemcpy(D2H dry-run sm120 mlp up input_scale)", error_message) ||
+        !check_cuda(cudaMemcpy(&up_weight_scale_2, up.weight_scale_2, sizeof(float), cudaMemcpyDeviceToHost), "cudaMemcpy(D2H dry-run sm120 mlp up weight_scale_2)", error_message) ||
+        !check_cuda(cudaMemcpy(&down_input_scale, down.input_scale, sizeof(float), cudaMemcpyDeviceToHost), "cudaMemcpy(D2H dry-run sm120 mlp down input_scale)", error_message) ||
+        !check_cuda(cudaMemcpy(&down_weight_scale_2, down.weight_scale_2, sizeof(float), cudaMemcpyDeviceToHost), "cudaMemcpy(D2H dry-run sm120 mlp down weight_scale_2)", error_message) ||
+        !qwen35x::cuda::run_nvfp4_sm120_mlp_device(
+          static_cast<const float *>(state.g_normalized),
+          static_cast<const std::uint32_t *>(gate.sm120_packed_weight_fragments),
+          static_cast<const std::uint32_t *>(gate.sm120_weight_scale_fragments),
+          gate_input_scale,
+          gate_weight_scale_2,
+          static_cast<const std::uint32_t *>(up.sm120_packed_weight_fragments),
+          static_cast<const std::uint32_t *>(up.sm120_weight_scale_fragments),
+          up_input_scale,
+          up_weight_scale_2,
+          static_cast<const std::uint32_t *>(down.sm120_packed_weight_fragments),
+          static_cast<const std::uint32_t *>(down.sm120_weight_scale_fragments),
+          down_input_scale,
+          down_weight_scale_2,
+          gate.output_size,
+          gate.input_size,
+          gate.sm120_row_tiles,
+          gate.sm120_k_blocks,
+          down.output_size,
+          down.input_size,
+          down.sm120_row_tiles,
+          down.sm120_k_blocks,
+          state.sm120_activation_fragments,
+          state.sm120_activation_scales,
+          state.fp4_projection_output_f32,
+          static_cast<float *>(state.g_mlp_inter),
+          state.fp4_projection_input_f32,
+          &elapsed_ms,
+          error_message)) {
+      error_message = "dry-run decode SM120 FP4 MLP failed: " + error_message;
+      return false;
+    }
+  }
+
   const auto token_download_start = std::chrono::steady_clock::now();
   if (!check_cuda(
         cudaMemcpy(&out_next_token, state.output_token, sizeof(int), cudaMemcpyDeviceToHost),
