@@ -830,10 +830,11 @@ std::vector<std::uint8_t> pad_nvfp4_weight_for_tensor_core(
   weight_padding_cols = padded_packed_cols - source_packed_cols;
   std::vector<std::uint8_t> padded(static_cast<std::size_t>(padded_rows) * padded_packed_cols, 0);
   for (int row = 0; row < rows; ++row) {
-    std::memcpy(
-      padded.data() + static_cast<std::size_t>(row) * padded_packed_cols,
-      packed_weight.data() + static_cast<std::size_t>(row) * source_packed_cols,
-      static_cast<std::size_t>(source_packed_cols));
+    auto * dst_row = padded.data() + static_cast<std::size_t>(row) * padded_packed_cols;
+    const auto * src_row = packed_weight.data() + static_cast<std::size_t>(row) * source_packed_cols;
+    for (int col = 0; col < source_packed_cols; ++col) {
+      dst_row[col] = static_cast<std::uint8_t>((src_row[col] >> 4u) | (src_row[col] << 4u));
+    }
   }
   return padded;
 }

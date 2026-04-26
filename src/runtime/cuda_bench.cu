@@ -215,6 +215,97 @@ std::uint8_t encode_nvfp4_e2m1(float value) {
   return static_cast<std::uint8_t>((negative ? 0x8u : 0u) | static_cast<std::uint8_t>(best));
 }
 
+bool run_cublaslt_fp4_projection(
+  const std::uint8_t * d_input,
+  const std::uint8_t * d_input_scales,
+  const std::uint8_t * d_weights,
+  const std::uint8_t * d_weight_scales,
+  float weight_scale_2,
+  int rows,
+  int cols,
+  float * d_output,
+  double & elapsed_ms,
+  std::string & error_message) {
+  cublasLtHandle_t handle = nullptr;
+  cublasLtMatmulDesc_t op_desc = nullptr;
+  cublasLtMatrixLayout_t a_desc = nullptr;
+  cublasLtMatrixLayout_t b_desc = nullptr;
+  cublasLtMatrixLayout_t c_desc = nullptr;
+  cublasLtMatmulPreference_t pref = nullptr;
+  cudaEvent_t start_event = nullptr;
+  cudaEvent_t stop_event = nullptr;
+  auto cleanup = [&]() {
+    cudaEventDestroy(start_event);
+    cudaEventDestroy(stop_event);
+    if (pref) cublasLtMatmulPreferenceDestroy(pref);
+    if (c_desc) cublasLtMatrixLayoutDestroy(c_desc);
+    if (b_desc) cublasLtMatrixLayoutDestroy(b_desc);
+    if (a_desc) cublasLtMatrixLayoutDestroy(a_desc);
+    if (op_desc) cublasLtMatmulDescDestroy(op_desc);
+    if (handle) cublasLtDestroy(handle);
+  };
+
+  const cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F;
+  const cudaDataType_t scale_type = CUDA_R_32F;
+  const cublasOperation_t transa = CUBLAS_OP_N;
+  const cublasOperation_t transb = CUBLAS_OP_T;
+  const cublasLtOrder_t row_order = CUBLASLT_ORDER_ROW;
+  const cublasLtMatmulMatrixScale_t vec16_scale = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+  if (!check_cublas(cublasLtCreate(&handle), "cublasLtCreate", error_message) ||
+      !check_cublas(cublasLtMatmulDescCreate(&op_desc, compute_type, scale_type), "cublasLtMatmulDescCreate(fp4)", error_message) ||
+      !check_cublas(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)), "cublasLtMatmulDescSetAttribute(TRANSA fp4)", error_message) ||
+      !check_cublas(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)), "cublasLtMatmulDescSetAttribute(TRANSB fp4)", error_message) ||
+      !check_cublas(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &vec16_scale, sizeof(vec16_scale)), "cublasLtMatmulDescSetAttribute(A_SCALE_MODE fp4)", error_message) ||
+      !check_cublas(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &vec16_scale, sizeof(vec16_scale)), "cublasLtMatmulDescSetAttribute(B_SCALE_MODE fp4)", error_message) ||
+      !check_cublas(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &d_input_scales, sizeof(d_input_scales)), "cublasLtMatmulDescSetAttribute(A_SCALE_POINTER fp4)", error_message) ||
+      !check_cublas(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &d_weight_scales, sizeof(d_weight_scales)), "cublasLtMatmulDescSetAttribute(B_SCALE_POINTER fp4)", error_message) ||
+      !check_cublas(cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_4F_E2M1, 1, cols, cols), "cublasLtMatrixLayoutCreate(A fp4)", error_message) ||
+      !check_cublas(cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_4F_E2M1, rows, cols, cols), "cublasLtMatrixLayoutCreate(B fp4)", error_message) ||
+      !check_cublas(cublasLtMatrixLayoutCreate(&c_desc, CUDA_R_32F, 1, rows, rows), "cublasLtMatrixLayoutCreate(C fp4)", error_message) ||
+      !check_cublas(cublasLtMatrixLayoutSetAttribute(a_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)), "cublasLtMatrixLayoutSetAttribute(A_ORDER fp4)", error_message) ||
+      !check_cublas(cublasLtMatrixLayoutSetAttribute(b_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)), "cublasLtMatrixLayoutSetAttribute(B_ORDER fp4)", error_message) ||
+      !check_cublas(cublasLtMatrixLayoutSetAttribute(c_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)), "cublasLtMatrixLayoutSetAttribute(C_ORDER fp4)", error_message) ||
+      !check_cublas(cublasLtMatmulPreferenceCreate(&pref), "cublasLtMatmulPreferenceCreate(fp4)", error_message)) {
+    cleanup();
+    return false;
+  }
+
+  std::size_t workspace_bytes = 0;
+  cublasLtMatmulHeuristicResult_t heuristic{};
+  int returned_results = 0;
+  if (!check_cublas(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_bytes, sizeof(workspace_bytes)), "cublasLtMatmulPreferenceSetAttribute(fp4 workspace)", error_message) ||
+      !check_cublas(cublasLtMatmulAlgoGetHeuristic(handle, op_desc, a_desc, b_desc, c_desc, c_desc, pref, 1, &heuristic, &returned_results), "cublasLtMatmulAlgoGetHeuristic(fp4)", error_message)) {
+    cleanup();
+    return false;
+  }
+  if (returned_results <= 0 || heuristic.state != CUBLAS_STATUS_SUCCESS) {
+    error_message = "cuBLASLt returned no valid FP4 block-scale matmul algorithm.";
+    cleanup();
+    return false;
+  }
+
+  const float alpha = weight_scale_2;
+  const float beta = 0.0f;
+  if (!check_cuda(cudaEventCreate(&start_event), "cudaEventCreate(fp4 start)", error_message) ||
+      !check_cuda(cudaEventCreate(&stop_event), "cudaEventCreate(fp4 stop)", error_message) ||
+      !check_cuda(cudaEventRecord(start_event), "cudaEventRecord(fp4 start)", error_message) ||
+      !check_cublas(cublasLtMatmul(handle, op_desc, &alpha, d_input, a_desc, d_weights, b_desc, &beta, d_output, c_desc, d_output, c_desc, &heuristic.algo, nullptr, 0, nullptr), "cublasLtMatmul(fp4)", error_message) ||
+      !check_cuda(cudaEventRecord(stop_event), "cudaEventRecord(fp4 stop)", error_message) ||
+      !check_cuda(cudaEventSynchronize(stop_event), "cudaEventSynchronize(fp4 stop)", error_message)) {
+    cleanup();
+    return false;
+  }
+
+  float elapsed = 0.0f;
+  if (!check_cuda(cudaEventElapsedTime(&elapsed, start_event, stop_event), "cudaEventElapsedTime(fp4)", error_message)) {
+    cleanup();
+    return false;
+  }
+  elapsed_ms = static_cast<double>(elapsed);
+  cleanup();
+  return true;
+}
+
 int round_up_to_multiple(const int value, const int multiple) {
   return ((value + multiple - 1) / multiple) * multiple;
 }
@@ -573,23 +664,7 @@ bool run_nvfp4_cublaslt_probe(
   std::uint8_t * d_weights = nullptr;
   std::uint8_t * d_weight_scales = nullptr;
   float * d_output = nullptr;
-  cublasLtHandle_t handle = nullptr;
-  cublasLtMatmulDesc_t op_desc = nullptr;
-  cublasLtMatrixLayout_t a_desc = nullptr;
-  cublasLtMatrixLayout_t b_desc = nullptr;
-  cublasLtMatrixLayout_t c_desc = nullptr;
-  cublasLtMatmulPreference_t pref = nullptr;
-  cudaEvent_t start_event = nullptr;
-  cudaEvent_t stop_event = nullptr;
   auto cleanup = [&]() {
-    cudaEventDestroy(start_event);
-    cudaEventDestroy(stop_event);
-    if (pref) cublasLtMatmulPreferenceDestroy(pref);
-    if (c_desc) cublasLtMatrixLayoutDestroy(c_desc);
-    if (b_desc) cublasLtMatrixLayoutDestroy(b_desc);
-    if (a_desc) cublasLtMatrixLayoutDestroy(a_desc);
-    if (op_desc) cublasLtMatmulDescDestroy(op_desc);
-    if (handle) cublasLtDestroy(handle);
     cudaFree(d_input_f32);
     cudaFree(d_input);
     cudaFree(d_input_scales);
@@ -615,13 +690,22 @@ bool run_nvfp4_cublaslt_probe(
       !check_cuda(cudaMemset(d_input, 0, input_bytes), "cudaMemset(fp4 input)", error_message) ||
       !check_cuda(cudaMemset(d_input_scales, 0, input_scales.size()), "cudaMemset(fp4 input scales)", error_message) ||
       !check_cuda(cudaMemcpy(d_weights, cublaslt_packed_weights.data(), weight_bytes, cudaMemcpyHostToDevice), "cudaMemcpy(fp4 weights)", error_message) ||
-      !check_cuda(cudaMemcpy(d_weight_scales, weight_scales_ue4m3.data(), weight_scales_ue4m3.size(), cudaMemcpyHostToDevice), "cudaMemcpy(fp4 weight scales)", error_message) ||
-      !check_cublas(cublasLtCreate(&handle), "cublasLtCreate", error_message)) {
+      !check_cuda(cudaMemcpy(d_weight_scales, weight_scales_ue4m3.data(), weight_scales_ue4m3.size(), cudaMemcpyHostToDevice), "cudaMemcpy(fp4 weight scales)", error_message)) {
     cleanup();
     return false;
   }
-  nvfp4_quantize_single_row_for_cublaslt_kernel<<<scale_cols, 16>>>(d_input_f32, d_input, d_input_scales, cols);
-  if (!check_cuda(cudaGetLastError(), "nvfp4_quantize_single_row_for_cublaslt_kernel", error_message)) {
+  if (!run_nvfp4_cublaslt_projection_device(
+        d_input_f32,
+        d_weights,
+        d_weight_scales,
+        weight_scale_2,
+        used_rows,
+        cols,
+        d_input,
+        d_input_scales,
+        d_output,
+        &elapsed_ms,
+        error_message)) {
     cleanup();
     return false;
   }
@@ -660,59 +744,8 @@ bool run_nvfp4_cublaslt_probe(
     return false;
   }
 
-  const cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F;
-  const cudaDataType_t scale_type = CUDA_R_32F;
-  const cublasOperation_t transa = CUBLAS_OP_N;
-  const cublasOperation_t transb = CUBLAS_OP_T;
-  const cublasLtOrder_t row_order = CUBLASLT_ORDER_ROW;
-  const cublasLtMatmulMatrixScale_t vec16_scale = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
-  if (!check_cublas(cublasLtMatmulDescCreate(&op_desc, compute_type, scale_type), "cublasLtMatmulDescCreate(fp4)", error_message) ||
-      !check_cublas(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)), "cublasLtMatmulDescSetAttribute(TRANSA fp4)", error_message) ||
-      !check_cublas(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)), "cublasLtMatmulDescSetAttribute(TRANSB fp4)", error_message) ||
-      !check_cublas(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &vec16_scale, sizeof(vec16_scale)), "cublasLtMatmulDescSetAttribute(A_SCALE_MODE fp4)", error_message) ||
-      !check_cublas(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &vec16_scale, sizeof(vec16_scale)), "cublasLtMatmulDescSetAttribute(B_SCALE_MODE fp4)", error_message) ||
-      !check_cublas(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &d_input_scales, sizeof(d_input_scales)), "cublasLtMatmulDescSetAttribute(A_SCALE_POINTER fp4)", error_message) ||
-      !check_cublas(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &d_weight_scales, sizeof(d_weight_scales)), "cublasLtMatmulDescSetAttribute(B_SCALE_POINTER fp4)", error_message) ||
-      !check_cublas(cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_4F_E2M1, 1, cols, cols), "cublasLtMatrixLayoutCreate(A fp4)", error_message) ||
-      !check_cublas(cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_4F_E2M1, used_rows, cols, cols), "cublasLtMatrixLayoutCreate(B fp4)", error_message) ||
-      !check_cublas(cublasLtMatrixLayoutCreate(&c_desc, CUDA_R_32F, 1, used_rows, used_rows), "cublasLtMatrixLayoutCreate(C fp4)", error_message) ||
-      !check_cublas(cublasLtMatrixLayoutSetAttribute(a_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)), "cublasLtMatrixLayoutSetAttribute(A_ORDER fp4)", error_message) ||
-      !check_cublas(cublasLtMatrixLayoutSetAttribute(b_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)), "cublasLtMatrixLayoutSetAttribute(B_ORDER fp4)", error_message) ||
-      !check_cublas(cublasLtMatrixLayoutSetAttribute(c_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)), "cublasLtMatrixLayoutSetAttribute(C_ORDER fp4)", error_message) ||
-      !check_cublas(cublasLtMatmulPreferenceCreate(&pref), "cublasLtMatmulPreferenceCreate(fp4)", error_message)) {
-    cleanup();
-    return false;
-  }
-
-  std::size_t workspace_bytes = 0;
-  cublasLtMatmulHeuristicResult_t heuristic{};
-  int returned_results = 0;
-  if (!check_cublas(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_bytes, sizeof(workspace_bytes)), "cublasLtMatmulPreferenceSetAttribute(fp4 workspace)", error_message) ||
-      !check_cublas(cublasLtMatmulAlgoGetHeuristic(handle, op_desc, a_desc, b_desc, c_desc, c_desc, pref, 1, &heuristic, &returned_results), "cublasLtMatmulAlgoGetHeuristic(fp4)", error_message)) {
-    cleanup();
-    return false;
-  }
-  if (returned_results <= 0 || heuristic.state != CUBLAS_STATUS_SUCCESS) {
-    error_message = "cuBLASLt returned no valid FP4 block-scale matmul algorithm.";
-    cleanup();
-    return false;
-  }
-
-  const float alpha = weight_scale_2;
-  const float beta = 0.0f;
-  if (!check_cuda(cudaEventCreate(&start_event), "cudaEventCreate(fp4 start)", error_message) ||
-      !check_cuda(cudaEventCreate(&stop_event), "cudaEventCreate(fp4 stop)", error_message) ||
-      !check_cuda(cudaEventRecord(start_event), "cudaEventRecord(fp4 start)", error_message) ||
-      !check_cublas(cublasLtMatmul(handle, op_desc, &alpha, d_input, a_desc, d_weights, b_desc, &beta, d_output, c_desc, d_output, c_desc, &heuristic.algo, nullptr, 0, nullptr), "cublasLtMatmul(fp4)", error_message) ||
-      !check_cuda(cudaEventRecord(stop_event), "cudaEventRecord(fp4 stop)", error_message) ||
-      !check_cuda(cudaEventSynchronize(stop_event), "cudaEventSynchronize(fp4 stop)", error_message)) {
-    cleanup();
-    return false;
-  }
-  float elapsed = 0.0f;
   std::vector<float> actual(static_cast<std::size_t>(used_rows), 0.0f);
-  if (!check_cuda(cudaEventElapsedTime(&elapsed, start_event, stop_event), "cudaEventElapsedTime(fp4)", error_message) ||
-      !check_cuda(cudaMemcpy(actual.data(), d_output, output_bytes, cudaMemcpyDeviceToHost), "cudaMemcpy(fp4 output)", error_message)) {
+  if (!check_cuda(cudaMemcpy(actual.data(), d_output, output_bytes, cudaMemcpyDeviceToHost), "cudaMemcpy(fp4 output)", error_message)) {
     cleanup();
     return false;
   }
@@ -724,8 +757,63 @@ bool run_nvfp4_cublaslt_probe(
     max_abs_actual = std::max(max_abs_actual, static_cast<double>(std::fabs(actual[static_cast<std::size_t>(row)])));
     max_abs_error = std::max(max_abs_error, static_cast<double>(std::fabs(actual[static_cast<std::size_t>(row)] - expected[static_cast<std::size_t>(row)])));
   }
-  elapsed_ms = static_cast<double>(elapsed);
   cleanup();
+  return true;
+}
+
+bool run_nvfp4_cublaslt_projection_device(
+  const float * input_f32,
+  const std::uint8_t * packed_weights_cublaslt,
+  const std::uint8_t * weight_scales_tiled,
+  float weight_scale_2,
+  int rows,
+  int cols,
+  std::uint8_t * activation_scratch,
+  std::uint8_t * activation_scale_scratch,
+  float * output_f32,
+  double * elapsed_ms,
+  std::string & error_message) {
+  if (input_f32 == nullptr || packed_weights_cublaslt == nullptr || weight_scales_tiled == nullptr ||
+      activation_scratch == nullptr || activation_scale_scratch == nullptr || output_f32 == nullptr) {
+    error_message = "NVFP4 cuBLASLt projection received a null device buffer.";
+    return false;
+  }
+  if (rows <= 0 || cols <= 0 || (cols % 16) != 0 || (cols % 2) != 0) {
+    error_message = "Invalid matrix dimensions for NVFP4 cuBLASLt projection.";
+    return false;
+  }
+
+  const int scale_cols = cols / 16;
+  const std::size_t activation_bytes = static_cast<std::size_t>(cols / 2);
+  const std::size_t activation_scale_bytes =
+    static_cast<std::size_t>(round_up_to_multiple(1, 128)) * round_up_to_multiple(scale_cols, 4);
+  if (!check_cuda(cudaMemset(activation_scratch, 0, activation_bytes), "cudaMemset(fp4 projection activation)", error_message) ||
+      !check_cuda(cudaMemset(activation_scale_scratch, 0, activation_scale_bytes), "cudaMemset(fp4 projection activation scales)", error_message)) {
+    return false;
+  }
+
+  nvfp4_quantize_single_row_for_cublaslt_kernel<<<scale_cols, 16>>>(input_f32, activation_scratch, activation_scale_scratch, cols);
+  if (!check_cuda(cudaGetLastError(), "nvfp4_quantize_single_row_for_cublaslt_kernel", error_message)) {
+    return false;
+  }
+
+  double local_elapsed_ms = 0.0;
+  if (!run_cublaslt_fp4_projection(
+        activation_scratch,
+        activation_scale_scratch,
+        packed_weights_cublaslt,
+        weight_scales_tiled,
+        weight_scale_2,
+        rows,
+        cols,
+        output_f32,
+        local_elapsed_ms,
+        error_message)) {
+    return false;
+  }
+  if (elapsed_ms != nullptr) {
+    *elapsed_ms = local_elapsed_ms;
+  }
   return true;
 }
 

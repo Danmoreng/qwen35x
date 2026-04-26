@@ -39,4 +39,17 @@ bool run_nvfp4_cublaslt_probe(
   double & max_abs_actual,
   std::string & error_message);
 
+bool run_nvfp4_cublaslt_projection_device(
+  const float * input_f32,
+  const std::uint8_t * packed_weights_cublaslt,
+  const std::uint8_t * weight_scales_tiled,
+  float weight_scale_2,
+  int rows,
+  int cols,
+  std::uint8_t * activation_scratch,
+  std::uint8_t * activation_scale_scratch,
+  float * output_f32,
+  double * elapsed_ms,
+  std::string & error_message);
+
 } // namespace qwen35x::cuda
