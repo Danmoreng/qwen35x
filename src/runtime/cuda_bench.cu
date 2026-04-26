@@ -138,6 +138,18 @@ __global__ void silu_multiply_kernel(const float * gate, const float * up, float
   output[idx] = (gate_value / (1.0f + expf(-gate_value))) * up[idx];
 }
 
+__global__ void add_residual_write_bf16_kernel(
+  const float * input,
+  const __nv_bfloat16 * residual,
+  __nv_bfloat16 * output,
+  int size) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= size) {
+    return;
+  }
+  output[idx] = __float2bfloat16(input[idx] + __bfloat162float(residual[idx]));
+}
+
 __global__ void nvfp4_matvec_check_kernel(
   const std::uint8_t * packed_weights,
   const std::uint8_t * weight_scales,
@@ -1291,6 +1303,90 @@ bool run_nvfp4_sm120_mlp_device(
   }
   if (elapsed_ms != nullptr) {
     *elapsed_ms = gate_up_ms + down_ms;
+  }
+  return true;
+}
+
+bool run_nvfp4_sm120_mlp_residual_device(
+  const float * input_f32,
+  const std::uint32_t * gate_packed_weight_fragments,
+  const std::uint32_t * gate_weight_scale_fragments,
+  float gate_input_scale,
+  float gate_weight_scale_2,
+  const std::uint32_t * up_packed_weight_fragments,
+  const std::uint32_t * up_weight_scale_fragments,
+  float up_input_scale,
+  float up_weight_scale_2,
+  const std::uint32_t * down_packed_weight_fragments,
+  const std::uint32_t * down_weight_scale_fragments,
+  float down_input_scale,
+  float down_weight_scale_2,
+  int intermediate_rows,
+  int hidden_cols,
+  int gate_up_row_tiles,
+  int gate_up_k_blocks,
+  int down_rows,
+  int down_cols,
+  int down_row_tiles,
+  int down_k_blocks,
+  std::uint32_t * activation_fragment_scratch,
+  std::uint32_t * activation_scale_scratch,
+  float * gate_silu_output_f32,
+  float * up_output_f32,
+  float * down_output_f32,
+  const void * residual_bf16,
+  void * hidden_out_bf16,
+  double * elapsed_ms,
+  std::string & error_message) {
+  if (residual_bf16 == nullptr || hidden_out_bf16 == nullptr) {
+    error_message = "SM120 FP4 MLP residual path received a null residual/output buffer.";
+    return false;
+  }
+  double mlp_ms = 0.0;
+  if (!run_nvfp4_sm120_mlp_device(
+        input_f32,
+        gate_packed_weight_fragments,
+        gate_weight_scale_fragments,
+        gate_input_scale,
+        gate_weight_scale_2,
+        up_packed_weight_fragments,
+        up_weight_scale_fragments,
+        up_input_scale,
+        up_weight_scale_2,
+        down_packed_weight_fragments,
+        down_weight_scale_fragments,
+        down_input_scale,
+        down_weight_scale_2,
+        intermediate_rows,
+        hidden_cols,
+        gate_up_row_tiles,
+        gate_up_k_blocks,
+        down_rows,
+        down_cols,
+        down_row_tiles,
+        down_k_blocks,
+        activation_fragment_scratch,
+        activation_scale_scratch,
+        gate_silu_output_f32,
+        up_output_f32,
+        down_output_f32,
+        elapsed_ms == nullptr ? nullptr : &mlp_ms,
+        error_message)) {
+    return false;
+  }
+
+  constexpr int block_size = 256;
+  const int grid_size = (down_rows + block_size - 1) / block_size;
+  add_residual_write_bf16_kernel<<<grid_size, block_size>>>(
+    down_output_f32,
+    static_cast<const __nv_bfloat16 *>(residual_bf16),
+    static_cast<__nv_bfloat16 *>(hidden_out_bf16),
+    down_rows);
+  if (!check_cuda(cudaGetLastError(), "add_residual_write_bf16_kernel(sm120 mlp)", error_message)) {
+    return false;
+  }
+  if (elapsed_ms != nullptr) {
+    *elapsed_ms = mlp_ms;
   }
   return true;
 }

@@ -150,6 +150,38 @@ bool run_nvfp4_sm120_mlp_device(
   double * elapsed_ms,
   std::string & error_message);
 
+bool run_nvfp4_sm120_mlp_residual_device(
+  const float * input_f32,
+  const std::uint32_t * gate_packed_weight_fragments,
+  const std::uint32_t * gate_weight_scale_fragments,
+  float gate_input_scale,
+  float gate_weight_scale_2,
+  const std::uint32_t * up_packed_weight_fragments,
+  const std::uint32_t * up_weight_scale_fragments,
+  float up_input_scale,
+  float up_weight_scale_2,
+  const std::uint32_t * down_packed_weight_fragments,
+  const std::uint32_t * down_weight_scale_fragments,
+  float down_input_scale,
+  float down_weight_scale_2,
+  int intermediate_rows,
+  int hidden_cols,
+  int gate_up_row_tiles,
+  int gate_up_k_blocks,
+  int down_rows,
+  int down_cols,
+  int down_row_tiles,
+  int down_k_blocks,
+  std::uint32_t * activation_fragment_scratch,
+  std::uint32_t * activation_scale_scratch,
+  float * gate_silu_output_f32,
+  float * up_output_f32,
+  float * down_output_f32,
+  const void * residual_bf16,
+  void * hidden_out_bf16,
+  double * elapsed_ms,
+  std::string & error_message);
+
 bool run_nvfp4_cublaslt_gate_up_benchmark(
   const std::vector<std::uint8_t> & gate_packed_weights,
   const std::vector<std::uint8_t> & gate_weight_scales_e4m3,

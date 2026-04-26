@@ -138,6 +138,41 @@ bool run_nvfp4_sm120_mlp_device(
   return false;
 }
 
+bool run_nvfp4_sm120_mlp_residual_device(
+  const float *,
+  const std::uint32_t *,
+  const std::uint32_t *,
+  float,
+  float,
+  const std::uint32_t *,
+  const std::uint32_t *,
+  float,
+  float,
+  const std::uint32_t *,
+  const std::uint32_t *,
+  float,
+  float,
+  int,
+  int,
+  int,
+  int,
+  int,
+  int,
+  int,
+  int,
+  std::uint32_t *,
+  std::uint32_t *,
+  float *,
+  float *,
+  float *,
+  const void *,
+  void *,
+  double *,
+  std::string & error_message) {
+  error_message = "CUDA is not enabled in this build.";
+  return false;
+}
+
 bool run_nvfp4_custom_projection_benchmark(
   const std::vector<std::uint8_t> &,
   const std::vector<std::uint8_t> &,
