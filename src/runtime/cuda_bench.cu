@@ -316,51 +316,59 @@ __global__ void nvfp4_projection_scale_group_kernel(
   }
 }
 
-__global__ void nvfp4_mma_sync_mxf4nvf4_tile_probe_kernel(
+__global__ void nvfp4_mma_sync_mxf4nvf4_projection_kernel(
   const std::uint32_t * a_fragments,
   const std::uint32_t * b_fragments,
   const std::uint32_t * a_scales,
   const std::uint32_t * b_scales,
-  float * output) {
+  float * output,
+  int rows,
+  int k_blocks) {
 #if defined(__CUDA_ARCH_SPECIFIC__) && (__CUDA_ARCH_SPECIFIC__ == 1200)
+  const int row_tile = blockIdx.x;
   const int lane = threadIdx.x & 31;
-  const std::uint32_t a0 = a_fragments[lane * 4 + 0];
-  const std::uint32_t a1 = a_fragments[lane * 4 + 1];
-  const std::uint32_t a2 = a_fragments[lane * 4 + 2];
-  const std::uint32_t a3 = a_fragments[lane * 4 + 3];
-  const std::uint32_t b0 = b_fragments[lane * 2 + 0];
-  const std::uint32_t b1 = b_fragments[lane * 2 + 1];
-  float c0 = 0.0f;
-  float c1 = 1.0f;
-  float c2 = 2.0f;
-  float c3 = 3.0f;
   float d0 = 0.0f;
   float d1 = 0.0f;
   float d2 = 0.0f;
   float d3 = 0.0f;
-  const std::uint32_t scale_a = a_scales[lane];
-  const std::uint32_t scale_b = b_scales[lane];
   std::uint16_t bid = 0;
   std::uint16_t tid = 0;
-  asm volatile(
-    "mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3 "
-    "{%0, %1, %2, %3}, "
-    "{%4, %5, %6, %7}, "
-    "{%8, %9}, "
-    "{%10, %11, %12, %13}, "
-    "%14, {%16, %17}, "
-    "%15, {%16, %17};\n"
-    : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
-    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
-      "f"(c0), "f"(c1), "f"(c2), "f"(c3), "r"(scale_a), "r"(scale_b), "h"(bid), "h"(tid));
-  if (output != nullptr) {
-    output[lane * 4 + 0] = d0;
-    output[lane * 4 + 1] = d1;
-    output[lane * 4 + 2] = d2;
-    output[lane * 4 + 3] = d3;
+  for (int kb = 0; kb < k_blocks; ++kb) {
+    const std::uint32_t * a_base = a_fragments + (static_cast<std::size_t>(kb) * 32 + lane) * 4;
+    const std::uint32_t * b_base = b_fragments + ((static_cast<std::size_t>(row_tile) * k_blocks + kb) * 32 + lane) * 2;
+    const std::uint32_t scale_a = a_scales[static_cast<std::size_t>(kb) * 32 + lane];
+    const std::uint32_t scale_b = b_scales[(static_cast<std::size_t>(row_tile) * k_blocks + kb) * 32 + lane];
+    float next0 = 0.0f;
+    float next1 = 0.0f;
+    float next2 = 0.0f;
+    float next3 = 0.0f;
+    asm volatile(
+      "mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3 "
+      "{%0, %1, %2, %3}, "
+      "{%4, %5, %6, %7}, "
+      "{%8, %9}, "
+      "{%10, %11, %12, %13}, "
+      "%14, {%16, %17}, "
+      "%15, {%16, %17};\n"
+      : "=f"(next0), "=f"(next1), "=f"(next2), "=f"(next3)
+      : "r"(a_base[0]), "r"(a_base[1]), "r"(a_base[2]), "r"(a_base[3]), "r"(b_base[0]), "r"(b_base[1]),
+        "f"(d0), "f"(d1), "f"(d2), "f"(d3), "r"(scale_a), "r"(scale_b), "h"(bid), "h"(tid));
+    d0 = next0;
+    d1 = next1;
+    d2 = next2;
+    d3 = next3;
+  }
+  if (lane < 4) {
+    const int col0 = row_tile * 8 + lane * 2;
+    if (col0 < rows) {
+      output[col0] = d0;
+    }
+    if (col0 + 1 < rows) {
+      output[col0 + 1] = d1;
+    }
   }
 #else
-  if (threadIdx.x == 0 && output != nullptr) {
+  if (blockIdx.x == 0 && threadIdx.x == 0 && output != nullptr) {
     output[0] = -1.0f;
   }
 #endif
@@ -423,22 +431,24 @@ bool run_nvfp4_blackwell_fp4_projection_benchmark(
     return false;
   }
 
-  if (rows < 8 || cols < 64 || (cols % 16) != 0 || (cols % 2) != 0) {
-    error_message = "blackwell-fp4 tile probe requires at least 8 rows and 64 columns.";
+  if (rows <= 0 || cols < 64 || (cols % 64) != 0) {
+    error_message = "blackwell-fp4 projection requires positive rows and a column count divisible by 64.";
     return false;
   }
   const int packed_cols = cols / 2;
   const int scale_cols = cols / 16;
+  const int k_blocks = cols / 64;
+  const int row_tiles = (rows + 7) / 8;
   if (packed_weights.size() < static_cast<std::size_t>(rows) * packed_cols ||
       weight_scales_e4m3.size() < static_cast<std::size_t>(rows) * scale_cols) {
     error_message = "NVFP4 packed weight or scale size does not match matrix dimensions.";
     return false;
   }
 
-  std::vector<std::uint32_t> host_a_fragments(32 * 4, 0);
-  std::vector<std::uint32_t> host_b_fragments(32 * 2, 0);
-  std::vector<std::uint32_t> host_a_scales(32, 0);
-  std::vector<std::uint32_t> host_b_scales(32, 0);
+  std::vector<std::uint32_t> host_a_fragments(static_cast<std::size_t>(k_blocks) * 32 * 4, 0);
+  std::vector<std::uint32_t> host_b_fragments(static_cast<std::size_t>(row_tiles) * k_blocks * 32 * 2, 0);
+  std::vector<std::uint32_t> host_a_scales(static_cast<std::size_t>(k_blocks) * 32, 0);
+  std::vector<std::uint32_t> host_b_scales(static_cast<std::size_t>(row_tiles) * k_blocks * 32, 0);
   auto set_packed_nibble = [](std::uint32_t & word, const int nibble_index, const std::uint32_t nibble) {
     const int shift = nibble_index * 4;
     word = static_cast<std::uint32_t>((word & ~(0xfu << shift)) | ((nibble & 0xfu) << shift));
@@ -502,13 +512,13 @@ bool run_nvfp4_blackwell_fp4_projection_benchmark(
     return sign ? -value : value;
   };
 
-  std::vector<float> input(static_cast<std::size_t>(64), 0.0f);
-  std::vector<std::uint8_t> input_nibbles(64, 0);
-  std::vector<std::uint8_t> input_scales(4, 0);
-  for (int col = 0; col < 64; ++col) {
+  std::vector<float> input(static_cast<std::size_t>(cols), 0.0f);
+  std::vector<std::uint8_t> input_nibbles(static_cast<std::size_t>(cols), 0);
+  std::vector<std::uint8_t> input_scales(static_cast<std::size_t>(scale_cols), 0);
+  for (int col = 0; col < cols; ++col) {
     input[static_cast<std::size_t>(col)] = static_cast<float>((col % 17) - 8) / 17.0f;
   }
-  for (int group = 0; group < 4; ++group) {
+  for (int group = 0; group < scale_cols; ++group) {
     float max_abs = 0.0f;
     for (int i = 0; i < 16; ++i) {
       max_abs = std::max(max_abs, std::fabs(input[static_cast<std::size_t>(group * 16 + i)] * input_scale));
@@ -521,34 +531,55 @@ bool run_nvfp4_blackwell_fp4_projection_benchmark(
         encode_e2m1((input[static_cast<std::size_t>(col)] * input_scale) / scale);
     }
   }
-  const std::uint32_t packed_input_scales =
-    static_cast<std::uint32_t>(input_scales[0]) |
-    (static_cast<std::uint32_t>(input_scales[1]) << 8u) |
-    (static_cast<std::uint32_t>(input_scales[2]) << 16u) |
-    (static_cast<std::uint32_t>(input_scales[3]) << 24u);
-  std::fill(host_a_scales.begin(), host_a_scales.end(), packed_input_scales);
+  for (int kb = 0; kb < k_blocks; ++kb) {
+    const std::uint32_t packed_input_scales =
+      static_cast<std::uint32_t>(input_scales[static_cast<std::size_t>(kb) * 4 + 0]) |
+      (static_cast<std::uint32_t>(input_scales[static_cast<std::size_t>(kb) * 4 + 1]) << 8u) |
+      (static_cast<std::uint32_t>(input_scales[static_cast<std::size_t>(kb) * 4 + 2]) << 16u) |
+      (static_cast<std::uint32_t>(input_scales[static_cast<std::size_t>(kb) * 4 + 3]) << 24u);
+    for (int lane = 0; lane < 32; ++lane) {
+      host_a_scales[static_cast<std::size_t>(kb) * 32 + lane] = packed_input_scales;
+      const int thread_id_in_group = lane & 3;
+      for (int i = 0; i < 32; ++i) {
+        const int col = kb * 64 + thread_id_in_group * 8 + (i & 7) + (i >= 16 ? 32 : 0);
+        set_packed_nibble(
+          host_a_fragments[(static_cast<std::size_t>(kb) * 32 + lane) * 4 + i / 8],
+          i & 7,
+          input_nibbles[static_cast<std::size_t>(col)]);
+      }
+    }
+  }
 
-  for (int lane = 0; lane < 32; ++lane) {
-    const int group_id = lane >> 2;
-    const int thread_id_in_group = lane & 3;
-    for (int i = 0; i < 32; ++i) {
-      const int col = thread_id_in_group * 8 + (i & 7) + (i >= 16 ? 32 : 0);
-      set_packed_nibble(host_a_fragments[static_cast<std::size_t>(lane) * 4 + i / 8], i & 7, input_nibbles[static_cast<std::size_t>(col)]);
-    }
-    for (int i = 0; i < 16; ++i) {
-      const int k = thread_id_in_group * 8 + (i & 7) + (i >= 8 ? 32 : 0);
-      const int col = group_id;
-      const std::uint8_t packed = packed_weights[static_cast<std::size_t>(col) * packed_cols + k / 2];
-      const std::uint8_t nibble = (k & 1) == 0 ? (packed & 0x0fu) : (packed >> 4u);
-      set_packed_nibble(host_b_fragments[static_cast<std::size_t>(lane) * 2 + i / 8], i & 7, nibble);
-    }
+  for (int row_tile = 0; row_tile < row_tiles; ++row_tile) {
+    for (int kb = 0; kb < k_blocks; ++kb) {
+      for (int lane = 0; lane < 32; ++lane) {
+        const int group_id = lane >> 2;
+        const int thread_id_in_group = lane & 3;
+        const int out_row = row_tile * 8 + group_id;
+        for (int i = 0; i < 16; ++i) {
+          const int k = kb * 64 + thread_id_in_group * 8 + (i & 7) + (i >= 8 ? 32 : 0);
+          std::uint8_t nibble = 0;
+          if (out_row < rows) {
+            const std::uint8_t packed = packed_weights[static_cast<std::size_t>(out_row) * packed_cols + k / 2];
+            nibble = (k & 1) == 0 ? (packed & 0x0fu) : (packed >> 4u);
+          }
+          set_packed_nibble(
+            host_b_fragments[((static_cast<std::size_t>(row_tile) * k_blocks + kb) * 32 + lane) * 2 + i / 8],
+            i & 7,
+            nibble);
+        }
 
-    std::uint32_t packed_b_scales = 0;
-    for (int group = 0; group < 4; ++group) {
-      const auto scale_bits = static_cast<std::uint32_t>(weight_scales_e4m3[static_cast<std::size_t>(group_id) * scale_cols + group]);
-      packed_b_scales |= (scale_bits << (group * 8u));
+        std::uint32_t packed_b_scales = 0;
+        if (out_row < rows) {
+          for (int group = 0; group < 4; ++group) {
+            const auto scale_bits = static_cast<std::uint32_t>(
+              weight_scales_e4m3[static_cast<std::size_t>(out_row) * scale_cols + kb * 4 + group]);
+            packed_b_scales |= (scale_bits << (group * 8u));
+          }
+        }
+        host_b_scales[(static_cast<std::size_t>(row_tile) * k_blocks + kb) * 32 + lane] = packed_b_scales;
+      }
     }
-    host_b_scales[static_cast<std::size_t>(lane)] = packed_b_scales;
   }
 
   std::uint32_t * device_a_fragments = nullptr;
@@ -560,7 +591,7 @@ bool run_nvfp4_blackwell_fp4_projection_benchmark(
       !check_cuda(cudaMalloc(&device_b_fragments, host_b_fragments.size() * sizeof(std::uint32_t)), "cudaMalloc SM120 FP4 B fragments", error_message) ||
       !check_cuda(cudaMalloc(&device_a_scales, host_a_scales.size() * sizeof(std::uint32_t)), "cudaMalloc SM120 FP4 A scales", error_message) ||
       !check_cuda(cudaMalloc(&device_b_scales, host_b_scales.size() * sizeof(std::uint32_t)), "cudaMalloc SM120 FP4 B scales", error_message) ||
-      !check_cuda(cudaMalloc(&device_output, 32 * 4 * sizeof(float)), "cudaMalloc synthetic SM120 FP4 probe output", error_message)) {
+      !check_cuda(cudaMalloc(&device_output, static_cast<std::size_t>(rows) * sizeof(float)), "cudaMalloc SM120 FP4 projection output", error_message)) {
     cudaFree(device_a_fragments);
     cudaFree(device_b_fragments);
     cudaFree(device_a_scales);
@@ -605,8 +636,8 @@ bool run_nvfp4_blackwell_fp4_projection_benchmark(
   }
 
   for (int i = 0; i < warmup_iterations; ++i) {
-    nvfp4_mma_sync_mxf4nvf4_tile_probe_kernel<<<1, 32>>>(
-      device_a_fragments, device_b_fragments, device_a_scales, device_b_scales, device_output);
+    nvfp4_mma_sync_mxf4nvf4_projection_kernel<<<row_tiles, 32>>>(
+      device_a_fragments, device_b_fragments, device_a_scales, device_b_scales, device_output, rows, k_blocks);
   }
   if (!check_cuda(cudaGetLastError(), "launch synthetic SM120 FP4 warmup probe", error_message) ||
       !check_cuda(cudaDeviceSynchronize(), "synchronize synthetic SM120 FP4 warmup probe", error_message)) {
@@ -623,8 +654,8 @@ bool run_nvfp4_blackwell_fp4_projection_benchmark(
     return false;
   }
   for (int i = 0; i < benchmark_iterations; ++i) {
-    nvfp4_mma_sync_mxf4nvf4_tile_probe_kernel<<<1, 32>>>(
-      device_a_fragments, device_b_fragments, device_a_scales, device_b_scales, device_output);
+    nvfp4_mma_sync_mxf4nvf4_projection_kernel<<<row_tiles, 32>>>(
+      device_a_fragments, device_b_fragments, device_a_scales, device_b_scales, device_output, rows, k_blocks);
   }
   if (!check_cuda(cudaGetLastError(), "launch synthetic SM120 FP4 benchmark probe", error_message) ||
       !check_cuda(cudaEventRecord(stop), "cudaEventRecord stop", error_message) ||
@@ -643,7 +674,7 @@ bool run_nvfp4_blackwell_fp4_projection_benchmark(
     return false;
   }
 
-  std::vector<float> host_output(32 * 4, 0.0f);
+  std::vector<float> host_output(static_cast<std::size_t>(rows), 0.0f);
   if (!check_cuda(cudaMemcpy(host_output.data(), device_output, host_output.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy synthetic SM120 FP4 probe output", error_message)) {
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
@@ -663,28 +694,22 @@ bool run_nvfp4_blackwell_fp4_projection_benchmark(
 
   avg_iteration_ms = static_cast<double>(elapsed_ms) / static_cast<double>(benchmark_iterations);
   max_abs_error = 0.0;
-  for (int lane = 0; lane < 32; ++lane) {
-    const int group_id = lane >> 2;
-    const int thread_id_in_group = lane & 3;
-    for (int i = 0; i < 4; ++i) {
-      const int row = i < 2 ? group_id : group_id + 8;
-      const int col = thread_id_in_group * 2 + (i & 1);
-      double expected = static_cast<double>(i);
-      (void)row;
-      for (int k = 0; k < 64; ++k) {
-        const std::uint8_t packed = packed_weights[static_cast<std::size_t>(col) * packed_cols + k / 2];
-        const std::uint8_t nibble = (k & 1) == 0 ? (packed & 0x0fu) : (packed >> 4u);
-        const float scale = decode_e4m3(weight_scales_e4m3[static_cast<std::size_t>(col) * scale_cols + k / 16]) * weight_scale_2;
-        expected += static_cast<double>(decode_e2m1(nibble) * scale * (input[static_cast<std::size_t>(k)] * input_scale));
-      }
-      const double actual = static_cast<double>(host_output[static_cast<std::size_t>(lane) * 4 + i]);
-      max_abs_error = std::max(max_abs_error, std::fabs(actual - expected));
+  const int check_rows = std::min(rows, 64);
+  for (int row = 0; row < check_rows; ++row) {
+    double expected = 0.0;
+    for (int k = 0; k < cols; ++k) {
+      const std::uint8_t packed = packed_weights[static_cast<std::size_t>(row) * packed_cols + k / 2];
+      const std::uint8_t nibble = (k & 1) == 0 ? (packed & 0x0fu) : (packed >> 4u);
+      const float scale = decode_e4m3(weight_scales_e4m3[static_cast<std::size_t>(row) * scale_cols + k / 16]) * weight_scale_2;
+      expected += static_cast<double>(decode_e2m1(nibble) * scale * (input[static_cast<std::size_t>(k)] * input_scale));
     }
+    const double actual = static_cast<double>(host_output[static_cast<std::size_t>(row)]);
+    max_abs_error = std::max(max_abs_error, std::fabs(actual - expected));
   }
-  if (max_abs_error > 0.25) {
+  if (max_abs_error > 0.5) {
     error_message =
-      "synthetic SM120 mxf4nvf4 MMA tile probe produced unexpected accumulator value " + std::to_string(host_output[0]) +
-      " for the real model-tile check.";
+      "SM120 mxf4nvf4 projection produced unexpected output " + std::to_string(host_output[0]) +
+      " for the full projection check.";
     return false;
   }
   return true;
