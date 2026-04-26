@@ -36,7 +36,8 @@ decode_kernel(
     float *__restrict__ g_normalized,
     unsigned int *__restrict__ barrier_counter,
     unsigned int *__restrict__ barrier_generation,
-    int input_token_id, int position, int max_seq_len)
+    int input_token_id, int position, int max_seq_len,
+    int use_sm120_mlp)
 {
     int block_id = blockIdx.x;
     int num_blocks = gridDim.x;
@@ -56,6 +57,7 @@ decode_kernel(
 
     for (int layer = 0; layer < NUM_LAYERS; layer++) {
         const __nv_bfloat16 *layer_input = (layer == 0) ? embed_row : hidden_buffer;
+        const bool use_sm120_mlp_for_layer = use_sm120_mlp > layer;
 
         if (LAYER_TYPE[layer] == 0) {
             deltanet_layer(
@@ -65,7 +67,7 @@ decode_kernel(
                 g_residual, g_activations, g_qkv_scratch, g_z_scratch,
                 g_beta_scratch, g_alpha_scratch, g_attn_out, g_mlp_inter,
                 dn_states + dn_layer_idx * dn_state_stride,
-                conv_bufs, hidden_buffer, dn_layer_idx, shmem_bf16, false);
+                conv_bufs, hidden_buffer, dn_layer_idx, shmem_bf16, 0, use_sm120_mlp_for_layer);
             dn_layer_idx++;
         } else {
             full_attention_layer(
@@ -76,7 +78,7 @@ decode_kernel(
                 fa_v_cache + fa_layer_idx * fa_kv_stride,
                 g_residual, g_activations, g_qkv_scratch, g_kv_scratch,
                 g_attn_out, g_attn_partials, g_mlp_inter, hidden_buffer,
-                position, max_seq_len, shmem_bf16, false);
+                position, max_seq_len, shmem_bf16, 0, use_sm120_mlp_for_layer);
             fa_layer_idx++;
         }
     }

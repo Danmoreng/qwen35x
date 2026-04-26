@@ -68,6 +68,8 @@ if (CMAKE_CUDA_COMPILER)
         decode_kernel=decode_kernel_${variant_name}
         decode_prefix_mlp_kernel=decode_prefix_mlp_kernel_${variant_name}
         decode_mlp_only_kernel=decode_mlp_only_kernel_${variant_name}
+        decode_mlp_from_activation_kernel=decode_mlp_from_activation_kernel_${variant_name}
+        decode_gate_up_from_activation_kernel=decode_gate_up_from_activation_kernel_${variant_name}
         final_norm_kernel=final_norm_kernel_${variant_name}
         lm_head_kernel=lm_head_kernel_${variant_name}
         rmsnorm_redundant=rmsnorm_redundant_${variant_name}
@@ -98,6 +100,8 @@ if (CMAKE_CUDA_COMPILER)
         launch_decode=launch_decode_${variant_name}
         launch_decode_prefix_mlp=launch_decode_prefix_mlp_${variant_name}
         launch_decode_mlp_only=launch_decode_mlp_only_${variant_name}
+        launch_decode_mlp_from_activation=launch_decode_mlp_from_activation_${variant_name}
+        launch_decode_gate_up_from_activation=launch_decode_gate_up_from_activation_${variant_name}
         launch_decode_final_lm=launch_decode_final_lm_${variant_name}
         launch_prefill_bf16=launch_prefill_bf16_${variant_name}
         set_decode_blocks_override=set_decode_blocks_override_${variant_name}

@@ -16,6 +16,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <utility>
 
@@ -247,6 +248,7 @@ struct PackedLayerNvfp4Weights {
   float repetition_penalty, \
   int position, \
   int max_seq_len, \
+  int use_sm120_mlp, \
   Qwen35xDecodeProfile * profile, \
   cudaStream_t stream
 
@@ -343,6 +345,28 @@ using LaunchDecodeMlpOnlyFn = void (*)(
   int layer,
   int decode_blocks,
   cudaStream_t stream);
+using LaunchDecodeMlpFromActivationFn = void (*)(
+  const PackedLayerWeights * layer_weights,
+  const PackedLayerNvfp4Weights * layer_nvfp4_weights,
+  const void * g_activations,
+  void * hidden_buffer,
+  void * g_residual,
+  void * g_mlp_inter,
+  unsigned int * barrier_counter,
+  unsigned int * barrier_generation,
+  int layer,
+  int decode_blocks,
+  cudaStream_t stream);
+using LaunchDecodeGateUpFromActivationFn = void (*)(
+  const PackedLayerWeights * layer_weights,
+  const PackedLayerNvfp4Weights * layer_nvfp4_weights,
+  const void * g_activations,
+  void * g_mlp_inter,
+  unsigned int * barrier_counter,
+  unsigned int * barrier_generation,
+  int layer,
+  int decode_blocks,
+  cudaStream_t stream);
 
 extern "C" void launch_decode_0p8b(QWEN35X_LAUNCH_DECODE_PARAMS);
 extern "C" void launch_decode_4b(QWEN35X_LAUNCH_DECODE_PARAMS);
@@ -362,6 +386,14 @@ extern "C" void launch_decode_mlp_only_0p8b(
   const PackedLayerWeights *, const PackedLayerNvfp4Weights *, void *, void *, void *, unsigned int *, unsigned int *, int, int, cudaStream_t);
 extern "C" void launch_decode_mlp_only_4b(
   const PackedLayerWeights *, const PackedLayerNvfp4Weights *, void *, void *, void *, unsigned int *, unsigned int *, int, int, cudaStream_t);
+extern "C" void launch_decode_mlp_from_activation_0p8b(
+  const PackedLayerWeights *, const PackedLayerNvfp4Weights *, const void *, void *, void *, void *, unsigned int *, unsigned int *, int, int, cudaStream_t);
+extern "C" void launch_decode_mlp_from_activation_4b(
+  const PackedLayerWeights *, const PackedLayerNvfp4Weights *, const void *, void *, void *, void *, unsigned int *, unsigned int *, int, int, cudaStream_t);
+extern "C" void launch_decode_gate_up_from_activation_0p8b(
+  const PackedLayerWeights *, const PackedLayerNvfp4Weights *, const void *, void *, unsigned int *, unsigned int *, int, int, cudaStream_t);
+extern "C" void launch_decode_gate_up_from_activation_4b(
+  const PackedLayerWeights *, const PackedLayerNvfp4Weights *, const void *, void *, unsigned int *, unsigned int *, int, int, cudaStream_t);
 extern "C" void launch_prefill_bf16_0p8b(QWEN35X_LAUNCH_PREFILL_PARAMS);
 extern "C" void launch_prefill_bf16_4b(QWEN35X_LAUNCH_PREFILL_PARAMS);
 #undef QWEN35X_LAUNCH_DECODE_PARAMS
@@ -392,6 +424,8 @@ struct VariantDescriptor {
   LaunchDecodePrefixMlpFn launch_decode_prefix_mlp;
   LaunchDecodeFinalLmFn launch_decode_final_lm;
   LaunchDecodeMlpOnlyFn launch_decode_mlp_only;
+  LaunchDecodeMlpFromActivationFn launch_decode_mlp_from_activation;
+  LaunchDecodeGateUpFromActivationFn launch_decode_gate_up_from_activation;
   LaunchPrefillFn launch_prefill;
   void (*set_decode_blocks_override)(int);
   int (*query_max_safe_decode_blocks)();
@@ -407,12 +441,12 @@ struct VariantDescriptor {
 
 const VariantDescriptor kVariant0p8b{
   "0.8b", 24, 1024, 3584, 248320, 8, 2, 256, 64, 16, 16, 128, 128, 4, kLayerType0p8b, 3584,
-  launch_decode_0p8b, launch_decode_prefix_mlp_0p8b, launch_decode_final_lm_0p8b, launch_decode_mlp_only_0p8b, launch_prefill_bf16_0p8b,
+  launch_decode_0p8b, launch_decode_prefix_mlp_0p8b, launch_decode_final_lm_0p8b, launch_decode_mlp_only_0p8b, launch_decode_mlp_from_activation_0p8b, launch_decode_gate_up_from_activation_0p8b, launch_prefill_bf16_0p8b,
   set_decode_blocks_override_0p8b, query_max_safe_decode_blocks_0p8b
 };
 const VariantDescriptor kVariant4b{
   "4b", 32, 2560, 9216, 248320, 16, 4, 256, 64, 16, 32, 128, 256, 4, kLayerType4b, 64,
-  launch_decode_4b, launch_decode_prefix_mlp_4b, launch_decode_final_lm_4b, launch_decode_mlp_only_4b, launch_prefill_bf16_4b,
+  launch_decode_4b, launch_decode_prefix_mlp_4b, launch_decode_final_lm_4b, launch_decode_mlp_only_4b, launch_decode_mlp_from_activation_4b, launch_decode_gate_up_from_activation_4b, launch_prefill_bf16_4b,
   set_decode_blocks_override_4b, query_max_safe_decode_blocks_4b
 };
 const VariantDescriptor * const kVariants[] = {&kVariant0p8b, &kVariant4b};
@@ -1980,6 +2014,7 @@ bool copy_nvfp4_scales_to_host(
   float & weight_scale_2,
   const char * label,
   std::string & error_message);
+int parse_optional_nonnegative_env(const char * name, int fallback);
 bool debug_check_f32_buffer(
   const float * device_buffer,
   int count,
@@ -2048,9 +2083,22 @@ bool run_decode_step_impl(
     std::getenv("QWEN35X_DEBUG_SPLIT_INKERNEL_MLP") != nullptr;
   const bool use_split_mlp_only =
     std::getenv("QWEN35X_DEBUG_SPLIT_MLP_ONLY") != nullptr;
+  const bool debug_external_mlp_parity =
+    std::getenv("QWEN35X_DEBUG_EXTERNAL_MLP_PARITY") != nullptr;
+  const bool use_sm120_gate_up_scalar_down =
+    std::getenv("QWEN35X_DEBUG_SM120_GATE_UP_SCALAR_DOWN") != nullptr;
+  const bool use_scalar_gate_up_sm120_down =
+    std::getenv("QWEN35X_DEBUG_SCALAR_GATE_UP_SM120_DOWN") != nullptr;
 
   if (use_sm120_mlp_substitution) {
-    const int substitution_decode_blocks = descriptor.dn_num_heads;
+    const int substitution_decode_blocks = variant.query_max_safe_decode_blocks();
+    const int sm120_layer_limit =
+      parse_optional_nonnegative_env("QWEN35X_DEBUG_SM120_MLP_LAYER_LIMIT", descriptor.num_layers);
+    if (debug_external_mlp_parity) {
+      std::cerr << "[external-mlp-parity] enabled decode_blocks=" << substitution_decode_blocks
+                << " position=" << position
+                << " input_token=" << input_token << std::endl;
+    }
     if (std::getenv("QWEN35X_DEBUG_SM120_MLP_SUBSTITUTION") != nullptr &&
         !debug_check_bf16_buffer(
           static_cast<const std::uint16_t *>(state.embed_weight) +
@@ -2070,6 +2118,7 @@ bool run_decode_step_impl(
       const auto & gate = nvfp4_state->tensors[tensor_idx + 0];
       const auto & up = nvfp4_state->tensors[tensor_idx + 1];
       const auto & down = nvfp4_state->tensors[tensor_idx + 2];
+      const bool use_native_sm120_for_layer = layer_idx < sm120_layer_limit;
 
       variant.launch_decode_prefix_mlp(
         input_token,
@@ -2097,7 +2146,7 @@ bool run_decode_step_impl(
         position,
         max_seq_len,
         substitution_decode_blocks,
-        (use_split_inkernel_mlp && !use_split_mlp_only) ? 0 : 1,
+        debug_external_mlp_parity ? 2 : ((use_split_inkernel_mlp && !use_split_mlp_only) ? 0 : 1),
         nullptr);
       if (!check_cuda(cudaGetLastError(), "launch_decode_prefix_mlp", error_message)) {
         return false;
@@ -2120,13 +2169,30 @@ bool run_decode_step_impl(
       }
 
       if (use_split_inkernel_mlp) {
+        if (std::getenv("QWEN35X_DEBUG_SM120_MLP_SUBSTITUTION") != nullptr &&
+            !debug_check_bf16_buffer(
+              state.hidden_buffer,
+              descriptor.hidden_size,
+              "position " + std::to_string(position) + " input_token " + std::to_string(input_token) +
+                " layer " + std::to_string(layer_idx) + " split in-kernel hidden",
+              error_message)) {
+          return false;
+        }
         continue;
       }
 
-      if (use_split_mlp_only) {
-        variant.launch_decode_mlp_only(
+      if (debug_external_mlp_parity) {
+        const std::size_t hidden_bytes = static_cast<std::size_t>(descriptor.hidden_size) * sizeof(std::uint16_t);
+        if (!check_cuda(
+              cudaMemcpy(state.pf_hidden_bf16_out, state.hidden_buffer, hidden_bytes, cudaMemcpyDeviceToDevice),
+              "cudaMemcpy(D2D external MLP parity save in-kernel hidden)",
+              error_message)) {
+          return false;
+        }
+        variant.launch_decode_mlp_from_activation(
           state.layer_weights,
           state.layer_nvfp4_weights,
+          state.g_activations,
           state.hidden_buffer,
           state.g_residual,
           state.g_mlp_inter,
@@ -2135,7 +2201,37 @@ bool run_decode_step_impl(
           layer_idx,
           substitution_decode_blocks,
           nullptr);
-        if (!check_cuda(cudaGetLastError(), "launch_decode_mlp_only", error_message)) {
+        if (!check_cuda(cudaGetLastError(), "launch_decode_mlp_from_activation(external parity)", error_message) ||
+            !debug_compare_bf16_buffers(
+              state.pf_hidden_bf16_out,
+              state.hidden_buffer,
+              descriptor.hidden_size,
+              "position " + std::to_string(position) + " input_token " + std::to_string(input_token) +
+                " layer " + std::to_string(layer_idx) + " in-kernel-vs-external-mlp hidden",
+              error_message) ||
+            !check_cuda(
+              cudaMemcpy(state.hidden_buffer, state.pf_hidden_bf16_out, hidden_bytes, cudaMemcpyDeviceToDevice),
+              "cudaMemcpy(D2D external MLP parity restore in-kernel hidden)",
+              error_message)) {
+          return false;
+        }
+        continue;
+      }
+
+      if (use_split_mlp_only) {
+        variant.launch_decode_mlp_from_activation(
+          state.layer_weights,
+          state.layer_nvfp4_weights,
+          state.g_activations,
+          state.hidden_buffer,
+          state.g_residual,
+          state.g_mlp_inter,
+          state.barrier_counter,
+          state.barrier_generation,
+          layer_idx,
+          substitution_decode_blocks,
+          nullptr);
+        if (!check_cuda(cudaGetLastError(), "launch_decode_mlp_from_activation", error_message)) {
           return false;
         }
         continue;
@@ -2147,9 +2243,10 @@ bool run_decode_step_impl(
             !check_cuda(cudaMemcpy(state.pf_residual, state.g_residual, hidden_bytes, cudaMemcpyDeviceToDevice), "cudaMemcpy(D2D parity save residual)", error_message)) {
           return false;
         }
-        variant.launch_decode_mlp_only(
+        variant.launch_decode_mlp_from_activation(
           state.layer_weights,
           state.layer_nvfp4_weights,
+          state.g_activations,
           state.hidden_buffer,
           state.g_residual,
           state.g_mlp_inter,
@@ -2158,7 +2255,7 @@ bool run_decode_step_impl(
           layer_idx,
           substitution_decode_blocks,
           nullptr);
-        if (!check_cuda(cudaGetLastError(), "launch_decode_mlp_only(parity reference)", error_message) ||
+        if (!check_cuda(cudaGetLastError(), "launch_decode_mlp_from_activation(parity reference)", error_message) ||
             !check_cuda(cudaMemcpy(state.pf_hidden_bf16_out, state.hidden_buffer, hidden_bytes, cudaMemcpyDeviceToDevice), "cudaMemcpy(D2D parity save mlp-only reference)", error_message) ||
             !check_cuda(cudaMemcpy(state.hidden_buffer, state.pf_hidden, hidden_bytes, cudaMemcpyDeviceToDevice), "cudaMemcpy(D2D parity restore post-attn hidden)", error_message) ||
             !check_cuda(cudaMemcpy(state.g_residual, state.pf_residual, hidden_bytes, cudaMemcpyDeviceToDevice), "cudaMemcpy(D2D parity restore residual)", error_message)) {
@@ -2210,6 +2307,94 @@ bool run_decode_step_impl(
           error_message = "scalar NVFP4 MLP parity reference failed at layer " + std::to_string(layer_idx) + ": " + error_message;
           return false;
         }
+      } else if (!use_native_sm120_for_layer) {
+        variant.launch_decode_mlp_from_activation(
+          state.layer_weights,
+          state.layer_nvfp4_weights,
+          state.g_activations,
+          state.hidden_buffer,
+          state.g_residual,
+          state.g_mlp_inter,
+          state.barrier_counter,
+          state.barrier_generation,
+          layer_idx,
+          substitution_decode_blocks,
+          nullptr);
+        if (!check_cuda(cudaGetLastError(), "launch_decode_mlp_from_activation(layer-limit fallback)", error_message)) {
+          return false;
+        }
+      } else if (use_sm120_gate_up_scalar_down) {
+        if (!qwen35x::cuda::run_nvfp4_sm120_gate_up_silu_device(
+              static_cast<const float *>(state.g_activations),
+              static_cast<const std::uint32_t *>(gate.sm120_packed_weight_fragments),
+              static_cast<const std::uint32_t *>(gate.sm120_weight_scale_fragments),
+              live_activation_scale,
+              gate_weight_scale_2,
+              static_cast<const std::uint32_t *>(up.sm120_packed_weight_fragments),
+              static_cast<const std::uint32_t *>(up.sm120_weight_scale_fragments),
+              live_activation_scale,
+              up_weight_scale_2,
+              gate.output_size,
+              gate.input_size,
+              gate.sm120_row_tiles,
+              gate.sm120_k_blocks,
+              state.sm120_activation_fragments,
+              state.sm120_activation_scales,
+              state.fp4_projection_output_f32,
+              static_cast<float *>(state.g_mlp_inter),
+              nullptr,
+              error_message) ||
+            !qwen35x::cuda::run_nvfp4_scalar_down_residual_device(
+              state.fp4_projection_output_f32,
+              static_cast<const std::uint8_t *>(down.packed_weight),
+              static_cast<const std::uint8_t *>(down.weight_scale),
+              live_activation_scale,
+              down_weight_scale_2,
+              down.output_size,
+              down.input_size,
+              state.fp4_projection_input_f32,
+              state.g_residual,
+              state.hidden_buffer,
+              error_message)) {
+          error_message = "SM120 gate/up + scalar down MLP substitution failed at layer " + std::to_string(layer_idx) + ": " + error_message;
+          return false;
+        }
+      } else if (use_scalar_gate_up_sm120_down) {
+        variant.launch_decode_gate_up_from_activation(
+          state.layer_weights,
+          state.layer_nvfp4_weights,
+          state.g_activations,
+          state.g_mlp_inter,
+          state.barrier_counter,
+          state.barrier_generation,
+          layer_idx,
+          substitution_decode_blocks,
+          nullptr);
+        if (!check_cuda(cudaGetLastError(), "launch_decode_gate_up_from_activation", error_message) ||
+            !qwen35x::cuda::run_nvfp4_sm120_projection_device(
+              static_cast<const float *>(state.g_mlp_inter),
+              static_cast<const std::uint32_t *>(down.sm120_packed_weight_fragments),
+              static_cast<const std::uint32_t *>(down.sm120_weight_scale_fragments),
+              live_activation_scale,
+              down_weight_scale_2,
+              down.output_size,
+              down.input_size,
+              down.sm120_row_tiles,
+              down.sm120_k_blocks,
+              state.sm120_activation_fragments,
+              state.sm120_activation_scales,
+              state.fp4_projection_input_f32,
+              nullptr,
+              error_message) ||
+            !qwen35x::cuda::add_residual_write_bf16_device(
+              state.fp4_projection_input_f32,
+              state.g_residual,
+              state.hidden_buffer,
+              down.output_size,
+              error_message)) {
+          error_message = "scalar gate/up + SM120 down MLP substitution failed at layer " + std::to_string(layer_idx) + ": " + error_message;
+          return false;
+        }
       }
 
       if (use_scalar_split_mlp) {
@@ -2219,7 +2404,8 @@ bool run_decode_step_impl(
               error_message)) {
           return false;
         }
-      } else if (!qwen35x::cuda::run_nvfp4_sm120_mlp_residual_device(
+      } else if (use_native_sm120_for_layer && !use_sm120_gate_up_scalar_down && !use_scalar_gate_up_sm120_down &&
+          !qwen35x::cuda::run_nvfp4_sm120_mlp_residual_device(
             static_cast<const float *>(state.g_activations),
             static_cast<const std::uint32_t *>(gate.sm120_packed_weight_fragments),
             static_cast<const std::uint32_t *>(gate.sm120_weight_scale_fragments),
@@ -2335,6 +2521,9 @@ bool run_decode_step_impl(
       repetition_penalty,
       position,
       max_seq_len,
+      (std::getenv("QWEN35X_ENABLE_INKERNEL_SM120_MLP") != nullptr && nvfp4_state != nullptr)
+        ? parse_optional_nonnegative_env("QWEN35X_DEBUG_INKERNEL_SM120_MLP_LAYER_LIMIT", descriptor.num_layers)
+        : 0,
       profile,
       nullptr);
 
@@ -2621,6 +2810,19 @@ bool copy_nvfp4_scales_to_host(
     return false;
   }
   return true;
+}
+
+int parse_optional_nonnegative_env(const char * name, int fallback) {
+  const char * raw = std::getenv(name);
+  if (raw == nullptr || *raw == '\0') {
+    return fallback;
+  }
+  char * end = nullptr;
+  const long parsed = std::strtol(raw, &end, 10);
+  if (end == raw || parsed < 0 || parsed > std::numeric_limits<int>::max()) {
+    return fallback;
+  }
+  return static_cast<int>(parsed);
 }
 
 bool debug_check_f32_buffer(

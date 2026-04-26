@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "decode_sm120_mlp.cuh"
 #include "decode_sync.cuh"
 #include "variant.cuh"
 #include "weights.cuh"
@@ -463,7 +464,8 @@ __device__ void full_attention_layer(
     __nv_bfloat16 *__restrict__ hidden_out,   // [HIDDEN] bf16
     int position, int max_seq_len,
     __nv_bfloat16 *__restrict__ shmem,
-    bool external_mlp)
+    int external_mlp,
+    bool use_sm120_mlp)
 {
     int block_id = blockIdx.x;
     int num_blocks = gridDim.x;
@@ -769,10 +771,26 @@ __device__ void full_attention_layer(
             g_activations[i] = __bfloat162float(s_act[i]);
         }
         grid.sync();
-        return;
+        if (external_mlp == 1) {
+            return;
+        }
+    } else {
+        grid.sync();
     }
 
-    if (qw != nullptr && qw->ptrs[8].packed_weight != nullptr && qw->ptrs[9].packed_weight != nullptr) {
+    const bool use_sm120_mlp_layer =
+        use_sm120_mlp && qw != nullptr &&
+        qw->ptrs[8].sm120_packed_weight_fragments != nullptr &&
+        qw->ptrs[8].sm120_weight_scale_fragments != nullptr &&
+        qw->ptrs[9].sm120_packed_weight_fragments != nullptr &&
+        qw->ptrs[9].sm120_weight_scale_fragments != nullptr &&
+        qw->ptrs[10].sm120_packed_weight_fragments != nullptr &&
+        qw->ptrs[10].sm120_weight_scale_fragments != nullptr;
+
+    if (use_sm120_mlp_layer) {
+        matvec_gate_up_silu_nvfp4_sm120(grid, s_act, qw->ptrs[8], qw->ptrs[9],
+                                        g_mlp_inter, g_activations, HIDDEN_SIZE, INTERMEDIATE_SIZE, num_blocks);
+    } else if (qw != nullptr && qw->ptrs[8].packed_weight != nullptr && qw->ptrs[9].packed_weight != nullptr) {
         matvec_gate_up_silu_nvfp4(s_act, qw->ptrs[8], qw->ptrs[9],
                                   g_mlp_inter, HIDDEN_SIZE, INTERMEDIATE_SIZE, num_blocks);
     } else {
@@ -786,7 +804,10 @@ __device__ void full_attention_layer(
     for (int i = threadIdx.x; i < INTERMEDIATE_SIZE; i += BLOCK_SIZE) s_mlp[i] = g_mlp_inter[i];
     __syncthreads();
 
-    if (qw != nullptr && qw->ptrs[10].packed_weight != nullptr) {
+    if (use_sm120_mlp_layer) {
+        matvec_down_residual_nvfp4_sm120(grid, s_mlp, qw->ptrs[10], g_residual, hidden_out,
+                                         g_activations, INTERMEDIATE_SIZE, HIDDEN_SIZE, num_blocks);
+    } else if (qw != nullptr && qw->ptrs[10].packed_weight != nullptr) {
         matvec_down_residual_nvfp4(s_mlp, qw->ptrs[10], g_residual, hidden_out,
                                    INTERMEDIATE_SIZE, HIDDEN_SIZE, num_blocks);
     } else {
@@ -818,7 +839,8 @@ __device__ void deltanet_layer(
     __nv_bfloat16 *__restrict__ hidden_out,
     int dn_layer_idx,
     __nv_bfloat16 *__restrict__ shmem,
-    bool external_mlp)
+    int external_mlp,
+    bool use_sm120_mlp)
 {
     int block_id = blockIdx.x;
     int num_blocks = gridDim.x;
@@ -982,10 +1004,26 @@ __device__ void deltanet_layer(
             g_activations[i] = __bfloat162float(s_act[i]);
         }
         grid.sync();
-        return;
+        if (external_mlp == 1) {
+            return;
+        }
+    } else {
+        grid.sync();
     }
 
-    if (qw != nullptr && qw->ptrs[11].packed_weight != nullptr && qw->ptrs[12].packed_weight != nullptr) {
+    const bool use_sm120_mlp_layer =
+        use_sm120_mlp && qw != nullptr &&
+        qw->ptrs[11].sm120_packed_weight_fragments != nullptr &&
+        qw->ptrs[11].sm120_weight_scale_fragments != nullptr &&
+        qw->ptrs[12].sm120_packed_weight_fragments != nullptr &&
+        qw->ptrs[12].sm120_weight_scale_fragments != nullptr &&
+        qw->ptrs[13].sm120_packed_weight_fragments != nullptr &&
+        qw->ptrs[13].sm120_weight_scale_fragments != nullptr;
+
+    if (use_sm120_mlp_layer) {
+        matvec_gate_up_silu_nvfp4_sm120(grid, s_act, qw->ptrs[11], qw->ptrs[12],
+                                        g_mlp_inter, g_activations, HIDDEN_SIZE, INTERMEDIATE_SIZE, num_blocks);
+    } else if (qw != nullptr && qw->ptrs[11].packed_weight != nullptr && qw->ptrs[12].packed_weight != nullptr) {
         matvec_gate_up_silu_nvfp4(s_act, qw->ptrs[11], qw->ptrs[12],
                                   g_mlp_inter, HIDDEN_SIZE, INTERMEDIATE_SIZE, num_blocks);
     } else {
@@ -997,7 +1035,10 @@ __device__ void deltanet_layer(
     float *s_mlp = reinterpret_cast<float *>(shmem);
     for (int i = threadIdx.x; i < INTERMEDIATE_SIZE; i += BLOCK_SIZE) s_mlp[i] = g_mlp_inter[i];
     __syncthreads();
-    if (qw != nullptr && qw->ptrs[13].packed_weight != nullptr) {
+    if (use_sm120_mlp_layer) {
+        matvec_down_residual_nvfp4_sm120(grid, s_mlp, qw->ptrs[13], g_residual, hidden_out,
+                                         g_activations, INTERMEDIATE_SIZE, HIDDEN_SIZE, num_blocks);
+    } else if (qw != nullptr && qw->ptrs[13].packed_weight != nullptr) {
         matvec_down_residual_nvfp4(s_mlp, qw->ptrs[13], g_residual, hidden_out,
                                    INTERMEDIATE_SIZE, HIDDEN_SIZE, num_blocks);
     } else {

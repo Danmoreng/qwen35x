@@ -92,7 +92,7 @@ decode_prefix_mlp_kernel(
             g_residual, g_activations, g_qkv_scratch, g_z_scratch,
             g_beta_scratch, g_alpha_scratch, g_attn_out, g_mlp_inter,
             dn_states + dn_layer_idx * dn_state_stride,
-            conv_bufs, hidden_buffer, dn_layer_idx, shmem_bf16, external_mlp != 0);
+            conv_bufs, hidden_buffer, dn_layer_idx, shmem_bf16, external_mlp, false);
     } else {
         full_attention_layer(
             grid, layer_weights[layer].fa,
@@ -102,7 +102,7 @@ decode_prefix_mlp_kernel(
             fa_v_cache + fa_layer_idx * fa_kv_stride,
             g_residual, g_activations, g_qkv_scratch, g_kv_scratch,
             g_attn_out, g_attn_partials, g_mlp_inter, hidden_buffer,
-            position, max_seq_len, shmem_bf16, external_mlp != 0);
+            position, max_seq_len, shmem_bf16, external_mlp, false);
     }
 }
 
@@ -208,6 +208,116 @@ decode_mlp_only_kernel(
     grid.sync();
 }
 
+__global__ void __launch_bounds__(BLOCK_SIZE, 1)
+decode_mlp_from_activation_kernel(
+    const LayerWeights *__restrict__ layer_weights,
+    const LayerNvfp4Weights *__restrict__ layer_nvfp4_weights,
+    const float *__restrict__ g_activations,
+    __nv_bfloat16 *__restrict__ hidden_buffer,
+    __nv_bfloat16 *__restrict__ g_residual,
+    float *__restrict__ g_mlp_inter,
+    unsigned int *__restrict__ barrier_counter,
+    unsigned int *__restrict__ barrier_generation,
+    int layer)
+{
+    int num_blocks = gridDim.x;
+    AtomicGridSync grid{barrier_counter, barrier_generation, (unsigned int)num_blocks, 0};
+    __shared__ __align__(16) char shmem_raw[MAX_ACT_DIM * sizeof(float)];
+    __nv_bfloat16 *s_act = reinterpret_cast<__nv_bfloat16 *>(shmem_raw);
+    const LayerNvfp4Weights *qw = layer_nvfp4_weights == nullptr ? nullptr : &layer_nvfp4_weights[layer];
+
+    for (int i = threadIdx.x; i < HIDDEN_SIZE; i += BLOCK_SIZE) {
+        s_act[i] = __float2bfloat16(g_activations[i]);
+    }
+    __syncthreads();
+
+    if (LAYER_TYPE[layer] == 0) {
+        const DeltaNetWeights &w = layer_weights[layer].dn;
+        if (qw != nullptr && qw->ptrs[11].packed_weight != nullptr && qw->ptrs[12].packed_weight != nullptr) {
+            matvec_gate_up_silu_nvfp4(s_act, qw->ptrs[11], qw->ptrs[12],
+                                      g_mlp_inter, HIDDEN_SIZE, INTERMEDIATE_SIZE, num_blocks);
+        } else {
+            matvec_gate_up_silu_bf16(s_act, w.gate_proj_weight, w.up_proj_weight,
+                                      g_mlp_inter, HIDDEN_SIZE, INTERMEDIATE_SIZE, num_blocks);
+        }
+        grid.sync();
+        float *s_mlp = reinterpret_cast<float *>(s_act);
+        for (int i = threadIdx.x; i < INTERMEDIATE_SIZE; i += BLOCK_SIZE) s_mlp[i] = g_mlp_inter[i];
+        __syncthreads();
+        if (qw != nullptr && qw->ptrs[13].packed_weight != nullptr) {
+            matvec_down_residual_nvfp4(s_mlp, qw->ptrs[13], g_residual, hidden_buffer,
+                                       INTERMEDIATE_SIZE, HIDDEN_SIZE, num_blocks);
+        } else {
+            matvec_down_residual_bf16(s_mlp, w.down_proj_weight, g_residual, hidden_buffer,
+                                       INTERMEDIATE_SIZE, HIDDEN_SIZE, num_blocks);
+        }
+    } else {
+        const FullAttnWeights &w = layer_weights[layer].fa;
+        if (qw != nullptr && qw->ptrs[8].packed_weight != nullptr && qw->ptrs[9].packed_weight != nullptr) {
+            matvec_gate_up_silu_nvfp4(s_act, qw->ptrs[8], qw->ptrs[9],
+                                      g_mlp_inter, HIDDEN_SIZE, INTERMEDIATE_SIZE, num_blocks);
+        } else {
+            matvec_gate_up_silu_bf16(s_act, w.gate_proj_weight, w.up_proj_weight,
+                                      g_mlp_inter, HIDDEN_SIZE, INTERMEDIATE_SIZE, num_blocks);
+        }
+        grid.sync();
+        float *s_mlp = reinterpret_cast<float *>(s_act);
+        for (int i = threadIdx.x; i < INTERMEDIATE_SIZE; i += BLOCK_SIZE) s_mlp[i] = g_mlp_inter[i];
+        __syncthreads();
+        if (qw != nullptr && qw->ptrs[10].packed_weight != nullptr) {
+            matvec_down_residual_nvfp4(s_mlp, qw->ptrs[10], g_residual, hidden_buffer,
+                                       INTERMEDIATE_SIZE, HIDDEN_SIZE, num_blocks);
+        } else {
+            matvec_down_residual_bf16(s_mlp, w.down_proj_weight, g_residual, hidden_buffer,
+                                       INTERMEDIATE_SIZE, HIDDEN_SIZE, num_blocks);
+        }
+    }
+    grid.sync();
+}
+
+__global__ void __launch_bounds__(BLOCK_SIZE, 1)
+decode_gate_up_from_activation_kernel(
+    const LayerWeights *__restrict__ layer_weights,
+    const LayerNvfp4Weights *__restrict__ layer_nvfp4_weights,
+    const float *__restrict__ g_activations,
+    float *__restrict__ g_mlp_inter,
+    unsigned int *__restrict__ barrier_counter,
+    unsigned int *__restrict__ barrier_generation,
+    int layer)
+{
+    int num_blocks = gridDim.x;
+    AtomicGridSync grid{barrier_counter, barrier_generation, (unsigned int)num_blocks, 0};
+    __shared__ __align__(16) char shmem_raw[MAX_ACT_DIM * sizeof(float)];
+    __nv_bfloat16 *s_act = reinterpret_cast<__nv_bfloat16 *>(shmem_raw);
+    const LayerNvfp4Weights *qw = layer_nvfp4_weights == nullptr ? nullptr : &layer_nvfp4_weights[layer];
+
+    for (int i = threadIdx.x; i < HIDDEN_SIZE; i += BLOCK_SIZE) {
+        s_act[i] = __float2bfloat16(g_activations[i]);
+    }
+    __syncthreads();
+
+    if (LAYER_TYPE[layer] == 0) {
+        const DeltaNetWeights &w = layer_weights[layer].dn;
+        if (qw != nullptr && qw->ptrs[11].packed_weight != nullptr && qw->ptrs[12].packed_weight != nullptr) {
+            matvec_gate_up_silu_nvfp4(s_act, qw->ptrs[11], qw->ptrs[12],
+                                      g_mlp_inter, HIDDEN_SIZE, INTERMEDIATE_SIZE, num_blocks);
+        } else {
+            matvec_gate_up_silu_bf16(s_act, w.gate_proj_weight, w.up_proj_weight,
+                                      g_mlp_inter, HIDDEN_SIZE, INTERMEDIATE_SIZE, num_blocks);
+        }
+    } else {
+        const FullAttnWeights &w = layer_weights[layer].fa;
+        if (qw != nullptr && qw->ptrs[8].packed_weight != nullptr && qw->ptrs[9].packed_weight != nullptr) {
+            matvec_gate_up_silu_nvfp4(s_act, qw->ptrs[8], qw->ptrs[9],
+                                      g_mlp_inter, HIDDEN_SIZE, INTERMEDIATE_SIZE, num_blocks);
+        } else {
+            matvec_gate_up_silu_bf16(s_act, w.gate_proj_weight, w.up_proj_weight,
+                                      g_mlp_inter, HIDDEN_SIZE, INTERMEDIATE_SIZE, num_blocks);
+        }
+    }
+    grid.sync();
+}
+
 // =============================================================================
 // C entry point
 // =============================================================================
@@ -230,6 +340,7 @@ extern "C" void launch_decode(
     float *seen_token_mask,
     float repetition_penalty,
     int position, int max_seq_len,
+    int use_sm120_mlp,
     qwen35x::cuda_backend::Qwen35xDecodeProfile *profile,
     cudaStream_t stream)
 {
@@ -296,7 +407,8 @@ extern "C" void launch_decode(
         (float *)g_z_scratch, (float *)g_beta_scratch,
         (float *)g_alpha_scratch, (float *)g_normalized,
         barrier_counter, barrier_generation,
-        input_token_id, position, max_seq_len);
+        input_token_id, position, max_seq_len,
+        use_sm120_mlp);
 
     if (profile) {
         cudaEventRecord(profile_decode_end, stream);
@@ -449,6 +561,60 @@ extern "C" void launch_decode_mlp_only(
         layer_nvfp4_weights,
         (__nv_bfloat16 *)hidden_buffer,
         (__nv_bfloat16 *)g_residual,
+        (float *)g_mlp_inter,
+        barrier_counter,
+        barrier_generation,
+        layer);
+}
+
+extern "C" void launch_decode_mlp_from_activation(
+    const LayerWeights *layer_weights,
+    const LayerNvfp4Weights *layer_nvfp4_weights,
+    const void *g_activations,
+    void *hidden_buffer,
+    void *g_residual,
+    void *g_mlp_inter,
+    unsigned int *barrier_counter,
+    unsigned int *barrier_generation,
+    int layer,
+    int decode_blocks,
+    cudaStream_t stream)
+{
+    cudaMemsetAsync(barrier_counter, 0, sizeof(unsigned int), stream);
+    cudaMemsetAsync(barrier_generation, 0, sizeof(unsigned int), stream);
+    if (decode_blocks < MIN_DECODE_BLOCKS) decode_blocks = MIN_DECODE_BLOCKS;
+    if (decode_blocks > MAX_DECODE_BLOCKS) decode_blocks = MAX_DECODE_BLOCKS;
+    decode_mlp_from_activation_kernel<<<decode_blocks, BLOCK_SIZE, 0, stream>>>(
+        layer_weights,
+        layer_nvfp4_weights,
+        (const float *)g_activations,
+        (__nv_bfloat16 *)hidden_buffer,
+        (__nv_bfloat16 *)g_residual,
+        (float *)g_mlp_inter,
+        barrier_counter,
+        barrier_generation,
+        layer);
+}
+
+extern "C" void launch_decode_gate_up_from_activation(
+    const LayerWeights *layer_weights,
+    const LayerNvfp4Weights *layer_nvfp4_weights,
+    const void *g_activations,
+    void *g_mlp_inter,
+    unsigned int *barrier_counter,
+    unsigned int *barrier_generation,
+    int layer,
+    int decode_blocks,
+    cudaStream_t stream)
+{
+    cudaMemsetAsync(barrier_counter, 0, sizeof(unsigned int), stream);
+    cudaMemsetAsync(barrier_generation, 0, sizeof(unsigned int), stream);
+    if (decode_blocks < MIN_DECODE_BLOCKS) decode_blocks = MIN_DECODE_BLOCKS;
+    if (decode_blocks > MAX_DECODE_BLOCKS) decode_blocks = MAX_DECODE_BLOCKS;
+    decode_gate_up_from_activation_kernel<<<decode_blocks, BLOCK_SIZE, 0, stream>>>(
+        layer_weights,
+        layer_nvfp4_weights,
+        (const float *)g_activations,
         (float *)g_mlp_inter,
         barrier_counter,
         barrier_generation,

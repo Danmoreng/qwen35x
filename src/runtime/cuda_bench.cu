@@ -1408,6 +1408,74 @@ bool run_nvfp4_sm120_mlp_residual_device(
   return true;
 }
 
+bool run_nvfp4_scalar_down_residual_device(
+  const float * input_f32,
+  const std::uint8_t * down_packed_weight,
+  const std::uint8_t * down_weight_scale,
+  float down_input_scale,
+  float down_weight_scale_2,
+  int down_rows,
+  int down_cols,
+  float * down_output_f32,
+  const void * residual_bf16,
+  void * hidden_out_bf16,
+  std::string & error_message) {
+  if (input_f32 == nullptr || down_packed_weight == nullptr || down_weight_scale == nullptr ||
+      down_output_f32 == nullptr || residual_bf16 == nullptr || hidden_out_bf16 == nullptr) {
+    error_message = "scalar NVFP4 down residual path received a null pointer.";
+    return false;
+  }
+  if (down_rows <= 0 || down_cols <= 0 || (down_cols % 16) != 0) {
+    error_message = "Invalid scalar NVFP4 down residual dimensions.";
+    return false;
+  }
+
+  constexpr int block_size = 256;
+  nvfp4_projection_scale_group_kernel<<<down_rows, block_size>>>(
+    down_packed_weight,
+    down_weight_scale,
+    input_f32,
+    down_input_scale,
+    down_weight_scale_2,
+    down_output_f32,
+    down_rows,
+    down_cols);
+  if (!check_cuda(cudaGetLastError(), "launch scalar NVFP4 down projection", error_message)) {
+    return false;
+  }
+
+  const int hidden_grid = (down_rows + block_size - 1) / block_size;
+  add_residual_write_bf16_kernel<<<hidden_grid, block_size>>>(
+    down_output_f32,
+    static_cast<const __nv_bfloat16 *>(residual_bf16),
+    static_cast<__nv_bfloat16 *>(hidden_out_bf16),
+    down_rows);
+  if (!check_cuda(cudaGetLastError(), "add_residual_write_bf16_kernel(scalar nvfp4 down)", error_message)) {
+    return false;
+  }
+  return true;
+}
+
+bool add_residual_write_bf16_device(
+  const float * input_f32,
+  const void * residual_bf16,
+  void * hidden_out_bf16,
+  int rows,
+  std::string & error_message) {
+  if (input_f32 == nullptr || residual_bf16 == nullptr || hidden_out_bf16 == nullptr || rows <= 0) {
+    error_message = "add residual bf16 path received an invalid argument.";
+    return false;
+  }
+  constexpr int block_size = 256;
+  const int grid_size = (rows + block_size - 1) / block_size;
+  add_residual_write_bf16_kernel<<<grid_size, block_size>>>(
+    input_f32,
+    static_cast<const __nv_bfloat16 *>(residual_bf16),
+    static_cast<__nv_bfloat16 *>(hidden_out_bf16),
+    rows);
+  return check_cuda(cudaGetLastError(), "add_residual_write_bf16_kernel", error_message);
+}
+
 bool convert_bf16_to_f32_device(
   const void * input_bf16,
   float * output_f32,
