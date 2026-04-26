@@ -182,6 +182,17 @@ bool run_nvfp4_sm120_mlp_residual_device(
   double * elapsed_ms,
   std::string & error_message);
 
+bool convert_bf16_to_f32_device(
+  const void * input_bf16,
+  float * output_f32,
+  int size,
+  std::string & error_message);
+
+bool fill_i32_device(
+  int * device_value,
+  int value,
+  std::string & error_message);
+
 bool run_nvfp4_scalar_mlp_residual_device(
   const float * input_f32,
   const std::uint8_t * gate_packed_weight,

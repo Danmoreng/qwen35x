@@ -173,6 +173,23 @@ bool run_nvfp4_sm120_mlp_residual_device(
   return false;
 }
 
+bool convert_bf16_to_f32_device(
+  const void *,
+  float *,
+  int,
+  std::string & error_message) {
+  error_message = "CUDA is not enabled in this build.";
+  return false;
+}
+
+bool fill_i32_device(
+  int *,
+  int,
+  std::string & error_message) {
+  error_message = "CUDA is not enabled in this build.";
+  return false;
+}
+
 bool run_nvfp4_scalar_mlp_residual_device(
   const float *,
   const std::uint8_t *,

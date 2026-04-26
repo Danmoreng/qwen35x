@@ -150,6 +150,23 @@ __global__ void add_residual_write_bf16_kernel(
   output[idx] = __float2bfloat16(input[idx] + __bfloat162float(residual[idx]));
 }
 
+__global__ void bf16_to_f32_kernel(
+  const __nv_bfloat16 * input,
+  float * output,
+  int size) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= size) {
+    return;
+  }
+  output[idx] = __bfloat162float(input[idx]);
+}
+
+__global__ void fill_i32_kernel(int * output, int value) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    *output = value;
+  }
+}
+
 __global__ void nvfp4_matvec_check_kernel(
   const std::uint8_t * packed_weights,
   const std::uint8_t * weight_scales,
@@ -1389,6 +1406,36 @@ bool run_nvfp4_sm120_mlp_residual_device(
     *elapsed_ms = mlp_ms;
   }
   return true;
+}
+
+bool convert_bf16_to_f32_device(
+  const void * input_bf16,
+  float * output_f32,
+  int size,
+  std::string & error_message) {
+  if (input_bf16 == nullptr || output_f32 == nullptr || size <= 0) {
+    error_message = "BF16 to F32 conversion received invalid buffers.";
+    return false;
+  }
+  constexpr int block_size = 256;
+  const int grid_size = (size + block_size - 1) / block_size;
+  bf16_to_f32_kernel<<<grid_size, block_size>>>(
+    static_cast<const __nv_bfloat16 *>(input_bf16),
+    output_f32,
+    size);
+  return check_cuda(cudaGetLastError(), "bf16_to_f32_kernel", error_message);
+}
+
+bool fill_i32_device(
+  int * device_value,
+  int value,
+  std::string & error_message) {
+  if (device_value == nullptr) {
+    error_message = "fill_i32_device received a null pointer.";
+    return false;
+  }
+  fill_i32_kernel<<<1, 1>>>(device_value, value);
+  return check_cuda(cudaGetLastError(), "fill_i32_kernel", error_message);
 }
 
 bool run_nvfp4_scalar_mlp_residual_device(
