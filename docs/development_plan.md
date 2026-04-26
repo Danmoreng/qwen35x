@@ -402,9 +402,12 @@ Validation policy for each new size:
     Current status: direct AxionML row-major packed weights and `[out,K/16]` scale tensors are not numerically compatible with the raw cuBLASLt FP4 path. Production FP4 execution needs a backend-specific packed projection layout rather than passing safetensor rows directly to cuBLASLt.
   - [x] Add NVIDIA tiled 1D block-scale layout handling to the diagnostic probe.
     Current status: the probe pads scales to `M % 128 == 0` and `(K/16) % 4 == 0`, then applies the documented FP4 1D block-scale tile order used for Blackwell block-scaled GEMM scale tensors.
+  - [x] Establish the cuBLASLt operand orientation for native FP4 projection.
+    Current status: `input[1,K] x weight[rows,K]^T -> output[1,rows]` with input scales bound to operand A and weight scales bound to operand B produces numerically plausible output. A full `gate_proj` probe over 3,584 rows reports `max_abs_expected ~= 0.467`, `max_abs_actual ~= 0.465`, and `max_abs_error ~= 0.051`; the remaining gap is consistent with FP4 activation quantization and needs thresholding against model quality tests.
   - [x] Implement a ModelOpt FP4 projection layout object that stores padded packed weights, swizzled FP8 block scales, `alpha=input_scale*weight_scale_2`, and original output size per tensor.
     Current status: the CUDA loader now materializes raw scalar-fallback tensors and a second tensor-core-ready projection layout for every ModelOpt NVFP4 projection. Decode still uses the scalar fallback until the in-tree FP4 GEMM backend is wired in.
-  - [ ] Add an in-tree Blackwell FP4 GEMM backend using the padded packed-weight and tiled-scale projection layout.
+  - [ ] Add a reusable Blackwell FP4 projection backend using the proven cuBLASLt operand orientation and the padded packed-weight/tiled-scale projection layout.
+  - [ ] Add a GPU activation quantization stage that emits packed E2M1 activations plus tiled UE4M3 per-16 scales without host round-trips.
   - [ ] Add a custom Blackwell decode projection path for batch-1/token decode if cuBLASLt GEMM is inefficient at current shapes.
   - [ ] Keep scalar NVFP4 matvecs as the correctness fallback until tensor-core kernels pass error-threshold and quality smoke tests.
 - [ ] Expand NVFP4 native coverage to embedding/LM-head or document why those remain BF16.

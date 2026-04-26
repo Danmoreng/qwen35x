@@ -177,6 +177,14 @@ std::vector<std::uint8_t> swizzle_nvfp4_block_scale(
   return swizzled;
 }
 
+std::vector<std::uint8_t> swap_fp4_nibbles(const std::uint8_t * data, const std::size_t bytes) {
+  std::vector<std::uint8_t> swapped(bytes, 0);
+  for (std::size_t i = 0; i < bytes; ++i) {
+    swapped[i] = static_cast<std::uint8_t>((data[i] >> 4u) | (data[i] << 4u));
+  }
+  return swapped;
+}
+
 } // namespace
 
 bool run_bf16_matvec_benchmark(
@@ -466,6 +474,7 @@ bool run_nvfp4_cublaslt_probe(
     }
   }
   const auto input_scales = swizzle_nvfp4_block_scale(input_scales_linear, 1, scale_cols);
+  const auto cublaslt_packed_input = swap_fp4_nibbles(packed_input.data(), packed_input.size());
 
   std::vector<float> expected(static_cast<std::size_t>(used_rows), 0.0f);
   std::vector<std::uint8_t> weight_scales_ue4m3_linear(static_cast<std::size_t>(used_rows) * scale_cols, 0);
@@ -482,6 +491,7 @@ bool run_nvfp4_cublaslt_probe(
     }
   }
   const auto weight_scales_ue4m3 = swizzle_nvfp4_block_scale(weight_scales_ue4m3_linear, used_rows, scale_cols);
+  const auto cublaslt_packed_weights = swap_fp4_nibbles(packed_weights.data(), static_cast<std::size_t>(used_rows) * packed_cols);
 
   std::uint8_t * d_input = nullptr;
   std::uint8_t * d_input_scales = nullptr;
@@ -523,9 +533,9 @@ bool run_nvfp4_cublaslt_probe(
     cleanup();
     return false;
   }
-  if (!check_cuda(cudaMemcpy(d_input, packed_input.data(), input_bytes, cudaMemcpyHostToDevice), "cudaMemcpy(fp4 input)", error_message) ||
+  if (!check_cuda(cudaMemcpy(d_input, cublaslt_packed_input.data(), input_bytes, cudaMemcpyHostToDevice), "cudaMemcpy(fp4 input)", error_message) ||
       !check_cuda(cudaMemcpy(d_input_scales, input_scales.data(), input_scales.size(), cudaMemcpyHostToDevice), "cudaMemcpy(fp4 input scales)", error_message) ||
-      !check_cuda(cudaMemcpy(d_weights, packed_weights.data(), weight_bytes, cudaMemcpyHostToDevice), "cudaMemcpy(fp4 weights)", error_message) ||
+      !check_cuda(cudaMemcpy(d_weights, cublaslt_packed_weights.data(), weight_bytes, cudaMemcpyHostToDevice), "cudaMemcpy(fp4 weights)", error_message) ||
       !check_cuda(cudaMemcpy(d_weight_scales, weight_scales_ue4m3.data(), weight_scales_ue4m3.size(), cudaMemcpyHostToDevice), "cudaMemcpy(fp4 weight scales)", error_message) ||
       !check_cublas(cublasLtCreate(&handle), "cublasLtCreate", error_message)) {
     cleanup();
@@ -543,11 +553,11 @@ bool run_nvfp4_cublaslt_probe(
       !check_cublas(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)), "cublasLtMatmulDescSetAttribute(TRANSB fp4)", error_message) ||
       !check_cublas(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &vec16_scale, sizeof(vec16_scale)), "cublasLtMatmulDescSetAttribute(A_SCALE_MODE fp4)", error_message) ||
       !check_cublas(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &vec16_scale, sizeof(vec16_scale)), "cublasLtMatmulDescSetAttribute(B_SCALE_MODE fp4)", error_message) ||
-      !check_cublas(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &d_weight_scales, sizeof(d_weight_scales)), "cublasLtMatmulDescSetAttribute(A_SCALE_POINTER fp4)", error_message) ||
-      !check_cublas(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &d_input_scales, sizeof(d_input_scales)), "cublasLtMatmulDescSetAttribute(B_SCALE_POINTER fp4)", error_message) ||
-      !check_cublas(cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_4F_E2M1, used_rows, cols, cols), "cublasLtMatrixLayoutCreate(A fp4)", error_message) ||
-      !check_cublas(cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_4F_E2M1, 1, cols, cols), "cublasLtMatrixLayoutCreate(B fp4)", error_message) ||
-      !check_cublas(cublasLtMatrixLayoutCreate(&c_desc, CUDA_R_32F, used_rows, 1, 1), "cublasLtMatrixLayoutCreate(C fp4)", error_message) ||
+      !check_cublas(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &d_input_scales, sizeof(d_input_scales)), "cublasLtMatmulDescSetAttribute(A_SCALE_POINTER fp4)", error_message) ||
+      !check_cublas(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &d_weight_scales, sizeof(d_weight_scales)), "cublasLtMatmulDescSetAttribute(B_SCALE_POINTER fp4)", error_message) ||
+      !check_cublas(cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_4F_E2M1, 1, cols, cols), "cublasLtMatrixLayoutCreate(A fp4)", error_message) ||
+      !check_cublas(cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_4F_E2M1, used_rows, cols, cols), "cublasLtMatrixLayoutCreate(B fp4)", error_message) ||
+      !check_cublas(cublasLtMatrixLayoutCreate(&c_desc, CUDA_R_32F, 1, used_rows, used_rows), "cublasLtMatrixLayoutCreate(C fp4)", error_message) ||
       !check_cublas(cublasLtMatrixLayoutSetAttribute(a_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)), "cublasLtMatrixLayoutSetAttribute(A_ORDER fp4)", error_message) ||
       !check_cublas(cublasLtMatrixLayoutSetAttribute(b_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)), "cublasLtMatrixLayoutSetAttribute(B_ORDER fp4)", error_message) ||
       !check_cublas(cublasLtMatrixLayoutSetAttribute(c_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)), "cublasLtMatrixLayoutSetAttribute(C_ORDER fp4)", error_message) ||
@@ -575,7 +585,7 @@ bool run_nvfp4_cublaslt_probe(
   if (!check_cuda(cudaEventCreate(&start_event), "cudaEventCreate(fp4 start)", error_message) ||
       !check_cuda(cudaEventCreate(&stop_event), "cudaEventCreate(fp4 stop)", error_message) ||
       !check_cuda(cudaEventRecord(start_event), "cudaEventRecord(fp4 start)", error_message) ||
-      !check_cublas(cublasLtMatmul(handle, op_desc, &alpha, d_weights, a_desc, d_input, b_desc, &beta, d_output, c_desc, d_output, c_desc, &heuristic.algo, nullptr, 0, nullptr), "cublasLtMatmul(fp4)", error_message) ||
+      !check_cublas(cublasLtMatmul(handle, op_desc, &alpha, d_input, a_desc, d_weights, b_desc, &beta, d_output, c_desc, d_output, c_desc, &heuristic.algo, nullptr, 0, nullptr), "cublasLtMatmul(fp4)", error_message) ||
       !check_cuda(cudaEventRecord(stop_event), "cudaEventRecord(fp4 stop)", error_message) ||
       !check_cuda(cudaEventSynchronize(stop_event), "cudaEventSynchronize(fp4 stop)", error_message)) {
     cleanup();
