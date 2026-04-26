@@ -1,6 +1,19 @@
 #pragma once
 
 #include <cuda_bf16.h>
+#include <cstdint>
+
+struct Nvfp4Weight {
+    const std::uint8_t *packed_weight;   // [out_dim, in_dim / 2]
+    const std::uint8_t *weight_scale;    // [out_dim, in_dim / 16], E4M3 bytes
+    const float *weight_scale_2;         // scalar f32
+};
+
+struct LayerNvfp4Weights {
+    int layer_type;
+    int _pad[3];
+    Nvfp4Weight ptrs[14];
+};
 
 // Decode path weight structs - ALL BF16.
 struct FullAttnWeights {

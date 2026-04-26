@@ -135,6 +135,124 @@ __device__ void matvec_bf16(
     }
 }
 
+__device__ __forceinline__ float decode_nvfp4_e2m1(const std::uint8_t nibble)
+{
+    const std::uint8_t magnitude = nibble & 0x7u;
+    float value = 0.0f;
+    if (magnitude == 1) value = 0.5f;
+    else if (magnitude == 2) value = 1.0f;
+    else if (magnitude == 3) value = 1.5f;
+    else if (magnitude == 4) value = 2.0f;
+    else if (magnitude == 5) value = 3.0f;
+    else if (magnitude == 6) value = 4.0f;
+    else if (magnitude == 7) value = 6.0f;
+    return (nibble & 0x8u) ? -value : value;
+}
+
+__device__ __forceinline__ float decode_e4m3_scale(const std::uint8_t bits)
+{
+    if (bits == 0) return 0.0f;
+    const int sign = (bits >> 7) & 1;
+    const int exponent = (bits >> 3) & 0xf;
+    const int mantissa = bits & 0x7;
+    float value = 0.0f;
+    if (exponent == 0) {
+        value = ldexpf(float(mantissa) * 0.125f, -6);
+    } else {
+        value = ldexpf(1.0f + float(mantissa) * 0.125f, exponent - 7);
+    }
+    return sign ? -value : value;
+}
+
+static __device__ float nvfp4_row_dot(
+    const Nvfp4Weight &weight,
+    const __nv_bfloat16 *__restrict__ input,
+    int row,
+    int in_dim,
+    int lane_id)
+{
+    const std::uint8_t *packed_row = weight.packed_weight + row * (in_dim / 2);
+    const std::uint8_t *scale_row = weight.weight_scale + row * (in_dim / 16);
+    const float scale2 = __ldg(weight.weight_scale_2);
+    float sum = 0.0f;
+#pragma unroll 4
+    for (int k = lane_id * 8; k < in_dim; k += WARP_SIZE * 8) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int col = k + i;
+            const std::uint8_t packed = __ldg(packed_row + col / 2);
+            const std::uint8_t nibble = (col & 1) == 0 ? (packed & 0x0fu) : (packed >> 4u);
+            const float scale = decode_e4m3_scale(__ldg(scale_row + col / 16)) * scale2;
+            sum += decode_nvfp4_e2m1(nibble) * scale * __bfloat162float(input[col]);
+        }
+    }
+    return sum;
+}
+
+static __device__ float nvfp4_row_dot_f32(
+    const Nvfp4Weight &weight,
+    const float *__restrict__ input,
+    int row,
+    int in_dim,
+    int lane_id)
+{
+    const std::uint8_t *packed_row = weight.packed_weight + row * (in_dim / 2);
+    const std::uint8_t *scale_row = weight.weight_scale + row * (in_dim / 16);
+    const float scale2 = __ldg(weight.weight_scale_2);
+    float sum = 0.0f;
+#pragma unroll 4
+    for (int k = lane_id * 8; k < in_dim; k += WARP_SIZE * 8) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int col = k + i;
+            const std::uint8_t packed = __ldg(packed_row + col / 2);
+            const std::uint8_t nibble = (col & 1) == 0 ? (packed & 0x0fu) : (packed >> 4u);
+            const float scale = decode_e4m3_scale(__ldg(scale_row + col / 16)) * scale2;
+            sum += decode_nvfp4_e2m1(nibble) * scale * input[col];
+        }
+    }
+    return sum;
+}
+
+static __device__ void matvec_nvfp4_bf16(
+    const __nv_bfloat16 *__restrict__ s_input,
+    const Nvfp4Weight &weight,
+    float *__restrict__ output,
+    int in_dim, int out_dim, int num_blocks)
+{
+    int block_id = blockIdx.x;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+
+    int rows_per_block = (out_dim + num_blocks - 1) / num_blocks;
+    int row_start = block_id * rows_per_block;
+    int row_end = min(row_start + rows_per_block, out_dim);
+
+    for (int m_base = row_start; m_base < row_end; m_base += NUM_WARPS) {
+        int m = m_base + warp_id;
+        if (m < row_end) {
+            float sum = nvfp4_row_dot(weight, s_input, m, in_dim, lane_id);
+            sum = warp_reduce_sum(sum);
+            if (lane_id == 0) output[m] = sum;
+        }
+    }
+}
+
+static __device__ void matvec_select_bf16_or_nvfp4(
+    const __nv_bfloat16 *__restrict__ s_input,
+    const __nv_bfloat16 *__restrict__ bf16_weight,
+    const LayerNvfp4Weights *__restrict__ nvfp4_layer,
+    int nvfp4_ptr_idx,
+    float *__restrict__ output,
+    int in_dim, int out_dim, int num_blocks)
+{
+    if (nvfp4_layer != nullptr && nvfp4_layer->ptrs[nvfp4_ptr_idx].packed_weight != nullptr) {
+        matvec_nvfp4_bf16(s_input, nvfp4_layer->ptrs[nvfp4_ptr_idx], output, in_dim, out_dim, num_blocks);
+    } else {
+        matvec_bf16(s_input, bf16_weight, output, in_dim, out_dim, num_blocks);
+    }
+}
+
 // Fused gate+up+SiLU matvec (bf16 weights, bf16 activations)
 __device__ void matvec_gate_up_silu_bf16(
     const __nv_bfloat16 *__restrict__ s_input,
@@ -164,6 +282,34 @@ __device__ void matvec_gate_up_silu_bf16(
                 gate_sum += dot8_bf16(g_u4, s_input + k);
                 up_sum += dot8_bf16(u_u4, s_input + k);
             }
+            gate_sum = warp_reduce_sum(gate_sum);
+            up_sum = warp_reduce_sum(up_sum);
+            if (lane_id == 0)
+                output[m] = fast_silu(gate_sum) * up_sum;
+        }
+    }
+}
+
+static __device__ void matvec_gate_up_silu_nvfp4(
+    const __nv_bfloat16 *__restrict__ s_input,
+    const Nvfp4Weight &gate_weight,
+    const Nvfp4Weight &up_weight,
+    float *__restrict__ output,
+    int in_dim, int out_dim, int num_blocks)
+{
+    int block_id = blockIdx.x;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+
+    int rows_per_block = (out_dim + num_blocks - 1) / num_blocks;
+    int row_start = block_id * rows_per_block;
+    int row_end = min(row_start + rows_per_block, out_dim);
+
+    for (int m_base = row_start; m_base < row_end; m_base += NUM_WARPS) {
+        int m = m_base + warp_id;
+        if (m < row_end) {
+            float gate_sum = nvfp4_row_dot(gate_weight, s_input, m, in_dim, lane_id);
+            float up_sum = nvfp4_row_dot(up_weight, s_input, m, in_dim, lane_id);
             gate_sum = warp_reduce_sum(gate_sum);
             up_sum = warp_reduce_sum(up_sum);
             if (lane_id == 0)
@@ -209,6 +355,32 @@ __device__ void matvec_down_residual_bf16(
     }
 }
 
+static __device__ void matvec_down_residual_nvfp4(
+    const float *__restrict__ s_input,
+    const Nvfp4Weight &weight,
+    const __nv_bfloat16 *__restrict__ residual,
+    __nv_bfloat16 *__restrict__ hidden_out,
+    int in_dim, int out_dim, int num_blocks)
+{
+    int block_id = blockIdx.x;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+
+    int rows_per_block = (out_dim + num_blocks - 1) / num_blocks;
+    int row_start = block_id * rows_per_block;
+    int row_end = min(row_start + rows_per_block, out_dim);
+
+    for (int m_base = row_start; m_base < row_end; m_base += NUM_WARPS) {
+        int m = m_base + warp_id;
+        if (m < row_end) {
+            float sum = nvfp4_row_dot_f32(weight, s_input, m, in_dim, lane_id);
+            sum = warp_reduce_sum(sum);
+            if (lane_id == 0)
+                hidden_out[m] = __float2bfloat16(sum + __bfloat162float(residual[m]));
+        }
+    }
+}
+
 // O projection + residual → bf16
 __device__ void matvec_o_residual_bf16(
     const float *__restrict__ s_input,           // shared [Q_SIZE] f32
@@ -244,6 +416,32 @@ __device__ void matvec_o_residual_bf16(
     }
 }
 
+static __device__ void matvec_o_residual_nvfp4(
+    const float *__restrict__ s_input,
+    const Nvfp4Weight &weight,
+    const __nv_bfloat16 *__restrict__ residual,
+    __nv_bfloat16 *__restrict__ hidden_out,
+    int in_dim, int out_dim, int num_blocks)
+{
+    int block_id = blockIdx.x;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+
+    int rows_per_block = (out_dim + num_blocks - 1) / num_blocks;
+    int row_start = block_id * rows_per_block;
+    int row_end = min(row_start + rows_per_block, out_dim);
+
+    for (int m_base = row_start; m_base < row_end; m_base += NUM_WARPS) {
+        int m = m_base + warp_id;
+        if (m < row_end) {
+            float sum = nvfp4_row_dot_f32(weight, s_input, m, in_dim, lane_id);
+            sum = warp_reduce_sum(sum);
+            if (lane_id == 0)
+                hidden_out[m] = __float2bfloat16(sum + __bfloat162float(residual[m]));
+        }
+    }
+}
+
 // =============================================================================
 // Full Attention layer (bf16)
 // =============================================================================
@@ -251,6 +449,7 @@ __device__ void matvec_o_residual_bf16(
 __device__ void full_attention_layer(
     AtomicGridSync &grid,
     const FullAttnWeights &w,
+    const LayerNvfp4Weights *__restrict__ qw,
     const __nv_bfloat16 *__restrict__ input,
     __nv_bfloat16 *__restrict__ k_cache,
     __nv_bfloat16 *__restrict__ v_cache,
@@ -274,9 +473,9 @@ __device__ void full_attention_layer(
     __nv_bfloat16 *s_norm = shmem;
     rmsnorm_redundant(input, w.input_layernorm_weight, s_norm, g_residual);
 
-    matvec_bf16(s_norm, w.q_proj_weight, g_q, HIDDEN_SIZE, FA_QPROJ_SIZE, num_blocks);
-    matvec_bf16(s_norm, w.k_proj_weight, g_kv, HIDDEN_SIZE, FA_KV_SIZE, num_blocks);
-    matvec_bf16(s_norm, w.v_proj_weight, g_kv + FA_KV_SIZE, HIDDEN_SIZE, FA_KV_SIZE, num_blocks);
+    matvec_select_bf16_or_nvfp4(s_norm, w.q_proj_weight, qw, 1, g_q, HIDDEN_SIZE, FA_QPROJ_SIZE, num_blocks);
+    matvec_select_bf16_or_nvfp4(s_norm, w.k_proj_weight, qw, 2, g_kv, HIDDEN_SIZE, FA_KV_SIZE, num_blocks);
+    matvec_select_bf16_or_nvfp4(s_norm, w.v_proj_weight, qw, 3, g_kv + FA_KV_SIZE, HIDDEN_SIZE, FA_KV_SIZE, num_blocks);
     grid.sync();
 
     // Phase 2: QK norm + partial RoPE + KV cache write
@@ -553,7 +752,11 @@ __device__ void full_attention_layer(
         float *s_attn = reinterpret_cast<float *>(shmem);
         for (int i = threadIdx.x; i < FA_Q_SIZE; i += BLOCK_SIZE) s_attn[i] = g_attn_out[i];
         __syncthreads();
-        matvec_o_residual_bf16(s_attn, w.o_proj_weight, g_residual, hidden_out, FA_Q_SIZE, HIDDEN_SIZE, num_blocks);
+        if (qw != nullptr && qw->ptrs[6].packed_weight != nullptr) {
+            matvec_o_residual_nvfp4(s_attn, qw->ptrs[6], g_residual, hidden_out, FA_Q_SIZE, HIDDEN_SIZE, num_blocks);
+        } else {
+            matvec_o_residual_bf16(s_attn, w.o_proj_weight, g_residual, hidden_out, FA_Q_SIZE, HIDDEN_SIZE, num_blocks);
+        }
     }
     grid.sync();
 
@@ -561,8 +764,13 @@ __device__ void full_attention_layer(
     __nv_bfloat16 *s_act = shmem;
     rmsnorm_from_bf16(hidden_out, w.post_attn_layernorm_weight, s_act, g_residual);
 
-    matvec_gate_up_silu_bf16(s_act, w.gate_proj_weight, w.up_proj_weight,
-                              g_mlp_inter, HIDDEN_SIZE, INTERMEDIATE_SIZE, num_blocks);
+    if (qw != nullptr && qw->ptrs[8].packed_weight != nullptr && qw->ptrs[9].packed_weight != nullptr) {
+        matvec_gate_up_silu_nvfp4(s_act, qw->ptrs[8], qw->ptrs[9],
+                                  g_mlp_inter, HIDDEN_SIZE, INTERMEDIATE_SIZE, num_blocks);
+    } else {
+        matvec_gate_up_silu_bf16(s_act, w.gate_proj_weight, w.up_proj_weight,
+                                  g_mlp_inter, HIDDEN_SIZE, INTERMEDIATE_SIZE, num_blocks);
+    }
     grid.sync();
 
     // Load MLP intermediate to shared (f32)
@@ -570,8 +778,13 @@ __device__ void full_attention_layer(
     for (int i = threadIdx.x; i < INTERMEDIATE_SIZE; i += BLOCK_SIZE) s_mlp[i] = g_mlp_inter[i];
     __syncthreads();
 
-    matvec_down_residual_bf16(s_mlp, w.down_proj_weight, g_residual, hidden_out,
-                               INTERMEDIATE_SIZE, HIDDEN_SIZE, num_blocks);
+    if (qw != nullptr && qw->ptrs[10].packed_weight != nullptr) {
+        matvec_down_residual_nvfp4(s_mlp, qw->ptrs[10], g_residual, hidden_out,
+                                   INTERMEDIATE_SIZE, HIDDEN_SIZE, num_blocks);
+    } else {
+        matvec_down_residual_bf16(s_mlp, w.down_proj_weight, g_residual, hidden_out,
+                                   INTERMEDIATE_SIZE, HIDDEN_SIZE, num_blocks);
+    }
     grid.sync();
 }
 
@@ -582,6 +795,7 @@ __device__ void full_attention_layer(
 __device__ void deltanet_layer(
     AtomicGridSync &grid,
     const DeltaNetWeights &w,
+    const LayerNvfp4Weights *__restrict__ qw,
     const __nv_bfloat16 *__restrict__ input,
     __nv_bfloat16 *__restrict__ g_residual,
     float *__restrict__ g_activations,
@@ -606,10 +820,10 @@ __device__ void deltanet_layer(
     __nv_bfloat16 *s_norm = shmem;
     rmsnorm_redundant(input, w.input_layernorm_weight, s_norm, g_residual);
 
-    matvec_bf16(s_norm, w.qkv_proj_weight, g_qkv, HIDDEN_SIZE, DN_CONV_CHANNELS, num_blocks);
-    matvec_bf16(s_norm, w.z_proj_weight, g_z, HIDDEN_SIZE, DN_V_SIZE, num_blocks);
-    matvec_bf16(s_norm, w.beta_proj_weight, g_beta, HIDDEN_SIZE, DN_GATE_HEADS, num_blocks);
-    matvec_bf16(s_norm, w.alpha_proj_weight, g_alpha, HIDDEN_SIZE, DN_GATE_HEADS, num_blocks);
+    matvec_select_bf16_or_nvfp4(s_norm, w.qkv_proj_weight, qw, 1, g_qkv, HIDDEN_SIZE, DN_CONV_CHANNELS, num_blocks);
+    matvec_select_bf16_or_nvfp4(s_norm, w.z_proj_weight, qw, 2, g_z, HIDDEN_SIZE, DN_V_SIZE, num_blocks);
+    matvec_select_bf16_or_nvfp4(s_norm, w.beta_proj_weight, qw, 3, g_beta, HIDDEN_SIZE, DN_GATE_HEADS, num_blocks);
+    matvec_select_bf16_or_nvfp4(s_norm, w.alpha_proj_weight, qw, 4, g_alpha, HIDDEN_SIZE, DN_GATE_HEADS, num_blocks);
     grid.sync();
 
     if (block_id < DN_GATE_HEADS) {
@@ -743,7 +957,11 @@ __device__ void deltanet_layer(
         float *s_dn = reinterpret_cast<float *>(shmem);
         for (int i = threadIdx.x; i < DN_V_SIZE; i += BLOCK_SIZE) s_dn[i] = g_dn_out[i];
         __syncthreads();
-        matvec_o_residual_bf16(s_dn, w.out_proj_weight, g_residual, hidden_out, DN_V_SIZE, HIDDEN_SIZE, num_blocks);
+        if (qw != nullptr && qw->ptrs[9].packed_weight != nullptr) {
+            matvec_o_residual_nvfp4(s_dn, qw->ptrs[9], g_residual, hidden_out, DN_V_SIZE, HIDDEN_SIZE, num_blocks);
+        } else {
+            matvec_o_residual_bf16(s_dn, w.out_proj_weight, g_residual, hidden_out, DN_V_SIZE, HIDDEN_SIZE, num_blocks);
+        }
     }
     grid.sync();
 
@@ -751,15 +969,25 @@ __device__ void deltanet_layer(
     __nv_bfloat16 *s_act = shmem;
     rmsnorm_from_bf16(hidden_out, w.post_attn_layernorm_weight, s_act, g_residual);
 
-    matvec_gate_up_silu_bf16(s_act, w.gate_proj_weight, w.up_proj_weight,
-                              g_mlp_inter, HIDDEN_SIZE, INTERMEDIATE_SIZE, num_blocks);
+    if (qw != nullptr && qw->ptrs[11].packed_weight != nullptr && qw->ptrs[12].packed_weight != nullptr) {
+        matvec_gate_up_silu_nvfp4(s_act, qw->ptrs[11], qw->ptrs[12],
+                                  g_mlp_inter, HIDDEN_SIZE, INTERMEDIATE_SIZE, num_blocks);
+    } else {
+        matvec_gate_up_silu_bf16(s_act, w.gate_proj_weight, w.up_proj_weight,
+                                  g_mlp_inter, HIDDEN_SIZE, INTERMEDIATE_SIZE, num_blocks);
+    }
     grid.sync();
 
     float *s_mlp = reinterpret_cast<float *>(shmem);
     for (int i = threadIdx.x; i < INTERMEDIATE_SIZE; i += BLOCK_SIZE) s_mlp[i] = g_mlp_inter[i];
     __syncthreads();
-    matvec_down_residual_bf16(s_mlp, w.down_proj_weight, g_residual, hidden_out,
-                               INTERMEDIATE_SIZE, HIDDEN_SIZE, num_blocks);
+    if (qw != nullptr && qw->ptrs[13].packed_weight != nullptr) {
+        matvec_down_residual_nvfp4(s_mlp, qw->ptrs[13], g_residual, hidden_out,
+                                   INTERMEDIATE_SIZE, HIDDEN_SIZE, num_blocks);
+    } else {
+        matvec_down_residual_bf16(s_mlp, w.down_proj_weight, g_residual, hidden_out,
+                                   INTERMEDIATE_SIZE, HIDDEN_SIZE, num_blocks);
+    }
     grid.sync();
 }
 

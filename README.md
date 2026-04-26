@@ -48,7 +48,7 @@ Current Qwen35x prefill behavior:
 
 Current Qwen35x precision behavior:
 - `--qwen35x-weight-precision bf16` and `--qwen35x-cache-precision bf16` are the stable default path.
-- `--qwen35x-weight-precision nvfp4` validates AxionML/ModelOpt NVFP4 weights and runs inference through a transitional load-time dequantize-to-BF16 path. Native packed NVFP4 projection kernels are still being brought up.
+- `--qwen35x-weight-precision nvfp4` validates AxionML/ModelOpt NVFP4 weights and runs decode with native packed NVFP4 projection weights plus BF16 KV cache. The current native path is a correctness-first scalar dequantized warp matvec; Blackwell tensor-core/cuBLASLt FP4 kernels are the next performance step.
 - `--qwen35x-cache-precision quantized` is reserved for the upcoming quantized-cache path and currently fails fast with a clear unsupported-mode diagnostic.
 - AxionML/ModelOpt NVFP4 checkpoint layout can be checked before CUDA loading with:
   `.\build\qwen35x.exe --validate-nvfp4-model --hf-model-dir models/qwen3.5-0.8b-nvfp4-axionml`

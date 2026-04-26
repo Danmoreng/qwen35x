@@ -43,6 +43,7 @@ __device__ __constant__ int LAYER_TYPE[NUM_LAYERS] = {
 extern "C" void launch_decode(
     int input_token_id, int *output_token_id,
     const void *embed_weight, const LayerWeights *layer_weights,
+    const LayerNvfp4Weights *layer_nvfp4_weights,
     const void *final_norm_weight,
     const void *lm_head_weight,
     void *fa_k_cache, void *fa_v_cache,
@@ -113,6 +114,7 @@ extern "C" void launch_decode(
         (const __nv_bfloat16 *)final_norm_weight,
         (const __nv_bfloat16 *)lm_head_weight,
         layer_weights,
+        layer_nvfp4_weights,
         (__nv_bfloat16 *)fa_k_cache, (__nv_bfloat16 *)fa_v_cache,
         (float *)dn_states, (float *)conv_bufs,
         (__nv_bfloat16 *)hidden_buffer,

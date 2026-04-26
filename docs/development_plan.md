@@ -385,17 +385,24 @@ Validation policy for each new size:
 - [x] Add explicit Qwen35x CUDA precision/cache mode plumbing: `weight_precision={bf16,nvfp4}` and `cache_precision={bf16,quantized}`, defaulting to `bf16/bf16`.
 - [x] Add fail-fast diagnostics for unsupported `nvfp4` and quantized-cache modes until kernels and artifacts exist.
 - [x] Include weight/cache precision labels in CLI output, profile JSON, benchmark CSVs, and Qwen35x runtime diagnostics.
-  Current status: `--qwen35x-weight-precision bf16` and `--qwen35x-cache-precision bf16` are the default supported path. `nvfp4` and `quantized` are accepted as explicit modes but fail during Qwen35x CUDA backend initialization until the duplicate kernels, artifacts, and cache ABI are implemented.
-- [ ] Use the AxionML/ModelOpt NVFP4 checkpoints as the canonical quantized artifact source instead of local max-abs conversion.
+  Current status: `--qwen35x-weight-precision bf16` and `--qwen35x-cache-precision bf16` are the default supported path. `--qwen35x-weight-precision nvfp4` runs with BF16 KV cache when a ModelOpt NVFP4 checkpoint is loaded. `--qwen35x-cache-precision quantized` still fails during backend initialization until the cache ABI is implemented.
+- [x] Use the AxionML/ModelOpt NVFP4 checkpoints as the canonical quantized artifact source instead of local max-abs conversion.
 - [x] Document the AxionML safetensors tensor naming, packed payload dtype, FP8 scale tensors, and per-tensor shape rules for 0.8B and 4B.
   Current status: `--validate-nvfp4-model` checks ModelOpt `hf_quant_config.json`, group size 16, null KV-cache quantization, `U8` packed `.weight` tensors shaped `[rows, cols / 2]`, `F8_E4M3` `.weight_scale` tensors shaped `[rows, cols / 16]`, and scalar `F32` `.input_scale` / `.weight_scale_2` tensors. The downloaded AxionML 0.8B checkpoint validates 186 quantized modules.
 - [x] Add Qwen35x CUDA loader support for AxionML/ModelOpt NVFP4 safetensors while preserving the current BF16 loader and shape-validation path.
-  Current status: `--qwen35x-weight-precision nvfp4` validates ModelOpt `U8` packed weights, `F8_E4M3` weight scales, and scalar `F32` scale metadata. It can run actual inference through a transitional load-time dequantize-to-BF16 path while native packed NVFP4 kernels are brought up.
-- [ ] Add duplicated NVFP4 weight structs and launchers for the 0.8B decode path with BF16 KV cache.
-- [x] Implement the first NVFP4 decode matvec path for a narrow projection class and keep all unsupported projections on BF16 or fail clearly.
-  Current status: `--check-nvfp4-tensor` runs a CUDA E2M1/U8 + E4M3-scale dequantized matvec check for one ModelOpt tensor family and compares sampled rows against a CPU reference. This is a standalone primitive check, not yet wired into decode.
-- [ ] Expand NVFP4 decode coverage across full-attention, DeltaNet, MLP, embedding/LM-head as separate measured steps.
+  Current status: `--qwen35x-weight-precision nvfp4` validates ModelOpt `U8` packed weights, `F8_E4M3` weight scales, and scalar `F32` scale metadata. Decode now consumes native packed NVFP4 projection weights through a separate per-layer pointer table while keeping BF16 embedding, norms, LM head, recurrent state, and KV cache.
+- [x] Add duplicated NVFP4 weight structs for the decode path with BF16 KV cache.
+- [x] Implement a correctness-first native packed NVFP4 decode matvec path.
+  Current status: full-attention Q/K/V/O, DeltaNet QKV/Z/beta/alpha/out, and MLP gate/up/down projections can consume packed ModelOpt NVFP4 tensors. The implementation dequantizes E2M1 weights and E4M3 block scales inside warp matvecs; it is native packed inference, but not yet Blackwell tensor-core accelerated.
+- [ ] Add a separate NVFP4 decode launcher/dispatch path so BF16 kernels have no runtime precision checks.
+- [ ] Replace scalar dequantized NVFP4 matvecs with Blackwell-optimized kernels:
+  - [ ] Add a cuBLASLt FP4/NVFP4 block-scale GEMM probe for prefill-sized projections using `CUDA_R_4F_E2M1` and `CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3`.
+  - [ ] Validate AxionML packed weight/scale layout against cuBLASLt operand layout requirements without repacking at runtime.
+  - [ ] Add a custom Blackwell decode projection path for batch-1/token decode if cuBLASLt GEMM is inefficient at current shapes.
+  - [ ] Keep scalar NVFP4 matvecs as the correctness fallback until tensor-core kernels pass error-threshold and quality smoke tests.
+- [ ] Expand NVFP4 native coverage to embedding/LM-head or document why those remain BF16.
 - [ ] Validate `NVFP4 weights + BF16 KV cache` with parity/error-threshold tests and short/medium/long decode benchmarks.
+  Current smoke status: `Hello`, 8-token greedy decode on the AxionML 0.8B checkpoint completes with native packed NVFP4 projections and coherent output. Throughput is currently about `95 tok/s` for this tiny smoke, versus about `330 tok/s` for the BF16 path on the same prompt; this confirms the scalar fallback is for correctness bring-up, not the final Blackwell performance path.
 - [ ] Add NVFP4 prefill support after decode-only weight quantization is validated, preferably through cuBLASLt FP4/NVFP4 GEMM where available or a measured custom fallback.
 - [ ] Define the quantized KV cache ABI: storage type, per-head/per-block scale metadata, cache strides, and descriptor-derived allocation sizes.
 - [ ] Add quantized full-attention cache writes in prefill/decode and matching decode-side dequantized reads.

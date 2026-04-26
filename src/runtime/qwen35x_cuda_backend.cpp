@@ -188,11 +188,24 @@ struct PackedLayerWeights {
   void * ptrs[14] = {};
 };
 
+struct PackedNvfp4Weight {
+  void * packed_weight = nullptr;
+  void * weight_scale = nullptr;
+  float * weight_scale_2 = nullptr;
+};
+
+struct PackedLayerNvfp4Weights {
+  int layer_type = 0;
+  int pad[3] = {0, 0, 0};
+  PackedNvfp4Weight ptrs[14] = {};
+};
+
 #define QWEN35X_LAUNCH_DECODE_PARAMS \
   int input_token_id, \
   int * output_token_id, \
   const void * embed_weight, \
   const PackedLayerWeights * layer_weights, \
+  const PackedLayerNvfp4Weights * layer_nvfp4_weights, \
   const void * final_norm_weight, \
   const void * lm_head_weight, \
   void * fa_k_cache, \
@@ -345,6 +358,7 @@ struct BackendState {
   void * final_norm_weight = nullptr;
   void * lm_head_weight = nullptr;
   PackedLayerWeights * layer_weights = nullptr;
+  PackedLayerNvfp4Weights * layer_nvfp4_weights = nullptr;
 
   void * fa_k_cache = nullptr;
   void * fa_v_cache = nullptr;
@@ -1253,6 +1267,69 @@ bool load_modelopt_nvfp4_state(
   return true;
 }
 
+bool initialize_nvfp4_layer_weights(
+  const Qwen35xModelDescriptor & descriptor,
+  DeviceArena & arena,
+  const Nvfp4BackendState & nvfp4_state,
+  BackendState & state,
+  std::string & error_message) {
+  std::vector<PackedLayerNvfp4Weights> host_layers(static_cast<std::size_t>(descriptor.num_layers));
+  std::size_t tensor_idx = 0;
+  auto attach = [&](PackedLayerNvfp4Weights & layer, int ptr_idx) -> bool {
+    if (tensor_idx >= nvfp4_state.tensors.size()) {
+      error_message = "ModelOpt NVFP4 layer table underflow while assigning ptr[" + std::to_string(ptr_idx) + "].";
+      return false;
+    }
+    const auto & tensor = nvfp4_state.tensors[tensor_idx++];
+    layer.ptrs[ptr_idx].packed_weight = tensor.packed_weight;
+    layer.ptrs[ptr_idx].weight_scale = tensor.weight_scale;
+    layer.ptrs[ptr_idx].weight_scale_2 = tensor.weight_scale_2;
+    return true;
+  };
+
+  for (int layer_idx = 0; layer_idx < descriptor.num_layers; ++layer_idx) {
+    auto & layer = host_layers[static_cast<std::size_t>(layer_idx)];
+    layer.layer_type = descriptor.layer_type[static_cast<std::size_t>(layer_idx)];
+    if (layer.layer_type == 0) {
+      if (!attach(layer, 11) || !attach(layer, 12) || !attach(layer, 13) ||
+          !attach(layer, 1) || !attach(layer, 2) || !attach(layer, 3) || !attach(layer, 4) ||
+          !attach(layer, 9)) {
+        error_message = "layer " + std::to_string(layer_idx) + ": " + error_message;
+        return false;
+      }
+    } else {
+      if (!attach(layer, 8) || !attach(layer, 9) || !attach(layer, 10) ||
+          !attach(layer, 1) || !attach(layer, 2) || !attach(layer, 3) ||
+          !attach(layer, 6)) {
+        error_message = "layer " + std::to_string(layer_idx) + ": " + error_message;
+        return false;
+      }
+    }
+  }
+
+  if (tensor_idx != nvfp4_state.tensors.size()) {
+    error_message =
+      "ModelOpt NVFP4 layer table overflow: assigned " + std::to_string(tensor_idx) +
+      " tensors but loaded " + std::to_string(nvfp4_state.tensors.size()) + ".";
+    return false;
+  }
+
+  if (!arena.alloc_bytes(
+        host_layers.size() * sizeof(PackedLayerNvfp4Weights),
+        reinterpret_cast<void *&>(state.layer_nvfp4_weights),
+        error_message)) {
+    return false;
+  }
+  return check_cuda(
+    cudaMemcpy(
+      state.layer_nvfp4_weights,
+      host_layers.data(),
+      host_layers.size() * sizeof(PackedLayerNvfp4Weights),
+      cudaMemcpyHostToDevice),
+    "cudaMemcpy(H2D layer_nvfp4_weights)",
+    error_message);
+}
+
 bool reset_state(const Qwen35xModelDescriptor & descriptor, const BackendState & state, int max_seq_len, std::string & error_message) {
   const int n_full_layers = descriptor_full_layer_count(descriptor);
   const int n_delta_layers = descriptor_delta_layer_count(descriptor);
@@ -1468,6 +1545,7 @@ bool run_decode_step_impl(
     state.output_token,
     state.embed_weight,
     state.layer_weights,
+    state.layer_nvfp4_weights,
     state.final_norm_weight,
     state.lm_head_weight,
     state.fa_k_cache,
@@ -1586,6 +1664,11 @@ bool Qwen35xCudaBackend::initialize(const Qwen35xCudaBackendConfig & config, std
   }
 
   if (!initialize_backend_state(impl_->descriptor, *variant, config, impl_->arena, impl_->state, error_message)) {
+    impl_ = std::make_unique<Impl>();
+    return false;
+  }
+  if (config.weight_precision == Qwen35xWeightPrecision::nvfp4 &&
+      !initialize_nvfp4_layer_weights(impl_->descriptor, impl_->arena, impl_->nvfp4_state, impl_->state, error_message)) {
     impl_ = std::make_unique<Impl>();
     return false;
   }

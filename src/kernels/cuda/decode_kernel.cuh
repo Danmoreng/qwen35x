@@ -17,6 +17,7 @@ decode_kernel(
     const __nv_bfloat16 *__restrict__ final_norm_weight,
     const __nv_bfloat16 *__restrict__ lm_head_weight,
     const LayerWeights *__restrict__ layer_weights,
+    const LayerNvfp4Weights *__restrict__ layer_nvfp4_weights,
     __nv_bfloat16 *__restrict__ fa_k_cache,
     __nv_bfloat16 *__restrict__ fa_v_cache,
     float *__restrict__ dn_states,
@@ -58,7 +59,9 @@ decode_kernel(
 
         if (LAYER_TYPE[layer] == 0) {
             deltanet_layer(
-                grid, layer_weights[layer].dn, layer_input,
+                grid, layer_weights[layer].dn,
+                layer_nvfp4_weights == nullptr ? nullptr : &layer_nvfp4_weights[layer],
+                layer_input,
                 g_residual, g_activations, g_qkv_scratch, g_z_scratch,
                 g_beta_scratch, g_alpha_scratch, g_attn_out, g_mlp_inter,
                 dn_states + dn_layer_idx * dn_state_stride,
@@ -66,7 +69,9 @@ decode_kernel(
             dn_layer_idx++;
         } else {
             full_attention_layer(
-                grid, layer_weights[layer].fa, layer_input,
+                grid, layer_weights[layer].fa,
+                layer_nvfp4_weights == nullptr ? nullptr : &layer_nvfp4_weights[layer],
+                layer_input,
                 fa_k_cache + fa_layer_idx * fa_kv_stride,
                 fa_v_cache + fa_layer_idx * fa_kv_stride,
                 g_residual, g_activations, g_qkv_scratch, g_kv_scratch,
