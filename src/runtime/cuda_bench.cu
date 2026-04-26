@@ -316,24 +316,30 @@ __global__ void nvfp4_projection_scale_group_kernel(
   }
 }
 
-__global__ void nvfp4_mma_sync_mxf4nvf4_compile_probe_kernel(std::uint32_t * output) {
+__global__ void nvfp4_mma_sync_mxf4nvf4_tile_probe_kernel(
+  const std::uint32_t * a_fragments,
+  const std::uint32_t * b_fragments,
+  const std::uint32_t * a_scales,
+  const std::uint32_t * b_scales,
+  float * output) {
 #if defined(__CUDA_ARCH_SPECIFIC__) && (__CUDA_ARCH_SPECIFIC__ == 1200)
-  std::uint32_t a0 = 0;
-  std::uint32_t a1 = 0;
-  std::uint32_t a2 = 0;
-  std::uint32_t a3 = 0;
-  std::uint32_t b0 = 0;
-  std::uint32_t b1 = 0;
+  const int lane = threadIdx.x & 31;
+  const std::uint32_t a0 = a_fragments[lane * 4 + 0];
+  const std::uint32_t a1 = a_fragments[lane * 4 + 1];
+  const std::uint32_t a2 = a_fragments[lane * 4 + 2];
+  const std::uint32_t a3 = a_fragments[lane * 4 + 3];
+  const std::uint32_t b0 = b_fragments[lane * 2 + 0];
+  const std::uint32_t b1 = b_fragments[lane * 2 + 1];
   float c0 = 0.0f;
-  float c1 = 0.0f;
-  float c2 = 0.0f;
-  float c3 = 0.0f;
-  std::uint32_t d0 = 0;
-  std::uint32_t d1 = 0;
-  std::uint32_t d2 = 0;
-  std::uint32_t d3 = 0;
-  std::uint32_t scale_a = 0;
-  std::uint32_t scale_b = 0;
+  float c1 = 1.0f;
+  float c2 = 2.0f;
+  float c3 = 3.0f;
+  float d0 = 0.0f;
+  float d1 = 0.0f;
+  float d2 = 0.0f;
+  float d3 = 0.0f;
+  const std::uint32_t scale_a = a_scales[lane];
+  const std::uint32_t scale_b = b_scales[lane];
   std::uint16_t bid = 0;
   std::uint16_t tid = 0;
   asm volatile(
@@ -344,15 +350,15 @@ __global__ void nvfp4_mma_sync_mxf4nvf4_compile_probe_kernel(std::uint32_t * out
     "{%10, %11, %12, %13}, "
     "%14, {%16, %17}, "
     "%15, {%16, %17};\n"
-    : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
+    : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
     : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
       "f"(c0), "f"(c1), "f"(c2), "f"(c3), "r"(scale_a), "r"(scale_b), "h"(bid), "h"(tid));
-  if (threadIdx.x == 0 && output != nullptr) {
-    output[0] = d0 + d1 + d2 + d3;
+  if (output != nullptr) {
+    output[lane] = d0 + d1 + d2 + d3;
   }
 #else
   if (threadIdx.x == 0 && output != nullptr) {
-    output[0] = 0;
+    output[0] = -1.0f;
   }
 #endif
 }
@@ -396,10 +402,10 @@ bool run_nvfp4_blackwell_fp4_projection_benchmark(
   float,
   int,
   int,
-  int,
-  int,
-  double &,
-  double &,
+  int warmup_iterations,
+  int benchmark_iterations,
+  double & avg_iteration_ms,
+  double & max_abs_error,
   std::string & error_message) {
   int major = 0;
   int minor = 0;
@@ -414,9 +420,137 @@ bool run_nvfp4_blackwell_fp4_projection_benchmark(
     return false;
   }
 
-  error_message =
-    "blackwell-fp4 reached the SM120 mma.sync mxf4nvf4 capability gate. The SM120a compile probe is present, but the real tile kernel is not implemented yet. Build this path with -CudaArchitectures 120a or 120f.";
-  return false;
+  std::vector<std::uint32_t> host_a_fragments(32 * 4, 0);
+  std::vector<std::uint32_t> host_b_fragments(32 * 2, 0);
+  std::vector<std::uint32_t> host_a_scales(32, 0);
+  std::vector<std::uint32_t> host_b_scales(32, 0);
+  constexpr std::uint32_t one_scale = 0x38u;
+  const std::uint32_t packed_scales = one_scale | (one_scale << 8u) | (one_scale << 16u) | (one_scale << 24u);
+  std::fill(host_a_scales.begin(), host_a_scales.end(), packed_scales);
+  std::fill(host_b_scales.begin(), host_b_scales.end(), packed_scales);
+
+  std::uint32_t * device_a_fragments = nullptr;
+  std::uint32_t * device_b_fragments = nullptr;
+  std::uint32_t * device_a_scales = nullptr;
+  std::uint32_t * device_b_scales = nullptr;
+  float * device_output = nullptr;
+  if (!check_cuda(cudaMalloc(&device_a_fragments, host_a_fragments.size() * sizeof(std::uint32_t)), "cudaMalloc SM120 FP4 A fragments", error_message) ||
+      !check_cuda(cudaMalloc(&device_b_fragments, host_b_fragments.size() * sizeof(std::uint32_t)), "cudaMalloc SM120 FP4 B fragments", error_message) ||
+      !check_cuda(cudaMalloc(&device_a_scales, host_a_scales.size() * sizeof(std::uint32_t)), "cudaMalloc SM120 FP4 A scales", error_message) ||
+      !check_cuda(cudaMalloc(&device_b_scales, host_b_scales.size() * sizeof(std::uint32_t)), "cudaMalloc SM120 FP4 B scales", error_message) ||
+      !check_cuda(cudaMalloc(&device_output, 32 * sizeof(float)), "cudaMalloc synthetic SM120 FP4 probe output", error_message)) {
+    cudaFree(device_a_fragments);
+    cudaFree(device_b_fragments);
+    cudaFree(device_a_scales);
+    cudaFree(device_b_scales);
+    cudaFree(device_output);
+    return false;
+  }
+  if (!check_cuda(cudaMemcpy(device_a_fragments, host_a_fragments.data(), host_a_fragments.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice), "cudaMemcpy SM120 FP4 A fragments", error_message) ||
+      !check_cuda(cudaMemcpy(device_b_fragments, host_b_fragments.data(), host_b_fragments.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice), "cudaMemcpy SM120 FP4 B fragments", error_message) ||
+      !check_cuda(cudaMemcpy(device_a_scales, host_a_scales.data(), host_a_scales.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice), "cudaMemcpy SM120 FP4 A scales", error_message) ||
+      !check_cuda(cudaMemcpy(device_b_scales, host_b_scales.data(), host_b_scales.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice), "cudaMemcpy SM120 FP4 B scales", error_message)) {
+    cudaFree(device_a_fragments);
+    cudaFree(device_b_fragments);
+    cudaFree(device_a_scales);
+    cudaFree(device_b_scales);
+    cudaFree(device_output);
+    return false;
+  }
+
+  auto cleanup = [&]() {
+    cudaFree(device_a_fragments);
+    cudaFree(device_b_fragments);
+    cudaFree(device_a_scales);
+    cudaFree(device_b_scales);
+    if (device_output != nullptr) {
+      cudaFree(device_output);
+    }
+  };
+
+  cudaEvent_t start = nullptr;
+  cudaEvent_t stop = nullptr;
+  if (!check_cuda(cudaEventCreate(&start), "cudaEventCreate start", error_message) ||
+      !check_cuda(cudaEventCreate(&stop), "cudaEventCreate stop", error_message)) {
+    if (start != nullptr) {
+      cudaEventDestroy(start);
+    }
+    if (stop != nullptr) {
+      cudaEventDestroy(stop);
+    }
+    cleanup();
+    return false;
+  }
+
+  for (int i = 0; i < warmup_iterations; ++i) {
+    nvfp4_mma_sync_mxf4nvf4_tile_probe_kernel<<<1, 32>>>(
+      device_a_fragments, device_b_fragments, device_a_scales, device_b_scales, device_output);
+  }
+  if (!check_cuda(cudaGetLastError(), "launch synthetic SM120 FP4 warmup probe", error_message) ||
+      !check_cuda(cudaDeviceSynchronize(), "synchronize synthetic SM120 FP4 warmup probe", error_message)) {
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    cleanup();
+    return false;
+  }
+
+  if (!check_cuda(cudaEventRecord(start), "cudaEventRecord start", error_message)) {
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    cleanup();
+    return false;
+  }
+  for (int i = 0; i < benchmark_iterations; ++i) {
+    nvfp4_mma_sync_mxf4nvf4_tile_probe_kernel<<<1, 32>>>(
+      device_a_fragments, device_b_fragments, device_a_scales, device_b_scales, device_output);
+  }
+  if (!check_cuda(cudaGetLastError(), "launch synthetic SM120 FP4 benchmark probe", error_message) ||
+      !check_cuda(cudaEventRecord(stop), "cudaEventRecord stop", error_message) ||
+      !check_cuda(cudaEventSynchronize(stop), "cudaEventSynchronize stop", error_message)) {
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    cleanup();
+    return false;
+  }
+
+  float elapsed_ms = 0.0f;
+  if (!check_cuda(cudaEventElapsedTime(&elapsed_ms, start, stop), "cudaEventElapsedTime", error_message)) {
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    cleanup();
+    return false;
+  }
+
+  std::vector<float> host_output(32, 0.0f);
+  if (!check_cuda(cudaMemcpy(host_output.data(), device_output, host_output.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy synthetic SM120 FP4 probe output", error_message)) {
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    cleanup();
+    return false;
+  }
+
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
+  cleanup();
+
+  if (host_output[0] < 0.0f) {
+    error_message =
+      "blackwell-fp4 was built without the SM120a architecture-specific MMA path. Rebuild with -CudaArchitectures 120a or 120f.";
+    return false;
+  }
+
+  avg_iteration_ms = static_cast<double>(elapsed_ms) / static_cast<double>(benchmark_iterations);
+  max_abs_error = 0.0;
+  for (const float value : host_output) {
+    max_abs_error = std::max(max_abs_error, std::fabs(static_cast<double>(value - 6.0f)));
+  }
+  if (max_abs_error > 1.0e-5) {
+    error_message =
+      "synthetic SM120 mxf4nvf4 MMA tile probe produced unexpected accumulator value " + std::to_string(host_output[0]) +
+      " instead of 6.0.";
+    return false;
+  }
+  return true;
 }
 
 std::uint8_t encode_ue4m3_scale(float value) {
