@@ -267,10 +267,12 @@ int main(int argc, char ** argv) {
   qwen35x::RuntimeTarget target;
   bool bench_bf16 = false;
   bool validate_nvfp4_model = false;
+  bool check_nvfp4_tensor = false;
   bool infer_reference = false;
   bool infer_gpu = false;
   bool gpu_decode_backend_explicit = false;
   qwen35x::Bf16TensorBenchOptions bench_options;
+  qwen35x::Nvfp4TensorCheckOptions nvfp4_check_options;
   qwen35x::ReferenceInferenceOptions infer_options;
 
   for (int i = 1; i < argc; ++i) {
@@ -280,10 +282,13 @@ int main(int argc, char ** argv) {
     } else if (arg == "--hf-model-dir" && i + 1 < argc) {
       hf_model_dir = argv[++i];
       bench_options.model_dir = hf_model_dir;
+      nvfp4_check_options.model_dir = hf_model_dir;
     } else if (arg == "--bench-bf16") {
       bench_bf16 = true;
     } else if (arg == "--validate-nvfp4-model") {
       validate_nvfp4_model = true;
+    } else if (arg == "--check-nvfp4-tensor") {
+      check_nvfp4_tensor = true;
     } else if (arg == "--infer-reference") {
       infer_reference = true;
     } else if (arg == "--infer-gpu") {
@@ -293,6 +298,10 @@ int main(int argc, char ** argv) {
       infer_options.use_cuda_matvec_bf16 = true;
     } else if (arg == "--bench-tensor" && i + 1 < argc) {
       bench_options.tensor_name = argv[++i];
+    } else if (arg == "--nvfp4-tensor" && i + 1 < argc) {
+      nvfp4_check_options.tensor_base_name = argv[++i];
+    } else if (arg == "--nvfp4-sample-rows" && i + 1 < argc) {
+      nvfp4_check_options.sample_rows = std::stoi(argv[++i]);
     } else if (arg == "--bench-warmup" && i + 1 < argc) {
       bench_options.warmup_iterations = std::stoi(argv[++i]);
     } else if (arg == "--bench-iters" && i + 1 < argc) {
@@ -391,6 +400,7 @@ int main(int argc, char ** argv) {
       std::cout << "usage: qwen35x [--profile <json>] [--hf-model-dir <path>] [--sm <int>] [--cpu]\n";
       std::cout << "       qwen35x --bench-bf16 --hf-model-dir <path> [--bench-tensor <name>] [--bench-warmup <n>] [--bench-iters <n>]\n";
       std::cout << "       qwen35x --validate-nvfp4-model --hf-model-dir <path>\n";
+      std::cout << "       qwen35x --check-nvfp4-tensor --hf-model-dir <path> [--nvfp4-tensor <base-name>] [--nvfp4-sample-rows <n>]\n";
       std::cout << "       qwen35x --infer-reference --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "       qwen35x --infer-gpu --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "               [--temperature <float>] [--top-p <float>] [--top-k <int>] [--repeat-penalty <float>] [--seed <int64>]\n";
@@ -464,6 +474,48 @@ int main(int argc, char ** argv) {
     std::cout << "  fp8_scale_tensors: " << result.fp8_scale_tensors << "\n";
     std::cout << "  f32_input_scale_tensors: " << result.f32_input_scale_tensors << "\n";
     std::cout << "  f32_weight_scale2_tensors: " << result.f32_weight_scale2_tensors << "\n";
+    return 0;
+  }
+
+  if (check_nvfp4_tensor) {
+    if (nvfp4_check_options.model_dir.empty()) {
+      std::cerr << "NVFP4 tensor check failed: --hf-model-dir is required\n";
+      return 10;
+    }
+    std::string error_message;
+    qwen35x::Nvfp4TensorCheckResult result;
+    if (!qwen35x::run_nvfp4_tensor_check(nvfp4_check_options, result, error_message)) {
+      std::cerr << "NVFP4 tensor check failed: " << error_message << "\n";
+      return 10;
+    }
+
+    std::cout << "NVFP4 tensor check\n";
+    std::cout << "  tensor_base: " << result.tensor_base_name << "\n";
+    std::cout << "  source_shape: ";
+    for (std::size_t i = 0; i < result.source_shape.size(); ++i) {
+      if (i > 0) {
+        std::cout << "x";
+      }
+      std::cout << result.source_shape[i];
+    }
+    std::cout << "\n";
+    std::cout << "  packed_shape: ";
+    for (std::size_t i = 0; i < result.packed_shape.size(); ++i) {
+      if (i > 0) {
+        std::cout << "x";
+      }
+      std::cout << result.packed_shape[i];
+    }
+    std::cout << "\n";
+    std::cout << "  scale_shape: ";
+    for (std::size_t i = 0; i < result.scale_shape.size(); ++i) {
+      if (i > 0) {
+        std::cout << "x";
+      }
+      std::cout << result.scale_shape[i];
+    }
+    std::cout << "\n";
+    std::cout << "  max_abs_error: " << result.max_abs_error << "\n";
     return 0;
   }
 

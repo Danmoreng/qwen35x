@@ -26,9 +26,28 @@ struct Bf16TensorBenchResult {
   double gflops = 0.0;
 };
 
+struct Nvfp4TensorCheckOptions {
+  std::string model_dir;
+  std::string tensor_base_name = "model.language_model.layers.0.linear_attn.in_proj_qkv";
+  int sample_rows = 16;
+};
+
+struct Nvfp4TensorCheckResult {
+  std::string tensor_base_name;
+  std::vector<std::int64_t> source_shape;
+  std::vector<std::int64_t> packed_shape;
+  std::vector<std::int64_t> scale_shape;
+  double max_abs_error = 0.0;
+};
+
 bool run_bf16_tensor_benchmark(
   const Bf16TensorBenchOptions & options,
   Bf16TensorBenchResult & result,
+  std::string & error_message);
+
+bool run_nvfp4_tensor_check(
+  const Nvfp4TensorCheckOptions & options,
+  Nvfp4TensorCheckResult & result,
   std::string & error_message);
 
 class EngineRuntime {

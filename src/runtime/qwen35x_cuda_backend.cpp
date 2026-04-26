@@ -465,6 +465,46 @@ bool load_bf16_tensor_to_device(
     bits += rounding_bias;
     return static_cast<std::uint16_t>(bits >> 16U);
   };
+  auto decode_nvfp4_e2m1 = [](std::uint8_t nibble) -> float {
+    constexpr float levels[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    const float value = levels[nibble & 0x7u];
+    return (nibble & 0x8u) ? -value : value;
+  };
+  auto decode_e4m3 = [](std::uint8_t bits) -> float {
+    if (bits == 0) {
+      return 0.0f;
+    }
+    const int sign = (bits >> 7) & 1;
+    const int exponent = (bits >> 3) & 0xf;
+    const int mantissa = bits & 0x7;
+    float value = 0.0f;
+    if (exponent == 0) {
+      value = std::ldexp(static_cast<float>(mantissa) / 8.0f, -6);
+    } else {
+      value = std::ldexp(1.0f + static_cast<float>(mantissa) / 8.0f, exponent - 7);
+    }
+    return sign ? -value : value;
+  };
+  auto read_raw = [](const std::string & file, const qwen35x::SafetensorTensorInfo & tensor_info, std::vector<std::uint8_t> & out, std::string & local_error) -> bool {
+    const std::uint64_t byte_count = tensor_info.data_end - tensor_info.data_start;
+    out.resize(static_cast<std::size_t>(byte_count));
+    std::ifstream in(file, std::ios::binary);
+    if (!in) {
+      local_error = "Could not open safetensors shard: " + file;
+      return false;
+    }
+    in.seekg(static_cast<std::streamoff>(tensor_info.data_start), std::ios::beg);
+    if (!in) {
+      local_error = "Failed to seek tensor '" + tensor_info.name + "' in shard.";
+      return false;
+    }
+    in.read(reinterpret_cast<char *>(out.data()), static_cast<std::streamsize>(out.size()));
+    if (!in) {
+      local_error = "Failed to read tensor '" + tensor_info.name + "' from shard.";
+      return false;
+    }
+    return true;
+  };
 
   std::string last_error;
   for (const auto & name : tensor_names) {
@@ -481,7 +521,77 @@ bool load_bf16_tensor_to_device(
       last_error = local_error;
       continue;
     }
-    if (!accepted_shapes.empty() &&
+    if (info.dtype == "U8" && !accepted_shapes.empty()) {
+      bool matched_quantized_shape = false;
+      std::vector<std::int64_t> source_shape;
+      for (const auto & accepted_shape : accepted_shapes) {
+        if (accepted_shape.size() == 2 &&
+            info.shape.size() == 2 &&
+            info.shape[0] == accepted_shape[0] &&
+            info.shape[1] * 2 == accepted_shape[1] &&
+            (accepted_shape[1] % 16) == 0) {
+          matched_quantized_shape = true;
+          source_shape = accepted_shape;
+          break;
+        }
+      }
+      if (!matched_quantized_shape) {
+        last_error = "Tensor '" + name + "' has U8 NVFP4 shape that does not match accepted source shapes.";
+        continue;
+      }
+
+      std::vector<std::uint8_t> packed;
+      if (!read_raw(tensor_file, info, packed, local_error)) {
+        last_error = local_error;
+        continue;
+      }
+
+      const std::string base_name = name.size() > 7 && name.substr(name.size() - 7) == ".weight"
+        ? name.substr(0, name.size() - 7)
+        : name;
+      std::string scale_file;
+      qwen35x::SafetensorTensorInfo scale_info;
+      if (!qwen35x::SafetensorLoader::resolve_tensor_file(model_dir, base_name + ".weight_scale", scale_file, local_error) ||
+          !qwen35x::SafetensorLoader::load_tensor_info(scale_file, base_name + ".weight_scale", scale_info, local_error)) {
+        last_error = local_error;
+        continue;
+      }
+      const std::vector<std::int64_t> expected_scale_shape{source_shape[0], source_shape[1] / 16};
+      if (scale_info.dtype != "F8_E4M3" || scale_info.shape != expected_scale_shape) {
+        last_error = "Tensor '" + scale_info.name + "' shape or dtype mismatch for NVFP4 dequantization.";
+        continue;
+      }
+      std::vector<std::uint8_t> scales;
+      if (!read_raw(scale_file, scale_info, scales, local_error)) {
+        last_error = local_error;
+        continue;
+      }
+
+      qwen35x::SafetensorTensorF32 input_scale_tensor;
+      qwen35x::SafetensorTensorF32 weight_scale2_tensor;
+      if (!qwen35x::SafetensorLoader::read_tensor_f32(model_dir, base_name + ".input_scale", input_scale_tensor, local_error) ||
+          !qwen35x::SafetensorLoader::read_tensor_f32(model_dir, base_name + ".weight_scale_2", weight_scale2_tensor, local_error) ||
+          input_scale_tensor.data.size() != 1 ||
+          weight_scale2_tensor.data.size() != 1) {
+        last_error = local_error.empty() ? ("Invalid NVFP4 scalar scales for tensor '" + name + "'.") : local_error;
+        continue;
+      }
+
+      const std::int64_t rows = source_shape[0];
+      const std::int64_t cols = source_shape[1];
+      const std::int64_t packed_cols = cols / 2;
+      const std::int64_t scale_cols = cols / 16;
+      host_data.resize(static_cast<std::size_t>(rows * cols));
+      for (std::int64_t row = 0; row < rows; ++row) {
+        for (std::int64_t col = 0; col < cols; ++col) {
+          const std::uint8_t packed_byte = packed[static_cast<std::size_t>(row * packed_cols + col / 2)];
+          const std::uint8_t nibble = (col & 1) == 0 ? (packed_byte & 0x0fu) : (packed_byte >> 4u);
+          const float scale = decode_e4m3(scales[static_cast<std::size_t>(row * scale_cols + col / 16)]) * weight_scale2_tensor.data[0];
+          const float value = decode_nvfp4_e2m1(nibble) * scale;
+          host_data[static_cast<std::size_t>(row * cols + col)] = float_to_bf16(value);
+        }
+      }
+    } else if (!accepted_shapes.empty() &&
         std::find(accepted_shapes.begin(), accepted_shapes.end(), info.shape) == accepted_shapes.end()) {
       auto shape_to_string = [](const std::vector<std::int64_t> & shape) {
         std::string out = "[";
@@ -507,7 +617,9 @@ bool load_bf16_tensor_to_device(
       return false;
     }
 
-    if (info.dtype == "BF16") {
+    if (!host_data.empty()) {
+      // Already populated by the ModelOpt NVFP4 dequantization path above.
+    } else if (info.dtype == "BF16") {
       if (!qwen35x::SafetensorLoader::read_bf16_tensor(tensor_file, info, host_data, local_error)) {
         last_error = local_error;
         continue;
@@ -1459,22 +1571,18 @@ bool Qwen35xCudaBackend::initialize(const Qwen35xCudaBackendConfig & config, std
   impl_->variant = variant;
   variant->set_decode_blocks_override(config.decode_blocks);
 
-  if (config.weight_precision == Qwen35xWeightPrecision::nvfp4) {
+  if (config.weight_precision != Qwen35xWeightPrecision::bf16) {
+    if (config.weight_precision != Qwen35xWeightPrecision::nvfp4) {
+      error_message =
+        "Qwen35x CUDA weight precision '" + std::string(to_string(config.weight_precision)) +
+        "' is not implemented yet; supported weight_precision=bf16|nvfp4.";
+      impl_ = std::make_unique<Impl>();
+      return false;
+    }
     if (!load_modelopt_nvfp4_state(impl_->descriptor, config, impl_->arena, impl_->nvfp4_state, error_message)) {
       impl_ = std::make_unique<Impl>();
       return false;
     }
-    error_message =
-      "Qwen35x CUDA weight precision 'nvfp4' checkpoint loaded successfully, but NVFP4 kernels are not implemented yet.";
-    impl_ = std::make_unique<Impl>();
-    return false;
-  }
-  if (config.weight_precision != Qwen35xWeightPrecision::bf16) {
-    error_message =
-      "Qwen35x CUDA weight precision '" + std::string(to_string(config.weight_precision)) +
-      "' is not implemented yet; supported weight_precision=bf16.";
-    impl_ = std::make_unique<Impl>();
-    return false;
   }
 
   if (!initialize_backend_state(impl_->descriptor, *variant, config, impl_->arena, impl_->state, error_message)) {

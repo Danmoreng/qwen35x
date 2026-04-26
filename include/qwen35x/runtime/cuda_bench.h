@@ -15,5 +15,15 @@ bool run_bf16_matvec_benchmark(
   double & avg_iteration_ms,
   std::string & error_message);
 
-} // namespace qwen35x::cuda
+bool run_nvfp4_matvec_check(
+  const std::vector<std::uint8_t> & packed_weights,
+  const std::vector<std::uint8_t> & weight_scales_e4m3,
+  float input_scale,
+  float weight_scale_2,
+  int rows,
+  int cols,
+  int sample_rows,
+  double & max_abs_error,
+  std::string & error_message);
 
+} // namespace qwen35x::cuda

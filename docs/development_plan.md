@@ -390,9 +390,10 @@ Validation policy for each new size:
 - [x] Document the AxionML safetensors tensor naming, packed payload dtype, FP8 scale tensors, and per-tensor shape rules for 0.8B and 4B.
   Current status: `--validate-nvfp4-model` checks ModelOpt `hf_quant_config.json`, group size 16, null KV-cache quantization, `U8` packed `.weight` tensors shaped `[rows, cols / 2]`, `F8_E4M3` `.weight_scale` tensors shaped `[rows, cols / 16]`, and scalar `F32` `.input_scale` / `.weight_scale_2` tensors. The downloaded AxionML 0.8B checkpoint validates 186 quantized modules.
 - [x] Add Qwen35x CUDA loader support for AxionML/ModelOpt NVFP4 safetensors while preserving the current BF16 loader and shape-validation path.
-  Current status: `--qwen35x-weight-precision nvfp4` validates and uploads ModelOpt `U8` packed weights, `F8_E4M3` weight scales, and scalar `F32` input/secondary scales, then stops with the expected "NVFP4 kernels are not implemented yet" diagnostic.
+  Current status: `--qwen35x-weight-precision nvfp4` validates ModelOpt `U8` packed weights, `F8_E4M3` weight scales, and scalar `F32` scale metadata. It can run actual inference through a transitional load-time dequantize-to-BF16 path while native packed NVFP4 kernels are brought up.
 - [ ] Add duplicated NVFP4 weight structs and launchers for the 0.8B decode path with BF16 KV cache.
-- [ ] Implement the first NVFP4 decode matvec path for a narrow projection class and keep all unsupported projections on BF16 or fail clearly.
+- [x] Implement the first NVFP4 decode matvec path for a narrow projection class and keep all unsupported projections on BF16 or fail clearly.
+  Current status: `--check-nvfp4-tensor` runs a CUDA E2M1/U8 + E4M3-scale dequantized matvec check for one ModelOpt tensor family and compares sampled rows against a CPU reference. This is a standalone primitive check, not yet wired into decode.
 - [ ] Expand NVFP4 decode coverage across full-attention, DeltaNet, MLP, embedding/LM-head as separate measured steps.
 - [ ] Validate `NVFP4 weights + BF16 KV cache` with parity/error-threshold tests and short/medium/long decode benchmarks.
 - [ ] Add NVFP4 prefill support after decode-only weight quantization is validated, preferably through cuBLASLt FP4/NVFP4 GEMM where available or a measured custom fallback.

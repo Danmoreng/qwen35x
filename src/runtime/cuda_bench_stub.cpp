@@ -16,7 +16,20 @@ bool run_bf16_matvec_benchmark(
   return false;
 }
 
+bool run_nvfp4_matvec_check(
+  const std::vector<std::uint8_t> &,
+  const std::vector<std::uint8_t> &,
+  float,
+  float,
+  int,
+  int,
+  int,
+  double &,
+  std::string & error_message) {
+  error_message = "CUDA is not enabled in this build.";
+  return false;
+}
+
 } // namespace qwen35x::cuda
 
 #endif
-
