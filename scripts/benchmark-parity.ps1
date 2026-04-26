@@ -17,6 +17,10 @@ param(
     [Alias("LucePrefillMode")]
     [ValidateSet("default", "replay", "batched")]
     [string]$Qwen35xPrefillMode = "default",
+    [ValidateSet("bf16", "nvfp4")]
+    [string]$Qwen35xWeightPrecision = "bf16",
+    [ValidateSet("bf16", "quantized")]
+    [string]$Qwen35xCachePrecision = "bf16",
     [switch]$ProfileSync,
     [bool]$FailOnMismatch = $true,
     [switch]$KeepProfiles
@@ -105,6 +109,8 @@ function Invoke-InferenceProfile {
         [Parameter(Mandatory = $true)][double]$RepeatPenalty,
         [Parameter(Mandatory = $true)][int64]$Seed,
         [Parameter(Mandatory = $true)][string]$Qwen35xPrefillMode,
+        [Parameter(Mandatory = $true)][string]$Qwen35xWeightPrecision,
+        [Parameter(Mandatory = $true)][string]$Qwen35xCachePrecision,
         [Parameter(Mandatory = $true)][bool]$ProfileSyncEnabled,
         [Parameter(Mandatory = $true)][string]$ProfileJsonPath
     )
@@ -150,6 +156,12 @@ function Invoke-InferenceProfile {
     }
     if ($Mode -ne "cpu-reference" -and $Qwen35xPrefillMode -ne "default") {
         $args += @("--qwen35x-prefill-mode", $Qwen35xPrefillMode)
+    }
+    if ($Mode -ne "cpu-reference" -and $Qwen35xWeightPrecision -ne "bf16") {
+        $args += @("--qwen35x-weight-precision", $Qwen35xWeightPrecision)
+    }
+    if ($Mode -ne "cpu-reference" -and $Qwen35xCachePrecision -ne "bf16") {
+        $args += @("--qwen35x-cache-precision", $Qwen35xCachePrecision)
     }
 
     $runOutput = & $ExePath @args 2>&1
@@ -264,6 +276,8 @@ foreach ($prompt in $prompts) {
             -RepeatPenalty $RepeatPenalty `
             -Seed $Seed `
             -Qwen35xPrefillMode "default" `
+            -Qwen35xWeightPrecision "bf16" `
+            -Qwen35xCachePrecision "bf16" `
             -ProfileSyncEnabled $false `
             -ProfileJsonPath $cpuProfilePath
 
@@ -281,6 +295,8 @@ foreach ($prompt in $prompts) {
             -RepeatPenalty $RepeatPenalty `
             -Seed $Seed `
             -Qwen35xPrefillMode $Qwen35xPrefillMode `
+            -Qwen35xWeightPrecision $Qwen35xWeightPrecision `
+            -Qwen35xCachePrecision $Qwen35xCachePrecision `
             -ProfileSyncEnabled $ProfileSync.IsPresent `
             -ProfileJsonPath $gpuProfilePath
 
@@ -319,6 +335,8 @@ foreach ($prompt in $prompts) {
             repeat_penalty = To-InvariantString $RepeatPenalty
             seed = $Seed
             qwen35x_prefill_mode = $Qwen35xPrefillMode
+            qwen35x_weight_precision = $Qwen35xWeightPrecision
+            qwen35x_cache_precision = $Qwen35xCachePrecision
             token_parity_pass = if ($parityPass) { "true" } else { "false" }
             first_mismatch_index = $comparison.first_mismatch_index
             cpu_mismatch_token = $comparison.cpu_mismatch_token

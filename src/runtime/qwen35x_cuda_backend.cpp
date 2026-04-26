@@ -17,6 +17,28 @@
 
 namespace qwen35x::cuda_backend {
 
+const char * to_string(const Qwen35xWeightPrecision precision) {
+  switch (precision) {
+    case Qwen35xWeightPrecision::bf16:
+      return "bf16";
+    case Qwen35xWeightPrecision::nvfp4:
+      return "nvfp4";
+    default:
+      return "unknown";
+  }
+}
+
+const char * to_string(const Qwen35xCachePrecision precision) {
+  switch (precision) {
+    case Qwen35xCachePrecision::bf16:
+      return "bf16";
+    case Qwen35xCachePrecision::quantized:
+      return "quantized";
+    default:
+      return "unknown";
+  }
+}
+
 bool validate_descriptor(const Qwen35xModelDescriptor & descriptor, std::string & error_message) {
   if (descriptor.num_layers <= 0 ||
       descriptor.hidden_size <= 0 ||
@@ -1192,6 +1214,18 @@ bool Qwen35xCudaBackend::initialize(const Qwen35xCudaBackendConfig & config, std
   }
   if (config.repetition_penalty < 1.0f) {
     error_message = "repetition_penalty must be >= 1.0.";
+    return false;
+  }
+  if (config.weight_precision != Qwen35xWeightPrecision::bf16) {
+    error_message =
+      "Qwen35x CUDA weight precision '" + std::string(to_string(config.weight_precision)) +
+      "' is not implemented yet; supported weight_precision=bf16.";
+    return false;
+  }
+  if (config.cache_precision != Qwen35xCachePrecision::bf16) {
+    error_message =
+      "Qwen35x CUDA cache precision '" + std::string(to_string(config.cache_precision)) +
+      "' is not implemented yet; supported cache_precision=bf16.";
     return false;
   }
   Qwen35xModelDescriptor descriptor;

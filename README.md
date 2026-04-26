@@ -46,6 +46,10 @@ Current Qwen35x prefill behavior:
 - `QWEN35X_PREFILL_MLP_CHUNK_TOKENS` overrides the MLP/DeltaNet chunk size. The default is `4096`.
 - `QWEN35X_PREFILL_ATTENTION_QUERY_TOKENS` overrides the materialized full-attention query tile. Defaults are variant-aware: large tile for 0.8B throughput, 64-token tile for 4B VRAM safety.
 
+Current Qwen35x precision behavior:
+- `--qwen35x-weight-precision bf16` and `--qwen35x-cache-precision bf16` are the stable default path.
+- `--qwen35x-weight-precision nvfp4` and `--qwen35x-cache-precision quantized` are reserved for the upcoming quantized paths and currently fail fast with a clear unsupported-mode diagnostic.
+
 Current decode control behavior:
 - The default Qwen35x CUDA path returns the selected token id each step and performs stop checks on the host.
 - `--gpu-decode-blocks <n>` can override decode grid size for tuning; the Qwen35x CUDA kernel clamps unsafe low values to one block per DeltaNet head and reports requested/effective block counts in profile JSON.

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "qwen35x/common/model_profile.h"
+#include "qwen35x/runtime/qwen35x_cuda_backend.h"
 #include "qwen35x/runtime/qwen35x_profile.h"
 
 #include <cstdint>
@@ -36,6 +37,8 @@ struct ReferenceInferenceOptions {
   bool use_cuda_matvec_bf16 = false;
   GpuDecodeBackend gpu_decode_backend = GpuDecodeBackend::runtime_default;
   Qwen35xPrefillMode qwen35x_prefill_mode = Qwen35xPrefillMode::batched;
+  cuda_backend::Qwen35xWeightPrecision qwen35x_weight_precision = cuda_backend::Qwen35xWeightPrecision::bf16;
+  cuda_backend::Qwen35xCachePrecision qwen35x_cache_precision = cuda_backend::Qwen35xCachePrecision::bf16;
   int gpu_decode_blocks = 0;
   bool profile_cuda_sync = false;
   bool profile_qwen35x = false;

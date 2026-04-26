@@ -25,6 +25,10 @@ param(
     [Alias("LucePrefillMode")]
     [ValidateSet("default", "replay", "batched")]
     [string]$Qwen35xPrefillMode = "default",
+    [ValidateSet("bf16", "nvfp4")]
+    [string]$Qwen35xWeightPrecision = "bf16",
+    [ValidateSet("bf16", "quantized")]
+    [string]$Qwen35xCachePrecision = "bf16",
     [switch]$PrefillOnly,
     [switch]$ProfileSync,
     [Alias("LuceProfile")]
@@ -128,6 +132,8 @@ function Invoke-BenchmarkRun {
         [Parameter(Mandatory = $true)][double]$RepeatPenalty,
         [Parameter(Mandatory = $true)][int64]$Seed,
         [Parameter(Mandatory = $true)][string]$Qwen35xPrefillMode,
+        [Parameter(Mandatory = $true)][string]$Qwen35xWeightPrecision,
+        [Parameter(Mandatory = $true)][string]$Qwen35xCachePrecision,
         [Parameter(Mandatory = $true)][bool]$PrefillOnlyEnabled,
         [Parameter(Mandatory = $true)][bool]$ProfileSyncEnabled,
         [Parameter(Mandatory = $true)][bool]$Qwen35xProfileEnabled,
@@ -183,6 +189,12 @@ function Invoke-BenchmarkRun {
     }
     if ($Mode -ne "cpu-reference" -and $Qwen35xPrefillMode -ne "default") {
         $args += @("--qwen35x-prefill-mode", $Qwen35xPrefillMode)
+    }
+    if ($Mode -ne "cpu-reference" -and $Qwen35xWeightPrecision -ne "bf16") {
+        $args += @("--qwen35x-weight-precision", $Qwen35xWeightPrecision)
+    }
+    if ($Mode -ne "cpu-reference" -and $Qwen35xCachePrecision -ne "bf16") {
+        $args += @("--qwen35x-cache-precision", $Qwen35xCachePrecision)
     }
     if ($Mode -ne "cpu-reference" -and $GpuDecodeBlocks -gt 0) {
         $args += @("--gpu-decode-blocks", "$GpuDecodeBlocks")
@@ -281,6 +293,8 @@ foreach ($mode in $Modes) {
                 -RepeatPenalty $RepeatPenalty `
                 -Seed $Seed `
                 -Qwen35xPrefillMode $Qwen35xPrefillMode `
+                -Qwen35xWeightPrecision $Qwen35xWeightPrecision `
+                -Qwen35xCachePrecision $Qwen35xCachePrecision `
                 -PrefillOnlyEnabled $PrefillOnly.IsPresent `
                 -ProfileSyncEnabled $ProfileSync.IsPresent `
                 -Qwen35xProfileEnabled $Qwen35xProfile.IsPresent `
@@ -313,6 +327,8 @@ foreach ($mode in $Modes) {
                 -RepeatPenalty $RepeatPenalty `
                 -Seed $Seed `
                 -Qwen35xPrefillMode $Qwen35xPrefillMode `
+                -Qwen35xWeightPrecision $Qwen35xWeightPrecision `
+                -Qwen35xCachePrecision $Qwen35xCachePrecision `
                 -PrefillOnlyEnabled $PrefillOnly.IsPresent `
                 -ProfileSyncEnabled $ProfileSync.IsPresent `
                 -Qwen35xProfileEnabled $Qwen35xProfile.IsPresent `
@@ -336,12 +352,22 @@ foreach ($mode in $Modes) {
             if ([string]::IsNullOrWhiteSpace($effectiveQwen35xPrefillMode)) {
                 $effectiveQwen35xPrefillMode = $Qwen35xPrefillMode
             }
+            $effectiveQwen35xWeightPrecision = [string](Get-JsonProperty -Object $profile -Name "qwen35x_weight_precision")
+            if ([string]::IsNullOrWhiteSpace($effectiveQwen35xWeightPrecision)) {
+                $effectiveQwen35xWeightPrecision = $Qwen35xWeightPrecision
+            }
+            $effectiveQwen35xCachePrecision = [string](Get-JsonProperty -Object $profile -Name "qwen35x_cache_precision")
+            if ([string]::IsNullOrWhiteSpace($effectiveQwen35xCachePrecision)) {
+                $effectiveQwen35xCachePrecision = $Qwen35xCachePrecision
+            }
 
             $row = [PSCustomObject]@{
                 timestamp_utc    = [DateTime]::UtcNow.ToString("o")
                 run_label        = $RunLabel
                 mode             = $mode
                 qwen35x_prefill_mode = $effectiveQwen35xPrefillMode
+                qwen35x_weight_precision = $effectiveQwen35xWeightPrecision
+                qwen35x_cache_precision = $effectiveQwen35xCachePrecision
                 qwen35x_decode_blocks_requested = $GpuDecodeBlocks
                 prefill_only     = [bool]$profile.prefill_only
                 run_index        = $runIndex

@@ -63,6 +63,14 @@ const char * qwen35x_prefill_mode_name(const qwen35x::Qwen35xPrefillMode mode) {
   }
 }
 
+const char * qwen35x_weight_precision_name(const qwen35x::cuda_backend::Qwen35xWeightPrecision precision) {
+  return qwen35x::cuda_backend::to_string(precision);
+}
+
+const char * qwen35x_cache_precision_name(const qwen35x::cuda_backend::Qwen35xCachePrecision precision) {
+  return qwen35x::cuda_backend::to_string(precision);
+}
+
 const char * qwen35x_layer_type_name(const int layer_type) {
   return layer_type == 0 ? "deltanet" : "full_attention";
 }
@@ -158,6 +166,8 @@ bool write_profile_json(
   out << "  \"backend\": \"" << json_escape(backend) << "\",\n";
   out << "  \"decode_backend\": \"" << json_escape(decode_backend) << "\",\n";
   out << "  \"qwen35x_prefill_mode\": \"" << json_escape(qwen35x_prefill_mode_name(options.qwen35x_prefill_mode)) << "\",\n";
+  out << "  \"qwen35x_weight_precision\": \"" << json_escape(qwen35x_weight_precision_name(options.qwen35x_weight_precision)) << "\",\n";
+  out << "  \"qwen35x_cache_precision\": \"" << json_escape(qwen35x_cache_precision_name(options.qwen35x_cache_precision)) << "\",\n";
   out << "  \"prefill_only\": " << (options.prefill_only ? "true" : "false") << ",\n";
   out << "  \"prompt_tokens\": " << options.prompt_tokens.size() << ",\n";
   out << "  \"prompt_token_ids\": [";
@@ -332,6 +342,26 @@ int main(int argc, char ** argv) {
         std::cerr << "unknown " << arg << " value: " << mode << " (expected: replay|batched)\n";
         return 11;
       }
+    } else if (arg == "--qwen35x-weight-precision" && i + 1 < argc) {
+      const std::string precision = argv[++i];
+      if (precision == "bf16") {
+        infer_options.qwen35x_weight_precision = qwen35x::cuda_backend::Qwen35xWeightPrecision::bf16;
+      } else if (precision == "nvfp4") {
+        infer_options.qwen35x_weight_precision = qwen35x::cuda_backend::Qwen35xWeightPrecision::nvfp4;
+      } else {
+        std::cerr << "unknown --qwen35x-weight-precision value: " << precision << " (expected: bf16|nvfp4)\n";
+        return 11;
+      }
+    } else if (arg == "--qwen35x-cache-precision" && i + 1 < argc) {
+      const std::string precision = argv[++i];
+      if (precision == "bf16") {
+        infer_options.qwen35x_cache_precision = qwen35x::cuda_backend::Qwen35xCachePrecision::bf16;
+      } else if (precision == "quantized") {
+        infer_options.qwen35x_cache_precision = qwen35x::cuda_backend::Qwen35xCachePrecision::quantized;
+      } else {
+        std::cerr << "unknown --qwen35x-cache-precision value: " << precision << " (expected: bf16|quantized)\n";
+        return 11;
+      }
     } else if (arg == "--profile-sync") {
       infer_options.profile_cuda_sync = true;
     } else if (arg == "--qwen35x-profile" || arg == "--luce-profile") {
@@ -359,7 +389,8 @@ int main(int argc, char ** argv) {
       std::cout << "       qwen35x --infer-reference --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "       qwen35x --infer-gpu --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "               [--temperature <float>] [--top-p <float>] [--top-k <int>] [--repeat-penalty <float>] [--seed <int64>]\n";
-      std::cout << "               [--gpu-bf16|--gpu-f32-matvec] [--gpu-decode-backend <default|qwen35x>] [--gpu-decode-blocks <n>] [--qwen35x-prefill-mode <replay|batched>] [--profile-sync] [--qwen35x-profile] [--prefill-only]\n";
+      std::cout << "               [--gpu-bf16|--gpu-f32-matvec] [--gpu-decode-backend <default|qwen35x>] [--gpu-decode-blocks <n>] [--qwen35x-prefill-mode <replay|batched>]\n";
+      std::cout << "               [--qwen35x-weight-precision <bf16|nvfp4>] [--qwen35x-cache-precision <bf16|quantized>] [--profile-sync] [--qwen35x-profile] [--prefill-only]\n";
       std::cout << "               [--stop-token <csv>] [--stop-text <text>] [--stop-on-im-end] [--profile-json <path>]\n";
       return 0;
     }
@@ -510,6 +541,8 @@ int main(int argc, char ** argv) {
     std::cout << "  backend: " << (infer_options.use_cuda ? "cuda-hybrid" : "cpu-reference") << "\n";
     std::cout << "  decode_backend: " << gpu_decode_backend_name(infer_options.gpu_decode_backend) << "\n";
     std::cout << "  qwen35x_prefill_mode: " << qwen35x_prefill_mode_name(infer_options.qwen35x_prefill_mode) << "\n";
+    std::cout << "  qwen35x_weight_precision: " << qwen35x_weight_precision_name(infer_options.qwen35x_weight_precision) << "\n";
+    std::cout << "  qwen35x_cache_precision: " << qwen35x_cache_precision_name(infer_options.qwen35x_cache_precision) << "\n";
     std::cout << "  prefill_only: " << (infer_options.prefill_only ? "on" : "off") << "\n";
     std::cout << "  prompt_tokens: " << infer_options.prompt_tokens.size() << "\n";
     std::cout << "  generated_tokens: " << infer_result.generated_tokens.size() << "\n";

@@ -54,6 +54,8 @@ bool run_qwen35x_cuda_inference(
   config.max_context = options.max_context;
   config.decode_blocks = options.gpu_decode_blocks;
   config.repetition_penalty = options.sampling.repetition_penalty;
+  config.weight_precision = options.qwen35x_weight_precision;
+  config.cache_precision = options.qwen35x_cache_precision;
   config.profile_enabled = options.profile_qwen35x;
   if (!backend.initialize(config, error_message)) {
     return false;

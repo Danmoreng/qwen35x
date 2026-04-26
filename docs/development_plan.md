@@ -382,9 +382,10 @@ Validation policy for each new size:
 - [x] Add first-pass prefill chunking for larger prompt/model shapes while preserving the canonical prefill/decode cache layout.
 - [ ] Make prefill chunking descriptor-driven and move tuning defaults into per-model/per-GPU profiles.
 - [ ] Add per-model/per-GPU autotune profiles (decode blocks, block size, LM head tiling, chunk sizes, graph boundaries).
-- [ ] Add explicit Qwen35x CUDA precision/cache mode plumbing: `weight_precision={bf16,nvfp4}` and `cache_precision={bf16,quantized}`, defaulting to `bf16/bf16`.
-- [ ] Add fail-fast diagnostics for unsupported `nvfp4` and quantized-cache modes until kernels and artifacts exist.
-- [ ] Include weight/cache precision labels in CLI output, profile JSON, benchmark CSVs, and Qwen35x runtime diagnostics.
+- [x] Add explicit Qwen35x CUDA precision/cache mode plumbing: `weight_precision={bf16,nvfp4}` and `cache_precision={bf16,quantized}`, defaulting to `bf16/bf16`.
+- [x] Add fail-fast diagnostics for unsupported `nvfp4` and quantized-cache modes until kernels and artifacts exist.
+- [x] Include weight/cache precision labels in CLI output, profile JSON, benchmark CSVs, and Qwen35x runtime diagnostics.
+  Current status: `--qwen35x-weight-precision bf16` and `--qwen35x-cache-precision bf16` are the default supported path. `nvfp4` and `quantized` are accepted as explicit modes but fail during Qwen35x CUDA backend initialization until the duplicate kernels, artifacts, and cache ABI are implemented.
 - [ ] Define the NVFP4 quantized weight artifact format, including packed data layout, scale layout, group/block size, tensor naming, and descriptor validation rules.
 - [ ] Add an offline or build-time converter that produces NVFP4 artifacts from BF16 safetensors without modifying the BF16 model directory.
 - [ ] Add Qwen35x CUDA loader support for NVFP4 artifacts while preserving the current BF16 loader and shape-validation path.
