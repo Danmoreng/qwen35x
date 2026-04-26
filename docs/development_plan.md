@@ -71,6 +71,11 @@ Latest validation snapshot (April 24, 2026):
 - CPU reference vs PyTorch/Transformers external oracle (`scripts/benchmark-transformers-parity.ps1`, minimal prompt suite, `max_new_tokens=4`): pass `5/5` with prompt-token and generated-token parity.
 - Default GPU path vs CPU reference (`scripts/benchmark-parity.ps1`, minimal prompt suite, `gpu-f32`, Qwen35x batched prefill, `max_new_tokens=4`): pass `5/5`.
 - Extended CPU/GPU parity suite (`gpu-f32`, Qwen35x batched prefill + warmup, `max_new_tokens=4`): pass `12/12`.
+- Descriptor/shape-validation follow-up (April 26, 2026):
+  - CUDA safetensor shape validation is wired before allocation/upload for 0.8B and 4B, including the packed full-attention `q+gate` projection shape.
+  - Minimal CPU/GPU parity after shape validation: pass `5/5`, CSV `benchmarks/qwen35x-parity-shape-validation.csv`.
+  - 0.8B synthetic generation gates after shape validation stayed near the accepted decode range: `prompt1/gen128` avg `324.40 tok/s`, `pp512/gen128` avg `322.67 tok/s`, `pp1024/gen128` avg `311.58 tok/s`, `pp4096/gen128` avg `296.01 tok/s`.
+  - 4B synthetic generation gates after shape validation stayed near the accepted decode range: `prompt1/gen128` avg `60.67 tok/s`, `pp512/gen128` avg `60.63 tok/s`, `pp1024/gen128` avg `60.65 tok/s`.
 
 ## Vision
 
@@ -158,11 +163,11 @@ Active work for model-size generalization:
 1. Add a Qwen35x CUDA model descriptor
 - A first-class descriptor is now derived from `ModelProfile` / HF config and can be passed through `Qwen35xCudaBackendConfig`.
 - It includes layer count, hidden size, intermediate size, vocab size, attention heads/KV heads/head dim, RoPE dim/theta, DeltaNet dimensions including grouped value dimension, conv settings, and exact layer schedule.
-- Validate safetensor shapes against the descriptor before allocating or uploading device weights.
+- Safetensor shapes are validated against the descriptor before CUDA allocation/upload, including the CUDA packed full-attention `q+gate` projection shape.
 
 2. Make allocation and validation descriptor-driven
 - Runtime cache/state, RoPE table, decode scratch, and prefill scratch allocation in `src/runtime/qwen35x_cuda_backend.cpp` now use descriptor-derived sizes, with a descriptor/compiled-variant consistency check before allocation.
-- Continue moving tensor shape validation onto the descriptor before upload.
+- Tensor shape validation now runs before CUDA upload for embed/norm/lm head and per-layer MLP, full-attention, and DeltaNet tensors.
 - Keep the current 0.8B and 4B compiled kernels as the enabled fast variants in the single main binary until additional variants have explicit kernels and parity gates.
 - Add precise unsupported-variant errors for model shapes that do not yet have a compiled kernel variant.
 
@@ -341,7 +346,7 @@ Validation policy for each new size:
 - [x] Add descriptor validation and clear unsupported-variant errors for model shapes without a matching compiled kernel.
 - [x] Build the main `qwen35x` executable with both 0.8B and 4B CUDA variants and dispatch to the matching launchers at runtime.
 - [x] Replace Qwen35x CUDA-side runtime allocation/reset sizes with descriptor-derived sizes while keeping the current 0.8B and 4B kernels as the enabled compiled variants.
-- [ ] Validate safetensor tensor shapes against the Qwen35x CUDA descriptor before allocating or uploading device weights.
+- [x] Validate safetensor tensor shapes against the Qwen35x CUDA descriptor before allocating or uploading device weights.
 - [x] Split megakernel compile-time constants into per-variant configured values for `0.8B` and `4B`.
 - [ ] Extend per-variant generated/configured values to `9B` and `27B`.
 - [ ] Refactor shared-memory and LM-head assumptions that scale with hidden/intermediate size before enabling larger variants.

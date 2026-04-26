@@ -417,6 +417,7 @@ int get_prefill_attention_query_tokens(const VariantDescriptor & variant, const 
 bool load_bf16_tensor_to_device(
   const std::string & model_dir,
   const std::vector<std::string> & tensor_names,
+  const std::vector<std::vector<std::int64_t>> & accepted_shapes,
   DeviceArena & arena,
   void *& out_device_ptr,
   std::string & out_tensor_name,
@@ -444,6 +445,31 @@ bool load_bf16_tensor_to_device(
     if (!qwen35x::SafetensorLoader::load_tensor_info(tensor_file, name, info, local_error)) {
       last_error = local_error;
       continue;
+    }
+    if (!accepted_shapes.empty() &&
+        std::find(accepted_shapes.begin(), accepted_shapes.end(), info.shape) == accepted_shapes.end()) {
+      auto shape_to_string = [](const std::vector<std::int64_t> & shape) {
+        std::string out = "[";
+        for (std::size_t i = 0; i < shape.size(); ++i) {
+          if (i != 0) {
+            out += ",";
+          }
+          out += std::to_string(shape[i]);
+        }
+        out += "]";
+        return out;
+      };
+      std::string expected;
+      for (std::size_t i = 0; i < accepted_shapes.size(); ++i) {
+        if (i != 0) {
+          expected += " or ";
+        }
+        expected += shape_to_string(accepted_shapes[i]);
+      }
+      error_message =
+        "Tensor '" + name + "' shape mismatch: expected " + expected +
+        " actual " + shape_to_string(info.shape) + ".";
+      return false;
     }
 
     if (info.dtype == "BF16") {
@@ -600,11 +626,29 @@ bool initialize_backend_state(
   if (!validate_descriptor_matches_variant(descriptor, variant, error_message)) {
     return false;
   }
+  const auto shape = [](std::initializer_list<std::int64_t> dims) {
+    return std::vector<std::int64_t>(dims);
+  };
+  const auto one_shape = [&](std::initializer_list<std::int64_t> dims) {
+    return std::vector<std::vector<std::int64_t>>{shape(dims)};
+  };
+  const auto conv_shapes = [&](const std::int64_t channels, const std::int64_t kernel) {
+    return std::vector<std::vector<std::int64_t>>{shape({channels, kernel}), shape({channels, 1, kernel})};
+  };
+  const std::int64_t hidden = descriptor.hidden_size;
+  const std::int64_t intermediate = descriptor.intermediate_size;
+  const std::int64_t vocab = descriptor.vocab_size;
+  const std::int64_t full_q_out = descriptor_fa_q_size(descriptor);
+  const std::int64_t full_qproj_out = descriptor_fa_qproj_size(descriptor);
+  const std::int64_t full_kv_out = descriptor_fa_kv_size(descriptor);
+  const std::int64_t linear_conv_channels = descriptor_dn_conv_channels(descriptor);
+  const std::int64_t linear_v_dim = descriptor_dn_v_size(descriptor);
   {
     std::string used_name;
     if (!load_bf16_tensor_to_device(
           config.model_dir,
           {"model.language_model.embed_tokens.weight", "model.embed_tokens.weight"},
+          one_shape({vocab, hidden}),
           arena,
           state.embed_weight,
           used_name,
@@ -618,6 +662,7 @@ bool initialize_backend_state(
     if (!load_bf16_tensor_to_device(
           config.model_dir,
           {"model.language_model.norm.weight", "model.norm.weight"},
+          one_shape({hidden}),
           arena,
           state.final_norm_weight,
           used_name,
@@ -631,6 +676,7 @@ bool initialize_backend_state(
     if (!load_bf16_tensor_to_device(
           config.model_dir,
           {"lm_head.weight", "model.language_model.embed_tokens.weight", "model.embed_tokens.weight"},
+          one_shape({vocab, hidden}),
           arena,
           state.lm_head_weight,
           used_name,
@@ -645,7 +691,7 @@ bool initialize_backend_state(
     layer.layer_type = descriptor.layer_type[static_cast<std::size_t>(layer_idx)];
     const std::string base = "model.language_model.layers." + std::to_string(layer_idx) + ".";
 
-    auto load_ptr = [&](int ptr_idx, const std::vector<std::string> & suffixes) -> bool {
+    auto load_ptr = [&](int ptr_idx, const std::vector<std::string> & suffixes, const std::vector<std::vector<std::int64_t>> & accepted_shapes) -> bool {
       std::vector<std::string> names;
       names.reserve(suffixes.size());
       for (const auto & suffix : suffixes) {
@@ -653,7 +699,7 @@ bool initialize_backend_state(
       }
       std::string used_name;
       void * tensor_ptr = nullptr;
-      if (!load_bf16_tensor_to_device(config.model_dir, names, arena, tensor_ptr, used_name, error_message)) {
+      if (!load_bf16_tensor_to_device(config.model_dir, names, accepted_shapes, arena, tensor_ptr, used_name, error_message)) {
         error_message = "layer " + std::to_string(layer_idx) + " ptr[" + std::to_string(ptr_idx) + "]: " + error_message;
         return false;
       }
@@ -662,34 +708,34 @@ bool initialize_backend_state(
     };
 
     if (layer.layer_type == 0) {
-      if (!load_ptr(0, {"input_layernorm.weight"}) ||
-          !load_ptr(1, {"linear_attn.in_proj_qkv.weight"}) ||
-          !load_ptr(2, {"linear_attn.in_proj_z.weight"}) ||
-          !load_ptr(3, {"linear_attn.in_proj_b.weight"}) ||
-          !load_ptr(4, {"linear_attn.in_proj_a.weight"}) ||
-          !load_ptr(5, {"linear_attn.conv1d.weight"}) ||
-          !load_ptr(6, {"linear_attn.A_log"}) ||
-          !load_ptr(7, {"linear_attn.dt_bias"}) ||
-          !load_ptr(8, {"linear_attn.norm.weight"}) ||
-          !load_ptr(9, {"linear_attn.out_proj.weight"}) ||
-          !load_ptr(10, {"post_attention_layernorm.weight"}) ||
-          !load_ptr(11, {"mlp.gate_proj.weight"}) ||
-          !load_ptr(12, {"mlp.up_proj.weight"}) ||
-          !load_ptr(13, {"mlp.down_proj.weight"})) {
+      if (!load_ptr(0, {"input_layernorm.weight"}, one_shape({hidden})) ||
+          !load_ptr(1, {"linear_attn.in_proj_qkv.weight"}, one_shape({linear_conv_channels, hidden})) ||
+          !load_ptr(2, {"linear_attn.in_proj_z.weight"}, one_shape({linear_v_dim, hidden})) ||
+          !load_ptr(3, {"linear_attn.in_proj_b.weight"}, one_shape({descriptor.dn_gate_heads, hidden})) ||
+          !load_ptr(4, {"linear_attn.in_proj_a.weight"}, one_shape({descriptor.dn_gate_heads, hidden})) ||
+          !load_ptr(5, {"linear_attn.conv1d.weight"}, conv_shapes(linear_conv_channels, descriptor.dn_conv_kernel)) ||
+          !load_ptr(6, {"linear_attn.A_log"}, one_shape({descriptor.dn_gate_heads})) ||
+          !load_ptr(7, {"linear_attn.dt_bias"}, one_shape({descriptor.dn_gate_heads})) ||
+          !load_ptr(8, {"linear_attn.norm.weight"}, one_shape({descriptor.dn_value_head_dim})) ||
+          !load_ptr(9, {"linear_attn.out_proj.weight"}, one_shape({hidden, linear_v_dim})) ||
+          !load_ptr(10, {"post_attention_layernorm.weight"}, one_shape({hidden})) ||
+          !load_ptr(11, {"mlp.gate_proj.weight"}, one_shape({intermediate, hidden})) ||
+          !load_ptr(12, {"mlp.up_proj.weight"}, one_shape({intermediate, hidden})) ||
+          !load_ptr(13, {"mlp.down_proj.weight"}, one_shape({hidden, intermediate}))) {
         return false;
       }
     } else {
-      if (!load_ptr(0, {"input_layernorm.weight"}) ||
-          !load_ptr(1, {"self_attn.q_proj.weight"}) ||
-          !load_ptr(2, {"self_attn.k_proj.weight"}) ||
-          !load_ptr(3, {"self_attn.v_proj.weight"}) ||
-          !load_ptr(4, {"self_attn.q_norm.weight"}) ||
-          !load_ptr(5, {"self_attn.k_norm.weight"}) ||
-          !load_ptr(6, {"self_attn.o_proj.weight"}) ||
-          !load_ptr(7, {"post_attention_layernorm.weight"}) ||
-          !load_ptr(8, {"mlp.gate_proj.weight"}) ||
-          !load_ptr(9, {"mlp.up_proj.weight"}) ||
-          !load_ptr(10, {"mlp.down_proj.weight"})) {
+      if (!load_ptr(0, {"input_layernorm.weight"}, one_shape({hidden})) ||
+          !load_ptr(1, {"self_attn.q_proj.weight"}, one_shape({full_qproj_out, hidden})) ||
+          !load_ptr(2, {"self_attn.k_proj.weight"}, one_shape({full_kv_out, hidden})) ||
+          !load_ptr(3, {"self_attn.v_proj.weight"}, one_shape({full_kv_out, hidden})) ||
+          !load_ptr(4, {"self_attn.q_norm.weight"}, one_shape({descriptor.fa_head_dim})) ||
+          !load_ptr(5, {"self_attn.k_norm.weight"}, one_shape({descriptor.fa_head_dim})) ||
+          !load_ptr(6, {"self_attn.o_proj.weight"}, one_shape({hidden, full_q_out})) ||
+          !load_ptr(7, {"post_attention_layernorm.weight"}, one_shape({hidden})) ||
+          !load_ptr(8, {"mlp.gate_proj.weight"}, one_shape({intermediate, hidden})) ||
+          !load_ptr(9, {"mlp.up_proj.weight"}, one_shape({intermediate, hidden})) ||
+          !load_ptr(10, {"mlp.down_proj.weight"}, one_shape({hidden, intermediate}))) {
         return false;
       }
     }
