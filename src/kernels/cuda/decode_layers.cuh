@@ -165,6 +165,38 @@ __device__ __forceinline__ float decode_e4m3_scale(const std::uint8_t bits)
     return sign ? -value : value;
 }
 
+__device__ __forceinline__ uint32_t decode_nvfp4_to_bfloat162(uint32_t packed_byte) {
+    uint32_t mag0 = packed_byte & 7;
+    uint32_t mag1 = (packed_byte >> 4) & 7;
+    
+    uint32_t lo0, hi0, lo1, hi1;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(lo0) : "r"(0xc0800000), "r"(0xc0804000), "r"(mag0));
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(hi0) : "r"(0x3f3f3f00), "r"(0x40404040), "r"(mag0));
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(lo1) : "r"(0xc0800000), "r"(0xc0804000), "r"(mag1));
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(hi1) : "r"(0x3f3f3f00), "r"(0x40404040), "r"(mag1));
+    
+    uint32_t bf0 = lo0 | (hi0 << 8) | ((packed_byte & 8) << 12);
+    uint32_t bf1 = lo1 | (hi1 << 8) | ((packed_byte & 0x80) << 8);
+    
+    return bf0 | (bf1 << 16);
+}
+
+__device__ __forceinline__ float decode_e4m3_scale_fast(const std::uint8_t bits) {
+    if (bits == 0) return 0.0f;
+    const int sign = (bits >> 7) & 1;
+    const int exponent = (bits >> 3) & 0xf;
+    const int mantissa = bits & 0x7;
+    uint32_t val;
+    if (exponent == 0) {
+        float f = float(mantissa) * 1.953125e-3f;
+        return sign ? -f : f;
+    } else {
+        uint32_t exp_f32 = exponent + 120;
+        val = (sign << 31) | (exp_f32 << 23) | (mantissa << 20);
+        return __uint_as_float(val);
+    }
+}
+
 static __device__ float nvfp4_row_dot(
     const Nvfp4Weight &weight,
     const __nv_bfloat16 *__restrict__ input,
@@ -172,20 +204,23 @@ static __device__ float nvfp4_row_dot(
     int in_dim,
     int lane_id)
 {
-    const std::uint8_t *packed_row = weight.packed_weight + row * (in_dim / 2);
+    const uint32_t *packed_row = reinterpret_cast<const uint32_t*>(weight.packed_weight + row * (in_dim / 2));
     const std::uint8_t *scale_row = weight.weight_scale + row * (in_dim / 16);
     const float scale2 = __ldg(weight.weight_scale_2);
     float sum = 0.0f;
+
 #pragma unroll 4
     for (int k = lane_id * 8; k < in_dim; k += WARP_SIZE * 8) {
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const int col = k + i;
-            const std::uint8_t packed = __ldg(packed_row + col / 2);
-            const std::uint8_t nibble = (col & 1) == 0 ? (packed & 0x0fu) : (packed >> 4u);
-            const float scale = decode_e4m3_scale(__ldg(scale_row + col / 16)) * scale2;
-            sum += decode_nvfp4_e2m1(nibble) * scale * __bfloat162float(input[col]);
-        }
+        uint32_t packed_4b = __ldg(packed_row + k / 8);
+        float scale = decode_e4m3_scale_fast(__ldg(scale_row + k / 16)) * scale2;
+        
+        uint4 w_u4;
+        w_u4.x = decode_nvfp4_to_bfloat162(packed_4b & 0xff);
+        w_u4.y = decode_nvfp4_to_bfloat162((packed_4b >> 8) & 0xff);
+        w_u4.z = decode_nvfp4_to_bfloat162((packed_4b >> 16) & 0xff);
+        w_u4.w = decode_nvfp4_to_bfloat162((packed_4b >> 24) & 0xff);
+        
+        sum += dot8_bf16(w_u4, input + k) * scale;
     }
     return sum;
 }
@@ -197,20 +232,30 @@ static __device__ float nvfp4_row_dot_f32(
     int in_dim,
     int lane_id)
 {
-    const std::uint8_t *packed_row = weight.packed_weight + row * (in_dim / 2);
+    const uint32_t *packed_row = reinterpret_cast<const uint32_t*>(weight.packed_weight + row * (in_dim / 2));
     const std::uint8_t *scale_row = weight.weight_scale + row * (in_dim / 16);
     const float scale2 = __ldg(weight.weight_scale_2);
     float sum = 0.0f;
+
 #pragma unroll 4
     for (int k = lane_id * 8; k < in_dim; k += WARP_SIZE * 8) {
+        uint32_t packed_4b = __ldg(packed_row + k / 8);
+        float scale = decode_e4m3_scale_fast(__ldg(scale_row + k / 16)) * scale2;
+        
+        uint4 w_u4;
+        w_u4.x = decode_nvfp4_to_bfloat162(packed_4b & 0xff);
+        w_u4.y = decode_nvfp4_to_bfloat162((packed_4b >> 8) & 0xff);
+        w_u4.z = decode_nvfp4_to_bfloat162((packed_4b >> 16) & 0xff);
+        w_u4.w = decode_nvfp4_to_bfloat162((packed_4b >> 24) & 0xff);
+        
+        const __nv_bfloat16 *w = reinterpret_cast<const __nv_bfloat16 *>(&w_u4);
+        float local_sum = 0.0f;
 #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const int col = k + i;
-            const std::uint8_t packed = __ldg(packed_row + col / 2);
-            const std::uint8_t nibble = (col & 1) == 0 ? (packed & 0x0fu) : (packed >> 4u);
-            const float scale = decode_e4m3_scale(__ldg(scale_row + col / 16)) * scale2;
-            sum += decode_nvfp4_e2m1(nibble) * scale * input[col];
+        for (int i = 0; i < 8; i++) {
+            local_sum += __bfloat162float(w[i]) * input[k + i];
         }
+        
+        sum += local_sum * scale;
     }
     return sum;
 }

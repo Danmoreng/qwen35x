@@ -5,7 +5,7 @@ set -e
 # usage: ./scripts/benchmark-inference-seq.sh --mode gpu-f32 --max-new-tokens 128 ...
 
 EXECUTABLE="build/qwen35x"
-HF_MODEL_DIR="models/qwen3.5-0.8b"
+HF_MODEL_DIR="models/qwen3.5-0.8b-nvfp4"
 RUNS=3
 WARMUP_RUNS=1
 MAX_NEW_TOKENS=128
@@ -72,6 +72,8 @@ run_once() {
     args+=("--infer-gpu" "--gpu-f32-matvec")
   elif [ "$MODE" == "gpu-bf16" ]; then
     args+=("--infer-gpu" "--gpu-bf16")
+  elif [ "$MODE" == "nvfp4" ]; then
+    args+=("--infer-gpu" "--qwen35x-weight-precision" "nvfp4")
   else
     args+=("--infer-reference")
   fi
