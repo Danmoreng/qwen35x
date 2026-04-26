@@ -71,6 +71,7 @@ bool run_nvfp4_sm120_projection_device(
   const std::uint32_t * packed_weight_fragments,
   const std::uint32_t * weight_scale_fragments,
   float input_scale,
+  float weight_scale_2,
   int rows,
   int cols,
   int row_tiles,

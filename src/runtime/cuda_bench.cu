@@ -321,6 +321,7 @@ __global__ void nvfp4_mma_sync_mxf4nvf4_projection_kernel(
   const std::uint32_t * b_fragments,
   const std::uint32_t * a_scales,
   const std::uint32_t * b_scales,
+  float output_alpha,
   float * output,
   int rows,
   int k_blocks) {
@@ -361,22 +362,21 @@ __global__ void nvfp4_mma_sync_mxf4nvf4_projection_kernel(
   if (lane < 4) {
     const int col0 = row_tile * 8 + lane * 2;
     if (col0 < rows) {
-      output[col0] = d0;
+      output[col0] = d0 * output_alpha;
     }
     if (col0 + 1 < rows) {
-      output[col0 + 1] = d1;
+      output[col0 + 1] = d1 * output_alpha;
     }
   }
 #else
   if (blockIdx.x == 0 && threadIdx.x == 0 && output != nullptr) {
-    output[0] = -1.0f;
+    output[0] = -3.4028234663852886e38f;
   }
 #endif
 }
 
 __global__ void nvfp4_sm120_pack_activation_fragments_kernel(
   const float * input,
-  float input_scale,
   std::uint32_t * a_fragments,
   std::uint32_t * a_scales,
   int cols,
@@ -395,7 +395,7 @@ __global__ void nvfp4_sm120_pack_activation_fragments_kernel(
     for (int i = lane; i < 16; i += 32) {
       const int col = group_base + i;
       if (col < cols) {
-        local = fmaxf(local, fabsf(input[col] * input_scale));
+        local = fmaxf(local, fabsf(input[col]));
       }
     }
     if (lane >= 16) {
@@ -428,7 +428,7 @@ __global__ void nvfp4_sm120_pack_activation_fragments_kernel(
     const int col = kb * 64 + col_offset;
     float value = 0.0f;
     if (col < cols) {
-      value = input[col] * input_scale;
+      value = input[col];
     }
     const std::uint8_t nibble = encode_nvfp4_e2m1_device(value / decoded_scales[group]);
     regs[i / 8] |= static_cast<std::uint32_t>(nibble & 0xfu) << ((i & 7) * 4);
@@ -587,14 +587,14 @@ bool run_nvfp4_blackwell_fp4_projection_benchmark(
   for (int group = 0; group < scale_cols; ++group) {
     float max_abs = 0.0f;
     for (int i = 0; i < 16; ++i) {
-      max_abs = std::max(max_abs, std::fabs(input[static_cast<std::size_t>(group * 16 + i)] * input_scale));
+      max_abs = std::max(max_abs, std::fabs(input[static_cast<std::size_t>(group * 16 + i)]));
     }
     const float scale = std::max(max_abs / 6.0f, 1.0e-8f);
     input_scales[static_cast<std::size_t>(group)] = encode_scale(scale);
     for (int i = 0; i < 16; ++i) {
       const int col = group * 16 + i;
       input_nibbles[static_cast<std::size_t>(col)] =
-        encode_e2m1((input[static_cast<std::size_t>(col)] * input_scale) / scale);
+        encode_e2m1(input[static_cast<std::size_t>(col)] / scale);
     }
   }
   for (int kb = 0; kb < k_blocks; ++kb) {
@@ -698,6 +698,7 @@ bool run_nvfp4_blackwell_fp4_projection_benchmark(
           device_b_fragments,
           device_b_scales,
           input_scale,
+          weight_scale_2,
           rows,
           cols,
           row_tiles,
@@ -719,6 +720,7 @@ bool run_nvfp4_blackwell_fp4_projection_benchmark(
           device_b_fragments,
           device_b_scales,
           input_scale,
+          weight_scale_2,
           rows,
           cols,
           row_tiles,
@@ -742,7 +744,7 @@ bool run_nvfp4_blackwell_fp4_projection_benchmark(
 
   cleanup();
 
-  if (host_output[0] < 0.0f) {
+  if (host_output[0] == -3.4028234663852886e38f) {
     error_message =
       "blackwell-fp4 was built without the SM120a architecture-specific MMA path. Rebuild with -CudaArchitectures 120a or 120f.";
     return false;
@@ -750,22 +752,34 @@ bool run_nvfp4_blackwell_fp4_projection_benchmark(
 
   avg_iteration_ms = total_ms / static_cast<double>(benchmark_iterations);
   max_abs_error = 0.0;
+  double max_abs_expected = 0.0;
+  double max_abs_actual = 0.0;
   const int check_rows = std::min(rows, 64);
   for (int row = 0; row < check_rows; ++row) {
     double expected = 0.0;
     for (int k = 0; k < cols; ++k) {
       const std::uint8_t packed = packed_weights[static_cast<std::size_t>(row) * packed_cols + k / 2];
       const std::uint8_t nibble = (k & 1) == 0 ? (packed & 0x0fu) : (packed >> 4u);
-      const float scale = decode_e4m3(weight_scales_e4m3[static_cast<std::size_t>(row) * scale_cols + k / 16]) * weight_scale_2;
-      expected += static_cast<double>(decode_e2m1(nibble) * scale * (input[static_cast<std::size_t>(k)] * input_scale));
+      const int input_group = k / 16;
+      const float input_quantized =
+        decode_e2m1(input_nibbles[static_cast<std::size_t>(k)]) * decode_e4m3(input_scales[static_cast<std::size_t>(input_group)]);
+      const float weight_scale = decode_e4m3(weight_scales_e4m3[static_cast<std::size_t>(row) * scale_cols + input_group]);
+      expected += static_cast<double>(
+        decode_e2m1(nibble) * weight_scale * input_quantized * input_scale * weight_scale_2);
     }
     const double actual = static_cast<double>(host_output[static_cast<std::size_t>(row)]);
+    max_abs_expected = std::max(max_abs_expected, std::fabs(expected));
+    max_abs_actual = std::max(max_abs_actual, std::fabs(actual));
     max_abs_error = std::max(max_abs_error, std::fabs(actual - expected));
   }
-  if (max_abs_error > 0.5) {
+  const double relative_error = max_abs_error / std::max(max_abs_expected, 1.0e-12);
+  if ((max_abs_expected > 1.0e-5 && max_abs_actual < max_abs_expected * 0.05) ||
+      (max_abs_expected > 1.0e-5 && relative_error > 0.25)) {
     error_message =
-      "SM120 mxf4nvf4 projection produced unexpected output " + std::to_string(host_output[0]) +
-      " for the full projection check.";
+      "SM120 mxf4nvf4 projection failed full projection check: max_abs_error=" +
+      std::to_string(max_abs_error) + " max_abs_expected=" + std::to_string(max_abs_expected) +
+      " max_abs_actual=" + std::to_string(max_abs_actual) + " relative_error=" +
+      std::to_string(relative_error) + ".";
     return false;
   }
   return true;
@@ -976,6 +990,7 @@ bool run_nvfp4_sm120_projection_device(
   const std::uint32_t * packed_weight_fragments,
   const std::uint32_t * weight_scale_fragments,
   float input_scale,
+  float weight_scale_2,
   int rows,
   int cols,
   int row_tiles,
@@ -994,23 +1009,29 @@ bool run_nvfp4_sm120_projection_device(
     error_message = "Invalid SM120 FP4 projection dimensions.";
     return false;
   }
-  int major = 0;
-  int minor = 0;
-  if (!query_device_compute_capability(major, minor, error_message)) {
-    return false;
+  static int cached_major = -1;
+  static int cached_minor = -1;
+  if (cached_major < 0 || cached_minor < 0) {
+    if (!query_device_compute_capability(cached_major, cached_minor, error_message)) {
+      return false;
+    }
   }
-  if (!device_supports_sm120_mma_mxf4nvf4(major, minor)) {
+  if (!device_supports_sm120_mma_mxf4nvf4(cached_major, cached_minor)) {
     error_message =
       "SM120 FP4 projection requires the mma.sync.aligned kind::mxf4nvf4.block_scale path; current device is sm_" +
-      std::to_string(major) + std::to_string(minor) + ".";
+      std::to_string(cached_major) + std::to_string(cached_minor) + ".";
     return false;
   }
 
   cudaEvent_t start_event = nullptr;
   cudaEvent_t stop_event = nullptr;
   auto cleanup_events = [&]() {
-    cudaEventDestroy(start_event);
-    cudaEventDestroy(stop_event);
+    if (start_event != nullptr) {
+      cudaEventDestroy(start_event);
+    }
+    if (stop_event != nullptr) {
+      cudaEventDestroy(stop_event);
+    }
   };
   if (elapsed_ms != nullptr &&
       (!check_cuda(cudaEventCreate(&start_event), "cudaEventCreate(sm120 start)", error_message) ||
@@ -1023,7 +1044,6 @@ bool run_nvfp4_sm120_projection_device(
   cudaGetLastError();
   nvfp4_sm120_pack_activation_fragments_kernel<<<k_blocks, 32>>>(
     input_f32,
-    input_scale,
     activation_fragment_scratch,
     activation_scale_scratch,
     cols,
@@ -1037,18 +1057,18 @@ bool run_nvfp4_sm120_projection_device(
     packed_weight_fragments,
     activation_scale_scratch,
     weight_scale_fragments,
+    input_scale * weight_scale_2,
     output_f32,
     rows,
     k_blocks);
   if (!check_cuda(cudaGetLastError(), "launch SM120 FP4 projection", error_message) ||
-      !check_cuda(cudaDeviceSynchronize(), "synchronize SM120 FP4 projection", error_message)) {
+      (elapsed_ms != nullptr && !check_cuda(cudaEventRecord(stop_event), "cudaEventRecord(sm120 stop)", error_message))) {
     cleanup_events();
     return false;
   }
   if (elapsed_ms != nullptr) {
     float elapsed = 0.0f;
-    if (!check_cuda(cudaEventRecord(stop_event), "cudaEventRecord(sm120 stop)", error_message) ||
-        !check_cuda(cudaEventSynchronize(stop_event), "cudaEventSynchronize(sm120 stop)", error_message) ||
+    if (!check_cuda(cudaEventSynchronize(stop_event), "cudaEventSynchronize(sm120 stop)", error_message) ||
         !check_cuda(cudaEventElapsedTime(&elapsed, start_event, stop_event), "cudaEventElapsedTime(sm120)", error_message)) {
       cleanup_events();
       return false;

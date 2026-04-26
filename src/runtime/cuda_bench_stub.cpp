@@ -67,6 +67,7 @@ bool run_nvfp4_sm120_projection_device(
   const std::uint32_t *,
   const std::uint32_t *,
   float,
+  float,
   int,
   int,
   int,

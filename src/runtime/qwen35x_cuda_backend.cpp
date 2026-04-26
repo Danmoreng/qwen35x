@@ -1987,16 +1987,22 @@ bool run_decode_step_impl(
       !nvfp4_state->tensors.empty()) {
     const auto & tensor = nvfp4_state->tensors.front();
     float input_scale = 0.0f;
+    float weight_scale_2 = 0.0f;
     double elapsed_ms = 0.0;
     if (!check_cuda(
           cudaMemcpy(&input_scale, tensor.input_scale, sizeof(float), cudaMemcpyDeviceToHost),
           "cudaMemcpy(D2H dry-run sm120 projection input_scale)",
+          error_message) ||
+        !check_cuda(
+          cudaMemcpy(&weight_scale_2, tensor.weight_scale_2, sizeof(float), cudaMemcpyDeviceToHost),
+          "cudaMemcpy(D2H dry-run sm120 projection weight_scale_2)",
           error_message) ||
         !qwen35x::cuda::run_nvfp4_sm120_projection_device(
           static_cast<const float *>(state.g_normalized),
           static_cast<const std::uint32_t *>(tensor.sm120_packed_weight_fragments),
           static_cast<const std::uint32_t *>(tensor.sm120_weight_scale_fragments),
           input_scale,
+          weight_scale_2,
           tensor.output_size,
           tensor.input_size,
           tensor.sm120_row_tiles,
