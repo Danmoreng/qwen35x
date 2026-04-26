@@ -96,16 +96,50 @@ The main `qwen35x.exe` includes the supported 0.8B and 4B CUDA variants and sele
 .\build\qwen35x.exe --infer-gpu --hf-model-dir models/qwen3.5-0.8b --chat-user "Tell me a short joke." --max-new-tokens 64 --max-context 256 --temperature 0 --stop-on-im-end
 ```
 
+## Quick Start (Linux / Bash)
+
+1. Download model
+
+```bash
+./scripts/download-hf-model.sh --install-deps
+```
+
+2. Build
+
+```bash
+./scripts/build.sh --ninja --config Release
+```
+
+3. Run chat inference (CPU reference)
+
+```bash
+./build/qwen35x --infer-reference --hf-model-dir models/qwen3.5-0.8b --chat-user "Tell me a short joke." --max-new-tokens 64 --max-context 256 --stop-on-im-end
+```
+
+4. Run chat inference (CUDA / Qwen35x CUDA default)
+
+```bash
+./build/qwen35x --infer-gpu --hf-model-dir models/qwen3.5-0.8b --chat-user "Tell me a short joke." --max-new-tokens 64 --max-context 256 --temperature 0 --stop-on-im-end
+```
+
 The same binary can run the 4B model:
 
 ```powershell
 .\build\qwen35x.exe --infer-gpu --hf-model-dir models/qwen3.5-4b --chat-user "Tell me a short joke." --max-new-tokens 64 --max-context 256 --temperature 0 --stop-on-im-end
 ```
 
+```bash
+./build/qwen35x --infer-gpu --hf-model-dir models/qwen3.5-4b --chat-user "Tell me a short joke." --max-new-tokens 64 --max-context 256 --temperature 0 --stop-on-im-end
+```
+
 5. Run with profiling JSON
 
 ```powershell
 .\build\qwen35x.exe --infer-gpu --hf-model-dir models/qwen3.5-0.8b --chat-user "Tell me a short joke." --max-new-tokens 64 --max-context 256 --temperature 0 --profile-json build/last_profile.json
+```
+
+```bash
+./build/qwen35x --infer-gpu --hf-model-dir models/qwen3.5-0.8b --chat-user "Tell me a short joke." --max-new-tokens 64 --max-context 256 --temperature 0 --profile-json build/last_profile.json
 ```
 
 ## Performance Snapshot
