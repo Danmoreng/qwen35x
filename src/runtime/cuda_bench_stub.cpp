@@ -30,6 +30,22 @@ bool run_nvfp4_matvec_check(
   return false;
 }
 
+bool run_nvfp4_cublaslt_probe(
+  const std::vector<std::uint8_t> &,
+  const std::vector<std::uint8_t> &,
+  float,
+  int,
+  int,
+  int,
+  double &,
+  double &,
+  double &,
+  double &,
+  std::string & error_message) {
+  error_message = "CUDA is not enabled in this build.";
+  return false;
+}
+
 } // namespace qwen35x::cuda
 
 #endif

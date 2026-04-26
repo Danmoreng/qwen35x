@@ -40,6 +40,17 @@ struct Nvfp4TensorCheckResult {
   double max_abs_error = 0.0;
 };
 
+struct Nvfp4CublasLtProbeResult {
+  std::string tensor_base_name;
+  std::vector<std::int64_t> source_shape;
+  std::vector<std::int64_t> packed_shape;
+  std::vector<std::int64_t> scale_shape;
+  double max_abs_error = 0.0;
+  double elapsed_ms = 0.0;
+  double max_abs_expected = 0.0;
+  double max_abs_actual = 0.0;
+};
+
 bool run_bf16_tensor_benchmark(
   const Bf16TensorBenchOptions & options,
   Bf16TensorBenchResult & result,
@@ -48,6 +59,11 @@ bool run_bf16_tensor_benchmark(
 bool run_nvfp4_tensor_check(
   const Nvfp4TensorCheckOptions & options,
   Nvfp4TensorCheckResult & result,
+  std::string & error_message);
+
+bool run_nvfp4_cublaslt_probe(
+  const Nvfp4TensorCheckOptions & options,
+  Nvfp4CublasLtProbeResult & result,
   std::string & error_message);
 
 class EngineRuntime {

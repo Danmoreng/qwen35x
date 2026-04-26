@@ -268,6 +268,7 @@ int main(int argc, char ** argv) {
   bool bench_bf16 = false;
   bool validate_nvfp4_model = false;
   bool check_nvfp4_tensor = false;
+  bool probe_nvfp4_cublaslt = false;
   bool infer_reference = false;
   bool infer_gpu = false;
   bool gpu_decode_backend_explicit = false;
@@ -289,6 +290,8 @@ int main(int argc, char ** argv) {
       validate_nvfp4_model = true;
     } else if (arg == "--check-nvfp4-tensor") {
       check_nvfp4_tensor = true;
+    } else if (arg == "--probe-nvfp4-cublaslt") {
+      probe_nvfp4_cublaslt = true;
     } else if (arg == "--infer-reference") {
       infer_reference = true;
     } else if (arg == "--infer-gpu") {
@@ -401,6 +404,7 @@ int main(int argc, char ** argv) {
       std::cout << "       qwen35x --bench-bf16 --hf-model-dir <path> [--bench-tensor <name>] [--bench-warmup <n>] [--bench-iters <n>]\n";
       std::cout << "       qwen35x --validate-nvfp4-model --hf-model-dir <path>\n";
       std::cout << "       qwen35x --check-nvfp4-tensor --hf-model-dir <path> [--nvfp4-tensor <base-name>] [--nvfp4-sample-rows <n>]\n";
+      std::cout << "       qwen35x --probe-nvfp4-cublaslt --hf-model-dir <path> [--nvfp4-tensor <base-name>] [--nvfp4-sample-rows <n>]\n";
       std::cout << "       qwen35x --infer-reference --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "       qwen35x --infer-gpu --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "               [--temperature <float>] [--top-p <float>] [--top-k <int>] [--repeat-penalty <float>] [--seed <int64>]\n";
@@ -515,6 +519,51 @@ int main(int argc, char ** argv) {
       std::cout << result.scale_shape[i];
     }
     std::cout << "\n";
+    std::cout << "  max_abs_error: " << result.max_abs_error << "\n";
+    return 0;
+  }
+
+  if (probe_nvfp4_cublaslt) {
+    if (nvfp4_check_options.model_dir.empty()) {
+      std::cerr << "NVFP4 cuBLASLt probe failed: --hf-model-dir is required\n";
+      return 10;
+    }
+    std::string error_message;
+    qwen35x::Nvfp4CublasLtProbeResult result;
+    if (!qwen35x::run_nvfp4_cublaslt_probe(nvfp4_check_options, result, error_message)) {
+      std::cerr << "NVFP4 cuBLASLt probe failed: " << error_message << "\n";
+      return 10;
+    }
+
+    std::cout << "NVFP4 cuBLASLt probe\n";
+    std::cout << "  tensor_base: " << result.tensor_base_name << "\n";
+    std::cout << "  source_shape: ";
+    for (std::size_t i = 0; i < result.source_shape.size(); ++i) {
+      if (i > 0) {
+        std::cout << "x";
+      }
+      std::cout << result.source_shape[i];
+    }
+    std::cout << "\n";
+    std::cout << "  packed_shape: ";
+    for (std::size_t i = 0; i < result.packed_shape.size(); ++i) {
+      if (i > 0) {
+        std::cout << "x";
+      }
+      std::cout << result.packed_shape[i];
+    }
+    std::cout << "\n";
+    std::cout << "  scale_shape: ";
+    for (std::size_t i = 0; i < result.scale_shape.size(); ++i) {
+      if (i > 0) {
+        std::cout << "x";
+      }
+      std::cout << result.scale_shape[i];
+    }
+    std::cout << "\n";
+    std::cout << "  elapsed_ms: " << result.elapsed_ms << "\n";
+    std::cout << "  max_abs_expected: " << result.max_abs_expected << "\n";
+    std::cout << "  max_abs_actual: " << result.max_abs_actual << "\n";
     std::cout << "  max_abs_error: " << result.max_abs_error << "\n";
     return 0;
   }

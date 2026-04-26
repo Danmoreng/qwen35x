@@ -204,6 +204,78 @@ bool run_nvfp4_tensor_check(
   return true;
 }
 
+bool run_nvfp4_cublaslt_probe(
+  const Nvfp4TensorCheckOptions & options,
+  Nvfp4CublasLtProbeResult & result,
+  std::string & error_message) {
+  if (options.model_dir.empty()) {
+    error_message = "model_dir is required for NVFP4 cuBLASLt probe.";
+    return false;
+  }
+  if (options.tensor_base_name.empty()) {
+    error_message = "tensor_base_name is required for NVFP4 cuBLASLt probe.";
+    return false;
+  }
+  if (options.sample_rows <= 0) {
+    error_message = "sample_rows must be > 0.";
+    return false;
+  }
+
+  SafetensorTensorInfo weight_info;
+  SafetensorTensorInfo scale_info;
+  std::vector<std::uint8_t> packed_weights;
+  std::vector<std::uint8_t> weight_scales;
+  if (!read_raw_tensor_from_model(options.model_dir, options.tensor_base_name + ".weight", "U8", weight_info, packed_weights, error_message) ||
+      !read_raw_tensor_from_model(options.model_dir, options.tensor_base_name + ".weight_scale", "F8_E4M3", scale_info, weight_scales, error_message)) {
+    return false;
+  }
+  SafetensorTensorF32 weight_scale2_tensor;
+  if (!SafetensorLoader::read_tensor_f32(options.model_dir, options.tensor_base_name + ".weight_scale_2", weight_scale2_tensor, error_message)) {
+    return false;
+  }
+  if (weight_info.shape.size() != 2 || scale_info.shape.size() != 2 || weight_scale2_tensor.data.size() != 1) {
+    error_message = "Invalid NVFP4 tensor family for cuBLASLt probe.";
+    return false;
+  }
+
+  const int rows = static_cast<int>(weight_info.shape[0]);
+  const int cols = static_cast<int>(weight_info.shape[1] * 2);
+  const std::vector<std::int64_t> expected_scale_shape{weight_info.shape[0], cols / 16};
+  if (scale_info.shape != expected_scale_shape) {
+    error_message = "NVFP4 weight_scale shape does not match packed weight shape.";
+    return false;
+  }
+
+  double max_abs_error = 0.0;
+  double elapsed_ms = 0.0;
+  double max_abs_expected = 0.0;
+  double max_abs_actual = 0.0;
+  if (!cuda::run_nvfp4_cublaslt_probe(
+        packed_weights,
+        weight_scales,
+        weight_scale2_tensor.data[0],
+        rows,
+        cols,
+        options.sample_rows,
+        max_abs_error,
+        elapsed_ms,
+        max_abs_expected,
+        max_abs_actual,
+        error_message)) {
+    return false;
+  }
+
+  result.tensor_base_name = options.tensor_base_name;
+  result.packed_shape = weight_info.shape;
+  result.scale_shape = scale_info.shape;
+  result.source_shape = {weight_info.shape[0], weight_info.shape[1] * 2};
+  result.max_abs_error = max_abs_error;
+  result.elapsed_ms = elapsed_ms;
+  result.max_abs_expected = max_abs_expected;
+  result.max_abs_actual = max_abs_actual;
+  return true;
+}
+
 bool EngineRuntime::initialize(const ModelProfile & profile, const RuntimeTarget & target, std::string & error_message) {
   if (profile.family != "qwen3.5") {
     error_message = "Only qwen3.5 family is supported by this scaffold fast path.";

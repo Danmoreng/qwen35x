@@ -7,6 +7,14 @@ struct Nvfp4Weight {
     const std::uint8_t *packed_weight;   // [out_dim, in_dim / 2]
     const std::uint8_t *weight_scale;    // [out_dim, in_dim / 16], E4M3 bytes
     const float *weight_scale_2;         // scalar f32
+    const std::uint8_t *tc_packed_weight;
+    const std::uint8_t *tc_weight_scale;
+    const float *tc_alpha;
+    int output_size;
+    int input_size;
+    int padded_output_size;
+    int padded_scale_cols;
+    int weight_padding_cols;
 };
 
 struct LayerNvfp4Weights {

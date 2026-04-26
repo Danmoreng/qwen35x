@@ -192,6 +192,14 @@ struct PackedNvfp4Weight {
   void * packed_weight = nullptr;
   void * weight_scale = nullptr;
   float * weight_scale_2 = nullptr;
+  void * tc_packed_weight = nullptr;
+  void * tc_weight_scale = nullptr;
+  float * tc_alpha = nullptr;
+  int output_size = 0;
+  int input_size = 0;
+  int padded_output_size = 0;
+  int padded_scale_cols = 0;
+  int weight_padding_cols = 0;
 };
 
 struct PackedLayerNvfp4Weights {
@@ -414,6 +422,14 @@ struct Nvfp4TensorDevice {
   void * weight_scale = nullptr;
   float * input_scale = nullptr;
   float * weight_scale_2 = nullptr;
+  void * tc_packed_weight = nullptr;
+  void * tc_weight_scale = nullptr;
+  float * tc_alpha = nullptr;
+  int output_size = 0;
+  int input_size = 0;
+  int padded_output_size = 0;
+  int padded_scale_cols = 0;
+  int weight_padding_cols = 0;
 };
 
 struct Nvfp4BackendState {
@@ -713,13 +729,46 @@ bool load_tensor_info_from_model_dir(
   return qwen35x::SafetensorLoader::load_tensor_info(tensor_file, tensor_name, info, error_message);
 }
 
-bool load_raw_tensor_to_device(
+int round_up_to_multiple(const int value, const int multiple) {
+  return ((value + multiple - 1) / multiple) * multiple;
+}
+
+bool upload_bytes_to_device(
+  const std::vector<std::uint8_t> & host_data,
+  const std::string & label,
+  DeviceArena & arena,
+  void *& out_device_ptr,
+  std::string & error_message) {
+  if (!arena.alloc_bytes(host_data.size(), out_device_ptr, error_message)) {
+    return false;
+  }
+  return check_cuda(
+    cudaMemcpy(out_device_ptr, host_data.data(), host_data.size(), cudaMemcpyHostToDevice),
+    "cudaMemcpy(H2D " + label + ")",
+    error_message);
+}
+
+bool upload_scalar_to_device(
+  const float value,
+  const std::string & label,
+  DeviceArena & arena,
+  float *& out_device_ptr,
+  std::string & error_message) {
+  if (!arena.alloc_bytes(sizeof(float), reinterpret_cast<void *&>(out_device_ptr), error_message)) {
+    return false;
+  }
+  return check_cuda(
+    cudaMemcpy(out_device_ptr, &value, sizeof(float), cudaMemcpyHostToDevice),
+    "cudaMemcpy(H2D " + label + ")",
+    error_message);
+}
+
+bool read_raw_tensor_from_model_dir(
   const std::string & model_dir,
   const std::string & tensor_name,
   const std::string & expected_dtype,
   const std::vector<std::int64_t> & expected_shape,
-  DeviceArena & arena,
-  void *& out_device_ptr,
+  std::vector<std::uint8_t> & out_host_data,
   std::string & error_message) {
   std::string tensor_file;
   qwen35x::SafetensorTensorInfo info;
@@ -747,25 +796,13 @@ bool load_raw_tensor_to_device(
       " actual " + shape_to_string(info.shape) + ".";
     return false;
   }
-
-  std::vector<std::uint8_t> host_data;
-  if (!read_raw_tensor_bytes(tensor_file, info, host_data, error_message)) {
-    return false;
-  }
-  if (!arena.alloc_bytes(host_data.size(), out_device_ptr, error_message)) {
-    return false;
-  }
-  return check_cuda(
-    cudaMemcpy(out_device_ptr, host_data.data(), host_data.size(), cudaMemcpyHostToDevice),
-    "cudaMemcpy(H2D raw " + tensor_name + ")",
-    error_message);
+  return read_raw_tensor_bytes(tensor_file, info, out_host_data, error_message);
 }
 
-bool load_scalar_f32_to_device(
+bool read_scalar_f32_from_model_dir(
   const std::string & model_dir,
   const std::string & tensor_name,
-  DeviceArena & arena,
-  float *& out_device_ptr,
+  float & out_value,
   std::string & error_message) {
   qwen35x::SafetensorTensorF32 tensor;
   if (!qwen35x::SafetensorLoader::read_tensor_f32(model_dir, tensor_name, tensor, error_message)) {
@@ -775,13 +812,92 @@ bool load_scalar_f32_to_device(
     error_message = "Tensor '" + tensor_name + "' must be scalar F32.";
     return false;
   }
-  if (!arena.alloc_bytes(sizeof(float), reinterpret_cast<void *&>(out_device_ptr), error_message)) {
+  out_value = tensor.data[0];
+  return true;
+}
+
+std::vector<std::uint8_t> pad_nvfp4_weight_for_tensor_core(
+  const std::vector<std::uint8_t> & packed_weight,
+  const int rows,
+  const int cols,
+  int & padded_rows,
+  int & padded_cols,
+  int & weight_padding_cols) {
+  padded_rows = round_up_to_multiple(rows, 32);
+  padded_cols = round_up_to_multiple(cols, 32);
+  const int source_packed_cols = cols / 2;
+  const int padded_packed_cols = padded_cols / 2;
+  weight_padding_cols = padded_packed_cols - source_packed_cols;
+  std::vector<std::uint8_t> padded(static_cast<std::size_t>(padded_rows) * padded_packed_cols, 0);
+  for (int row = 0; row < rows; ++row) {
+    std::memcpy(
+      padded.data() + static_cast<std::size_t>(row) * padded_packed_cols,
+      packed_weight.data() + static_cast<std::size_t>(row) * source_packed_cols,
+      static_cast<std::size_t>(source_packed_cols));
+  }
+  return padded;
+}
+
+std::vector<std::uint8_t> swizzle_nvfp4_block_scale_for_tensor_core(
+  const std::vector<std::uint8_t> & weight_scale,
+  const int rows,
+  const int scale_cols,
+  int & padded_rows,
+  int & padded_scale_cols) {
+  padded_rows = round_up_to_multiple(rows, 128);
+  padded_scale_cols = round_up_to_multiple(scale_cols, 4);
+  std::vector<std::uint8_t> padded(static_cast<std::size_t>(padded_rows) * padded_scale_cols, 0);
+  for (int row = 0; row < rows; ++row) {
+    std::memcpy(
+      padded.data() + static_cast<std::size_t>(row) * padded_scale_cols,
+      weight_scale.data() + static_cast<std::size_t>(row) * scale_cols,
+      static_cast<std::size_t>(scale_cols));
+  }
+
+  std::vector<std::uint8_t> swizzled(padded.size(), 0);
+  std::size_t out_idx = 0;
+  for (int row_block = 0; row_block < padded_rows / 128; ++row_block) {
+    for (int col_block = 0; col_block < padded_scale_cols / 4; ++col_block) {
+      for (int row_in_group = 0; row_in_group < 32; ++row_in_group) {
+        for (int row_group = 0; row_group < 4; ++row_group) {
+          for (int col_in_group = 0; col_in_group < 4; ++col_in_group) {
+            const int row = row_block * 128 + row_group * 32 + row_in_group;
+            const int col = col_block * 4 + col_in_group;
+            swizzled[out_idx++] = padded[static_cast<std::size_t>(row) * padded_scale_cols + col];
+          }
+        }
+      }
+    }
+  }
+  return swizzled;
+}
+
+bool load_raw_tensor_to_device(
+  const std::string & model_dir,
+  const std::string & tensor_name,
+  const std::string & expected_dtype,
+  const std::vector<std::int64_t> & expected_shape,
+  DeviceArena & arena,
+  void *& out_device_ptr,
+  std::string & error_message) {
+  std::vector<std::uint8_t> host_data;
+  if (!read_raw_tensor_from_model_dir(model_dir, tensor_name, expected_dtype, expected_shape, host_data, error_message)) {
     return false;
   }
-  return check_cuda(
-    cudaMemcpy(out_device_ptr, tensor.data.data(), sizeof(float), cudaMemcpyHostToDevice),
-    "cudaMemcpy(H2D scalar " + tensor_name + ")",
-    error_message);
+  return upload_bytes_to_device(host_data, "raw " + tensor_name, arena, out_device_ptr, error_message);
+}
+
+bool load_scalar_f32_to_device(
+  const std::string & model_dir,
+  const std::string & tensor_name,
+  DeviceArena & arena,
+  float *& out_device_ptr,
+  std::string & error_message) {
+  float value = 0.0f;
+  if (!read_scalar_f32_from_model_dir(model_dir, tensor_name, value, error_message)) {
+    return false;
+  }
+  return upload_scalar_to_device(value, "scalar " + tensor_name, arena, out_device_ptr, error_message);
 }
 
 bool alloc_and_zero(DeviceArena & arena, std::size_t bytes, void *& out_ptr, const std::string & label, std::string & error_message) {
@@ -1234,27 +1350,56 @@ bool load_modelopt_nvfp4_state(
     const std::vector<std::int64_t> packed_shape{source_shape[0], source_shape[1] / 2};
     const std::vector<std::int64_t> scale_shape{source_shape[0], source_shape[1] / group_size};
     Nvfp4TensorDevice device_tensor;
-    if (!load_raw_tensor_to_device(
-          config.model_dir,
-          base_name + ".weight",
-          "U8",
-          packed_shape,
-          arena,
-          device_tensor.packed_weight,
-          error_message) ||
-        !load_raw_tensor_to_device(
-          config.model_dir,
-          base_name + ".weight_scale",
-          "F8_E4M3",
-          scale_shape,
-          arena,
-          device_tensor.weight_scale,
-          error_message) ||
-        !load_scalar_f32_to_device(config.model_dir, base_name + ".input_scale", arena, device_tensor.input_scale, error_message) ||
-        !load_scalar_f32_to_device(config.model_dir, base_name + ".weight_scale_2", arena, device_tensor.weight_scale_2, error_message)) {
+    std::vector<std::uint8_t> packed_weight;
+    std::vector<std::uint8_t> weight_scale;
+    float input_scale = 0.0f;
+    float weight_scale_2 = 0.0f;
+    if (!read_raw_tensor_from_model_dir(config.model_dir, base_name + ".weight", "U8", packed_shape, packed_weight, error_message) ||
+        !read_raw_tensor_from_model_dir(config.model_dir, base_name + ".weight_scale", "F8_E4M3", scale_shape, weight_scale, error_message) ||
+        !read_scalar_f32_from_model_dir(config.model_dir, base_name + ".input_scale", input_scale, error_message) ||
+        !read_scalar_f32_from_model_dir(config.model_dir, base_name + ".weight_scale_2", weight_scale_2, error_message)) {
       error_message = "ModelOpt NVFP4 load failed for '" + base_name + "': " + error_message;
       return false;
     }
+
+    int padded_weight_rows = 0;
+    int padded_weight_cols = 0;
+    int weight_padding_cols = 0;
+    std::vector<std::uint8_t> tc_packed_weight = pad_nvfp4_weight_for_tensor_core(
+      packed_weight,
+      static_cast<int>(source_shape[0]),
+      static_cast<int>(source_shape[1]),
+      padded_weight_rows,
+      padded_weight_cols,
+      weight_padding_cols);
+    (void)padded_weight_cols;
+
+    int padded_scale_rows = 0;
+    int padded_scale_cols = 0;
+    std::vector<std::uint8_t> tc_weight_scale = swizzle_nvfp4_block_scale_for_tensor_core(
+      weight_scale,
+      static_cast<int>(source_shape[0]),
+      static_cast<int>(source_shape[1] / group_size),
+      padded_scale_rows,
+      padded_scale_cols);
+    (void)padded_scale_rows;
+
+    const float alpha = input_scale * weight_scale_2;
+    if (!upload_bytes_to_device(packed_weight, "raw " + base_name + ".weight", arena, device_tensor.packed_weight, error_message) ||
+        !upload_bytes_to_device(weight_scale, "raw " + base_name + ".weight_scale", arena, device_tensor.weight_scale, error_message) ||
+        !upload_scalar_to_device(input_scale, "scalar " + base_name + ".input_scale", arena, device_tensor.input_scale, error_message) ||
+        !upload_scalar_to_device(weight_scale_2, "scalar " + base_name + ".weight_scale_2", arena, device_tensor.weight_scale_2, error_message) ||
+        !upload_bytes_to_device(tc_packed_weight, "tensor-core " + base_name + ".weight", arena, device_tensor.tc_packed_weight, error_message) ||
+        !upload_bytes_to_device(tc_weight_scale, "tensor-core " + base_name + ".weight_scale", arena, device_tensor.tc_weight_scale, error_message) ||
+        !upload_scalar_to_device(alpha, "tensor-core " + base_name + ".alpha", arena, device_tensor.tc_alpha, error_message)) {
+      error_message = "ModelOpt NVFP4 load failed for '" + base_name + "': " + error_message;
+      return false;
+    }
+    device_tensor.output_size = static_cast<int>(source_shape[0]);
+    device_tensor.input_size = static_cast<int>(source_shape[1]);
+    device_tensor.padded_output_size = padded_weight_rows;
+    device_tensor.padded_scale_cols = padded_scale_cols;
+    device_tensor.weight_padding_cols = weight_padding_cols;
     state.tensors.push_back(device_tensor);
   }
 
@@ -1284,6 +1429,14 @@ bool initialize_nvfp4_layer_weights(
     layer.ptrs[ptr_idx].packed_weight = tensor.packed_weight;
     layer.ptrs[ptr_idx].weight_scale = tensor.weight_scale;
     layer.ptrs[ptr_idx].weight_scale_2 = tensor.weight_scale_2;
+    layer.ptrs[ptr_idx].tc_packed_weight = tensor.tc_packed_weight;
+    layer.ptrs[ptr_idx].tc_weight_scale = tensor.tc_weight_scale;
+    layer.ptrs[ptr_idx].tc_alpha = tensor.tc_alpha;
+    layer.ptrs[ptr_idx].output_size = tensor.output_size;
+    layer.ptrs[ptr_idx].input_size = tensor.input_size;
+    layer.ptrs[ptr_idx].padded_output_size = tensor.padded_output_size;
+    layer.ptrs[ptr_idx].padded_scale_cols = tensor.padded_scale_cols;
+    layer.ptrs[ptr_idx].weight_padding_cols = tensor.weight_padding_cols;
     return true;
   };
 

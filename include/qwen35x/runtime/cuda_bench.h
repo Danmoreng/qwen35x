@@ -26,4 +26,17 @@ bool run_nvfp4_matvec_check(
   double & max_abs_error,
   std::string & error_message);
 
+bool run_nvfp4_cublaslt_probe(
+  const std::vector<std::uint8_t> & packed_weights,
+  const std::vector<std::uint8_t> & weight_scales_e4m3,
+  float weight_scale_2,
+  int rows,
+  int cols,
+  int sample_rows,
+  double & max_abs_error,
+  double & elapsed_ms,
+  double & max_abs_expected,
+  double & max_abs_actual,
+  std::string & error_message);
+
 } // namespace qwen35x::cuda

@@ -54,6 +54,9 @@ Current Qwen35x precision behavior:
   `.\build\qwen35x.exe --validate-nvfp4-model --hf-model-dir models/qwen3.5-0.8b-nvfp4-axionml`
 - The first NVFP4 CUDA primitive can be checked against a CPU dequantized reference with:
   `.\build\qwen35x.exe --check-nvfp4-tensor --hf-model-dir models/qwen3.5-0.8b-nvfp4-axionml --nvfp4-tensor model.language_model.layers.0.mlp.gate_proj`
+- Blackwell/cuBLASLt FP4 availability and layout assumptions can be probed with:
+  `.\build\qwen35x.exe --probe-nvfp4-cublaslt --hf-model-dir models/qwen3.5-0.8b-nvfp4-axionml --nvfp4-tensor model.language_model.layers.0.mlp.gate_proj`
+  This probe uses the NVIDIA-documented padded/tiled 1D block-scale layout for FP4 scale tensors. It remains diagnostic while the production path moves toward an in-tree Blackwell FP4 GEMM backend.
 
 Current decode control behavior:
 - The default Qwen35x CUDA path returns the selected token id each step and performs stop checks on the host.

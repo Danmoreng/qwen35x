@@ -396,8 +396,15 @@ Validation policy for each new size:
   Current status: full-attention Q/K/V/O, DeltaNet QKV/Z/beta/alpha/out, and MLP gate/up/down projections can consume packed ModelOpt NVFP4 tensors. The implementation dequantizes E2M1 weights and E4M3 block scales inside warp matvecs; it is native packed inference, but not yet Blackwell tensor-core accelerated.
 - [ ] Add a separate NVFP4 decode launcher/dispatch path so BF16 kernels have no runtime precision checks.
 - [ ] Replace scalar dequantized NVFP4 matvecs with Blackwell-optimized kernels:
-  - [ ] Add a cuBLASLt FP4/NVFP4 block-scale GEMM probe for prefill-sized projections using `CUDA_R_4F_E2M1` and `CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3`.
-  - [ ] Validate AxionML packed weight/scale layout against cuBLASLt operand layout requirements without repacking at runtime.
+  - [x] Add a cuBLASLt FP4/NVFP4 block-scale GEMM probe for prefill-sized projections using `CUDA_R_4F_E2M1` and `CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3`.
+    Current status: `--probe-nvfp4-cublaslt` confirms CUDA/cuBLASLt can select and execute a Blackwell FP4 block-scale algorithm for an AxionML tensor family.
+  - [x] Validate AxionML packed weight/scale layout against cuBLASLt operand layout requirements without repacking at runtime.
+    Current status: direct AxionML row-major packed weights and `[out,K/16]` scale tensors are not numerically compatible with the raw cuBLASLt FP4 path. Production FP4 execution needs a backend-specific packed projection layout rather than passing safetensor rows directly to cuBLASLt.
+  - [x] Add NVIDIA tiled 1D block-scale layout handling to the diagnostic probe.
+    Current status: the probe pads scales to `M % 128 == 0` and `(K/16) % 4 == 0`, then applies the documented FP4 1D block-scale tile order used for Blackwell block-scaled GEMM scale tensors.
+  - [x] Implement a ModelOpt FP4 projection layout object that stores padded packed weights, swizzled FP8 block scales, `alpha=input_scale*weight_scale_2`, and original output size per tensor.
+    Current status: the CUDA loader now materializes raw scalar-fallback tensors and a second tensor-core-ready projection layout for every ModelOpt NVFP4 projection. Decode still uses the scalar fallback until the in-tree FP4 GEMM backend is wired in.
+  - [ ] Add an in-tree Blackwell FP4 GEMM backend using the padded packed-weight and tiled-scale projection layout.
   - [ ] Add a custom Blackwell decode projection path for batch-1/token decode if cuBLASLt GEMM is inefficient at current shapes.
   - [ ] Keep scalar NVFP4 matvecs as the correctness fallback until tensor-core kernels pass error-threshold and quality smoke tests.
 - [ ] Expand NVFP4 native coverage to embedding/LM-head or document why those remain BF16.
