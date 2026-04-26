@@ -55,6 +55,80 @@ __device__ __forceinline__ float decode_e4m3_device(const std::uint8_t bits) {
   return sign ? -value : value;
 }
 
+__device__ __forceinline__ std::uint8_t encode_ue4m3_scale_device(float value) {
+  if (!(value > 0.0f)) {
+    return 0;
+  }
+  int best_bits = 0;
+  float best_error = 3.402823466e+38f;
+  for (int exponent = 0; exponent < 16; ++exponent) {
+    for (int mantissa = 0; mantissa < 8; ++mantissa) {
+      float decoded = 0.0f;
+      if (exponent == 0) {
+        decoded = ldexpf(static_cast<float>(mantissa) / 8.0f, -6);
+      } else {
+        decoded = ldexpf(1.0f + static_cast<float>(mantissa) / 8.0f, exponent - 7);
+      }
+      const float error = fabsf(decoded - value);
+      if (error < best_error) {
+        best_error = error;
+        best_bits = (exponent << 3) | mantissa;
+      }
+    }
+  }
+  return static_cast<std::uint8_t>(best_bits);
+}
+
+__device__ __forceinline__ std::uint8_t encode_nvfp4_e2m1_device(float value) {
+  constexpr float levels[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+  const bool negative = value < 0.0f;
+  const float abs_value = fabsf(value);
+  int best = 0;
+  float best_error = 3.402823466e+38f;
+  for (int i = 0; i < 8; ++i) {
+    const float error = fabsf(levels[i] - abs_value);
+    if (error < best_error) {
+      best_error = error;
+      best = i;
+    }
+  }
+  return static_cast<std::uint8_t>((negative ? 0x8u : 0u) | static_cast<std::uint8_t>(best));
+}
+
+__global__ void nvfp4_quantize_single_row_for_cublaslt_kernel(
+  const float * input,
+  std::uint8_t * packed_input,
+  std::uint8_t * tiled_scales,
+  int cols) {
+  const int group = blockIdx.x;
+  const int lane = threadIdx.x;
+  if (lane >= 16 || group * 16 + lane >= cols) {
+    return;
+  }
+
+  float local_abs = fabsf(input[group * 16 + lane]);
+  for (int offset = 8; offset > 0; offset >>= 1) {
+    local_abs = fmaxf(local_abs, __shfl_down_sync(0xffffu, local_abs, offset));
+  }
+  const float max_abs = __shfl_sync(0xffffu, local_abs, 0);
+  const float scale = fmaxf(max_abs / 6.0f, 1.0e-8f);
+
+  if (lane == 0) {
+    const int scale_col = group;
+    const int col_block = scale_col / 4;
+    const int col_in_group = scale_col % 4;
+    tiled_scales[col_block * 512 + col_in_group] = encode_ue4m3_scale_device(scale);
+  }
+
+  if ((lane & 1) == 0) {
+    const int col0 = group * 16 + lane;
+    const int col1 = col0 + 1;
+    const std::uint8_t nibble0 = encode_nvfp4_e2m1_device(input[col0] / scale);
+    const std::uint8_t nibble1 = col1 < cols ? encode_nvfp4_e2m1_device(input[col1] / scale) : 0;
+    packed_input[col0 / 2] = static_cast<std::uint8_t>((nibble0 << 4u) | nibble1);
+  }
+}
+
 __global__ void nvfp4_matvec_check_kernel(
   const std::uint8_t * packed_weights,
   const std::uint8_t * weight_scales,
@@ -456,7 +530,7 @@ bool run_nvfp4_cublaslt_probe(
   for (int col = 0; col < cols; ++col) {
     input[static_cast<std::size_t>(col)] = static_cast<float>((col % 17) - 8) / 17.0f;
   }
-  std::vector<std::uint8_t> packed_input(static_cast<std::size_t>(cols / 2), 0);
+  std::vector<std::uint8_t> host_packed_input(static_cast<std::size_t>(cols / 2), 0);
   std::vector<std::uint8_t> input_scales_linear(static_cast<std::size_t>(scale_cols), 0);
   for (int group = 0; group < scale_cols; ++group) {
     float max_abs = 0.0f;
@@ -468,13 +542,13 @@ bool run_nvfp4_cublaslt_probe(
     for (int i = 0; i < 16; ++i) {
       const int col = group * 16 + i;
       const std::uint8_t nibble = encode_nvfp4_e2m1(input[static_cast<std::size_t>(col)] / scale);
-      auto & packed = packed_input[static_cast<std::size_t>(col / 2)];
+      auto & packed = host_packed_input[static_cast<std::size_t>(col / 2)];
       packed = (col & 1) == 0 ? static_cast<std::uint8_t>((packed & 0xf0u) | nibble)
                               : static_cast<std::uint8_t>((packed & 0x0fu) | (nibble << 4u));
     }
   }
   const auto input_scales = swizzle_nvfp4_block_scale(input_scales_linear, 1, scale_cols);
-  const auto cublaslt_packed_input = swap_fp4_nibbles(packed_input.data(), packed_input.size());
+  const auto cublaslt_host_packed_input = swap_fp4_nibbles(host_packed_input.data(), host_packed_input.size());
 
   std::vector<float> expected(static_cast<std::size_t>(used_rows), 0.0f);
   std::vector<std::uint8_t> weight_scales_ue4m3_linear(static_cast<std::size_t>(used_rows) * scale_cols, 0);
@@ -493,6 +567,7 @@ bool run_nvfp4_cublaslt_probe(
   const auto weight_scales_ue4m3 = swizzle_nvfp4_block_scale(weight_scales_ue4m3_linear, used_rows, scale_cols);
   const auto cublaslt_packed_weights = swap_fp4_nibbles(packed_weights.data(), static_cast<std::size_t>(used_rows) * packed_cols);
 
+  float * d_input_f32 = nullptr;
   std::uint8_t * d_input = nullptr;
   std::uint8_t * d_input_scales = nullptr;
   std::uint8_t * d_weights = nullptr;
@@ -515,6 +590,7 @@ bool run_nvfp4_cublaslt_probe(
     if (a_desc) cublasLtMatrixLayoutDestroy(a_desc);
     if (op_desc) cublasLtMatmulDescDestroy(op_desc);
     if (handle) cublasLtDestroy(handle);
+    cudaFree(d_input_f32);
     cudaFree(d_input);
     cudaFree(d_input_scales);
     cudaFree(d_weights);
@@ -522,10 +598,12 @@ bool run_nvfp4_cublaslt_probe(
     cudaFree(d_output);
   };
 
-  const std::size_t input_bytes = packed_input.size();
+  const std::size_t input_f32_bytes = input.size() * sizeof(float);
+  const std::size_t input_bytes = static_cast<std::size_t>(cols / 2);
   const std::size_t weight_bytes = static_cast<std::size_t>(used_rows) * packed_cols;
   const std::size_t output_bytes = static_cast<std::size_t>(used_rows) * sizeof(float);
-  if (!check_cuda(cudaMalloc(&d_input, input_bytes), "cudaMalloc(fp4 input)", error_message) ||
+  if (!check_cuda(cudaMalloc(&d_input_f32, input_f32_bytes), "cudaMalloc(fp4 input f32)", error_message) ||
+      !check_cuda(cudaMalloc(&d_input, input_bytes), "cudaMalloc(fp4 input)", error_message) ||
       !check_cuda(cudaMalloc(&d_input_scales, input_scales.size()), "cudaMalloc(fp4 input scales)", error_message) ||
       !check_cuda(cudaMalloc(&d_weights, weight_bytes), "cudaMalloc(fp4 weights)", error_message) ||
       !check_cuda(cudaMalloc(&d_weight_scales, weight_scales_ue4m3.size()), "cudaMalloc(fp4 weight scales)", error_message) ||
@@ -533,11 +611,51 @@ bool run_nvfp4_cublaslt_probe(
     cleanup();
     return false;
   }
-  if (!check_cuda(cudaMemcpy(d_input, cublaslt_packed_input.data(), input_bytes, cudaMemcpyHostToDevice), "cudaMemcpy(fp4 input)", error_message) ||
-      !check_cuda(cudaMemcpy(d_input_scales, input_scales.data(), input_scales.size(), cudaMemcpyHostToDevice), "cudaMemcpy(fp4 input scales)", error_message) ||
+  if (!check_cuda(cudaMemcpy(d_input_f32, input.data(), input_f32_bytes, cudaMemcpyHostToDevice), "cudaMemcpy(fp4 input f32)", error_message) ||
+      !check_cuda(cudaMemset(d_input, 0, input_bytes), "cudaMemset(fp4 input)", error_message) ||
+      !check_cuda(cudaMemset(d_input_scales, 0, input_scales.size()), "cudaMemset(fp4 input scales)", error_message) ||
       !check_cuda(cudaMemcpy(d_weights, cublaslt_packed_weights.data(), weight_bytes, cudaMemcpyHostToDevice), "cudaMemcpy(fp4 weights)", error_message) ||
       !check_cuda(cudaMemcpy(d_weight_scales, weight_scales_ue4m3.data(), weight_scales_ue4m3.size(), cudaMemcpyHostToDevice), "cudaMemcpy(fp4 weight scales)", error_message) ||
       !check_cublas(cublasLtCreate(&handle), "cublasLtCreate", error_message)) {
+    cleanup();
+    return false;
+  }
+  nvfp4_quantize_single_row_for_cublaslt_kernel<<<scale_cols, 16>>>(d_input_f32, d_input, d_input_scales, cols);
+  if (!check_cuda(cudaGetLastError(), "nvfp4_quantize_single_row_for_cublaslt_kernel", error_message)) {
+    cleanup();
+    return false;
+  }
+  std::vector<std::uint8_t> gpu_packed_input(input_bytes, 0);
+  std::vector<std::uint8_t> gpu_input_scales(input_scales.size(), 0);
+  if (!check_cuda(cudaMemcpy(gpu_packed_input.data(), d_input, input_bytes, cudaMemcpyDeviceToHost), "cudaMemcpy(D2H fp4 quantized input)", error_message) ||
+      !check_cuda(cudaMemcpy(gpu_input_scales.data(), d_input_scales, input_scales.size(), cudaMemcpyDeviceToHost), "cudaMemcpy(D2H fp4 input scales)", error_message)) {
+    cleanup();
+    return false;
+  }
+  if (gpu_packed_input != cublaslt_host_packed_input || gpu_input_scales != input_scales) {
+    std::size_t packed_mismatch = gpu_packed_input.size();
+    for (std::size_t i = 0; i < gpu_packed_input.size(); ++i) {
+      if (gpu_packed_input[i] != cublaslt_host_packed_input[i]) {
+        packed_mismatch = i;
+        break;
+      }
+    }
+    std::size_t scale_mismatch = gpu_input_scales.size();
+    for (std::size_t i = 0; i < gpu_input_scales.size(); ++i) {
+      if (gpu_input_scales[i] != input_scales[i]) {
+        scale_mismatch = i;
+        break;
+      }
+    }
+    error_message =
+      "GPU FP4 activation quantization does not match host reference: packed_mismatch=" +
+      (packed_mismatch == gpu_packed_input.size() ? std::string("none") : std::to_string(packed_mismatch)) +
+      " scale_mismatch=" +
+      (scale_mismatch == gpu_input_scales.size() ? std::string("none") : std::to_string(scale_mismatch)) +
+      (scale_mismatch == gpu_input_scales.size()
+         ? std::string()
+         : (" host_scale=" + std::to_string(static_cast<int>(input_scales[scale_mismatch])) +
+            " gpu_scale=" + std::to_string(static_cast<int>(gpu_input_scales[scale_mismatch]))));
     cleanup();
     return false;
   }

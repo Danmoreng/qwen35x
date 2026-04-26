@@ -407,7 +407,9 @@ Validation policy for each new size:
   - [x] Implement a ModelOpt FP4 projection layout object that stores padded packed weights, swizzled FP8 block scales, `alpha=input_scale*weight_scale_2`, and original output size per tensor.
     Current status: the CUDA loader now materializes raw scalar-fallback tensors and a second tensor-core-ready projection layout for every ModelOpt NVFP4 projection. Decode still uses the scalar fallback until the in-tree FP4 GEMM backend is wired in.
   - [ ] Add a reusable Blackwell FP4 projection backend using the proven cuBLASLt operand orientation and the padded packed-weight/tiled-scale projection layout.
-  - [ ] Add a GPU activation quantization stage that emits packed E2M1 activations plus tiled UE4M3 per-16 scales without host round-trips.
+  - [x] Add a GPU activation quantization probe stage that emits packed E2M1 activations plus tiled UE4M3 per-16 scales without host round-trips.
+    Current status: `--probe-nvfp4-cublaslt` now quantizes the input vector on GPU, self-checks the packed activation and tiled scale buffers against the host reference, then feeds those GPU-produced buffers into cuBLASLt.
+  - [ ] Move the GPU activation quantization stage from the probe into a reusable decode/prefill projection backend.
   - [ ] Add a custom Blackwell decode projection path for batch-1/token decode if cuBLASLt GEMM is inefficient at current shapes.
   - [ ] Keep scalar NVFP4 matvecs as the correctness fallback until tensor-core kernels pass error-threshold and quality smoke tests.
 - [ ] Expand NVFP4 native coverage to embedding/LM-head or document why those remain BF16.
