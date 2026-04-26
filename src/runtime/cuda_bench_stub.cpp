@@ -62,6 +62,43 @@ bool run_nvfp4_cublaslt_projection_device(
   return false;
 }
 
+bool run_nvfp4_cublaslt_gate_up_silu_device(
+  const float *,
+  const std::uint8_t *,
+  const std::uint8_t *,
+  float,
+  const std::uint8_t *,
+  const std::uint8_t *,
+  float,
+  int,
+  int,
+  std::uint8_t *,
+  std::uint8_t *,
+  float *,
+  float *,
+  double *,
+  std::string & error_message) {
+  error_message = "CUDA is not enabled in this build.";
+  return false;
+}
+
+bool run_nvfp4_cublaslt_gate_up_benchmark(
+  const std::vector<std::uint8_t> &,
+  const std::vector<std::uint8_t> &,
+  float,
+  const std::vector<std::uint8_t> &,
+  const std::vector<std::uint8_t> &,
+  float,
+  int,
+  int,
+  int,
+  int,
+  double &,
+  std::string & error_message) {
+  error_message = "CUDA is not enabled in this build.";
+  return false;
+}
+
 } // namespace qwen35x::cuda
 
 #endif

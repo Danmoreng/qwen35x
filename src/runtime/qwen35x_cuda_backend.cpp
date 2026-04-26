@@ -1,6 +1,7 @@
 #include "qwen35x/runtime/qwen35x_cuda_backend.h"
 
 #include "qwen35x/compiler/compiler.h"
+#include "qwen35x/runtime/cuda_bench.h"
 #include "qwen35x/weights/safetensors.h"
 #include "qwen35x/weights/modelopt_nvfp4.h"
 
@@ -413,6 +414,10 @@ struct BackendState {
   int * pf_lm_bmi = nullptr;
   float * pf_rope_cos = nullptr;
   float * pf_rope_sin = nullptr;
+  float * fp4_projection_input_f32 = nullptr;
+  std::uint8_t * fp4_activation = nullptr;
+  std::uint8_t * fp4_activation_scales = nullptr;
+  float * fp4_projection_output_f32 = nullptr;
   int prefill_mlp_chunk_tokens = 0;
   int prefill_attention_query_tokens = 0;
 };
@@ -908,6 +913,10 @@ bool alloc_and_zero(DeviceArena & arena, std::size_t bytes, void *& out_ptr, con
   return check_cuda(cudaMemset(out_ptr, 0, bytes), "cudaMemset(" + label + ")", error_message);
 }
 
+std::size_t nvfp4_tiled_scale_bytes(const int rows, const int cols) {
+  return static_cast<std::size_t>(round_up_to_multiple(rows, 128)) * round_up_to_multiple(cols / 16, 4);
+}
+
 bool resolve_model_descriptor(
   const Qwen35xCudaBackendConfig & config,
   Qwen35xModelDescriptor & descriptor,
@@ -1206,6 +1215,22 @@ bool initialize_backend_state(
     return false;
   }
 
+  const int max_fp4_input = std::max(descriptor.hidden_size, descriptor.intermediate_size);
+  const int max_fp4_output = std::max({
+    descriptor.intermediate_size,
+    descriptor.hidden_size,
+    descriptor_fa_qproj_size(descriptor),
+    descriptor_dn_conv_channels(descriptor),
+    descriptor_dn_v_size(descriptor),
+    descriptor.dn_gate_heads
+  });
+  if (!arena.alloc_bytes(static_cast<std::size_t>(max_fp4_input) * f32_bytes, reinterpret_cast<void *&>(state.fp4_projection_input_f32), error_message) ||
+      !arena.alloc_bytes(static_cast<std::size_t>(max_fp4_input / 2), reinterpret_cast<void *&>(state.fp4_activation), error_message) ||
+      !arena.alloc_bytes(nvfp4_tiled_scale_bytes(1, max_fp4_input), reinterpret_cast<void *&>(state.fp4_activation_scales), error_message) ||
+      !arena.alloc_bytes(static_cast<std::size_t>(max_fp4_output) * f32_bytes, reinterpret_cast<void *&>(state.fp4_projection_output_f32), error_message)) {
+    return false;
+  }
+
   const std::size_t rope_elems = static_cast<std::size_t>(config.max_context) * descriptor.fa_rot_dim;
   if (!arena.alloc_bytes(rope_elems * sizeof(float), reinterpret_cast<void *&>(state.pf_rope_cos), error_message) ||
       !arena.alloc_bytes(rope_elems * sizeof(float), reinterpret_cast<void *&>(state.pf_rope_sin), error_message)) {
@@ -1484,6 +1509,111 @@ bool initialize_nvfp4_layer_weights(
     error_message);
 }
 
+bool validate_nvfp4_tensor_core_projection(
+  const Nvfp4BackendState & nvfp4_state,
+  const BackendState & state,
+  std::string & error_message) {
+  if (nvfp4_state.tensors.empty()) {
+    error_message = "No NVFP4 tensors are loaded for tensor-core projection validation.";
+    return false;
+  }
+  const auto & tensor = nvfp4_state.tensors.front();
+  if (tensor.tc_packed_weight == nullptr || tensor.tc_weight_scale == nullptr || tensor.weight_scale_2 == nullptr ||
+      tensor.input_size <= 0 || tensor.output_size <= 0) {
+    error_message = "First NVFP4 tensor is missing tensor-core projection buffers.";
+    return false;
+  }
+
+  std::vector<float> host_input(static_cast<std::size_t>(tensor.input_size));
+  for (int col = 0; col < tensor.input_size; ++col) {
+    host_input[static_cast<std::size_t>(col)] = static_cast<float>((col % 17) - 8) / 17.0f;
+  }
+
+  float weight_scale_2 = 0.0f;
+  double elapsed_ms = 0.0;
+  if (!check_cuda(
+        cudaMemcpy(state.fp4_projection_input_f32, host_input.data(), host_input.size() * sizeof(float), cudaMemcpyHostToDevice),
+        "cudaMemcpy(H2D fp4 projection validation input)",
+        error_message) ||
+      !check_cuda(
+        cudaMemcpy(&weight_scale_2, tensor.weight_scale_2, sizeof(float), cudaMemcpyDeviceToHost),
+        "cudaMemcpy(D2H fp4 projection weight_scale_2)",
+        error_message)) {
+    return false;
+  }
+
+  return qwen35x::cuda::run_nvfp4_cublaslt_projection_device(
+    state.fp4_projection_input_f32,
+    static_cast<const std::uint8_t *>(tensor.tc_packed_weight),
+    static_cast<const std::uint8_t *>(tensor.tc_weight_scale),
+    weight_scale_2,
+    tensor.output_size,
+    tensor.input_size,
+    state.fp4_activation,
+    state.fp4_activation_scales,
+    state.fp4_projection_output_f32,
+    &elapsed_ms,
+    error_message);
+}
+
+bool validate_nvfp4_gate_up_projection(
+  const Nvfp4BackendState & nvfp4_state,
+  const BackendState & state,
+  std::string & error_message) {
+  if (nvfp4_state.tensors.size() < 2) {
+    error_message = "Need at least gate/up NVFP4 tensors for gate-up projection validation.";
+    return false;
+  }
+  const auto & gate = nvfp4_state.tensors[0];
+  const auto & up = nvfp4_state.tensors[1];
+  if (gate.input_size != up.input_size || gate.output_size != up.output_size ||
+      gate.tc_packed_weight == nullptr || gate.tc_weight_scale == nullptr ||
+      up.tc_packed_weight == nullptr || up.tc_weight_scale == nullptr) {
+    error_message = "Gate/up NVFP4 tensor-core projection buffers are incompatible.";
+    return false;
+  }
+
+  std::vector<float> host_input(static_cast<std::size_t>(gate.input_size));
+  for (int col = 0; col < gate.input_size; ++col) {
+    host_input[static_cast<std::size_t>(col)] = static_cast<float>((col % 17) - 8) / 17.0f;
+  }
+
+  float gate_scale_2 = 0.0f;
+  float up_scale_2 = 0.0f;
+  double elapsed_ms = 0.0;
+  if (!check_cuda(
+        cudaMemcpy(state.fp4_projection_input_f32, host_input.data(), host_input.size() * sizeof(float), cudaMemcpyHostToDevice),
+        "cudaMemcpy(H2D fp4 gate-up validation input)",
+        error_message) ||
+      !check_cuda(
+        cudaMemcpy(&gate_scale_2, gate.weight_scale_2, sizeof(float), cudaMemcpyDeviceToHost),
+        "cudaMemcpy(D2H fp4 gate weight_scale_2)",
+        error_message) ||
+      !check_cuda(
+        cudaMemcpy(&up_scale_2, up.weight_scale_2, sizeof(float), cudaMemcpyDeviceToHost),
+        "cudaMemcpy(D2H fp4 up weight_scale_2)",
+        error_message)) {
+    return false;
+  }
+
+  return qwen35x::cuda::run_nvfp4_cublaslt_gate_up_silu_device(
+    state.fp4_projection_input_f32,
+    static_cast<const std::uint8_t *>(gate.tc_packed_weight),
+    static_cast<const std::uint8_t *>(gate.tc_weight_scale),
+    gate_scale_2,
+    static_cast<const std::uint8_t *>(up.tc_packed_weight),
+    static_cast<const std::uint8_t *>(up.tc_weight_scale),
+    up_scale_2,
+    gate.output_size,
+    gate.input_size,
+    state.fp4_activation,
+    state.fp4_activation_scales,
+    state.fp4_projection_output_f32,
+    static_cast<float *>(state.g_activations),
+    &elapsed_ms,
+    error_message);
+}
+
 bool reset_state(const Qwen35xModelDescriptor & descriptor, const BackendState & state, int max_seq_len, std::string & error_message) {
   const int n_full_layers = descriptor_full_layer_count(descriptor);
   const int n_delta_layers = descriptor_delta_layer_count(descriptor);
@@ -1656,6 +1786,7 @@ bool run_decode_step_impl(
   const Qwen35xModelDescriptor & descriptor,
   const VariantDescriptor & variant,
   const BackendState & state,
+  const Nvfp4BackendState * nvfp4_state,
   int input_token,
   int position,
   int max_seq_len,
@@ -1732,6 +1863,33 @@ bool run_decode_step_impl(
 
   if (!check_cuda(cudaGetLastError(), "launch_decode", error_message)) {
     return false;
+  }
+
+  if (std::getenv("QWEN35X_DRY_RUN_FP4_DECODE_PROJECTION") != nullptr &&
+      nvfp4_state != nullptr &&
+      !nvfp4_state->tensors.empty()) {
+    const auto & tensor = nvfp4_state->tensors.front();
+    float weight_scale_2 = 0.0f;
+    double elapsed_ms = 0.0;
+    if (!check_cuda(
+          cudaMemcpy(&weight_scale_2, tensor.weight_scale_2, sizeof(float), cudaMemcpyDeviceToHost),
+          "cudaMemcpy(D2H dry-run fp4 projection weight_scale_2)",
+          error_message) ||
+        !qwen35x::cuda::run_nvfp4_cublaslt_projection_device(
+          static_cast<const float *>(state.g_normalized),
+          static_cast<const std::uint8_t *>(tensor.tc_packed_weight),
+          static_cast<const std::uint8_t *>(tensor.tc_weight_scale),
+          weight_scale_2,
+          tensor.output_size,
+          tensor.input_size,
+          state.fp4_activation,
+          state.fp4_activation_scales,
+          state.fp4_projection_output_f32,
+          &elapsed_ms,
+          error_message)) {
+      error_message = "dry-run decode FP4 projection failed: " + error_message;
+      return false;
+    }
   }
 
   const auto token_download_start = std::chrono::steady_clock::now();
@@ -1826,6 +1984,20 @@ bool Qwen35xCudaBackend::initialize(const Qwen35xCudaBackendConfig & config, std
     impl_ = std::make_unique<Impl>();
     return false;
   }
+  if (config.weight_precision == Qwen35xWeightPrecision::nvfp4 &&
+      std::getenv("QWEN35X_VALIDATE_FP4_PROJECTION") != nullptr &&
+      !validate_nvfp4_tensor_core_projection(impl_->nvfp4_state, impl_->state, error_message)) {
+    error_message = "NVFP4 tensor-core projection validation failed: " + error_message;
+    impl_ = std::make_unique<Impl>();
+    return false;
+  }
+  if (config.weight_precision == Qwen35xWeightPrecision::nvfp4 &&
+      std::getenv("QWEN35X_VALIDATE_FP4_GATE_UP") != nullptr &&
+      !validate_nvfp4_gate_up_projection(impl_->nvfp4_state, impl_->state, error_message)) {
+    error_message = "NVFP4 gate/up projection validation failed: " + error_message;
+    impl_ = std::make_unique<Impl>();
+    return false;
+  }
   if (!warmup_prefill_backend(impl_->descriptor, *variant, impl_->state, config, error_message)) {
     impl_ = std::make_unique<Impl>();
     return false;
@@ -1899,6 +2071,7 @@ bool Qwen35xCudaBackend::run_decode_step(
     impl_->descriptor,
     *impl_->variant,
     impl_->state,
+    impl_->config.weight_precision == Qwen35xWeightPrecision::nvfp4 ? &impl_->nvfp4_state : nullptr,
     input_token,
     position,
     impl_->config.max_context,

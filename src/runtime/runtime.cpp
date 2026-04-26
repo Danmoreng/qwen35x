@@ -276,6 +276,88 @@ bool run_nvfp4_cublaslt_probe(
   return true;
 }
 
+bool run_nvfp4_gate_up_benchmark(
+  const Nvfp4GateUpBenchOptions & options,
+  Nvfp4GateUpBenchResult & result,
+  std::string & error_message) {
+  if (options.model_dir.empty()) {
+    error_message = "model_dir is required for NVFP4 gate/up benchmark.";
+    return false;
+  }
+  if (options.gate_tensor_base_name.empty() || options.up_tensor_base_name.empty()) {
+    error_message = "gate and up tensor base names are required for NVFP4 gate/up benchmark.";
+    return false;
+  }
+  if (options.warmup_iterations < 0 || options.benchmark_iterations <= 0) {
+    error_message = "warmup_iterations must be >= 0 and benchmark_iterations must be > 0.";
+    return false;
+  }
+
+  SafetensorTensorInfo gate_weight_info;
+  SafetensorTensorInfo gate_scale_info;
+  SafetensorTensorInfo up_weight_info;
+  SafetensorTensorInfo up_scale_info;
+  std::vector<std::uint8_t> gate_packed_weights;
+  std::vector<std::uint8_t> gate_weight_scales;
+  std::vector<std::uint8_t> up_packed_weights;
+  std::vector<std::uint8_t> up_weight_scales;
+  if (!read_raw_tensor_from_model(options.model_dir, options.gate_tensor_base_name + ".weight", "U8", gate_weight_info, gate_packed_weights, error_message) ||
+      !read_raw_tensor_from_model(options.model_dir, options.gate_tensor_base_name + ".weight_scale", "F8_E4M3", gate_scale_info, gate_weight_scales, error_message) ||
+      !read_raw_tensor_from_model(options.model_dir, options.up_tensor_base_name + ".weight", "U8", up_weight_info, up_packed_weights, error_message) ||
+      !read_raw_tensor_from_model(options.model_dir, options.up_tensor_base_name + ".weight_scale", "F8_E4M3", up_scale_info, up_weight_scales, error_message)) {
+    return false;
+  }
+
+  SafetensorTensorF32 gate_weight_scale2_tensor;
+  SafetensorTensorF32 up_weight_scale2_tensor;
+  if (!SafetensorLoader::read_tensor_f32(options.model_dir, options.gate_tensor_base_name + ".weight_scale_2", gate_weight_scale2_tensor, error_message) ||
+      !SafetensorLoader::read_tensor_f32(options.model_dir, options.up_tensor_base_name + ".weight_scale_2", up_weight_scale2_tensor, error_message)) {
+    return false;
+  }
+  if (gate_weight_info.shape.size() != 2 || gate_scale_info.shape.size() != 2 ||
+      up_weight_info.shape.size() != 2 || up_scale_info.shape.size() != 2 ||
+      gate_weight_scale2_tensor.data.size() != 1 || up_weight_scale2_tensor.data.size() != 1) {
+    error_message = "Invalid NVFP4 gate/up tensor family for benchmark.";
+    return false;
+  }
+  if (gate_weight_info.shape != up_weight_info.shape) {
+    error_message = "Gate and up packed weight shapes must match for benchmark.";
+    return false;
+  }
+
+  const int rows = static_cast<int>(gate_weight_info.shape[0]);
+  const int cols = static_cast<int>(gate_weight_info.shape[1] * 2);
+  const std::vector<std::int64_t> expected_scale_shape{gate_weight_info.shape[0], cols / 16};
+  if (gate_scale_info.shape != expected_scale_shape || up_scale_info.shape != expected_scale_shape) {
+    error_message = "NVFP4 gate/up weight_scale shape does not match packed weight shape.";
+    return false;
+  }
+
+  double avg_ms = 0.0;
+  if (!cuda::run_nvfp4_cublaslt_gate_up_benchmark(
+        gate_packed_weights,
+        gate_weight_scales,
+        gate_weight_scale2_tensor.data[0],
+        up_packed_weights,
+        up_weight_scales,
+        up_weight_scale2_tensor.data[0],
+        rows,
+        cols,
+        options.warmup_iterations,
+        options.benchmark_iterations,
+        avg_ms,
+        error_message)) {
+    return false;
+  }
+
+  result.gate_tensor_base_name = options.gate_tensor_base_name;
+  result.up_tensor_base_name = options.up_tensor_base_name;
+  result.source_shape = {gate_weight_info.shape[0], gate_weight_info.shape[1] * 2};
+  result.avg_iteration_ms = avg_ms;
+  result.iterations_per_second = 1000.0 / avg_ms;
+  return true;
+}
+
 bool EngineRuntime::initialize(const ModelProfile & profile, const RuntimeTarget & target, std::string & error_message) {
   if (profile.family != "qwen3.5") {
     error_message = "Only qwen3.5 family is supported by this scaffold fast path.";

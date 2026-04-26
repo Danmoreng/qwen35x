@@ -52,4 +52,35 @@ bool run_nvfp4_cublaslt_projection_device(
   double * elapsed_ms,
   std::string & error_message);
 
+bool run_nvfp4_cublaslt_gate_up_silu_device(
+  const float * input_f32,
+  const std::uint8_t * gate_packed_weights_cublaslt,
+  const std::uint8_t * gate_weight_scales_tiled,
+  float gate_weight_scale_2,
+  const std::uint8_t * up_packed_weights_cublaslt,
+  const std::uint8_t * up_weight_scales_tiled,
+  float up_weight_scale_2,
+  int rows,
+  int cols,
+  std::uint8_t * activation_scratch,
+  std::uint8_t * activation_scale_scratch,
+  float * gate_output_f32,
+  float * up_output_f32,
+  double * elapsed_ms,
+  std::string & error_message);
+
+bool run_nvfp4_cublaslt_gate_up_benchmark(
+  const std::vector<std::uint8_t> & gate_packed_weights,
+  const std::vector<std::uint8_t> & gate_weight_scales_e4m3,
+  float gate_weight_scale_2,
+  const std::vector<std::uint8_t> & up_packed_weights,
+  const std::vector<std::uint8_t> & up_weight_scales_e4m3,
+  float up_weight_scale_2,
+  int rows,
+  int cols,
+  int warmup_iterations,
+  int benchmark_iterations,
+  double & avg_iteration_ms,
+  std::string & error_message);
+
 } // namespace qwen35x::cuda

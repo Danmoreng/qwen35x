@@ -51,6 +51,22 @@ struct Nvfp4CublasLtProbeResult {
   double max_abs_actual = 0.0;
 };
 
+struct Nvfp4GateUpBenchOptions {
+  std::string model_dir;
+  std::string gate_tensor_base_name = "model.language_model.layers.0.mlp.gate_proj";
+  std::string up_tensor_base_name = "model.language_model.layers.0.mlp.up_proj";
+  int warmup_iterations = 5;
+  int benchmark_iterations = 20;
+};
+
+struct Nvfp4GateUpBenchResult {
+  std::string gate_tensor_base_name;
+  std::string up_tensor_base_name;
+  std::vector<std::int64_t> source_shape;
+  double avg_iteration_ms = 0.0;
+  double iterations_per_second = 0.0;
+};
+
 bool run_bf16_tensor_benchmark(
   const Bf16TensorBenchOptions & options,
   Bf16TensorBenchResult & result,
@@ -64,6 +80,11 @@ bool run_nvfp4_tensor_check(
 bool run_nvfp4_cublaslt_probe(
   const Nvfp4TensorCheckOptions & options,
   Nvfp4CublasLtProbeResult & result,
+  std::string & error_message);
+
+bool run_nvfp4_gate_up_benchmark(
+  const Nvfp4GateUpBenchOptions & options,
+  Nvfp4GateUpBenchResult & result,
   std::string & error_message);
 
 class EngineRuntime {
