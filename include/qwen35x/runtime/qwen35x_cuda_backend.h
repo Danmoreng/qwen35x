@@ -1,16 +1,40 @@
 #pragma once
 
+#include "qwen35x/common/model_profile.h"
 #include "qwen35x/runtime/qwen35x_profile.h"
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace qwen35x::cuda_backend {
 
+struct Qwen35xModelDescriptor {
+  std::string family;
+  std::string variant;
+  int num_layers = 0;
+  int hidden_size = 0;
+  int intermediate_size = 0;
+  int vocab_size = 0;
+  int fa_num_q_heads = 0;
+  int fa_num_kv_heads = 0;
+  int fa_head_dim = 0;
+  int fa_rot_dim = 0;
+  float rope_theta = 0.0f;
+  int dn_num_heads = 0;
+  int dn_gate_heads = 0;
+  int dn_key_dim = 0;
+  int dn_value_head_dim = 0;
+  int dn_value_dim = 0;
+  int dn_conv_kernel = 0;
+  std::vector<int> layer_type;
+};
+
 struct Qwen35xCudaBackendConfig {
   std::string model_dir = "models/qwen3.5-0.8b";
+  std::optional<Qwen35xModelDescriptor> model_descriptor;
   int max_context = 256;
   int decode_blocks = 0;
   float repetition_penalty = 1.0f;
@@ -54,5 +78,9 @@ private:
 
 int query_max_safe_decode_blocks();
 void set_decode_blocks_override(int blocks);
+bool build_model_descriptor(
+  const qwen35x::ModelProfile & profile,
+  Qwen35xModelDescriptor & descriptor,
+  std::string & error_message);
 
 } // namespace qwen35x::cuda_backend

@@ -17,6 +17,97 @@
 
 namespace qwen35x::cuda_backend {
 
+bool validate_descriptor(const Qwen35xModelDescriptor & descriptor, std::string & error_message) {
+  if (descriptor.num_layers <= 0 ||
+      descriptor.hidden_size <= 0 ||
+      descriptor.intermediate_size <= 0 ||
+      descriptor.vocab_size <= 0 ||
+      descriptor.fa_num_q_heads <= 0 ||
+      descriptor.fa_num_kv_heads <= 0 ||
+      descriptor.fa_head_dim <= 0 ||
+      descriptor.fa_rot_dim <= 0 ||
+      descriptor.dn_num_heads <= 0 ||
+      descriptor.dn_gate_heads <= 0 ||
+      descriptor.dn_key_dim <= 0 ||
+      descriptor.dn_value_head_dim <= 0 ||
+      descriptor.dn_value_dim <= 0 ||
+      descriptor.dn_conv_kernel <= 0) {
+    error_message = "invalid Qwen3.5 CUDA model descriptor: dimensions must be positive.";
+    return false;
+  }
+  if (static_cast<int>(descriptor.layer_type.size()) != descriptor.num_layers) {
+    error_message =
+      "invalid Qwen3.5 CUDA model descriptor: layer schedule length " +
+      std::to_string(descriptor.layer_type.size()) +
+      " does not match layer count " + std::to_string(descriptor.num_layers) + ".";
+    return false;
+  }
+  if ((descriptor.fa_head_dim % 2) != 0 || descriptor.fa_rot_dim > descriptor.fa_head_dim) {
+    error_message = "invalid Qwen3.5 CUDA model descriptor: RoPE dimensions are incompatible with head_dim.";
+    return false;
+  }
+  if (descriptor.fa_num_q_heads % descriptor.fa_num_kv_heads != 0) {
+    error_message = "invalid Qwen3.5 CUDA model descriptor: attention heads must be divisible by KV heads.";
+    return false;
+  }
+  if (descriptor.dn_gate_heads % descriptor.dn_num_heads != 0) {
+    error_message = "invalid Qwen3.5 CUDA model descriptor: DeltaNet value heads must be divisible by key heads.";
+    return false;
+  }
+  if (descriptor.dn_value_dim != descriptor.dn_value_head_dim * (descriptor.dn_gate_heads / descriptor.dn_num_heads)) {
+    error_message = "invalid Qwen3.5 CUDA model descriptor: grouped DeltaNet value dimension is inconsistent.";
+    return false;
+  }
+  return true;
+}
+
+bool build_model_descriptor(
+  const qwen35x::ModelProfile & profile,
+  Qwen35xModelDescriptor & descriptor,
+  std::string & error_message) {
+  descriptor = Qwen35xModelDescriptor{};
+  descriptor.family = profile.family;
+  descriptor.variant = profile.variant;
+  descriptor.num_layers = profile.text.num_hidden_layers;
+  descriptor.hidden_size = profile.text.hidden_size;
+  descriptor.intermediate_size = profile.text.intermediate_size;
+  descriptor.vocab_size = profile.text.vocab_size;
+  descriptor.fa_num_q_heads = profile.text.num_attention_heads;
+  descriptor.fa_num_kv_heads = profile.text.num_key_value_heads;
+  descriptor.fa_head_dim = profile.text.head_dim;
+  descriptor.fa_rot_dim = static_cast<int>(
+    std::lround(static_cast<float>(profile.text.head_dim) * profile.text.partial_rotary_factor));
+  descriptor.rope_theta = profile.text.rope_theta;
+  descriptor.dn_num_heads = profile.text.linear_num_key_heads;
+  descriptor.dn_gate_heads = profile.text.linear_num_value_heads;
+  descriptor.dn_key_dim = profile.text.linear_key_head_dim;
+  descriptor.dn_value_head_dim = profile.text.linear_value_head_dim;
+  if (descriptor.dn_num_heads > 0 && descriptor.dn_gate_heads > 0) {
+    descriptor.dn_value_dim = descriptor.dn_value_head_dim * (descriptor.dn_gate_heads / descriptor.dn_num_heads);
+  }
+  descriptor.dn_conv_kernel = profile.text.linear_conv_kernel_dim;
+
+  if (static_cast<int>(profile.fingerprint.attention_schedule.size()) != descriptor.num_layers) {
+    error_message =
+      "failed to build Qwen3.5 CUDA model descriptor: attention schedule length " +
+      std::to_string(profile.fingerprint.attention_schedule.size()) +
+      " does not match num_hidden_layers " + std::to_string(descriptor.num_layers) + ".";
+    return false;
+  }
+
+  descriptor.layer_type.reserve(profile.fingerprint.attention_schedule.size());
+  for (const auto block : profile.fingerprint.attention_schedule) {
+    descriptor.layer_type.push_back(block == qwen35x::AttentionBlock::full ? 1 : 0);
+  }
+
+  std::string validation_error;
+  if (!validate_descriptor(descriptor, validation_error)) {
+    error_message = "failed to build Qwen3.5 CUDA model descriptor: " + validation_error;
+    return false;
+  }
+  return true;
+}
+
 #if QWEN35X_HAS_CUDA
 
 namespace {
@@ -369,33 +460,37 @@ bool alloc_and_zero(DeviceArena & arena, std::size_t bytes, void *& out_ptr, con
   return check_cuda(cudaMemset(out_ptr, 0, bytes), "cudaMemset(" + label + ")", error_message);
 }
 
-const VariantDescriptor * select_variant_for_profile(
-  const qwen35x::ModelProfile & profile,
+const VariantDescriptor * select_variant_for_descriptor(
+  const Qwen35xModelDescriptor & descriptor,
   std::string & error_message) {
+  if (!validate_descriptor(descriptor, error_message)) {
+    return nullptr;
+  }
   for (const auto * variant : kVariants) {
     const bool dimensions_match =
-      profile.text.num_hidden_layers == variant->num_layers &&
-      profile.text.hidden_size == variant->hidden_size &&
-      profile.text.intermediate_size == variant->intermediate_size &&
-      profile.text.vocab_size == variant->vocab_size &&
-      profile.text.num_attention_heads == variant->fa_num_q_heads &&
-      profile.text.num_key_value_heads == variant->fa_num_kv_heads &&
-      profile.text.head_dim == variant->fa_head_dim &&
-      profile.text.linear_num_key_heads == variant->dn_num_heads &&
-      profile.text.linear_num_value_heads == variant->dn_gate_heads &&
-      profile.text.linear_key_head_dim == variant->dn_key_dim &&
-      profile.text.linear_conv_kernel_dim == variant->dn_conv_kernel;
+      descriptor.num_layers == variant->num_layers &&
+      descriptor.hidden_size == variant->hidden_size &&
+      descriptor.intermediate_size == variant->intermediate_size &&
+      descriptor.vocab_size == variant->vocab_size &&
+      descriptor.fa_num_q_heads == variant->fa_num_q_heads &&
+      descriptor.fa_num_kv_heads == variant->fa_num_kv_heads &&
+      descriptor.fa_head_dim == variant->fa_head_dim &&
+      descriptor.fa_rot_dim == variant->fa_rot_dim &&
+      descriptor.dn_num_heads == variant->dn_num_heads &&
+      descriptor.dn_gate_heads == variant->dn_gate_heads &&
+      descriptor.dn_key_dim == variant->dn_key_dim &&
+      descriptor.dn_value_dim == variant->dn_value_dim &&
+      descriptor.dn_conv_kernel == variant->dn_conv_kernel;
     if (!dimensions_match) {
       continue;
     }
 
-    if (static_cast<int>(profile.fingerprint.attention_schedule.size()) != variant->num_layers) {
+    if (static_cast<int>(descriptor.layer_type.size()) != variant->num_layers) {
       continue;
     }
     bool schedule_matches = true;
     for (int i = 0; i < variant->num_layers; ++i) {
-      const int expected = profile.fingerprint.attention_schedule[static_cast<std::size_t>(i)] == qwen35x::AttentionBlock::full ? 1 : 0;
-      if (expected != variant->layer_type[i]) {
+      if (descriptor.layer_type[static_cast<std::size_t>(i)] != variant->layer_type[i]) {
         schedule_matches = false;
         break;
       }
@@ -406,26 +501,39 @@ const VariantDescriptor * select_variant_for_profile(
   }
 
   error_message =
-    "unsupported Qwen3.5 CUDA model variant: profile variant=" + profile.variant +
-    " layers=" + std::to_string(profile.text.num_hidden_layers) +
-    " hidden=" + std::to_string(profile.text.hidden_size) +
-    " intermediate=" + std::to_string(profile.text.intermediate_size) +
-    " q_heads=" + std::to_string(profile.text.num_attention_heads) +
-    " kv_heads=" + std::to_string(profile.text.num_key_value_heads) +
-    " linear_key_heads=" + std::to_string(profile.text.linear_num_key_heads) +
-    " linear_value_heads=" + std::to_string(profile.text.linear_num_value_heads) +
+    "unsupported Qwen3.5 CUDA model variant: descriptor variant=" + descriptor.variant +
+    " layers=" + std::to_string(descriptor.num_layers) +
+    " hidden=" + std::to_string(descriptor.hidden_size) +
+    " intermediate=" + std::to_string(descriptor.intermediate_size) +
+    " vocab=" + std::to_string(descriptor.vocab_size) +
+    " q_heads=" + std::to_string(descriptor.fa_num_q_heads) +
+    " kv_heads=" + std::to_string(descriptor.fa_num_kv_heads) +
+    " head_dim=" + std::to_string(descriptor.fa_head_dim) +
+    " rope_dim=" + std::to_string(descriptor.fa_rot_dim) +
+    " linear_key_heads=" + std::to_string(descriptor.dn_num_heads) +
+    " linear_value_heads=" + std::to_string(descriptor.dn_gate_heads) +
+    " linear_value_head_dim=" + std::to_string(descriptor.dn_value_head_dim) +
+    " grouped_linear_value_dim=" + std::to_string(descriptor.dn_value_dim) +
     ". Supported CUDA variants: 0.8b, 4b.";
   return nullptr;
 }
 
 const VariantDescriptor * select_variant_for_config(const Qwen35xCudaBackendConfig & config, std::string & error_message) {
+  if (config.model_descriptor.has_value()) {
+    return select_variant_for_descriptor(*config.model_descriptor, error_message);
+  }
+
   std::string profile_error;
   const auto profile = qwen35x::ProfileLoader::load_from_hf_directory(config.model_dir, profile_error);
   if (!profile) {
-    error_message = "failed to load model profile for CUDA variant validation: " + profile_error;
+    error_message = "failed to load model profile for CUDA descriptor construction: " + profile_error;
     return nullptr;
   }
-  return select_variant_for_profile(*profile, error_message);
+  Qwen35xModelDescriptor descriptor;
+  if (!build_model_descriptor(*profile, descriptor, error_message)) {
+    return nullptr;
+  }
+  return select_variant_for_descriptor(descriptor, error_message);
 }
 
 bool initialize_backend_state(
