@@ -44,3 +44,23 @@ Unlike decoding, prefill is a Matrix-Matrix multiplication (GEMM). This is exact
 2.  **The Solution (`cuBLASLt`):** NVIDIA already provides `cuBLASLt`, which includes natively tuned FP4 Tensor Core GEMM routines for Blackwell. The `qwen35x` codebase actually already contains experimental probes for this (`run_nvfp4_cublaslt_projection_device` in `src/runtime/cuda_bench.cu`).
 
 **Conclusion for Prefill:** To make NVFP4 prefill faster than BF16, we should not write custom `mxf4nvf4` assembly. Instead, the engine's prefill pipeline (`src/kernels/cuda/prefill.cu`) should be refactored to skip the BF16 dequantization step and pass the raw packed NVFP4 weights and scales directly into `cublasLtMatmul` configured for FP4 block-scaling.
+
+---
+
+## 3. Engineering Challenges for cuBLASLt FP4 Prefill Integration
+
+While adopting `cuBLASLt` for FP4 prefill is the correct architectural direction, integrating it into the main pipeline requires overcoming several non-trivial engineering hurdles:
+
+### 3.1 The `cuBLASLt` Plan Caching Problem
+To use NVIDIA's FP4 Tensor Core math, we must use the `cublasLtMatmul` API, which requires setting up complex `cublasLtMatmulDesc_t` descriptors and heuristics. Building these descriptors takes milliseconds of CPU time.
+In the prefill pipeline, the matrix dimensions change constantly (e.g., from `HIDDEN x INTERMEDIATE` for the MLP up-projection, to `INTERMEDIATE x HIDDEN` for the down-projection, and the sequence length `S` changes on the final chunk). If we naively call `cuBLASLt`, it will destroy and recreate the execution plan on every single matrix multiplication, completely negating any performance gains. A robust **LRU cache for cuBLASLt descriptors** is mandatory.
+
+### 3.2 Dynamic Activation Quantization Overhead
+The prefill pipeline currently passes `__nv_bfloat16` (BF16) activations between layers. `cuBLASLt` FP4 requires both the weights *and* the activations to be in 4-bit format.
+To utilize FP4 GEMMs, a custom CUDA kernel must be injected *before every single matrix multiplication* to read the BF16 activations, calculate the E4M3 scale vectors, and pack them into FP4 format in a temporary workspace buffer. This overhead must be carefully managed to ensure it doesn't eclipse the GEMM speedup.
+
+### 3.3 Output Precision Mismatch
+`cuBLASLt` FP4 math typically outputs FP32. The entire prefill pipeline (RMSNorm, SiLU, RoPE) expects `BF16` as the intermediate format. This necessitates either coercing `cuBLASLt` to output BF16 directly (which has strict memory alignment requirements) or injecting another kernel after every multiplication to cast the FP32 output back down to BF16.
+
+**Final Recommendation:**
+The prefill pipeline is currently extremely fast (~25,600 tokens/sec) due to BF16 dequantization. Refactoring it to support `cuBLASLt` FP4 is a major architectural overhaul that should be treated as a dedicated roadmap feature, rather than a quick optimization.
