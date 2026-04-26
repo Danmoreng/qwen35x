@@ -187,7 +187,7 @@ static __device__ void sm120_mxf4nvf4_projection_grid(
     const int lane = threadIdx.x & 31;
     const int global_warp = blockIdx.x * NUM_WARPS + warp_id;
 
-#if defined(__CUDA_ARCH_SPECIFIC__) && (__CUDA_ARCH_SPECIFIC__ == 1200)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
     const int total_warps = num_blocks * NUM_WARPS;
     for (int row_tile = global_warp; row_tile < row_tiles; row_tile += total_warps) {
         float d0 = 0.0f;
