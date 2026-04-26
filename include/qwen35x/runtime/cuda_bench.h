@@ -39,6 +39,20 @@ bool run_nvfp4_cublaslt_probe(
   double & max_abs_actual,
   std::string & error_message);
 
+bool run_nvfp4_custom_projection_benchmark(
+  const std::vector<std::uint8_t> & packed_weights,
+  const std::vector<std::uint8_t> & weight_scales_e4m3,
+  float input_scale,
+  float weight_scale_2,
+  int rows,
+  int cols,
+  int kernel_variant,
+  int warmup_iterations,
+  int benchmark_iterations,
+  double & avg_iteration_ms,
+  double & max_abs_error,
+  std::string & error_message);
+
 bool run_nvfp4_cublaslt_projection_device(
   const float * input_f32,
   const std::uint8_t * packed_weights_cublaslt,

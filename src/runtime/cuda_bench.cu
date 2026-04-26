@@ -168,6 +168,195 @@ __global__ void nvfp4_matvec_check_kernel(
   output[row] = sum;
 }
 
+__global__ void nvfp4_projection_row_parallel_kernel(
+  const std::uint8_t * packed_weights,
+  const std::uint8_t * weight_scales,
+  const float * input,
+  float input_scale,
+  float weight_scale_2,
+  float * output,
+  int rows,
+  int cols) {
+  const int row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+
+  const int packed_cols = cols / 2;
+  const int scale_cols = cols / 16;
+  const std::uint8_t * row_packed = packed_weights + static_cast<std::size_t>(row) * packed_cols;
+  const std::uint8_t * row_scales = weight_scales + static_cast<std::size_t>(row) * scale_cols;
+
+  float partial = 0.0f;
+  for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+    const std::uint8_t packed = row_packed[c / 2];
+    const std::uint8_t nibble = (c & 1) == 0 ? (packed & 0x0fu) : (packed >> 4u);
+    const float scale = decode_e4m3_device(row_scales[c / 16]) * weight_scale_2;
+    const float weight = decode_nvfp4_e2m1_device(nibble) * scale;
+    partial += weight * (input[c] * input_scale);
+  }
+
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    partial += __shfl_down_sync(0xffffffffu, partial, offset);
+  }
+
+  __shared__ float warp_sums[32];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  if (lane == 0) {
+    warp_sums[warp] = partial;
+  }
+  __syncthreads();
+
+  if (warp == 0) {
+    const int warp_count = blockDim.x / 32;
+    float sum = lane < warp_count ? warp_sums[lane] : 0.0f;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    }
+    if (lane == 0) {
+      output[row] = sum;
+    }
+  }
+}
+
+__global__ void nvfp4_projection_warp_rows_kernel(
+  const std::uint8_t * packed_weights,
+  const std::uint8_t * weight_scales,
+  const float * input,
+  float input_scale,
+  float weight_scale_2,
+  float * output,
+  int rows,
+  int cols) {
+  const int warp_id_in_block = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int warps_per_block = blockDim.x >> 5;
+  const int row = blockIdx.x * warps_per_block + warp_id_in_block;
+  if (row >= rows) {
+    return;
+  }
+
+  const int packed_cols = cols / 2;
+  const int scale_cols = cols / 16;
+  const std::uint8_t * row_packed = packed_weights + static_cast<std::size_t>(row) * packed_cols;
+  const std::uint8_t * row_scales = weight_scales + static_cast<std::size_t>(row) * scale_cols;
+
+  float partial = 0.0f;
+  for (int c = lane; c < cols; c += 32) {
+    const std::uint8_t packed = row_packed[c / 2];
+    const std::uint8_t nibble = (c & 1) == 0 ? (packed & 0x0fu) : (packed >> 4u);
+    const float scale = decode_e4m3_device(row_scales[c / 16]) * weight_scale_2;
+    const float weight = decode_nvfp4_e2m1_device(nibble) * scale;
+    partial += weight * (input[c] * input_scale);
+  }
+
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    partial += __shfl_down_sync(0xffffffffu, partial, offset);
+  }
+  if (lane == 0) {
+    output[row] = partial;
+  }
+}
+
+__global__ void nvfp4_projection_scale_group_kernel(
+  const std::uint8_t * packed_weights,
+  const std::uint8_t * weight_scales,
+  const float * input,
+  float input_scale,
+  float weight_scale_2,
+  float * output,
+  int rows,
+  int cols) {
+  const int row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+
+  const int packed_cols = cols / 2;
+  const int scale_cols = cols / 16;
+  const std::uint8_t * row_packed = packed_weights + static_cast<std::size_t>(row) * packed_cols;
+  const std::uint8_t * row_scales = weight_scales + static_cast<std::size_t>(row) * scale_cols;
+
+  float partial = 0.0f;
+  for (int group = threadIdx.x; group < scale_cols; group += blockDim.x) {
+    const float scale = decode_e4m3_device(row_scales[group]) * weight_scale_2;
+    const int col_base = group * 16;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      const int c = col_base + i;
+      const std::uint8_t packed = row_packed[c / 2];
+      const std::uint8_t nibble = (c & 1) == 0 ? (packed & 0x0fu) : (packed >> 4u);
+      const float weight = decode_nvfp4_e2m1_device(nibble) * scale;
+      partial += weight * (input[c] * input_scale);
+    }
+  }
+
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    partial += __shfl_down_sync(0xffffffffu, partial, offset);
+  }
+
+  __shared__ float warp_sums[32];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  if (lane == 0) {
+    warp_sums[warp] = partial;
+  }
+  __syncthreads();
+
+  if (warp == 0) {
+    const int warp_count = blockDim.x / 32;
+    float sum = lane < warp_count ? warp_sums[lane] : 0.0f;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    }
+    if (lane == 0) {
+      output[row] = sum;
+    }
+  }
+}
+
+__global__ void nvfp4_mma_sync_mxf4nvf4_compile_probe_kernel(std::uint32_t * output) {
+#if defined(__CUDA_ARCH_SPECIFIC__) && (__CUDA_ARCH_SPECIFIC__ == 1200)
+  std::uint32_t a0 = 0;
+  std::uint32_t a1 = 0;
+  std::uint32_t a2 = 0;
+  std::uint32_t a3 = 0;
+  std::uint32_t b0 = 0;
+  std::uint32_t b1 = 0;
+  float c0 = 0.0f;
+  float c1 = 0.0f;
+  float c2 = 0.0f;
+  float c3 = 0.0f;
+  std::uint32_t d0 = 0;
+  std::uint32_t d1 = 0;
+  std::uint32_t d2 = 0;
+  std::uint32_t d3 = 0;
+  std::uint32_t scale_a = 0;
+  std::uint32_t scale_b = 0;
+  std::uint16_t bid = 0;
+  std::uint16_t tid = 0;
+  asm volatile(
+    "mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3 "
+    "{%0, %1, %2, %3}, "
+    "{%4, %5, %6, %7}, "
+    "{%8, %9}, "
+    "{%10, %11, %12, %13}, "
+    "%14, {%16, %17}, "
+    "%15, {%16, %17};\n"
+    : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
+    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
+      "f"(c0), "f"(c1), "f"(c2), "f"(c3), "r"(scale_a), "r"(scale_b), "h"(bid), "h"(tid));
+  if (threadIdx.x == 0 && output != nullptr) {
+    output[0] = d0 + d1 + d2 + d3;
+  }
+#else
+  if (threadIdx.x == 0 && output != nullptr) {
+    output[0] = 0;
+  }
+#endif
+}
+
 bool check_cuda(cudaError_t status, const char * step, std::string & error_message) {
   if (status == cudaSuccess) {
     return true;
@@ -181,6 +370,52 @@ bool check_cublas(cublasStatus_t status, const char * step, std::string & error_
     return true;
   }
   error_message = std::string(step) + " failed with cuBLAS status " + std::to_string(static_cast<int>(status)) + ".";
+  return false;
+}
+
+bool query_device_compute_capability(int & major, int & minor, std::string & error_message) {
+  int device = 0;
+  cudaDeviceProp props{};
+  if (!check_cuda(cudaGetDevice(&device), "cudaGetDevice", error_message) ||
+      !check_cuda(cudaGetDeviceProperties(&props, device), "cudaGetDeviceProperties", error_message)) {
+    return false;
+  }
+  major = props.major;
+  minor = props.minor;
+  return true;
+}
+
+bool device_supports_sm120_mma_mxf4nvf4(const int major, const int minor) {
+  return (major == 12 && (minor == 0 || minor == 1));
+}
+
+bool run_nvfp4_blackwell_fp4_projection_benchmark(
+  const std::vector<std::uint8_t> &,
+  const std::vector<std::uint8_t> &,
+  float,
+  float,
+  int,
+  int,
+  int,
+  int,
+  double &,
+  double &,
+  std::string & error_message) {
+  int major = 0;
+  int minor = 0;
+  if (!query_device_compute_capability(major, minor, error_message)) {
+    return false;
+  }
+  if (!device_supports_sm120_mma_mxf4nvf4(major, minor)) {
+    error_message =
+      "blackwell-fp4 currently targets the SM120 mma.sync.aligned kind::mxf4nvf4.block_scale path; current device is sm_" +
+      std::to_string(major) + std::to_string(minor) +
+      ". Keep using --nvfp4-projection-kernel scale-group on unsupported devices.";
+    return false;
+  }
+
+  error_message =
+    "blackwell-fp4 reached the SM120 mma.sync mxf4nvf4 capability gate. The SM120a compile probe is present, but the real tile kernel is not implemented yet. Build this path with -CudaArchitectures 120a or 120f.";
   return false;
 }
 
@@ -617,6 +852,154 @@ bool run_nvfp4_matvec_check(
   cudaFree(d_scales);
   cudaFree(d_input);
   cudaFree(d_output);
+  return true;
+}
+
+bool run_nvfp4_custom_projection_benchmark(
+  const std::vector<std::uint8_t> & packed_weights,
+  const std::vector<std::uint8_t> & weight_scales_e4m3,
+  float input_scale,
+  float weight_scale_2,
+  int rows,
+  int cols,
+  int kernel_variant,
+  int warmup_iterations,
+  int benchmark_iterations,
+  double & avg_iteration_ms,
+  double & max_abs_error,
+  std::string & error_message) {
+  if (rows <= 0 || cols <= 0 || (cols % 16) != 0 || (cols % 2) != 0) {
+    error_message = "Invalid matrix dimensions for custom NVFP4 projection benchmark.";
+    return false;
+  }
+  if (warmup_iterations < 0 || benchmark_iterations <= 0) {
+    error_message = "warmup_iterations must be >= 0 and benchmark_iterations must be > 0.";
+    return false;
+  }
+  if (kernel_variant == 3) {
+    return run_nvfp4_blackwell_fp4_projection_benchmark(
+      packed_weights,
+      weight_scales_e4m3,
+      input_scale,
+      weight_scale_2,
+      rows,
+      cols,
+      warmup_iterations,
+      benchmark_iterations,
+      avg_iteration_ms,
+      max_abs_error,
+      error_message);
+  }
+  const int packed_cols = cols / 2;
+  const int scale_cols = cols / 16;
+  if (packed_weights.size() != static_cast<std::size_t>(rows) * packed_cols ||
+      weight_scales_e4m3.size() != static_cast<std::size_t>(rows) * scale_cols) {
+    error_message = "NVFP4 packed weight or scale size does not match matrix dimensions.";
+    return false;
+  }
+
+  std::vector<float> input(static_cast<std::size_t>(cols));
+  for (int i = 0; i < cols; ++i) {
+    input[static_cast<std::size_t>(i)] = static_cast<float>((i % 17) - 8) / 17.0f;
+  }
+
+  const int check_rows = std::min(rows, 64);
+  std::vector<float> expected(static_cast<std::size_t>(check_rows), 0.0f);
+  for (int row = 0; row < check_rows; ++row) {
+    for (int c = 0; c < cols; ++c) {
+      const std::uint8_t packed = packed_weights[static_cast<std::size_t>(row) * packed_cols + c / 2];
+      const std::uint8_t nibble = (c & 1) == 0 ? (packed & 0x0fu) : (packed >> 4u);
+      const float scale = decode_e4m3_host(weight_scales_e4m3[static_cast<std::size_t>(row) * scale_cols + c / 16]) * weight_scale_2;
+      expected[static_cast<std::size_t>(row)] +=
+        decode_nvfp4_e2m1_host(nibble) * scale * (input[static_cast<std::size_t>(c)] * input_scale);
+    }
+  }
+
+  std::uint8_t * d_weights = nullptr;
+  std::uint8_t * d_scales = nullptr;
+  float * d_input = nullptr;
+  float * d_output = nullptr;
+  cudaEvent_t start_event = nullptr;
+  cudaEvent_t stop_event = nullptr;
+  auto cleanup = [&]() {
+    cudaEventDestroy(start_event);
+    cudaEventDestroy(stop_event);
+    cudaFree(d_weights);
+    cudaFree(d_scales);
+    cudaFree(d_input);
+    cudaFree(d_output);
+  };
+
+  const std::size_t weights_bytes = packed_weights.size();
+  const std::size_t scales_bytes = weight_scales_e4m3.size();
+  const std::size_t input_bytes = input.size() * sizeof(float);
+  const std::size_t output_bytes = static_cast<std::size_t>(rows) * sizeof(float);
+  if (!check_cuda(cudaMalloc(&d_weights, weights_bytes), "cudaMalloc(custom nvfp4 weights)", error_message) ||
+      !check_cuda(cudaMalloc(&d_scales, scales_bytes), "cudaMalloc(custom nvfp4 scales)", error_message) ||
+      !check_cuda(cudaMalloc(&d_input, input_bytes), "cudaMalloc(custom nvfp4 input)", error_message) ||
+      !check_cuda(cudaMalloc(&d_output, output_bytes), "cudaMalloc(custom nvfp4 output)", error_message)) {
+    cleanup();
+    return false;
+  }
+  if (!check_cuda(cudaMemcpy(d_weights, packed_weights.data(), weights_bytes, cudaMemcpyHostToDevice), "cudaMemcpy(custom nvfp4 weights)", error_message) ||
+      !check_cuda(cudaMemcpy(d_scales, weight_scales_e4m3.data(), scales_bytes, cudaMemcpyHostToDevice), "cudaMemcpy(custom nvfp4 scales)", error_message) ||
+      !check_cuda(cudaMemcpy(d_input, input.data(), input_bytes, cudaMemcpyHostToDevice), "cudaMemcpy(custom nvfp4 input)", error_message)) {
+    cleanup();
+    return false;
+  }
+
+  constexpr int block_size = 256;
+  auto launch_kernel = [&]() {
+    if (kernel_variant == 1) {
+      constexpr int warps_per_block = block_size / 32;
+      const int grid_size = (rows + warps_per_block - 1) / warps_per_block;
+      nvfp4_projection_warp_rows_kernel<<<grid_size, block_size>>>(
+        d_weights, d_scales, d_input, input_scale, weight_scale_2, d_output, rows, cols);
+    } else if (kernel_variant == 2) {
+      nvfp4_projection_scale_group_kernel<<<rows, block_size>>>(
+        d_weights, d_scales, d_input, input_scale, weight_scale_2, d_output, rows, cols);
+    } else {
+      nvfp4_projection_row_parallel_kernel<<<rows, block_size>>>(
+        d_weights, d_scales, d_input, input_scale, weight_scale_2, d_output, rows, cols);
+    }
+  };
+  for (int i = 0; i < warmup_iterations; ++i) {
+    launch_kernel();
+  }
+  if (!check_cuda(cudaGetLastError(), "custom nvfp4 projection kernel(warmup)", error_message) ||
+      !check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(custom nvfp4 warmup)", error_message) ||
+      !check_cuda(cudaEventCreate(&start_event), "cudaEventCreate(custom nvfp4 start)", error_message) ||
+      !check_cuda(cudaEventCreate(&stop_event), "cudaEventCreate(custom nvfp4 stop)", error_message) ||
+      !check_cuda(cudaEventRecord(start_event), "cudaEventRecord(custom nvfp4 start)", error_message)) {
+    cleanup();
+    return false;
+  }
+  for (int i = 0; i < benchmark_iterations; ++i) {
+    launch_kernel();
+  }
+  float total_ms = 0.0f;
+  if (!check_cuda(cudaGetLastError(), "custom nvfp4 projection kernel", error_message) ||
+      !check_cuda(cudaEventRecord(stop_event), "cudaEventRecord(custom nvfp4 stop)", error_message) ||
+      !check_cuda(cudaEventSynchronize(stop_event), "cudaEventSynchronize(custom nvfp4 stop)", error_message) ||
+      !check_cuda(cudaEventElapsedTime(&total_ms, start_event, stop_event), "cudaEventElapsedTime(custom nvfp4)", error_message)) {
+    cleanup();
+    return false;
+  }
+  avg_iteration_ms = static_cast<double>(total_ms) / static_cast<double>(benchmark_iterations);
+
+  std::vector<float> actual(static_cast<std::size_t>(check_rows), 0.0f);
+  if (!check_cuda(cudaMemcpy(actual.data(), d_output, actual.size() * sizeof(float), cudaMemcpyDeviceToHost), "cudaMemcpy(custom nvfp4 output)", error_message)) {
+    cleanup();
+    return false;
+  }
+  max_abs_error = 0.0;
+  for (int row = 0; row < check_rows; ++row) {
+    max_abs_error = std::max(
+      max_abs_error,
+      static_cast<double>(std::fabs(actual[static_cast<std::size_t>(row)] - expected[static_cast<std::size_t>(row)])));
+  }
+
+  cleanup();
   return true;
 }
 

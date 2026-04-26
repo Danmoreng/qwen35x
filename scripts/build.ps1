@@ -11,6 +11,7 @@ param (
     [string]$Target = "qwen35x",
     [string]$Profile = "configs/qwen3_5_0_8b.profile.json",
     [int]$SmVersion = 120,
+    [string]$CudaArchitectures = "native",
     [ValidateSet("0p8b", "4b")]
     [string]$CudaVariant = "0p8b",
     [Alias("LuceBlockSize")]
@@ -126,6 +127,7 @@ $configureArgs = @(
 ) + $GeneratorArgs + @(
     "-DCMAKE_CXX_STANDARD=20",
     "-DQWEN35X_ENABLE_CUDA=$cudaFlag",
+    "-DQWEN35X_CUDA_ARCHITECTURES=$CudaArchitectures",
     "-DQWEN35X_CUDA_VARIANT=$CudaVariant",
     "-DQWEN35X_KERNEL_BENCH_BLOCK_SIZE=$KernelBlockSize",
     "-DQWEN35X_KERNEL_BENCH_NUM_BLOCKS=$KernelNumBlocks"

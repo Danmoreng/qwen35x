@@ -48,12 +48,16 @@ Current Qwen35x prefill behavior:
 
 Current Qwen35x precision behavior:
 - `--qwen35x-weight-precision bf16` and `--qwen35x-cache-precision bf16` are the stable default path.
-- `--qwen35x-weight-precision nvfp4` validates AxionML/ModelOpt NVFP4 weights and runs decode with native packed NVFP4 projection weights plus BF16 KV cache. The current native path is a correctness-first scalar dequantized warp matvec; Blackwell tensor-core/cuBLASLt FP4 kernels are the next performance step.
+- `--qwen35x-weight-precision nvfp4` validates AxionML/ModelOpt NVFP4 weights and runs decode with native packed NVFP4 projection weights plus BF16 KV cache. The current decode path is a correctness-first scalar dequantized warp matvec; standalone custom projection kernels are being brought up before replacing decode hot-path projections.
 - `--qwen35x-cache-precision quantized` is reserved for the upcoming quantized-cache path and currently fails fast with a clear unsupported-mode diagnostic.
 - AxionML/ModelOpt NVFP4 checkpoint layout can be checked before CUDA loading with:
   `.\build\qwen35x.exe --validate-nvfp4-model --hf-model-dir models/qwen3.5-0.8b-nvfp4-axionml`
 - The first NVFP4 CUDA primitive can be checked against a CPU dequantized reference with:
   `.\build\qwen35x.exe --check-nvfp4-tensor --hf-model-dir models/qwen3.5-0.8b-nvfp4-axionml --nvfp4-tensor model.language_model.layers.0.mlp.gate_proj`
+- The custom batch-1 NVFP4 projection benchmark can be run with:
+  `.\build\qwen35x.exe --bench-nvfp4-projection --hf-model-dir models/qwen3.5-0.8b-nvfp4-axionml --nvfp4-tensor model.language_model.layers.0.mlp.gate_proj`
+  This benchmark currently defaults to a scale-group CUDA reduction over AxionML packed weights, with `--nvfp4-projection-kernel row|warp|scale-group` available for comparison. It validates against a CPU dequantized reference and is the staging point for the Blackwell FP4 tensor-core projection kernel.
+- `--nvfp4-projection-kernel blackwell-fp4` is reserved for the native SM120 tensor-core path. For RTX 50 / SM120 the public native FP4 route is `mma.sync.aligned...kind::mxf4nvf4.block_scale`, not the SM100/103/110 `tcgen05` path. Do not treat a missing `tcgen05` SM120 opcode as a CUDA/hardware blocker. Build native SM120 experiments with `.\scripts\build.ps1 ... -CudaArchitectures 120a` or `120f`; plain `sm_120` is not sufficient for the architecture-specific MMA opcode. The measured fallback remains `scale-group` until a real SM120 MMA tile kernel replaces the current compile probe.
 - Blackwell/cuBLASLt FP4 availability and layout assumptions can be probed with:
   `.\build\qwen35x.exe --probe-nvfp4-cublaslt --hf-model-dir models/qwen3.5-0.8b-nvfp4-axionml --nvfp4-tensor model.language_model.layers.0.mlp.gate_proj`
   This probe uses the NVIDIA-documented padded/tiled 1D block-scale layout for FP4 scale tensors and the native projection orientation `input[1,K] x weight[rows,K]^T`. It remains diagnostic while the production path moves toward a reusable Blackwell FP4 projection backend.

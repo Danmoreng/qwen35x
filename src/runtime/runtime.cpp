@@ -358,6 +358,99 @@ bool run_nvfp4_gate_up_benchmark(
   return true;
 }
 
+bool run_nvfp4_projection_benchmark(
+  const Nvfp4ProjectionBenchOptions & options,
+  Nvfp4ProjectionBenchResult & result,
+  std::string & error_message) {
+  if (options.model_dir.empty()) {
+    error_message = "model_dir is required for custom NVFP4 projection benchmark.";
+    return false;
+  }
+  if (options.tensor_base_name.empty()) {
+    error_message = "tensor_base_name is required for custom NVFP4 projection benchmark.";
+    return false;
+  }
+  if (options.warmup_iterations < 0 || options.benchmark_iterations <= 0) {
+    error_message = "warmup_iterations must be >= 0 and benchmark_iterations must be > 0.";
+    return false;
+  }
+  int kernel_variant = 0;
+  if (options.kernel == "row") {
+    kernel_variant = 0;
+  } else if (options.kernel == "warp") {
+    kernel_variant = 1;
+  } else if (options.kernel == "scale-group") {
+    kernel_variant = 2;
+  } else if (options.kernel == "blackwell-fp4") {
+    kernel_variant = 3;
+  } else {
+    error_message = "unknown custom NVFP4 projection kernel: " + options.kernel + " (expected row|warp|scale-group|blackwell-fp4).";
+    return false;
+  }
+
+  SafetensorTensorInfo weight_info;
+  SafetensorTensorInfo scale_info;
+  std::vector<std::uint8_t> packed_weights;
+  std::vector<std::uint8_t> weight_scales;
+  if (!read_raw_tensor_from_model(options.model_dir, options.tensor_base_name + ".weight", "U8", weight_info, packed_weights, error_message) ||
+      !read_raw_tensor_from_model(options.model_dir, options.tensor_base_name + ".weight_scale", "F8_E4M3", scale_info, weight_scales, error_message)) {
+    return false;
+  }
+
+  SafetensorTensorF32 input_scale_tensor;
+  SafetensorTensorF32 weight_scale2_tensor;
+  if (!SafetensorLoader::read_tensor_f32(options.model_dir, options.tensor_base_name + ".input_scale", input_scale_tensor, error_message) ||
+      !SafetensorLoader::read_tensor_f32(options.model_dir, options.tensor_base_name + ".weight_scale_2", weight_scale2_tensor, error_message)) {
+    return false;
+  }
+  if (weight_info.shape.size() != 2 || scale_info.shape.size() != 2 ||
+      input_scale_tensor.data.size() != 1 || weight_scale2_tensor.data.size() != 1) {
+    error_message = "Invalid NVFP4 tensor family for custom projection benchmark.";
+    return false;
+  }
+
+  const int rows = static_cast<int>(weight_info.shape[0]);
+  const int cols = static_cast<int>(weight_info.shape[1] * 2);
+  const std::vector<std::int64_t> expected_scale_shape{weight_info.shape[0], cols / 16};
+  if (scale_info.shape != expected_scale_shape) {
+    error_message = "NVFP4 weight_scale shape does not match packed weight shape.";
+    return false;
+  }
+
+  double avg_ms = 0.0;
+  double max_abs_error = 0.0;
+  if (!cuda::run_nvfp4_custom_projection_benchmark(
+        packed_weights,
+        weight_scales,
+        input_scale_tensor.data[0],
+        weight_scale2_tensor.data[0],
+        rows,
+        cols,
+        kernel_variant,
+        options.warmup_iterations,
+        options.benchmark_iterations,
+        avg_ms,
+        max_abs_error,
+        error_message)) {
+    return false;
+  }
+
+  result.tensor_base_name = options.tensor_base_name;
+  result.kernel = options.kernel;
+  if (options.kernel == "blackwell-fp4") {
+    result.backend_note = "native SM120 mma.sync mxf4nvf4 block-scale path";
+  } else if (options.kernel == "scale-group") {
+    result.backend_note = "CUDA-core fallback; one thread processes one 16-value NVFP4 scale group";
+  }
+  result.packed_shape = weight_info.shape;
+  result.scale_shape = scale_info.shape;
+  result.source_shape = {weight_info.shape[0], weight_info.shape[1] * 2};
+  result.avg_iteration_ms = avg_ms;
+  result.iterations_per_second = 1000.0 / avg_ms;
+  result.max_abs_error = max_abs_error;
+  return true;
+}
+
 bool EngineRuntime::initialize(const ModelProfile & profile, const RuntimeTarget & target, std::string & error_message) {
   if (profile.family != "qwen3.5") {
     error_message = "Only qwen3.5 family is supported by this scaffold fast path.";

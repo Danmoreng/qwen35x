@@ -269,12 +269,14 @@ int main(int argc, char ** argv) {
   bool validate_nvfp4_model = false;
   bool check_nvfp4_tensor = false;
   bool probe_nvfp4_cublaslt = false;
+  bool bench_nvfp4_projection = false;
   bool bench_nvfp4_gate_up = false;
   bool infer_reference = false;
   bool infer_gpu = false;
   bool gpu_decode_backend_explicit = false;
   qwen35x::Bf16TensorBenchOptions bench_options;
   qwen35x::Nvfp4TensorCheckOptions nvfp4_check_options;
+  qwen35x::Nvfp4ProjectionBenchOptions nvfp4_projection_bench_options;
   qwen35x::Nvfp4GateUpBenchOptions nvfp4_gate_up_bench_options;
   qwen35x::ReferenceInferenceOptions infer_options;
 
@@ -286,6 +288,7 @@ int main(int argc, char ** argv) {
       hf_model_dir = argv[++i];
       bench_options.model_dir = hf_model_dir;
       nvfp4_check_options.model_dir = hf_model_dir;
+      nvfp4_projection_bench_options.model_dir = hf_model_dir;
       nvfp4_gate_up_bench_options.model_dir = hf_model_dir;
     } else if (arg == "--bench-bf16") {
       bench_bf16 = true;
@@ -295,6 +298,8 @@ int main(int argc, char ** argv) {
       check_nvfp4_tensor = true;
     } else if (arg == "--probe-nvfp4-cublaslt") {
       probe_nvfp4_cublaslt = true;
+    } else if (arg == "--bench-nvfp4-projection") {
+      bench_nvfp4_projection = true;
     } else if (arg == "--bench-nvfp4-gate-up") {
       bench_nvfp4_gate_up = true;
     } else if (arg == "--infer-reference") {
@@ -308,6 +313,9 @@ int main(int argc, char ** argv) {
       bench_options.tensor_name = argv[++i];
     } else if (arg == "--nvfp4-tensor" && i + 1 < argc) {
       nvfp4_check_options.tensor_base_name = argv[++i];
+      nvfp4_projection_bench_options.tensor_base_name = nvfp4_check_options.tensor_base_name;
+    } else if (arg == "--nvfp4-projection-kernel" && i + 1 < argc) {
+      nvfp4_projection_bench_options.kernel = argv[++i];
     } else if (arg == "--nvfp4-gate-tensor" && i + 1 < argc) {
       nvfp4_gate_up_bench_options.gate_tensor_base_name = argv[++i];
     } else if (arg == "--nvfp4-up-tensor" && i + 1 < argc) {
@@ -316,9 +324,11 @@ int main(int argc, char ** argv) {
       nvfp4_check_options.sample_rows = std::stoi(argv[++i]);
     } else if (arg == "--bench-warmup" && i + 1 < argc) {
       bench_options.warmup_iterations = std::stoi(argv[++i]);
+      nvfp4_projection_bench_options.warmup_iterations = bench_options.warmup_iterations;
       nvfp4_gate_up_bench_options.warmup_iterations = bench_options.warmup_iterations;
     } else if (arg == "--bench-iters" && i + 1 < argc) {
       bench_options.benchmark_iterations = std::stoi(argv[++i]);
+      nvfp4_projection_bench_options.benchmark_iterations = bench_options.benchmark_iterations;
       nvfp4_gate_up_bench_options.benchmark_iterations = bench_options.benchmark_iterations;
     } else if (arg == "--prompt-tokens" && i + 1 < argc) {
       prompt_tokens_csv = argv[++i];
@@ -416,6 +426,7 @@ int main(int argc, char ** argv) {
       std::cout << "       qwen35x --validate-nvfp4-model --hf-model-dir <path>\n";
       std::cout << "       qwen35x --check-nvfp4-tensor --hf-model-dir <path> [--nvfp4-tensor <base-name>] [--nvfp4-sample-rows <n>]\n";
       std::cout << "       qwen35x --probe-nvfp4-cublaslt --hf-model-dir <path> [--nvfp4-tensor <base-name>] [--nvfp4-sample-rows <n>]\n";
+      std::cout << "       qwen35x --bench-nvfp4-projection --hf-model-dir <path> [--nvfp4-tensor <base-name>] [--nvfp4-projection-kernel <row|warp|scale-group|blackwell-fp4>] [--bench-warmup <n>] [--bench-iters <n>]\n";
       std::cout << "       qwen35x --bench-nvfp4-gate-up --hf-model-dir <path> [--nvfp4-gate-tensor <base-name>] [--nvfp4-up-tensor <base-name>] [--bench-warmup <n>] [--bench-iters <n>]\n";
       std::cout << "       qwen35x --infer-reference --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "       qwen35x --infer-gpu --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
@@ -576,6 +587,56 @@ int main(int argc, char ** argv) {
     std::cout << "  elapsed_ms: " << result.elapsed_ms << "\n";
     std::cout << "  max_abs_expected: " << result.max_abs_expected << "\n";
     std::cout << "  max_abs_actual: " << result.max_abs_actual << "\n";
+    std::cout << "  max_abs_error: " << result.max_abs_error << "\n";
+    return 0;
+  }
+
+  if (bench_nvfp4_projection) {
+    if (nvfp4_projection_bench_options.model_dir.empty()) {
+      std::cerr << "custom NVFP4 projection benchmark failed: --hf-model-dir is required\n";
+      return 10;
+    }
+    std::string error_message;
+    qwen35x::Nvfp4ProjectionBenchResult result;
+    if (!qwen35x::run_nvfp4_projection_benchmark(nvfp4_projection_bench_options, result, error_message)) {
+      std::cerr << "custom NVFP4 projection benchmark failed: " << error_message << "\n";
+      return 10;
+    }
+
+    std::cout << "custom NVFP4 projection benchmark\n";
+    std::cout << "  tensor_base: " << result.tensor_base_name << "\n";
+    std::cout << "  kernel: " << result.kernel << "\n";
+    if (!result.backend_note.empty()) {
+      std::cout << "  backend_note: " << result.backend_note << "\n";
+    }
+    std::cout << "  source_shape: ";
+    for (std::size_t i = 0; i < result.source_shape.size(); ++i) {
+      if (i > 0) {
+        std::cout << "x";
+      }
+      std::cout << result.source_shape[i];
+    }
+    std::cout << "\n";
+    std::cout << "  packed_shape: ";
+    for (std::size_t i = 0; i < result.packed_shape.size(); ++i) {
+      if (i > 0) {
+        std::cout << "x";
+      }
+      std::cout << result.packed_shape[i];
+    }
+    std::cout << "\n";
+    std::cout << "  scale_shape: ";
+    for (std::size_t i = 0; i < result.scale_shape.size(); ++i) {
+      if (i > 0) {
+        std::cout << "x";
+      }
+      std::cout << result.scale_shape[i];
+    }
+    std::cout << "\n";
+    std::cout << "  warmup_iterations: " << nvfp4_projection_bench_options.warmup_iterations << "\n";
+    std::cout << "  benchmark_iterations: " << nvfp4_projection_bench_options.benchmark_iterations << "\n";
+    std::cout << "  avg_iteration_ms: " << result.avg_iteration_ms << "\n";
+    std::cout << "  iterations_per_second: " << result.iterations_per_second << "\n";
     std::cout << "  max_abs_error: " << result.max_abs_error << "\n";
     return 0;
   }
