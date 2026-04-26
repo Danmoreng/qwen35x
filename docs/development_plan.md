@@ -312,6 +312,35 @@ Adaptation approach:
 - Generate per-model/per-GPU tuning profiles for decode blocks, block size, LM head tiling, prefill chunk size, cuBLASLt algorithms, and graph capture boundaries.
 - Store and reuse tuned profiles per `(model_variant, sm)` instead of relying on a single global default.
 
+## NVFP4 and Quantized Cache Objective
+
+The BF16 Qwen35x CUDA path remains the stable default. NVFP4 work should be added as duplicate, opt-in kernel paths rather than by adding heavy precision conditionals inside the current BF16 kernels.
+
+Precision rollout:
+1. `BF16 weights + BF16 KV cache`
+- Current production path.
+- Must remain behaviorally stable and performance-compatible while quantized work lands.
+
+2. `NVFP4 weights + BF16 KV cache`
+- First quantized target.
+- Add separate NVFP4 weight artifacts, packed weight structs, launchers, and decode kernels.
+- Reuse the current BF16 KV cache layout so cache correctness and weight quantization are not debugged at the same time.
+
+3. `NVFP4 weights + quantized KV cache`
+- Second quantized target after weight-only decode is validated.
+- Add a separate quantized cache layout with scale metadata, prefill cache writes, and decode cache reads/dequantization.
+- Keep BF16 KV as an available fallback.
+
+Kernel and dispatch policy:
+- Dispatch by `(model_variant, weight_precision, cache_precision, sm)` through the variant/registry path.
+- Use separate launchers such as BF16 decode and NVFP4 decode instead of mutating the BF16 kernel with many runtime branches.
+- Shared helper code can be factored, but BF16 kernels should stay simple and low-risk.
+
+Validation policy:
+- BF16 remains token-exact against CPU reference for greedy parity gates.
+- NVFP4 should start with token parity where possible, then add logit/hidden error thresholds and quality smoke prompts if token-exact parity is too strict.
+- Every quantized promotion needs side-by-side BF16 fallback runs and benchmark CSVs for both prefill and decode.
+
 Validation policy for each new size:
 - CPU/GPU token-level parity checks.
 - Long-prompt prefill and decode throughput benchmarks.
@@ -353,6 +382,21 @@ Validation policy for each new size:
 - [x] Add first-pass prefill chunking for larger prompt/model shapes while preserving the canonical prefill/decode cache layout.
 - [ ] Make prefill chunking descriptor-driven and move tuning defaults into per-model/per-GPU profiles.
 - [ ] Add per-model/per-GPU autotune profiles (decode blocks, block size, LM head tiling, chunk sizes, graph boundaries).
+- [ ] Add explicit Qwen35x CUDA precision/cache mode plumbing: `weight_precision={bf16,nvfp4}` and `cache_precision={bf16,quantized}`, defaulting to `bf16/bf16`.
+- [ ] Add fail-fast diagnostics for unsupported `nvfp4` and quantized-cache modes until kernels and artifacts exist.
+- [ ] Include weight/cache precision labels in CLI output, profile JSON, benchmark CSVs, and Qwen35x runtime diagnostics.
+- [ ] Define the NVFP4 quantized weight artifact format, including packed data layout, scale layout, group/block size, tensor naming, and descriptor validation rules.
+- [ ] Add an offline or build-time converter that produces NVFP4 artifacts from BF16 safetensors without modifying the BF16 model directory.
+- [ ] Add Qwen35x CUDA loader support for NVFP4 artifacts while preserving the current BF16 loader and shape-validation path.
+- [ ] Add duplicated NVFP4 weight structs and launchers for the 0.8B decode path with BF16 KV cache.
+- [ ] Implement the first NVFP4 decode matvec path for a narrow projection class and keep all unsupported projections on BF16 or fail clearly.
+- [ ] Expand NVFP4 decode coverage across full-attention, DeltaNet, MLP, embedding/LM-head as separate measured steps.
+- [ ] Validate `NVFP4 weights + BF16 KV cache` with parity/error-threshold tests and short/medium/long decode benchmarks.
+- [ ] Add NVFP4 prefill support after decode-only weight quantization is validated, preferably through cuBLASLt FP4/NVFP4 GEMM where available or a measured custom fallback.
+- [ ] Define the quantized KV cache ABI: storage type, per-head/per-block scale metadata, cache strides, and descriptor-derived allocation sizes.
+- [ ] Add quantized full-attention cache writes in prefill/decode and matching decode-side dequantized reads.
+- [ ] Validate `NVFP4 weights + quantized KV cache` as a separate opt-in mode against BF16 KV fallback before promotion.
+- [ ] Add memory-accounting and benchmark reporting for BF16 weights, NVFP4 weights/scales, BF16 KV, quantized KV/scales, recurrent state, and prefill scratch.
 - [x] Establish deterministic CPU vs GPU parity harness + fixed prompt suites (`scripts/benchmark-parity.ps1`, minimal + extended prompt sets). Latest baseline (April 24, 2026): batched Qwen35x prefill passes minimal `5/5` and extended `12/12`.
 - [x] Add optional PyTorch/Transformers parity harness (`scripts/benchmark-transformers-parity.ps1`) to validate tokenizer, prompt formatting, and greedy CPU-reference output against an external implementation. Latest baseline (April 24, 2026): minimal `5/5` pass.
 - [x] Run CPU vs GPU token-parity validation for the Qwen35x CUDA default integration and source move.
