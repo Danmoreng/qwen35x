@@ -421,6 +421,8 @@ struct BackendState {
   float * fp4_projection_input_f32 = nullptr;
   std::uint8_t * fp4_activation = nullptr;
   std::uint8_t * fp4_activation_scales = nullptr;
+  std::uint32_t * sm120_activation_fragments = nullptr;
+  std::uint32_t * sm120_activation_scales = nullptr;
   float * fp4_projection_output_f32 = nullptr;
   int prefill_mlp_chunk_tokens = 0;
   int prefill_attention_query_tokens = 0;
@@ -1313,9 +1315,12 @@ bool initialize_backend_state(
     descriptor_dn_v_size(descriptor),
     descriptor.dn_gate_heads
   });
+  const int max_sm120_k_blocks = (max_fp4_input + 63) / 64;
   if (!arena.alloc_bytes(static_cast<std::size_t>(max_fp4_input) * f32_bytes, reinterpret_cast<void *&>(state.fp4_projection_input_f32), error_message) ||
       !arena.alloc_bytes(static_cast<std::size_t>(max_fp4_input / 2), reinterpret_cast<void *&>(state.fp4_activation), error_message) ||
       !arena.alloc_bytes(nvfp4_tiled_scale_bytes(1, max_fp4_input), reinterpret_cast<void *&>(state.fp4_activation_scales), error_message) ||
+      !arena.alloc_bytes(static_cast<std::size_t>(max_sm120_k_blocks) * 32 * 4 * sizeof(std::uint32_t), reinterpret_cast<void *&>(state.sm120_activation_fragments), error_message) ||
+      !arena.alloc_bytes(static_cast<std::size_t>(max_sm120_k_blocks) * 32 * sizeof(std::uint32_t), reinterpret_cast<void *&>(state.sm120_activation_scales), error_message) ||
       !arena.alloc_bytes(static_cast<std::size_t>(max_fp4_output) * f32_bytes, reinterpret_cast<void *&>(state.fp4_projection_output_f32), error_message)) {
     return false;
   }
@@ -1981,25 +1986,27 @@ bool run_decode_step_impl(
       nvfp4_state != nullptr &&
       !nvfp4_state->tensors.empty()) {
     const auto & tensor = nvfp4_state->tensors.front();
-    float weight_scale_2 = 0.0f;
+    float input_scale = 0.0f;
     double elapsed_ms = 0.0;
     if (!check_cuda(
-          cudaMemcpy(&weight_scale_2, tensor.weight_scale_2, sizeof(float), cudaMemcpyDeviceToHost),
-          "cudaMemcpy(D2H dry-run fp4 projection weight_scale_2)",
+          cudaMemcpy(&input_scale, tensor.input_scale, sizeof(float), cudaMemcpyDeviceToHost),
+          "cudaMemcpy(D2H dry-run sm120 projection input_scale)",
           error_message) ||
-        !qwen35x::cuda::run_nvfp4_cublaslt_projection_device(
+        !qwen35x::cuda::run_nvfp4_sm120_projection_device(
           static_cast<const float *>(state.g_normalized),
-          static_cast<const std::uint8_t *>(tensor.tc_packed_weight),
-          static_cast<const std::uint8_t *>(tensor.tc_weight_scale),
-          weight_scale_2,
+          static_cast<const std::uint32_t *>(tensor.sm120_packed_weight_fragments),
+          static_cast<const std::uint32_t *>(tensor.sm120_weight_scale_fragments),
+          input_scale,
           tensor.output_size,
           tensor.input_size,
-          state.fp4_activation,
-          state.fp4_activation_scales,
+          tensor.sm120_row_tiles,
+          tensor.sm120_k_blocks,
+          state.sm120_activation_fragments,
+          state.sm120_activation_scales,
           state.fp4_projection_output_f32,
           &elapsed_ms,
           error_message)) {
-      error_message = "dry-run decode FP4 projection failed: " + error_message;
+      error_message = "dry-run decode SM120 FP4 projection failed: " + error_message;
       return false;
     }
   }
