@@ -2,6 +2,7 @@
 #include "qwen35x/runtime/reference_inference.h"
 #include "qwen35x/runtime/runtime.h"
 #include "qwen35x/tokenizer/tokenizer.h"
+#include "qwen35x/weights/modelopt_nvfp4.h"
 
 #include <algorithm>
 #include <fstream>
@@ -265,6 +266,7 @@ int main(int argc, char ** argv) {
   std::string profile_json_path;
   qwen35x::RuntimeTarget target;
   bool bench_bf16 = false;
+  bool validate_nvfp4_model = false;
   bool infer_reference = false;
   bool infer_gpu = false;
   bool gpu_decode_backend_explicit = false;
@@ -280,6 +282,8 @@ int main(int argc, char ** argv) {
       bench_options.model_dir = hf_model_dir;
     } else if (arg == "--bench-bf16") {
       bench_bf16 = true;
+    } else if (arg == "--validate-nvfp4-model") {
+      validate_nvfp4_model = true;
     } else if (arg == "--infer-reference") {
       infer_reference = true;
     } else if (arg == "--infer-gpu") {
@@ -386,6 +390,7 @@ int main(int argc, char ** argv) {
     } else if (arg == "--help") {
       std::cout << "usage: qwen35x [--profile <json>] [--hf-model-dir <path>] [--sm <int>] [--cpu]\n";
       std::cout << "       qwen35x --bench-bf16 --hf-model-dir <path> [--bench-tensor <name>] [--bench-warmup <n>] [--bench-iters <n>]\n";
+      std::cout << "       qwen35x --validate-nvfp4-model --hf-model-dir <path>\n";
       std::cout << "       qwen35x --infer-reference --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "       qwen35x --infer-gpu --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "               [--temperature <float>] [--top-p <float>] [--top-k <int>] [--repeat-penalty <float>] [--seed <int64>]\n";
@@ -427,6 +432,38 @@ int main(int argc, char ** argv) {
     std::cout << "  avg iteration: " << bench_result.avg_iteration_ms << " ms\n";
     std::cout << "  matvec/s: " << bench_result.matvec_per_second << "\n";
     std::cout << "  effective gflops: " << bench_result.gflops << "\n";
+    return 0;
+  }
+
+  if (validate_nvfp4_model) {
+    if (hf_model_dir.empty()) {
+      std::cerr << "NVFP4 model validation failed: --hf-model-dir is required\n";
+      return 10;
+    }
+
+    std::string error_message;
+    auto profile = qwen35x::ProfileLoader::load_from_hf_directory(hf_model_dir, error_message);
+    if (!profile) {
+      std::cerr << "NVFP4 model validation failed: " << error_message << "\n";
+      return 10;
+    }
+
+    qwen35x::ModelOptNvfp4ValidationOptions options;
+    options.model_dir = hf_model_dir;
+    qwen35x::ModelOptNvfp4ValidationResult result;
+    if (!qwen35x::validate_modelopt_nvfp4_checkpoint(*profile, options, result, error_message)) {
+      std::cerr << "NVFP4 model validation failed: " << error_message << "\n";
+      return 10;
+    }
+
+    std::cout << "ModelOpt NVFP4 validation passed\n";
+    std::cout << "  model_dir: " << hf_model_dir << "\n";
+    std::cout << "  group_size: " << result.group_size << "\n";
+    std::cout << "  quantized_modules: " << result.quantized_tensors << "\n";
+    std::cout << "  packed_u8_tensors: " << result.packed_u8_tensors << "\n";
+    std::cout << "  fp8_scale_tensors: " << result.fp8_scale_tensors << "\n";
+    std::cout << "  f32_input_scale_tensors: " << result.f32_input_scale_tensors << "\n";
+    std::cout << "  f32_weight_scale2_tensors: " << result.f32_weight_scale2_tensors << "\n";
     return 0;
   }
 

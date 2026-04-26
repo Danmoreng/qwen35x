@@ -387,7 +387,8 @@ Validation policy for each new size:
 - [x] Include weight/cache precision labels in CLI output, profile JSON, benchmark CSVs, and Qwen35x runtime diagnostics.
   Current status: `--qwen35x-weight-precision bf16` and `--qwen35x-cache-precision bf16` are the default supported path. `nvfp4` and `quantized` are accepted as explicit modes but fail during Qwen35x CUDA backend initialization until the duplicate kernels, artifacts, and cache ABI are implemented.
 - [ ] Use the AxionML/ModelOpt NVFP4 checkpoints as the canonical quantized artifact source instead of local max-abs conversion.
-- [ ] Document the AxionML safetensors tensor naming, packed payload dtype, FP8 scale tensors, and per-tensor shape rules for 0.8B and 4B.
+- [x] Document the AxionML safetensors tensor naming, packed payload dtype, FP8 scale tensors, and per-tensor shape rules for 0.8B and 4B.
+  Current status: `--validate-nvfp4-model` checks ModelOpt `hf_quant_config.json`, group size 16, null KV-cache quantization, `U8` packed `.weight` tensors shaped `[rows, cols / 2]`, `F8_E4M3` `.weight_scale` tensors shaped `[rows, cols / 16]`, and scalar `F32` `.input_scale` / `.weight_scale_2` tensors. The downloaded AxionML 0.8B checkpoint validates 186 quantized modules.
 - [ ] Add Qwen35x CUDA loader support for AxionML/ModelOpt NVFP4 safetensors while preserving the current BF16 loader and shape-validation path.
 - [ ] Add duplicated NVFP4 weight structs and launchers for the 0.8B decode path with BF16 KV cache.
 - [ ] Implement the first NVFP4 decode matvec path for a narrow projection class and keep all unsupported projections on BF16 or fail clearly.

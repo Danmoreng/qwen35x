@@ -49,6 +49,8 @@ Current Qwen35x prefill behavior:
 Current Qwen35x precision behavior:
 - `--qwen35x-weight-precision bf16` and `--qwen35x-cache-precision bf16` are the stable default path.
 - `--qwen35x-weight-precision nvfp4` and `--qwen35x-cache-precision quantized` are reserved for the upcoming quantized paths and currently fail fast with a clear unsupported-mode diagnostic.
+- AxionML/ModelOpt NVFP4 checkpoint layout can be checked before CUDA loading with:
+  `.\build\qwen35x.exe --validate-nvfp4-model --hf-model-dir models/qwen3.5-0.8b-nvfp4-axionml`
 
 Current decode control behavior:
 - The default Qwen35x CUDA path returns the selected token id each step and performs stop checks on the host.

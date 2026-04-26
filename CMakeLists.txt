@@ -34,6 +34,7 @@ add_library(qwen35x_core
   src/runtime/reference_inference.cpp
   src/runtime/runtime.cpp
   src/tokenizer/tokenizer.cpp
+  src/weights/modelopt_nvfp4.cpp
   src/weights/safetensors.cpp
 )
 
