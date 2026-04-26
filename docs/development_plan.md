@@ -389,7 +389,8 @@ Validation policy for each new size:
 - [ ] Use the AxionML/ModelOpt NVFP4 checkpoints as the canonical quantized artifact source instead of local max-abs conversion.
 - [x] Document the AxionML safetensors tensor naming, packed payload dtype, FP8 scale tensors, and per-tensor shape rules for 0.8B and 4B.
   Current status: `--validate-nvfp4-model` checks ModelOpt `hf_quant_config.json`, group size 16, null KV-cache quantization, `U8` packed `.weight` tensors shaped `[rows, cols / 2]`, `F8_E4M3` `.weight_scale` tensors shaped `[rows, cols / 16]`, and scalar `F32` `.input_scale` / `.weight_scale_2` tensors. The downloaded AxionML 0.8B checkpoint validates 186 quantized modules.
-- [ ] Add Qwen35x CUDA loader support for AxionML/ModelOpt NVFP4 safetensors while preserving the current BF16 loader and shape-validation path.
+- [x] Add Qwen35x CUDA loader support for AxionML/ModelOpt NVFP4 safetensors while preserving the current BF16 loader and shape-validation path.
+  Current status: `--qwen35x-weight-precision nvfp4` validates and uploads ModelOpt `U8` packed weights, `F8_E4M3` weight scales, and scalar `F32` input/secondary scales, then stops with the expected "NVFP4 kernels are not implemented yet" diagnostic.
 - [ ] Add duplicated NVFP4 weight structs and launchers for the 0.8B decode path with BF16 KV cache.
 - [ ] Implement the first NVFP4 decode matvec path for a narrow projection class and keep all unsupported projections on BF16 or fail clearly.
 - [ ] Expand NVFP4 decode coverage across full-attention, DeltaNet, MLP, embedding/LM-head as separate measured steps.

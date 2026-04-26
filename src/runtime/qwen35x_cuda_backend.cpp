@@ -2,6 +2,7 @@
 
 #include "qwen35x/compiler/compiler.h"
 #include "qwen35x/weights/safetensors.h"
+#include "qwen35x/weights/modelopt_nvfp4.h"
 
 #if QWEN35X_HAS_CUDA
 #include <cuda_runtime.h>
@@ -12,6 +13,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <utility>
 
@@ -393,6 +395,17 @@ struct BackendState {
   int prefill_attention_query_tokens = 0;
 };
 
+struct Nvfp4TensorDevice {
+  void * packed_weight = nullptr;
+  void * weight_scale = nullptr;
+  float * input_scale = nullptr;
+  float * weight_scale_2 = nullptr;
+};
+
+struct Nvfp4BackendState {
+  std::vector<Nvfp4TensorDevice> tensors;
+};
+
 bool check_cuda(cudaError_t status, const std::string & label, std::string & error_message) {
   if (status == cudaSuccess) {
     return true;
@@ -535,6 +548,114 @@ bool load_bf16_tensor_to_device(
     error_message = "None of the candidate tensors were found.";
   }
   return false;
+}
+
+bool read_raw_tensor_bytes(
+  const std::string & safetensors_file,
+  const qwen35x::SafetensorTensorInfo & info,
+  std::vector<std::uint8_t> & out_data,
+  std::string & error_message) {
+  const std::uint64_t byte_count = info.data_end - info.data_start;
+  out_data.resize(static_cast<std::size_t>(byte_count));
+  std::ifstream in(safetensors_file, std::ios::binary);
+  if (!in) {
+    error_message = "Could not open safetensors shard: " + safetensors_file;
+    return false;
+  }
+  in.seekg(static_cast<std::streamoff>(info.data_start), std::ios::beg);
+  if (!in) {
+    error_message = "Failed to seek tensor '" + info.name + "' in shard.";
+    return false;
+  }
+  in.read(reinterpret_cast<char *>(out_data.data()), static_cast<std::streamsize>(out_data.size()));
+  if (!in) {
+    error_message = "Failed to read tensor '" + info.name + "' from shard.";
+    return false;
+  }
+  return true;
+}
+
+bool load_tensor_info_from_model_dir(
+  const std::string & model_dir,
+  const std::string & tensor_name,
+  std::string & tensor_file,
+  qwen35x::SafetensorTensorInfo & info,
+  std::string & error_message) {
+  if (!qwen35x::SafetensorLoader::resolve_tensor_file(model_dir, tensor_name, tensor_file, error_message)) {
+    return false;
+  }
+  return qwen35x::SafetensorLoader::load_tensor_info(tensor_file, tensor_name, info, error_message);
+}
+
+bool load_raw_tensor_to_device(
+  const std::string & model_dir,
+  const std::string & tensor_name,
+  const std::string & expected_dtype,
+  const std::vector<std::int64_t> & expected_shape,
+  DeviceArena & arena,
+  void *& out_device_ptr,
+  std::string & error_message) {
+  std::string tensor_file;
+  qwen35x::SafetensorTensorInfo info;
+  if (!load_tensor_info_from_model_dir(model_dir, tensor_name, tensor_file, info, error_message)) {
+    return false;
+  }
+  if (info.dtype != expected_dtype) {
+    error_message = "Tensor '" + tensor_name + "' has dtype " + info.dtype + " (expected " + expected_dtype + ").";
+    return false;
+  }
+  if (info.shape != expected_shape) {
+    auto shape_to_string = [](const std::vector<std::int64_t> & shape) {
+      std::string out = "[";
+      for (std::size_t i = 0; i < shape.size(); ++i) {
+        if (i > 0) {
+          out += ",";
+        }
+        out += std::to_string(shape[i]);
+      }
+      out += "]";
+      return out;
+    };
+    error_message =
+      "Tensor '" + tensor_name + "' shape mismatch: expected " + shape_to_string(expected_shape) +
+      " actual " + shape_to_string(info.shape) + ".";
+    return false;
+  }
+
+  std::vector<std::uint8_t> host_data;
+  if (!read_raw_tensor_bytes(tensor_file, info, host_data, error_message)) {
+    return false;
+  }
+  if (!arena.alloc_bytes(host_data.size(), out_device_ptr, error_message)) {
+    return false;
+  }
+  return check_cuda(
+    cudaMemcpy(out_device_ptr, host_data.data(), host_data.size(), cudaMemcpyHostToDevice),
+    "cudaMemcpy(H2D raw " + tensor_name + ")",
+    error_message);
+}
+
+bool load_scalar_f32_to_device(
+  const std::string & model_dir,
+  const std::string & tensor_name,
+  DeviceArena & arena,
+  float *& out_device_ptr,
+  std::string & error_message) {
+  qwen35x::SafetensorTensorF32 tensor;
+  if (!qwen35x::SafetensorLoader::read_tensor_f32(model_dir, tensor_name, tensor, error_message)) {
+    return false;
+  }
+  if (tensor.dtype != "F32" || !tensor.shape.empty() || tensor.data.size() != 1) {
+    error_message = "Tensor '" + tensor_name + "' must be scalar F32.";
+    return false;
+  }
+  if (!arena.alloc_bytes(sizeof(float), reinterpret_cast<void *&>(out_device_ptr), error_message)) {
+    return false;
+  }
+  return check_cuda(
+    cudaMemcpy(out_device_ptr, tensor.data.data(), sizeof(float), cudaMemcpyHostToDevice),
+    "cudaMemcpy(H2D scalar " + tensor_name + ")",
+    error_message);
 }
 
 bool alloc_and_zero(DeviceArena & arena, std::size_t bytes, void *& out_ptr, const std::string & label, std::string & error_message) {
@@ -920,6 +1041,106 @@ bool initialize_backend_state(
   return true;
 }
 
+std::vector<std::pair<std::string, std::vector<std::int64_t>>> expected_nvfp4_module_shapes(const Qwen35xModelDescriptor & descriptor) {
+  std::vector<std::pair<std::string, std::vector<std::int64_t>>> modules;
+  const std::int64_t hidden = descriptor.hidden_size;
+  const std::int64_t intermediate = descriptor.intermediate_size;
+  const std::int64_t full_q_out = descriptor_fa_q_size(descriptor);
+  const std::int64_t full_qproj_out = descriptor_fa_qproj_size(descriptor);
+  const std::int64_t full_kv_out = descriptor_fa_kv_size(descriptor);
+  const std::int64_t linear_conv_channels = descriptor_dn_conv_channels(descriptor);
+  const std::int64_t linear_v_dim = descriptor_dn_v_size(descriptor);
+
+  for (int layer_idx = 0; layer_idx < descriptor.num_layers; ++layer_idx) {
+    const std::string base = "model.language_model.layers." + std::to_string(layer_idx) + ".";
+    modules.push_back({base + "mlp.gate_proj", {intermediate, hidden}});
+    modules.push_back({base + "mlp.up_proj", {intermediate, hidden}});
+    modules.push_back({base + "mlp.down_proj", {hidden, intermediate}});
+
+    const int layer_type = descriptor.layer_type[static_cast<std::size_t>(layer_idx)];
+    if (layer_type == 0) {
+      modules.push_back({base + "linear_attn.in_proj_qkv", {linear_conv_channels, hidden}});
+      modules.push_back({base + "linear_attn.in_proj_z", {linear_v_dim, hidden}});
+      modules.push_back({base + "linear_attn.in_proj_b", {descriptor.dn_gate_heads, hidden}});
+      modules.push_back({base + "linear_attn.in_proj_a", {descriptor.dn_gate_heads, hidden}});
+      modules.push_back({base + "linear_attn.out_proj", {hidden, linear_v_dim}});
+    } else {
+      modules.push_back({base + "self_attn.q_proj", {full_qproj_out, hidden}});
+      modules.push_back({base + "self_attn.k_proj", {full_kv_out, hidden}});
+      modules.push_back({base + "self_attn.v_proj", {full_kv_out, hidden}});
+      modules.push_back({base + "self_attn.o_proj", {hidden, full_q_out}});
+    }
+  }
+  return modules;
+}
+
+bool load_modelopt_nvfp4_state(
+  const Qwen35xModelDescriptor & descriptor,
+  const Qwen35xCudaBackendConfig & config,
+  DeviceArena & arena,
+  Nvfp4BackendState & state,
+  std::string & error_message) {
+  std::string profile_error;
+  const auto profile = qwen35x::ProfileLoader::load_from_hf_directory(config.model_dir, profile_error);
+  if (!profile) {
+    error_message = "failed to load model profile for ModelOpt NVFP4 validation: " + profile_error;
+    return false;
+  }
+  qwen35x::ModelOptNvfp4ValidationOptions validation_options;
+  validation_options.model_dir = config.model_dir;
+  qwen35x::ModelOptNvfp4ValidationResult validation_result;
+  if (!qwen35x::validate_modelopt_nvfp4_checkpoint(*profile, validation_options, validation_result, error_message)) {
+    return false;
+  }
+
+  constexpr std::int64_t group_size = 16;
+  const auto modules = expected_nvfp4_module_shapes(descriptor);
+  state.tensors.clear();
+  state.tensors.reserve(modules.size());
+  for (const auto & module : modules) {
+    const std::string & base_name = module.first;
+    const auto & source_shape = module.second;
+    if (source_shape.size() != 2 || (source_shape[1] % group_size) != 0) {
+      error_message = "Invalid source shape for ModelOpt NVFP4 module '" + base_name + "'.";
+      return false;
+    }
+
+    const std::vector<std::int64_t> packed_shape{source_shape[0], source_shape[1] / 2};
+    const std::vector<std::int64_t> scale_shape{source_shape[0], source_shape[1] / group_size};
+    Nvfp4TensorDevice device_tensor;
+    if (!load_raw_tensor_to_device(
+          config.model_dir,
+          base_name + ".weight",
+          "U8",
+          packed_shape,
+          arena,
+          device_tensor.packed_weight,
+          error_message) ||
+        !load_raw_tensor_to_device(
+          config.model_dir,
+          base_name + ".weight_scale",
+          "F8_E4M3",
+          scale_shape,
+          arena,
+          device_tensor.weight_scale,
+          error_message) ||
+        !load_scalar_f32_to_device(config.model_dir, base_name + ".input_scale", arena, device_tensor.input_scale, error_message) ||
+        !load_scalar_f32_to_device(config.model_dir, base_name + ".weight_scale_2", arena, device_tensor.weight_scale_2, error_message)) {
+      error_message = "ModelOpt NVFP4 load failed for '" + base_name + "': " + error_message;
+      return false;
+    }
+    state.tensors.push_back(device_tensor);
+  }
+
+  if (static_cast<int>(state.tensors.size()) != validation_result.quantized_tensors) {
+    error_message =
+      "ModelOpt NVFP4 loaded tensor count mismatch: loaded " + std::to_string(state.tensors.size()) +
+      " validation reported " + std::to_string(validation_result.quantized_tensors) + ".";
+    return false;
+  }
+  return true;
+}
+
 bool reset_state(const Qwen35xModelDescriptor & descriptor, const BackendState & state, int max_seq_len, std::string & error_message) {
   const int n_full_layers = descriptor_full_layer_count(descriptor);
   const int n_delta_layers = descriptor_delta_layer_count(descriptor);
@@ -1191,6 +1412,7 @@ struct Qwen35xCudaBackend::Impl {
   const VariantDescriptor * variant = nullptr;
   DeviceArena arena;
   BackendState state;
+  Nvfp4BackendState nvfp4_state;
   Qwen35xRuntimeProfile profile;
   bool initialized = false;
 };
@@ -1216,12 +1438,6 @@ bool Qwen35xCudaBackend::initialize(const Qwen35xCudaBackendConfig & config, std
     error_message = "repetition_penalty must be >= 1.0.";
     return false;
   }
-  if (config.weight_precision != Qwen35xWeightPrecision::bf16) {
-    error_message =
-      "Qwen35x CUDA weight precision '" + std::string(to_string(config.weight_precision)) +
-      "' is not implemented yet; supported weight_precision=bf16.";
-    return false;
-  }
   if (config.cache_precision != Qwen35xCachePrecision::bf16) {
     error_message =
       "Qwen35x CUDA cache precision '" + std::string(to_string(config.cache_precision)) +
@@ -1242,6 +1458,24 @@ bool Qwen35xCudaBackend::initialize(const Qwen35xCudaBackendConfig & config, std
   impl_->descriptor = descriptor;
   impl_->variant = variant;
   variant->set_decode_blocks_override(config.decode_blocks);
+
+  if (config.weight_precision == Qwen35xWeightPrecision::nvfp4) {
+    if (!load_modelopt_nvfp4_state(impl_->descriptor, config, impl_->arena, impl_->nvfp4_state, error_message)) {
+      impl_ = std::make_unique<Impl>();
+      return false;
+    }
+    error_message =
+      "Qwen35x CUDA weight precision 'nvfp4' checkpoint loaded successfully, but NVFP4 kernels are not implemented yet.";
+    impl_ = std::make_unique<Impl>();
+    return false;
+  }
+  if (config.weight_precision != Qwen35xWeightPrecision::bf16) {
+    error_message =
+      "Qwen35x CUDA weight precision '" + std::string(to_string(config.weight_precision)) +
+      "' is not implemented yet; supported weight_precision=bf16.";
+    impl_ = std::make_unique<Impl>();
+    return false;
+  }
 
   if (!initialize_backend_state(impl_->descriptor, *variant, config, impl_->arena, impl_->state, error_message)) {
     impl_ = std::make_unique<Impl>();
