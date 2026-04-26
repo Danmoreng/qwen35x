@@ -65,7 +65,7 @@ decode_kernel(
                 g_residual, g_activations, g_qkv_scratch, g_z_scratch,
                 g_beta_scratch, g_alpha_scratch, g_attn_out, g_mlp_inter,
                 dn_states + dn_layer_idx * dn_state_stride,
-                conv_bufs, hidden_buffer, dn_layer_idx, shmem_bf16);
+                conv_bufs, hidden_buffer, dn_layer_idx, shmem_bf16, false);
             dn_layer_idx++;
         } else {
             full_attention_layer(
@@ -76,7 +76,7 @@ decode_kernel(
                 fa_v_cache + fa_layer_idx * fa_kv_stride,
                 g_residual, g_activations, g_qkv_scratch, g_kv_scratch,
                 g_attn_out, g_attn_partials, g_mlp_inter, hidden_buffer,
-                position, max_seq_len, shmem_bf16);
+                position, max_seq_len, shmem_bf16, false);
             fa_layer_idx++;
         }
     }

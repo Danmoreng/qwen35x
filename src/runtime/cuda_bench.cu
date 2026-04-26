@@ -1391,6 +1391,101 @@ bool run_nvfp4_sm120_mlp_residual_device(
   return true;
 }
 
+bool run_nvfp4_scalar_mlp_residual_device(
+  const float * input_f32,
+  const std::uint8_t * gate_packed_weight,
+  const std::uint8_t * gate_weight_scale,
+  float gate_input_scale,
+  float gate_weight_scale_2,
+  const std::uint8_t * up_packed_weight,
+  const std::uint8_t * up_weight_scale,
+  float up_input_scale,
+  float up_weight_scale_2,
+  const std::uint8_t * down_packed_weight,
+  const std::uint8_t * down_weight_scale,
+  float down_input_scale,
+  float down_weight_scale_2,
+  int intermediate_rows,
+  int hidden_cols,
+  int down_rows,
+  int down_cols,
+  float * gate_silu_output_f32,
+  float * up_output_f32,
+  float * down_output_f32,
+  const void * residual_bf16,
+  void * hidden_out_bf16,
+  std::string & error_message) {
+  if (input_f32 == nullptr || gate_packed_weight == nullptr || gate_weight_scale == nullptr ||
+      up_packed_weight == nullptr || up_weight_scale == nullptr ||
+      down_packed_weight == nullptr || down_weight_scale == nullptr ||
+      gate_silu_output_f32 == nullptr || up_output_f32 == nullptr || down_output_f32 == nullptr ||
+      residual_bf16 == nullptr || hidden_out_bf16 == nullptr) {
+    error_message = "scalar NVFP4 MLP residual path received a null pointer.";
+    return false;
+  }
+  if (intermediate_rows <= 0 || hidden_cols <= 0 || down_rows <= 0 || down_cols != intermediate_rows ||
+      (hidden_cols % 16) != 0 || (down_cols % 16) != 0) {
+    error_message = "Invalid scalar NVFP4 MLP residual dimensions.";
+    return false;
+  }
+
+  constexpr int block_size = 256;
+  nvfp4_projection_scale_group_kernel<<<intermediate_rows, block_size>>>(
+    gate_packed_weight,
+    gate_weight_scale,
+    input_f32,
+    gate_input_scale,
+    gate_weight_scale_2,
+    gate_silu_output_f32,
+    intermediate_rows,
+    hidden_cols);
+  if (!check_cuda(cudaGetLastError(), "launch scalar NVFP4 gate projection", error_message)) {
+    return false;
+  }
+  nvfp4_projection_scale_group_kernel<<<intermediate_rows, block_size>>>(
+    up_packed_weight,
+    up_weight_scale,
+    input_f32,
+    up_input_scale,
+    up_weight_scale_2,
+    up_output_f32,
+    intermediate_rows,
+    hidden_cols);
+  if (!check_cuda(cudaGetLastError(), "launch scalar NVFP4 up projection", error_message)) {
+    return false;
+  }
+
+  const int intermediate_grid = (intermediate_rows + block_size - 1) / block_size;
+  silu_multiply_kernel<<<intermediate_grid, block_size>>>(gate_silu_output_f32, up_output_f32, gate_silu_output_f32, intermediate_rows);
+  if (!check_cuda(cudaGetLastError(), "silu_multiply_kernel(scalar nvfp4 mlp)", error_message)) {
+    return false;
+  }
+
+  nvfp4_projection_scale_group_kernel<<<down_rows, block_size>>>(
+    down_packed_weight,
+    down_weight_scale,
+    gate_silu_output_f32,
+    down_input_scale,
+    down_weight_scale_2,
+    down_output_f32,
+    down_rows,
+    down_cols);
+  if (!check_cuda(cudaGetLastError(), "launch scalar NVFP4 down projection", error_message)) {
+    return false;
+  }
+
+  const int hidden_grid = (down_rows + block_size - 1) / block_size;
+  add_residual_write_bf16_kernel<<<hidden_grid, block_size>>>(
+    down_output_f32,
+    static_cast<const __nv_bfloat16 *>(residual_bf16),
+    static_cast<__nv_bfloat16 *>(hidden_out_bf16),
+    down_rows);
+  if (!check_cuda(cudaGetLastError(), "add_residual_write_bf16_kernel(scalar nvfp4 mlp)", error_message)) {
+    return false;
+  }
+  return true;
+}
+
 bool run_bf16_matvec_benchmark(
   const std::vector<std::uint16_t> & weights,
   int rows,

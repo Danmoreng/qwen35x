@@ -462,7 +462,8 @@ __device__ void full_attention_layer(
     float *__restrict__ g_mlp_inter,          // [INTER] f32
     __nv_bfloat16 *__restrict__ hidden_out,   // [HIDDEN] bf16
     int position, int max_seq_len,
-    __nv_bfloat16 *__restrict__ shmem)
+    __nv_bfloat16 *__restrict__ shmem,
+    bool external_mlp)
 {
     int block_id = blockIdx.x;
     int num_blocks = gridDim.x;
@@ -763,6 +764,13 @@ __device__ void full_attention_layer(
     // Phase 5: Post-attn norm + MLP
     __nv_bfloat16 *s_act = shmem;
     rmsnorm_from_bf16(hidden_out, w.post_attn_layernorm_weight, s_act, g_residual);
+    if (external_mlp) {
+        for (int i = threadIdx.x; i < HIDDEN_SIZE; i += BLOCK_SIZE) {
+            g_activations[i] = __bfloat162float(s_act[i]);
+        }
+        grid.sync();
+        return;
+    }
 
     if (qw != nullptr && qw->ptrs[8].packed_weight != nullptr && qw->ptrs[9].packed_weight != nullptr) {
         matvec_gate_up_silu_nvfp4(s_act, qw->ptrs[8], qw->ptrs[9],
@@ -809,7 +817,8 @@ __device__ void deltanet_layer(
     float *__restrict__ conv_buf,     // [DN_CONV_CH, DN_CONV_K] f32
     __nv_bfloat16 *__restrict__ hidden_out,
     int dn_layer_idx,
-    __nv_bfloat16 *__restrict__ shmem)
+    __nv_bfloat16 *__restrict__ shmem,
+    bool external_mlp)
 {
     int block_id = blockIdx.x;
     int num_blocks = gridDim.x;
@@ -968,6 +977,13 @@ __device__ void deltanet_layer(
     // Phase 5: Post-attn norm + MLP
     __nv_bfloat16 *s_act = shmem;
     rmsnorm_from_bf16(hidden_out, w.post_attn_layernorm_weight, s_act, g_residual);
+    if (external_mlp) {
+        for (int i = threadIdx.x; i < HIDDEN_SIZE; i += BLOCK_SIZE) {
+            g_activations[i] = __bfloat162float(s_act[i]);
+        }
+        grid.sync();
+        return;
+    }
 
     if (qw != nullptr && qw->ptrs[11].packed_weight != nullptr && qw->ptrs[12].packed_weight != nullptr) {
         matvec_gate_up_silu_nvfp4(s_act, qw->ptrs[11], qw->ptrs[12],

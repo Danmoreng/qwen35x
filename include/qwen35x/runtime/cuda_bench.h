@@ -182,6 +182,31 @@ bool run_nvfp4_sm120_mlp_residual_device(
   double * elapsed_ms,
   std::string & error_message);
 
+bool run_nvfp4_scalar_mlp_residual_device(
+  const float * input_f32,
+  const std::uint8_t * gate_packed_weight,
+  const std::uint8_t * gate_weight_scale,
+  float gate_input_scale,
+  float gate_weight_scale_2,
+  const std::uint8_t * up_packed_weight,
+  const std::uint8_t * up_weight_scale,
+  float up_input_scale,
+  float up_weight_scale_2,
+  const std::uint8_t * down_packed_weight,
+  const std::uint8_t * down_weight_scale,
+  float down_input_scale,
+  float down_weight_scale_2,
+  int intermediate_rows,
+  int hidden_cols,
+  int down_rows,
+  int down_cols,
+  float * gate_silu_output_f32,
+  float * up_output_f32,
+  float * down_output_f32,
+  const void * residual_bf16,
+  void * hidden_out_bf16,
+  std::string & error_message);
+
 bool run_nvfp4_cublaslt_gate_up_benchmark(
   const std::vector<std::uint8_t> & gate_packed_weights,
   const std::vector<std::uint8_t> & gate_weight_scales_e4m3,

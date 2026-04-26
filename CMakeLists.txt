@@ -66,6 +66,8 @@ if (CMAKE_CUDA_COMPILER)
         QWEN35X_CUDA_VARIANT_${variant_name}=1
         LAYER_TYPE=LAYER_TYPE_${variant_name}
         decode_kernel=decode_kernel_${variant_name}
+        decode_prefix_mlp_kernel=decode_prefix_mlp_kernel_${variant_name}
+        final_norm_kernel=final_norm_kernel_${variant_name}
         lm_head_kernel=lm_head_kernel_${variant_name}
         rmsnorm_redundant=rmsnorm_redundant_${variant_name}
         rmsnorm_from_bf16=rmsnorm_from_bf16_${variant_name}
@@ -93,6 +95,8 @@ if (CMAKE_CUDA_COMPILER)
         pf_lm_head=pf_lm_head_${variant_name}
         pf_lm_reduce=pf_lm_reduce_${variant_name}
         launch_decode=launch_decode_${variant_name}
+        launch_decode_prefix_mlp=launch_decode_prefix_mlp_${variant_name}
+        launch_decode_final_lm=launch_decode_final_lm_${variant_name}
         launch_prefill_bf16=launch_prefill_bf16_${variant_name}
         set_decode_blocks_override=set_decode_blocks_override_${variant_name}
         query_max_safe_decode_blocks=query_max_safe_decode_blocks_${variant_name}
