@@ -354,7 +354,10 @@ __global__ void nvfp4_mma_sync_mxf4nvf4_tile_probe_kernel(
     : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
       "f"(c0), "f"(c1), "f"(c2), "f"(c3), "r"(scale_a), "r"(scale_b), "h"(bid), "h"(tid));
   if (output != nullptr) {
-    output[lane] = d0 + d1 + d2 + d3;
+    output[lane * 4 + 0] = d0;
+    output[lane * 4 + 1] = d1;
+    output[lane * 4 + 2] = d2;
+    output[lane * 4 + 3] = d3;
   }
 #else
   if (threadIdx.x == 0 && output != nullptr) {
@@ -396,12 +399,12 @@ bool device_supports_sm120_mma_mxf4nvf4(const int major, const int minor) {
 }
 
 bool run_nvfp4_blackwell_fp4_projection_benchmark(
-  const std::vector<std::uint8_t> &,
-  const std::vector<std::uint8_t> &,
-  float,
-  float,
-  int,
-  int,
+  const std::vector<std::uint8_t> & packed_weights,
+  const std::vector<std::uint8_t> & weight_scales_e4m3,
+  float input_scale,
+  float weight_scale_2,
+  int rows,
+  int cols,
   int warmup_iterations,
   int benchmark_iterations,
   double & avg_iteration_ms,
@@ -420,14 +423,133 @@ bool run_nvfp4_blackwell_fp4_projection_benchmark(
     return false;
   }
 
+  if (rows < 8 || cols < 64 || (cols % 16) != 0 || (cols % 2) != 0) {
+    error_message = "blackwell-fp4 tile probe requires at least 8 rows and 64 columns.";
+    return false;
+  }
+  const int packed_cols = cols / 2;
+  const int scale_cols = cols / 16;
+  if (packed_weights.size() < static_cast<std::size_t>(rows) * packed_cols ||
+      weight_scales_e4m3.size() < static_cast<std::size_t>(rows) * scale_cols) {
+    error_message = "NVFP4 packed weight or scale size does not match matrix dimensions.";
+    return false;
+  }
+
   std::vector<std::uint32_t> host_a_fragments(32 * 4, 0);
   std::vector<std::uint32_t> host_b_fragments(32 * 2, 0);
   std::vector<std::uint32_t> host_a_scales(32, 0);
   std::vector<std::uint32_t> host_b_scales(32, 0);
-  constexpr std::uint32_t one_scale = 0x38u;
-  const std::uint32_t packed_scales = one_scale | (one_scale << 8u) | (one_scale << 16u) | (one_scale << 24u);
-  std::fill(host_a_scales.begin(), host_a_scales.end(), packed_scales);
-  std::fill(host_b_scales.begin(), host_b_scales.end(), packed_scales);
+  auto set_packed_nibble = [](std::uint32_t & word, const int nibble_index, const std::uint32_t nibble) {
+    const int shift = nibble_index * 4;
+    word = static_cast<std::uint32_t>((word & ~(0xfu << shift)) | ((nibble & 0xfu) << shift));
+  };
+  auto encode_scale = [](const float value) -> std::uint8_t {
+    if (!(value > 0.0f)) {
+      return 0;
+    }
+    int best_bits = 0;
+    float best_error = std::numeric_limits<float>::infinity();
+    for (int exponent = 0; exponent < 16; ++exponent) {
+      for (int mantissa = 0; mantissa < 8; ++mantissa) {
+        float decoded = 0.0f;
+        if (exponent == 0) {
+          decoded = std::ldexp(static_cast<float>(mantissa) / 8.0f, -6);
+        } else {
+          decoded = std::ldexp(1.0f + static_cast<float>(mantissa) / 8.0f, exponent - 7);
+        }
+        const float error = std::fabs(decoded - value);
+        if (error < best_error) {
+          best_error = error;
+          best_bits = (exponent << 3) | mantissa;
+        }
+      }
+    }
+    return static_cast<std::uint8_t>(best_bits);
+  };
+  auto encode_e2m1 = [](const float value) -> std::uint8_t {
+    constexpr float levels[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    const bool negative = value < 0.0f;
+    const float abs_value = std::fabs(value);
+    int best = 0;
+    float best_error = std::numeric_limits<float>::infinity();
+    for (int i = 0; i < 8; ++i) {
+      const float error = std::fabs(levels[i] - abs_value);
+      if (error < best_error) {
+        best_error = error;
+        best = i;
+      }
+    }
+    return static_cast<std::uint8_t>((negative ? 0x8u : 0u) | static_cast<std::uint8_t>(best));
+  };
+  auto decode_e2m1 = [](const std::uint8_t nibble) -> float {
+    constexpr float levels[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    const float value = levels[nibble & 0x7u];
+    return (nibble & 0x8u) ? -value : value;
+  };
+  auto decode_e4m3 = [](const std::uint8_t bits) -> float {
+    if (bits == 0) {
+      return 0.0f;
+    }
+    const int sign = (bits >> 7) & 1;
+    const int exponent = (bits >> 3) & 0xf;
+    const int mantissa = bits & 0x7;
+    float value = 0.0f;
+    if (exponent == 0) {
+      value = std::ldexp(static_cast<float>(mantissa) / 8.0f, -6);
+    } else {
+      value = std::ldexp(1.0f + static_cast<float>(mantissa) / 8.0f, exponent - 7);
+    }
+    return sign ? -value : value;
+  };
+
+  std::vector<float> input(static_cast<std::size_t>(64), 0.0f);
+  std::vector<std::uint8_t> input_nibbles(64, 0);
+  std::vector<std::uint8_t> input_scales(4, 0);
+  for (int col = 0; col < 64; ++col) {
+    input[static_cast<std::size_t>(col)] = static_cast<float>((col % 17) - 8) / 17.0f;
+  }
+  for (int group = 0; group < 4; ++group) {
+    float max_abs = 0.0f;
+    for (int i = 0; i < 16; ++i) {
+      max_abs = std::max(max_abs, std::fabs(input[static_cast<std::size_t>(group * 16 + i)] * input_scale));
+    }
+    const float scale = std::max(max_abs / 6.0f, 1.0e-8f);
+    input_scales[static_cast<std::size_t>(group)] = encode_scale(scale);
+    for (int i = 0; i < 16; ++i) {
+      const int col = group * 16 + i;
+      input_nibbles[static_cast<std::size_t>(col)] =
+        encode_e2m1((input[static_cast<std::size_t>(col)] * input_scale) / scale);
+    }
+  }
+  const std::uint32_t packed_input_scales =
+    static_cast<std::uint32_t>(input_scales[0]) |
+    (static_cast<std::uint32_t>(input_scales[1]) << 8u) |
+    (static_cast<std::uint32_t>(input_scales[2]) << 16u) |
+    (static_cast<std::uint32_t>(input_scales[3]) << 24u);
+  std::fill(host_a_scales.begin(), host_a_scales.end(), packed_input_scales);
+
+  for (int lane = 0; lane < 32; ++lane) {
+    const int group_id = lane >> 2;
+    const int thread_id_in_group = lane & 3;
+    for (int i = 0; i < 32; ++i) {
+      const int col = thread_id_in_group * 8 + (i & 7) + (i >= 16 ? 32 : 0);
+      set_packed_nibble(host_a_fragments[static_cast<std::size_t>(lane) * 4 + i / 8], i & 7, input_nibbles[static_cast<std::size_t>(col)]);
+    }
+    for (int i = 0; i < 16; ++i) {
+      const int k = thread_id_in_group * 8 + (i & 7) + (i >= 8 ? 32 : 0);
+      const int col = group_id;
+      const std::uint8_t packed = packed_weights[static_cast<std::size_t>(col) * packed_cols + k / 2];
+      const std::uint8_t nibble = (k & 1) == 0 ? (packed & 0x0fu) : (packed >> 4u);
+      set_packed_nibble(host_b_fragments[static_cast<std::size_t>(lane) * 2 + i / 8], i & 7, nibble);
+    }
+
+    std::uint32_t packed_b_scales = 0;
+    for (int group = 0; group < 4; ++group) {
+      const auto scale_bits = static_cast<std::uint32_t>(weight_scales_e4m3[static_cast<std::size_t>(group_id) * scale_cols + group]);
+      packed_b_scales |= (scale_bits << (group * 8u));
+    }
+    host_b_scales[static_cast<std::size_t>(lane)] = packed_b_scales;
+  }
 
   std::uint32_t * device_a_fragments = nullptr;
   std::uint32_t * device_b_fragments = nullptr;
@@ -438,7 +560,7 @@ bool run_nvfp4_blackwell_fp4_projection_benchmark(
       !check_cuda(cudaMalloc(&device_b_fragments, host_b_fragments.size() * sizeof(std::uint32_t)), "cudaMalloc SM120 FP4 B fragments", error_message) ||
       !check_cuda(cudaMalloc(&device_a_scales, host_a_scales.size() * sizeof(std::uint32_t)), "cudaMalloc SM120 FP4 A scales", error_message) ||
       !check_cuda(cudaMalloc(&device_b_scales, host_b_scales.size() * sizeof(std::uint32_t)), "cudaMalloc SM120 FP4 B scales", error_message) ||
-      !check_cuda(cudaMalloc(&device_output, 32 * sizeof(float)), "cudaMalloc synthetic SM120 FP4 probe output", error_message)) {
+      !check_cuda(cudaMalloc(&device_output, 32 * 4 * sizeof(float)), "cudaMalloc synthetic SM120 FP4 probe output", error_message)) {
     cudaFree(device_a_fragments);
     cudaFree(device_b_fragments);
     cudaFree(device_a_scales);
@@ -521,7 +643,7 @@ bool run_nvfp4_blackwell_fp4_projection_benchmark(
     return false;
   }
 
-  std::vector<float> host_output(32, 0.0f);
+  std::vector<float> host_output(32 * 4, 0.0f);
   if (!check_cuda(cudaMemcpy(host_output.data(), device_output, host_output.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy synthetic SM120 FP4 probe output", error_message)) {
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
@@ -541,13 +663,28 @@ bool run_nvfp4_blackwell_fp4_projection_benchmark(
 
   avg_iteration_ms = static_cast<double>(elapsed_ms) / static_cast<double>(benchmark_iterations);
   max_abs_error = 0.0;
-  for (const float value : host_output) {
-    max_abs_error = std::max(max_abs_error, std::fabs(static_cast<double>(value - 6.0f)));
+  for (int lane = 0; lane < 32; ++lane) {
+    const int group_id = lane >> 2;
+    const int thread_id_in_group = lane & 3;
+    for (int i = 0; i < 4; ++i) {
+      const int row = i < 2 ? group_id : group_id + 8;
+      const int col = thread_id_in_group * 2 + (i & 1);
+      double expected = static_cast<double>(i);
+      (void)row;
+      for (int k = 0; k < 64; ++k) {
+        const std::uint8_t packed = packed_weights[static_cast<std::size_t>(col) * packed_cols + k / 2];
+        const std::uint8_t nibble = (k & 1) == 0 ? (packed & 0x0fu) : (packed >> 4u);
+        const float scale = decode_e4m3(weight_scales_e4m3[static_cast<std::size_t>(col) * scale_cols + k / 16]) * weight_scale_2;
+        expected += static_cast<double>(decode_e2m1(nibble) * scale * (input[static_cast<std::size_t>(k)] * input_scale));
+      }
+      const double actual = static_cast<double>(host_output[static_cast<std::size_t>(lane) * 4 + i]);
+      max_abs_error = std::max(max_abs_error, std::fabs(actual - expected));
+    }
   }
-  if (max_abs_error > 1.0e-5) {
+  if (max_abs_error > 0.25) {
     error_message =
       "synthetic SM120 mxf4nvf4 MMA tile probe produced unexpected accumulator value " + std::to_string(host_output[0]) +
-      " instead of 6.0.";
+      " for the real model-tile check.";
     return false;
   }
   return true;
