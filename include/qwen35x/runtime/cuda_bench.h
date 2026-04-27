@@ -66,6 +66,34 @@ bool run_nvfp4_cublaslt_projection_device(
   double * elapsed_ms,
   std::string & error_message);
 
+bool run_nvfp4_cublaslt_prefill_projection_device_bf16(
+  const void * input_bf16,
+  const std::uint8_t * packed_weights_cublaslt,
+  const std::uint8_t * weight_scales_tiled,
+  const float * weight_scale_2_device,
+  int sequence_length,
+  int rows,
+  int cols,
+  std::uint8_t * activation_scratch,
+  std::uint8_t * activation_scale_scratch,
+  float * output_f32,
+  double * elapsed_ms,
+  std::string & error_message);
+
+bool run_nvfp4_cublaslt_prefill_projection(
+  const float * input_f32,
+  const std::uint8_t * packed_weights_cublaslt,
+  const std::uint8_t * weight_scales_tiled,
+  float weight_scale_2,
+  int sequence_length,
+  int rows,
+  int cols,
+  int warmup_iterations,
+  int benchmark_iterations,
+  double & avg_iteration_ms,
+  double & max_abs_error,
+  std::string & error_message);
+
 bool run_nvfp4_sm120_projection_device(
   const float * input_f32,
   const std::uint32_t * packed_weight_fragments,

@@ -258,6 +258,7 @@ struct PackedLayerNvfp4Weights {
   int * output_token, \
   const void * embed_weight, \
   const PackedLayerWeights * layers, \
+  const PackedLayerNvfp4Weights * layer_nvfp4_weights, \
   const void * final_norm_w, \
   const void * lm_head_w, \
   void * fa_k_cache, \
@@ -274,6 +275,9 @@ struct PackedLayerNvfp4Weights {
   void * dn_out_buf, \
   float * dn_qkv_f32, \
   float * dn_out_f32, \
+  void * fp4_activation, \
+  void * fp4_activation_scales, \
+  float * fp4_output_f32, \
   void * beta_buf, \
   void * alpha_buf, \
   void * final_normed, \
@@ -518,6 +522,9 @@ struct BackendState {
   void * pf_dn_out_buf = nullptr;
   float * pf_dn_qkv_f32 = nullptr;
   float * pf_dn_out_f32 = nullptr;
+  std::uint8_t * pf_fp4_activation = nullptr;
+  std::uint8_t * pf_fp4_activation_scales = nullptr;
+  float * pf_fp4_output_f32 = nullptr;
   float * pf_beta_buf = nullptr;
   float * pf_alpha_buf = nullptr;
   void * pf_final_normed = nullptr;
@@ -1486,6 +1493,18 @@ bool initialize_backend_state(
     std::max(
       static_cast<std::size_t>(prefill_mlp_chunk_tokens) * static_cast<std::size_t>(descriptor_dn_v_size(descriptor)),
       attention_accum_elems);
+  const int pf_fp4_max_input_cols = std::max({
+    descriptor.hidden_size,
+    descriptor.intermediate_size,
+    descriptor_fa_q_size(descriptor),
+    descriptor_fa_kv_size(descriptor),
+    descriptor_dn_v_size(descriptor)
+  });
+  const std::size_t pf_fp4_activation_bytes =
+    static_cast<std::size_t>(prefill_s) * static_cast<std::size_t>(pf_fp4_max_input_cols / 2);
+  const std::size_t pf_fp4_activation_scale_bytes =
+    static_cast<std::size_t>(round_up_to_multiple(prefill_s, 128)) *
+    static_cast<std::size_t>(round_up_to_multiple(pf_fp4_max_input_cols / 16, 4));
 
   if (!arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * descriptor.hidden_size * bf16_bytes, state.pf_hidden, error_message) ||
       !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * descriptor.hidden_size * bf16_bytes, state.pf_residual, error_message) ||
@@ -1497,6 +1516,9 @@ bool initialize_backend_state(
       !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * descriptor_dn_v_size(descriptor) * bf16_bytes, state.pf_dn_out_buf, error_message) ||
       !arena.alloc_bytes(dn_qkv_f32_elems * sizeof(float), reinterpret_cast<void *&>(state.pf_dn_qkv_f32), error_message) ||
       !arena.alloc_bytes(dn_out_f32_elems * sizeof(float), reinterpret_cast<void *&>(state.pf_dn_out_f32), error_message) ||
+      !arena.alloc_bytes(pf_fp4_activation_bytes, reinterpret_cast<void *&>(state.pf_fp4_activation), error_message) ||
+      !arena.alloc_bytes(pf_fp4_activation_scale_bytes, reinterpret_cast<void *&>(state.pf_fp4_activation_scales), error_message) ||
+      !arena.alloc_bytes(proj_buf_elems * sizeof(float), reinterpret_cast<void *&>(state.pf_fp4_output_f32), error_message) ||
       !arena.alloc_bytes(static_cast<std::size_t>(prefill_mlp_chunk_tokens) * descriptor.dn_gate_heads * sizeof(float), reinterpret_cast<void *&>(state.pf_beta_buf), error_message) ||
       !arena.alloc_bytes(static_cast<std::size_t>(prefill_mlp_chunk_tokens) * descriptor.dn_gate_heads * sizeof(float), reinterpret_cast<void *&>(state.pf_alpha_buf), error_message) ||
       !arena.alloc_bytes(descriptor.hidden_size * f32_bytes, state.pf_final_normed, error_message) ||
@@ -1869,6 +1891,7 @@ void launch_prefill_for_state(
     state.output_token,
     state.embed_weight,
     state.layer_weights,
+    state.layer_nvfp4_weights,
     state.final_norm_weight,
     state.lm_head_weight,
     state.fa_k_cache,
@@ -1885,6 +1908,9 @@ void launch_prefill_for_state(
     state.pf_dn_out_buf,
     state.pf_dn_qkv_f32,
     state.pf_dn_out_f32,
+    state.pf_fp4_activation,
+    state.pf_fp4_activation_scales,
+    state.pf_fp4_output_f32,
     state.pf_beta_buf,
     state.pf_alpha_buf,
     state.pf_final_normed,

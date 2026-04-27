@@ -6,6 +6,7 @@
  * Weights bf16, activations bf16, state f32. No quantization, no conversion.
  */
 
+#include "qwen35x/runtime/cuda_bench.h"
 #include "qwen35x/runtime/qwen35x_profile.h"
 
 #include "common.cuh"
@@ -17,6 +18,9 @@
 #include <cublas_v2.h>
 
 #include <cfloat>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <vector>
 
 struct ProfileEvent {
@@ -545,6 +549,13 @@ __global__ void pf_lm_reduce(const float *bmv, const int *bmi, int *out, int nb)
     if(tid==0)*out=si[0];
 }
 
+static __global__ void pf_f32_to_bf16(const float *in, __nv_bfloat16 *out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = __float2bfloat16(in[idx]);
+    }
+}
+
 // ===== cuBLAS bf16 GEMM =====
 static void cublas_bf16_gemm(cublasHandle_t h,
     const __nv_bfloat16 *A, const __nv_bfloat16 *B, __nv_bfloat16 *C,
@@ -556,6 +567,51 @@ static void cublas_bf16_gemm(cublasHandle_t h,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 }
 
+static bool nvfp4_prefill_enabled(const LayerNvfp4Weights *layers) {
+    return layers != nullptr && std::getenv("QWEN35X_ENABLE_NVFP4_PREFILL") != nullptr;
+}
+
+static void cublas_nvfp4_prefill_gemm_or_bf16(
+    cublasHandle_t h,
+    const __nv_bfloat16 *A,
+    const __nv_bfloat16 *B,
+    const Nvfp4Weight *nvfp4,
+    __nv_bfloat16 *C,
+    int S,
+    int N,
+    int K,
+    std::uint8_t *activation_scratch,
+    std::uint8_t *activation_scale_scratch,
+    float *output_f32,
+    cudaStream_t stream) {
+    if (nvfp4 != nullptr &&
+        nvfp4->tc_packed_weight != nullptr &&
+        nvfp4->tc_weight_scale != nullptr &&
+        nvfp4->weight_scale_2 != nullptr &&
+        nvfp4->output_size == N &&
+        nvfp4->input_size == K) {
+        std::string error_message;
+        if (qwen35x::cuda::run_nvfp4_cublaslt_prefill_projection_device_bf16(
+                A,
+                nvfp4->tc_packed_weight,
+                nvfp4->tc_weight_scale,
+                nvfp4->weight_scale_2,
+                S,
+                N,
+                K,
+                activation_scratch,
+                activation_scale_scratch,
+                output_f32,
+                nullptr,
+                error_message)) {
+            pf_f32_to_bf16<<<(S * N + 255) / 256, 256, 0, stream>>>(output_f32, C, S * N);
+            return;
+        }
+        std::fprintf(stderr, "[nvfp4-prefill] falling back to BF16 GEMM: %s\n", error_message.c_str());
+    }
+    cublas_bf16_gemm(h, A, B, C, S, N, K);
+}
+
 static void pf_mlp_chunked(
     cublasHandle_t h,
     const __nv_bfloat16 *normalized,
@@ -564,9 +620,15 @@ static void pf_mlp_chunked(
     const __nv_bfloat16 *gate_w,
     const __nv_bfloat16 *up_w,
     const __nv_bfloat16 *down_w,
+    const Nvfp4Weight *gate_nvfp4,
+    const Nvfp4Weight *up_nvfp4,
+    const Nvfp4Weight *down_nvfp4,
     __nv_bfloat16 *gate_buf,
     __nv_bfloat16 *up_buf,
     __nv_bfloat16 *mlp_buf,
+    std::uint8_t *activation_scratch,
+    std::uint8_t *activation_scale_scratch,
+    float *output_f32,
     int S,
     int chunk_tokens,
     cudaStream_t stream)
@@ -577,10 +639,10 @@ static void pf_mlp_chunked(
         const __nv_bfloat16 *residual_chunk = residual + static_cast<size_t>(offset) * HIDDEN;
         __nv_bfloat16 *hidden_chunk = hidden + static_cast<size_t>(offset) * HIDDEN;
 
-        cublas_bf16_gemm(h, norm_chunk, gate_w, gate_buf, rows, INTER, HIDDEN);
-        cublas_bf16_gemm(h, norm_chunk, up_w, up_buf, rows, INTER, HIDDEN);
+        cublas_nvfp4_prefill_gemm_or_bf16(h, norm_chunk, gate_w, gate_nvfp4, gate_buf, rows, INTER, HIDDEN, activation_scratch, activation_scale_scratch, output_f32, stream);
+        cublas_nvfp4_prefill_gemm_or_bf16(h, norm_chunk, up_w, up_nvfp4, up_buf, rows, INTER, HIDDEN, activation_scratch, activation_scale_scratch, output_f32, stream);
         pf_silu_mul_bf16<<<(rows * INTER + 255) / 256, 256, 0, stream>>>(gate_buf, up_buf, mlp_buf, rows * INTER);
-        cublas_bf16_gemm(h, mlp_buf, down_w, gate_buf, rows, HIDDEN, INTER);
+        cublas_nvfp4_prefill_gemm_or_bf16(h, mlp_buf, down_w, down_nvfp4, gate_buf, rows, HIDDEN, INTER, activation_scratch, activation_scale_scratch, output_f32, stream);
         pf_add_residual_bf16<<<(rows * HIDDEN + 255) / 256, 256, 0, stream>>>(gate_buf, residual_chunk, hidden_chunk, rows * HIDDEN);
     }
 }
@@ -600,6 +662,9 @@ static void pf_deltanet_chunked(
     const __nv_bfloat16 *dt_bias,
     const __nv_bfloat16 *dn_norm,
     const __nv_bfloat16 *out_w,
+    const Nvfp4Weight *qkv_nvfp4,
+    const Nvfp4Weight *z_nvfp4,
+    const Nvfp4Weight *out_nvfp4,
     float *dn_state,
     float *conv_state,
     __nv_bfloat16 *proj_buf,
@@ -609,6 +674,9 @@ static void pf_deltanet_chunked(
     float *dn_out_f32,
     float *beta_buf,
     float *alpha_buf,
+    std::uint8_t *activation_scratch,
+    std::uint8_t *activation_scale_scratch,
+    float *output_f32,
     int S,
     int chunk_tokens,
     cudaStream_t stream,
@@ -622,10 +690,10 @@ static void pf_deltanet_chunked(
         __nv_bfloat16 *hidden_chunk = hidden + static_cast<size_t>(offset) * HIDDEN;
 
         profile_phase(profile ? &profile->qkv_projection_ms : nullptr, [&]() {
-            cublas_bf16_gemm(h, norm_chunk, qkv_w, proj_buf, rows, DN_CONV_CH, HIDDEN);
+            cublas_nvfp4_prefill_gemm_or_bf16(h, norm_chunk, qkv_w, qkv_nvfp4, proj_buf, rows, DN_CONV_CH, HIDDEN, activation_scratch, activation_scale_scratch, output_f32, stream);
         });
         profile_phase(profile ? &profile->z_projection_ms : nullptr, [&]() {
-            cublas_bf16_gemm(h, norm_chunk, z_w, proj_buf2, rows, DN_V_SIZE, HIDDEN);
+            cublas_nvfp4_prefill_gemm_or_bf16(h, norm_chunk, z_w, z_nvfp4, proj_buf2, rows, DN_V_SIZE, HIDDEN, activation_scratch, activation_scale_scratch, output_f32, stream);
         });
         profile_phase(profile ? &profile->beta_alpha_projection_ms : nullptr, [&]() {
             pf_bf16_matvec<<<rows * DN_GATE, 32, 0, stream>>>(norm_chunk, beta_w, beta_buf, rows, HIDDEN, DN_GATE);
@@ -649,7 +717,7 @@ static void pf_deltanet_chunked(
                 dn_out_f32, proj_buf2, dn_norm, dn_out_buf, rows);
         });
         profile_phase(profile ? &profile->out_projection_ms : nullptr, [&]() {
-            cublas_bf16_gemm(h, dn_out_buf, out_w, proj_buf, rows, HIDDEN, DN_V_SIZE);
+            cublas_nvfp4_prefill_gemm_or_bf16(h, dn_out_buf, out_w, out_nvfp4, proj_buf, rows, HIDDEN, DN_V_SIZE, activation_scratch, activation_scale_scratch, output_f32, stream);
         });
         profile_phase(profile ? &profile->residual_ms : nullptr, [&]() {
             pf_add_residual_bf16<<<(rows * HIDDEN + 255) / 256, 256, 0, stream>>>(proj_buf, residual_chunk, hidden_chunk, rows * HIDDEN);
@@ -776,6 +844,7 @@ static void pf_causal_attn_tiled_cublas(
 extern "C" void launch_prefill_bf16(
     const int *token_ids, int seq_len, int *output_token,
     const __nv_bfloat16 *embed_weight, const PFLayerWeights *layers,
+    const LayerNvfp4Weights *layer_nvfp4_weights,
     const __nv_bfloat16 *final_norm_w, const __nv_bfloat16 *lm_head_w,
     __nv_bfloat16 *fa_k_cache, __nv_bfloat16 *fa_v_cache,
     float *dn_states, float *conv_bufs,
@@ -785,6 +854,8 @@ extern "C" void launch_prefill_bf16(
     __nv_bfloat16 *attn_buf, __nv_bfloat16 *mlp_buf,
     __nv_bfloat16 *dn_out_buf,
     float *dn_qkv_f32, float *dn_out_f32,
+    std::uint8_t *fp4_activation, std::uint8_t *fp4_activation_scales,
+    float *fp4_output_f32,
     float *beta_buf, float *alpha_buf,
     float *final_normed, __nv_bfloat16 *hidden_bf16_out,
     float *lm_bmv, int *lm_bmi,
@@ -804,6 +875,13 @@ extern "C" void launch_prefill_bf16(
     static PFLayerWeights hl[NUM_LAYERS];
     static bool copied = false;
     if (!copied) { cudaMemcpy(hl, layers, NUM_LAYERS*sizeof(PFLayerWeights), cudaMemcpyDeviceToHost); copied = true; }
+    static LayerNvfp4Weights hq[NUM_LAYERS];
+    static bool copied_nvfp4 = false;
+    const bool use_nvfp4_prefill = nvfp4_prefill_enabled(layer_nvfp4_weights);
+    if (use_nvfp4_prefill && !copied_nvfp4) {
+        cudaMemcpy(hq, layer_nvfp4_weights, NUM_LAYERS*sizeof(LayerNvfp4Weights), cudaMemcpyDeviceToHost);
+        copied_nvfp4 = true;
+    }
 
     int S = seq_len;
     mlp_chunk_tokens = max(1, min(mlp_chunk_tokens, S));
@@ -900,6 +978,7 @@ extern "C" void launch_prefill_bf16(
 
     for (int li = 0; li < NUM_LAYERS; li++) {
         const PFLayerWeights &lw = hl[li];
+        const LayerNvfp4Weights *qlw = use_nvfp4_prefill ? &hq[li] : nullptr;
         int lt = QWEN35X_LAYER_TYPE_HOST[li];
         auto *layer_profile = profile ? &profile->layers[li] : nullptr;
 
@@ -938,6 +1017,9 @@ extern "C" void launch_prefill_bf16(
                 dt_bias,
                 dn_norm,
                 out_w,
+                qlw ? &qlw->ptrs[1] : nullptr,
+                qlw ? &qlw->ptrs[2] : nullptr,
+                qlw ? &qlw->ptrs[9] : nullptr,
                 dn_states + dn_idx*dn_stride,
                 conv_bufs + dn_idx*DN_CONV_CH*DN_CONV_K,
                 proj_buf,
@@ -947,6 +1029,9 @@ extern "C" void launch_prefill_bf16(
                 dn_out_f32,
                 beta_buf,
                 alpha_buf,
+                fp4_activation,
+                fp4_activation_scales,
+                fp4_output_f32,
                 S,
                 mlp_chunk_tokens,
                 stream,
@@ -966,9 +1051,15 @@ extern "C" void launch_prefill_bf16(
                     gate_w,
                     up_w,
                     down_w,
+                    qlw ? &qlw->ptrs[11] : nullptr,
+                    qlw ? &qlw->ptrs[12] : nullptr,
+                    qlw ? &qlw->ptrs[13] : nullptr,
                     proj_buf,
                     proj_buf2,
                     mlp_buf,
+                    fp4_activation,
+                    fp4_activation_scales,
+                    fp4_output_f32,
                     S,
                     mlp_chunk_tokens,
                     stream);
@@ -989,11 +1080,11 @@ extern "C" void launch_prefill_bf16(
             const __nv_bfloat16 *down_w=(const __nv_bfloat16*)lw.ptrs[10];
 
             profile_phase(layer_profile ? &layer_profile->qkv_projection_ms : nullptr, [&]() {
-                cublas_bf16_gemm(cublas, normalized, q_w, proj_buf, S, FA_QPROJ_SIZE, HIDDEN);
+                cublas_nvfp4_prefill_gemm_or_bf16(cublas, normalized, q_w, qlw ? &qlw->ptrs[1] : nullptr, proj_buf, S, FA_QPROJ_SIZE, HIDDEN, fp4_activation, fp4_activation_scales, fp4_output_f32, stream);
             });
             profile_phase(layer_profile ? &layer_profile->kv_projection_ms : nullptr, [&]() {
-                cublas_bf16_gemm(cublas, normalized, k_w, proj_buf2, S, FA_KV_SIZE, HIDDEN);
-                cublas_bf16_gemm(cublas, normalized, v_w, attn_buf, S, FA_KV_SIZE, HIDDEN);
+                cublas_nvfp4_prefill_gemm_or_bf16(cublas, normalized, k_w, qlw ? &qlw->ptrs[2] : nullptr, proj_buf2, S, FA_KV_SIZE, HIDDEN, fp4_activation, fp4_activation_scales, fp4_output_f32, stream);
+                cublas_nvfp4_prefill_gemm_or_bf16(cublas, normalized, v_w, qlw ? &qlw->ptrs[3] : nullptr, attn_buf, S, FA_KV_SIZE, HIDDEN, fp4_activation, fp4_activation_scales, fp4_output_f32, stream);
             });
 
             int total_heads = S*(FA_Q_HEADS+FA_KV_HEADS);
@@ -1022,7 +1113,7 @@ extern "C" void launch_prefill_bf16(
             });
 
             profile_phase(layer_profile ? &layer_profile->out_projection_ms : nullptr, [&]() {
-                cublas_bf16_gemm(cublas, dn_out_buf, o_w, proj_buf, S, HIDDEN, FA_Q_SIZE);
+                cublas_nvfp4_prefill_gemm_or_bf16(cublas, dn_out_buf, o_w, qlw ? &qlw->ptrs[6] : nullptr, proj_buf, S, HIDDEN, FA_Q_SIZE, fp4_activation, fp4_activation_scales, fp4_output_f32, stream);
             });
             profile_phase(layer_profile ? &layer_profile->residual_ms : nullptr, [&]() {
                 pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
@@ -1041,9 +1132,15 @@ extern "C" void launch_prefill_bf16(
                     gate_w,
                     up_w,
                     down_w,
+                    qlw ? &qlw->ptrs[8] : nullptr,
+                    qlw ? &qlw->ptrs[9] : nullptr,
+                    qlw ? &qlw->ptrs[10] : nullptr,
                     proj_buf,
                     proj_buf2,
                     mlp_buf,
+                    fp4_activation,
+                    fp4_activation_scales,
+                    fp4_output_f32,
                     S,
                     mlp_chunk_tokens,
                     stream);

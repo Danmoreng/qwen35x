@@ -71,6 +71,23 @@ struct Nvfp4ProjectionBenchResult {
   double max_abs_error = 0.0;
 };
 
+struct Nvfp4PrefillProjectionBenchOptions {
+  std::string model_dir;
+  std::string tensor_base_name = "model.language_model.layers.0.mlp.gate_proj";
+  int sequence_length = 256;
+  int warmup_iterations = 5;
+  int benchmark_iterations = 20;
+};
+
+struct Nvfp4PrefillProjectionBenchResult {
+  std::string tensor_base_name;
+  std::vector<std::int64_t> source_shape;
+  int sequence_length = 0;
+  double avg_iteration_ms = 0.0;
+  double iterations_per_second = 0.0;
+  double max_abs_error = 0.0;
+};
+
 struct Nvfp4GateUpBenchOptions {
   std::string model_dir;
   std::string gate_tensor_base_name = "model.language_model.layers.0.mlp.gate_proj";
@@ -105,6 +122,11 @@ bool run_nvfp4_cublaslt_probe(
 bool run_nvfp4_projection_benchmark(
   const Nvfp4ProjectionBenchOptions & options,
   Nvfp4ProjectionBenchResult & result,
+  std::string & error_message);
+
+bool run_nvfp4_prefill_projection_benchmark(
+  const Nvfp4PrefillProjectionBenchOptions & options,
+  Nvfp4PrefillProjectionBenchResult & result,
   std::string & error_message);
 
 bool run_nvfp4_gate_up_benchmark(

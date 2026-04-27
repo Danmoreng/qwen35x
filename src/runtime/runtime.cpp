@@ -3,6 +3,7 @@
 #include "qwen35x/weights/safetensors.h"
 
 #include <climits>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -445,6 +446,81 @@ bool run_nvfp4_projection_benchmark(
   result.packed_shape = weight_info.shape;
   result.scale_shape = scale_info.shape;
   result.source_shape = {weight_info.shape[0], weight_info.shape[1] * 2};
+  result.avg_iteration_ms = avg_ms;
+  result.iterations_per_second = 1000.0 / avg_ms;
+  result.max_abs_error = max_abs_error;
+  return true;
+}
+
+bool run_nvfp4_prefill_projection_benchmark(
+  const Nvfp4PrefillProjectionBenchOptions & options,
+  Nvfp4PrefillProjectionBenchResult & result,
+  std::string & error_message) {
+  if (options.model_dir.empty()) {
+    error_message = "model_dir is required for NVFP4 prefill projection benchmark.";
+    return false;
+  }
+  if (options.tensor_base_name.empty()) {
+    error_message = "tensor_base_name is required for NVFP4 prefill projection benchmark.";
+    return false;
+  }
+  if (options.sequence_length <= 0 || options.warmup_iterations < 0 || options.benchmark_iterations <= 0) {
+    error_message = "sequence_length and benchmark_iterations must be > 0; warmup_iterations must be >= 0.";
+    return false;
+  }
+
+  SafetensorTensorInfo weight_info;
+  SafetensorTensorInfo scale_info;
+  std::vector<std::uint8_t> packed_weights;
+  std::vector<std::uint8_t> weight_scales;
+  if (!read_raw_tensor_from_model(options.model_dir, options.tensor_base_name + ".weight", "U8", weight_info, packed_weights, error_message) ||
+      !read_raw_tensor_from_model(options.model_dir, options.tensor_base_name + ".weight_scale", "F8_E4M3", scale_info, weight_scales, error_message)) {
+    return false;
+  }
+
+  SafetensorTensorF32 weight_scale2_tensor;
+  if (!SafetensorLoader::read_tensor_f32(options.model_dir, options.tensor_base_name + ".weight_scale_2", weight_scale2_tensor, error_message)) {
+    return false;
+  }
+  if (weight_info.shape.size() != 2 || scale_info.shape.size() != 2 || weight_scale2_tensor.data.size() != 1) {
+    error_message = "Invalid NVFP4 tensor family for prefill projection benchmark.";
+    return false;
+  }
+
+  const int rows = static_cast<int>(weight_info.shape[0]);
+  const int cols = static_cast<int>(weight_info.shape[1] * 2);
+  const std::vector<std::int64_t> expected_scale_shape{weight_info.shape[0], cols / 16};
+  if (scale_info.shape != expected_scale_shape) {
+    error_message = "NVFP4 weight_scale shape does not match packed weight shape.";
+    return false;
+  }
+
+  std::vector<float> input(static_cast<std::size_t>(options.sequence_length) * cols);
+  for (std::size_t i = 0; i < input.size(); ++i) {
+    input[i] = std::sin(static_cast<float>(i % 251) * 0.03125f) * 0.25f;
+  }
+
+  double avg_ms = 0.0;
+  double max_abs_error = 0.0;
+  if (!cuda::run_nvfp4_cublaslt_prefill_projection(
+        input.data(),
+        packed_weights.data(),
+        weight_scales.data(),
+        weight_scale2_tensor.data[0],
+        options.sequence_length,
+        rows,
+        cols,
+        options.warmup_iterations,
+        options.benchmark_iterations,
+        avg_ms,
+        max_abs_error,
+        error_message)) {
+    return false;
+  }
+
+  result.tensor_base_name = options.tensor_base_name;
+  result.source_shape = {weight_info.shape[0], weight_info.shape[1] * 2};
+  result.sequence_length = options.sequence_length;
   result.avg_iteration_ms = avg_ms;
   result.iterations_per_second = 1000.0 / avg_ms;
   result.max_abs_error = max_abs_error;
