@@ -7,3 +7,6 @@
 [submodule "third_party/reference/lucebox-hub"]
 	path = third_party/reference/lucebox-hub
 	url = git@github.com:Luce-Org/lucebox-hub.git
+[submodule "third_party/reference/FlashQLA"]
+	path = third_party/reference/FlashQLA
+	url = git@github.com:QwenLM/FlashQLA.git

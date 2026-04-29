@@ -12,6 +12,11 @@ set(QWEN35X_KERNEL_BENCH_NUM_BLOCKS "82" CACHE STRING "Compile-time NUM_BLOCKS d
 set(QWEN35X_CUDA_VARIANT "0p8b" CACHE STRING "Qwen3.5 CUDA kernel specialization for qwen35x_kernelbench: 0p8b or 4b")
 set_property(CACHE QWEN35X_CUDA_VARIANT PROPERTY STRINGS 0p8b 4b)
 
+set(QWEN35X_ENABLE_SM120_MXF4NVF4 OFF)
+if (QWEN35X_CUDA_ARCHITECTURES MATCHES "(^|[; ,])120[af]($|[; ,])")
+  set(QWEN35X_ENABLE_SM120_MXF4NVF4 ON)
+endif ()
+
 include(CheckLanguage)
 if (QWEN35X_ENABLE_CUDA)
   check_language(CUDA)
@@ -52,6 +57,7 @@ if (CMAKE_CUDA_COMPILER)
     add_library(qwen35x_cuda_${variant_name} OBJECT
       src/kernels/cuda/kernel.cu
       src/kernels/cuda/prefill.cu
+      src/kernels/cuda/prefill_flashqla.cu
     )
     target_include_directories(qwen35x_cuda_${variant_name}
       PRIVATE
@@ -63,6 +69,7 @@ if (CMAKE_CUDA_COMPILER)
         BLOCK_SIZE=${QWEN35X_KERNEL_BENCH_BLOCK_SIZE}
         NUM_BLOCKS=${QWEN35X_KERNEL_BENCH_NUM_BLOCKS}
         ${variant_define}=1
+        $<$<BOOL:${QWEN35X_ENABLE_SM120_MXF4NVF4}>:QWEN35X_ENABLE_SM120_MXF4NVF4=1>
         QWEN35X_CUDA_VARIANT_${variant_name}=1
         LAYER_TYPE=LAYER_TYPE_${variant_name}
         decode_kernel=decode_kernel_${variant_name}
@@ -90,6 +97,12 @@ if (CMAKE_CUDA_COMPILER)
         pf_deltanet_conv_prepare=pf_deltanet_conv_prepare_${variant_name}
         pf_deltanet_prepare_norm_gate=pf_deltanet_prepare_norm_gate_${variant_name}
         pf_deltanet_recurrence_cols=pf_deltanet_recurrence_cols_${variant_name}
+        pf_deltanet_recurrence_flashqla64=pf_deltanet_recurrence_flashqla64_${variant_name}
+        pf_deltanet_recurrence_flashqla64_tiled=pf_deltanet_recurrence_flashqla64_tiled_${variant_name}
+        launch_pf_deltanet_recurrence_flashqla64=launch_pf_deltanet_recurrence_flashqla64_${variant_name}
+        launch_pf_deltanet_recurrence_flashqla64_tiled=launch_pf_deltanet_recurrence_flashqla64_tiled_${variant_name}
+        pf_deltanet_flashqla64_cuda_ref=pf_deltanet_flashqla64_cuda_ref_${variant_name}
+        launch_pf_deltanet_flashqla64_cuda_ref=launch_pf_deltanet_flashqla64_cuda_ref_${variant_name}
         pf_deltanet_post_norm_gate=pf_deltanet_post_norm_gate_${variant_name}
         pf_qk_norm_rope=pf_qk_norm_rope_${variant_name}
         pf_causal_softmax_to_bf16=pf_causal_softmax_to_bf16_${variant_name}
@@ -127,6 +140,7 @@ if (CMAKE_CUDA_COMPILER)
     PRIVATE
       BLOCK_SIZE=${QWEN35X_KERNEL_BENCH_BLOCK_SIZE}
       NUM_BLOCKS=${QWEN35X_KERNEL_BENCH_NUM_BLOCKS}
+      $<$<BOOL:${QWEN35X_ENABLE_SM120_MXF4NVF4}>:QWEN35X_ENABLE_SM120_MXF4NVF4=1>
   )
   target_link_libraries(qwen35x_core PRIVATE CUDA::cublasLt CUDA::cublas)
   target_compile_definitions(qwen35x_core PUBLIC QWEN35X_HAS_CUDA=1)

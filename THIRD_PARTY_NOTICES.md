@@ -24,6 +24,12 @@ License: MIT
 Local license file: `third_party/reference/lucebox-hub/LICENSE`  
 Usage in this repo: reference submodule; source provenance for the in-tree Qwen35x CUDA kernels
 
+4. `third_party/reference/FlashQLA`  
+Upstream: https://github.com/QwenLM/FlashQLA  
+License: MIT  
+Local license file: `third_party/reference/FlashQLA/LICENSE`  
+Usage in this repo: reference-only submodule (not linked into `qwen35x` build)
+
 ## Vendored Third-Party Sources
 
 1. `src/kernels/cuda/qwen35x_megakernel/kernel.cu` and `src/kernels/cuda/qwen35x_megakernel/prefill.cu`

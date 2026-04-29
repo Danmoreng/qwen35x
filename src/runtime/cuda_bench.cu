@@ -437,7 +437,7 @@ __global__ void nvfp4_mma_sync_mxf4nvf4_projection_kernel(
   float * output,
   int rows,
   int k_blocks) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
+#if defined(QWEN35X_ENABLE_SM120_MXF4NVF4)
   const int row_tile = blockIdx.x;
   const int lane = threadIdx.x & 31;
   float d0 = 0.0f;
@@ -479,10 +479,6 @@ __global__ void nvfp4_mma_sync_mxf4nvf4_projection_kernel(
     if (col0 + 1 < rows) {
       output[col0 + 1] = d1 * output_alpha;
     }
-  }
-#else
-  if (blockIdx.x == 0 && threadIdx.x == 0 && output != nullptr) {
-    output[0] = -3.4028234663852886e38f;
   }
 #endif
 }
@@ -581,7 +577,13 @@ bool query_device_compute_capability(int & major, int & minor, std::string & err
 }
 
 bool device_supports_sm120_mma_mxf4nvf4(const int major, const int minor) {
+#if defined(QWEN35X_ENABLE_SM120_MXF4NVF4)
   return (major == 12 && (minor == 0 || minor == 1));
+#else
+  (void)major;
+  (void)minor;
+  return false;
+#endif
 }
 
 bool run_nvfp4_blackwell_fp4_projection_benchmark(

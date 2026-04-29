@@ -824,7 +824,7 @@ __device__ void full_attention_layer(
     }
 
     const bool use_sm120_mlp_layer =
-        use_sm120_mlp && qw != nullptr &&
+        kSm120Mxf4nvf4Built && use_sm120_mlp && qw != nullptr &&
         qw->ptrs[8].sm120_packed_weight_fragments != nullptr &&
         qw->ptrs[8].sm120_weight_scale_fragments != nullptr &&
         qw->ptrs[9].sm120_packed_weight_fragments != nullptr &&
@@ -1057,7 +1057,7 @@ __device__ void deltanet_layer(
     }
 
     const bool use_sm120_mlp_layer =
-        use_sm120_mlp && qw != nullptr &&
+        kSm120Mxf4nvf4Built && use_sm120_mlp && qw != nullptr &&
         qw->ptrs[11].sm120_packed_weight_fragments != nullptr &&
         qw->ptrs[11].sm120_weight_scale_fragments != nullptr &&
         qw->ptrs[12].sm120_packed_weight_fragments != nullptr &&

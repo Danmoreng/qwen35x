@@ -10,6 +10,7 @@
 #include "qwen35x/runtime/qwen35x_profile.h"
 
 #include "common.cuh"
+#include "prefill_flashqla.cuh"
 #include "variant.cuh"
 #include "weights.cuh"
 
@@ -105,6 +106,7 @@ pf_deltanet_recurrence(
     float dt_b = __bfloat162float(dt_bias[h]);
 
     __shared__ float s_q[DN_KEY], s_k[DN_KEY], s_v[DN_VAL];
+    __shared__ float s_out[DN_VAL];
     __shared__ float s_beta, s_decay;
     __shared__ float s_gnorm[NWARPS];
 
@@ -172,18 +174,18 @@ pf_deltanet_recurrence(
                 attn += sreg[jj*RPL+ii] * s_q[lid+ii*32];
             }
             attn = pf_warp_sum(attn);
-            if (lid == 0) out_h[j] = __float2bfloat16(attn);
+            if (lid == 0) s_out[j] = attn;
         }
         __syncthreads();
 
         // Gated RMSNorm → bf16 output
         const __nv_bfloat16 *z_h = z_proj + t*DN_V_SIZE + h*DN_VAL;
-        float sq2=0;for(int i=tid;i<DN_VAL;i+=512){float v=__bfloat162float(out_h[i]);sq2+=v*v;}
+        float sq2=0;for(int i=tid;i<DN_VAL;i+=512){float v=s_out[i];sq2+=v*v;}
         sq2=pf_warp_sum(sq2);if(lid==0)s_gnorm[wid]=sq2;__syncthreads();
         if(wid==0){float v=(lid<NWARPS)?s_gnorm[lid]:0;v=pf_warp_sum(v);if(lid==0)s_gnorm[0]=rsqrtf(v/DN_VAL+RMS_EPS);}
         __syncthreads();float rstd=s_gnorm[0];
         for(int i=tid;i<DN_VAL;i+=512){
-            float n=__bfloat162float(out_h[i])*rstd*__bfloat162float(norm_w[i]);
+            float n=s_out[i]*rstd*__bfloat162float(norm_w[i]);
             out_h[i]=__float2bfloat16(n*pf_silu(__bfloat162float(z_h[i])));
         }
         __syncthreads();
@@ -571,6 +573,26 @@ static bool nvfp4_prefill_enabled(const LayerNvfp4Weights *layers) {
     return layers != nullptr && std::getenv("QWEN35X_ENABLE_NVFP4_PREFILL") != nullptr;
 }
 
+static bool fused_gdr_prefill_enabled() {
+    static const bool enabled = std::getenv("QWEN35X_ENABLE_FUSED_GDR_PREFILL") != nullptr;
+    return enabled;
+}
+
+static bool flashqla_gdr_prefill_enabled() {
+    static const bool enabled = std::getenv("QWEN35X_ENABLE_FLASHQLA_GDR_PREFILL") != nullptr;
+    return enabled;
+}
+
+static bool flashqla_gdr_tiled_prefill_enabled() {
+    static const bool enabled = std::getenv("QWEN35X_ENABLE_FLASHQLA_GDR_TILED_PREFILL") != nullptr;
+    return enabled;
+}
+
+static bool flashqla_gdr_cuda_prefill_enabled() {
+    static const bool enabled = std::getenv("QWEN35X_ENABLE_FLASHQLA_GDR_CUDA_PREFILL") != nullptr;
+    return enabled;
+}
+
 static void cublas_nvfp4_prefill_gemm_or_bf16(
     cublasHandle_t h,
     const __nv_bfloat16 *A,
@@ -699,23 +721,97 @@ static void pf_deltanet_chunked(
             pf_bf16_matvec<<<rows * DN_GATE, 32, 0, stream>>>(norm_chunk, beta_w, beta_buf, rows, HIDDEN, DN_GATE);
             pf_bf16_matvec<<<rows * DN_GATE, 32, 0, stream>>>(norm_chunk, alpha_w, alpha_buf, rows, HIDDEN, DN_GATE);
         });
-        profile_phase(profile ? &profile->conv_ms : nullptr, [&]() {
-            pf_deltanet_conv_prepare<<<(DN_CONV_CH + 255) / 256, 256, 0, stream>>>(
-                proj_buf, dn_qkv_f32, conv_w, conv_state, rows);
-        });
-        profile_phase(profile ? &profile->gate_ms : nullptr, [&]() {
-            constexpr int kNormGateItems = (DN_GATE > DN_HEADS) ? DN_GATE : DN_HEADS;
-            pf_deltanet_prepare_norm_gate<<<(rows * kNormGateItems + 15) / 16, 512, 0, stream>>>(
-                dn_qkv_f32, beta_buf, alpha_buf, a_log, dt_bias, rows);
-        });
-        profile_phase(profile ? &profile->recurrence_ms : nullptr, [&]() {
-            pf_deltanet_recurrence_cols<<<dim3(DN_HEADS, (DN_VAL + 3) / 4), dim3(32, 4), 0, stream>>>(
-                dn_qkv_f32, beta_buf, alpha_buf, dn_state, dn_out_f32, rows);
-        });
-        profile_phase(profile ? &profile->post_norm_gate_ms : nullptr, [&]() {
-            pf_deltanet_post_norm_gate<<<rows * DN_GATE, 256, 0, stream>>>(
-                dn_out_f32, proj_buf2, dn_norm, dn_out_buf, rows);
-        });
+        if (flashqla_gdr_cuda_prefill_enabled()) {
+            profile_phase(profile ? &profile->conv_ms : nullptr, [&]() {
+                pf_deltanet_conv_prepare<<<(DN_CONV_CH + 255) / 256, 256, 0, stream>>>(
+                    proj_buf, dn_qkv_f32, conv_w, conv_state, rows);
+            });
+            profile_phase(profile ? &profile->gate_ms : nullptr, [&]() {
+                constexpr int kNormGateItems = (DN_GATE > DN_HEADS) ? DN_GATE : DN_HEADS;
+                pf_deltanet_prepare_norm_gate<<<(rows * kNormGateItems + 15) / 16, 512, 0, stream>>>(
+                    dn_qkv_f32, beta_buf, alpha_buf, a_log, dt_bias, rows);
+            });
+            profile_phase(profile ? &profile->recurrence_ms : nullptr, [&]() {
+                launch_pf_deltanet_flashqla64_cuda_ref(
+                    dn_qkv_f32, beta_buf, alpha_buf, dn_state, dn_out_f32, rows, stream);
+            });
+            profile_phase(profile ? &profile->post_norm_gate_ms : nullptr, [&]() {
+                pf_deltanet_post_norm_gate<<<rows * DN_GATE, 256, 0, stream>>>(
+                    dn_out_f32, proj_buf2, dn_norm, dn_out_buf, rows);
+            });
+        } else if (flashqla_gdr_tiled_prefill_enabled()) {
+            profile_phase(profile ? &profile->conv_ms : nullptr, [&]() {
+                pf_deltanet_conv_prepare<<<(DN_CONV_CH + 255) / 256, 256, 0, stream>>>(
+                    proj_buf, dn_qkv_f32, conv_w, conv_state, rows);
+            });
+            profile_phase(profile ? &profile->gate_ms : nullptr, [&]() {
+                constexpr int kNormGateItems = (DN_GATE > DN_HEADS) ? DN_GATE : DN_HEADS;
+                pf_deltanet_prepare_norm_gate<<<(rows * kNormGateItems + 15) / 16, 512, 0, stream>>>(
+                    dn_qkv_f32, beta_buf, alpha_buf, a_log, dt_bias, rows);
+            });
+            profile_phase(profile ? &profile->recurrence_ms : nullptr, [&]() {
+                launch_pf_deltanet_recurrence_flashqla64_tiled(
+                    dn_qkv_f32, beta_buf, alpha_buf, dn_state, dn_out_f32, rows, stream);
+            });
+            profile_phase(profile ? &profile->post_norm_gate_ms : nullptr, [&]() {
+                pf_deltanet_post_norm_gate<<<rows * DN_GATE, 256, 0, stream>>>(
+                    dn_out_f32, proj_buf2, dn_norm, dn_out_buf, rows);
+            });
+        } else if (flashqla_gdr_prefill_enabled()) {
+            profile_phase(profile ? &profile->conv_ms : nullptr, [&]() {
+                pf_deltanet_conv_prepare<<<(DN_CONV_CH + 255) / 256, 256, 0, stream>>>(
+                    proj_buf, dn_qkv_f32, conv_w, conv_state, rows);
+            });
+            profile_phase(profile ? &profile->gate_ms : nullptr, [&]() {
+                constexpr int kNormGateItems = (DN_GATE > DN_HEADS) ? DN_GATE : DN_HEADS;
+                pf_deltanet_prepare_norm_gate<<<(rows * kNormGateItems + 15) / 16, 512, 0, stream>>>(
+                    dn_qkv_f32, beta_buf, alpha_buf, a_log, dt_bias, rows);
+            });
+            profile_phase(profile ? &profile->recurrence_ms : nullptr, [&]() {
+                launch_pf_deltanet_recurrence_flashqla64(
+                    dn_qkv_f32, beta_buf, alpha_buf, dn_state, dn_out_f32, rows, stream);
+            });
+            profile_phase(profile ? &profile->post_norm_gate_ms : nullptr, [&]() {
+                pf_deltanet_post_norm_gate<<<rows * DN_GATE, 256, 0, stream>>>(
+                    dn_out_f32, proj_buf2, dn_norm, dn_out_buf, rows);
+            });
+        } else if (fused_gdr_prefill_enabled() && DN_VAL_GROUPS == 1) {
+            // FlashQLA-inspired fusion test path for the 0.8B layout: keep the
+            // stateful GDR work in one launch after the four projections.
+            profile_phase(profile ? &profile->recurrence_ms : nullptr, [&]() {
+                pf_deltanet_recurrence<<<DN_HEADS, 512, 0, stream>>>(
+                    proj_buf,
+                    proj_buf2,
+                    beta_buf,
+                    alpha_buf,
+                    conv_w,
+                    a_log,
+                    dt_bias,
+                    dn_norm,
+                    dn_state,
+                    conv_state,
+                    dn_out_buf,
+                    rows);
+            });
+        } else {
+            profile_phase(profile ? &profile->conv_ms : nullptr, [&]() {
+                pf_deltanet_conv_prepare<<<(DN_CONV_CH + 255) / 256, 256, 0, stream>>>(
+                    proj_buf, dn_qkv_f32, conv_w, conv_state, rows);
+            });
+            profile_phase(profile ? &profile->gate_ms : nullptr, [&]() {
+                constexpr int kNormGateItems = (DN_GATE > DN_HEADS) ? DN_GATE : DN_HEADS;
+                pf_deltanet_prepare_norm_gate<<<(rows * kNormGateItems + 15) / 16, 512, 0, stream>>>(
+                    dn_qkv_f32, beta_buf, alpha_buf, a_log, dt_bias, rows);
+            });
+            profile_phase(profile ? &profile->recurrence_ms : nullptr, [&]() {
+                pf_deltanet_recurrence_cols<<<dim3(DN_HEADS, (DN_VAL + 3) / 4), dim3(32, 4), 0, stream>>>(
+                    dn_qkv_f32, beta_buf, alpha_buf, dn_state, dn_out_f32, rows);
+            });
+            profile_phase(profile ? &profile->post_norm_gate_ms : nullptr, [&]() {
+                pf_deltanet_post_norm_gate<<<rows * DN_GATE, 256, 0, stream>>>(
+                    dn_out_f32, proj_buf2, dn_norm, dn_out_buf, rows);
+            });
+        }
         profile_phase(profile ? &profile->out_projection_ms : nullptr, [&]() {
             cublas_nvfp4_prefill_gemm_or_bf16(h, dn_out_buf, out_w, out_nvfp4, proj_buf, rows, HIDDEN, DN_V_SIZE, activation_scratch, activation_scale_scratch, output_f32, stream);
         });

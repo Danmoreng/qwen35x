@@ -10,6 +10,12 @@
 #include <cstddef>
 #include <cstdint>
 
+#if defined(QWEN35X_ENABLE_SM120_MXF4NVF4)
+static constexpr bool kSm120Mxf4nvf4Built = true;
+#else
+static constexpr bool kSm120Mxf4nvf4Built = false;
+#endif
+
 __device__ __forceinline__ std::uint8_t sm120_encode_ue4m3_scale(float value)
 {
     if (!(value > 0.0f)) return 0;
@@ -183,11 +189,11 @@ static __device__ void sm120_mxf4nvf4_projection_grid(
     int k_blocks,
     int num_blocks)
 {
+#if defined(QWEN35X_ENABLE_SM120_MXF4NVF4)
     const int warp_id = threadIdx.x / WARP_SIZE;
     const int lane = threadIdx.x & 31;
     const int global_warp = blockIdx.x * NUM_WARPS + warp_id;
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
     const int total_warps = num_blocks * NUM_WARPS;
     for (int row_tile = global_warp; row_tile < row_tiles; row_tile += total_warps) {
         float d0 = 0.0f;
@@ -234,9 +240,16 @@ static __device__ void sm120_mxf4nvf4_projection_grid(
         }
     }
 #else
-    if (global_warp == 0 && lane == 0 && output != nullptr) {
-        output[0] = -3.4028234663852886e38f;
-    }
+    (void)a_fragments;
+    (void)b_fragments;
+    (void)a_scales;
+    (void)b_scales;
+    (void)output_alpha;
+    (void)output;
+    (void)rows;
+    (void)row_tiles;
+    (void)k_blocks;
+    (void)num_blocks;
 #endif
 }
 

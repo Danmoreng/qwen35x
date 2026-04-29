@@ -44,6 +44,22 @@ git submodule update --remote third_party/reference/tinygrad
 
 - `8eeb77a905aff0108e365dfdc41d36c75b5790a2`
 
+## FlashQLA
+
+- Path: `third_party/reference/FlashQLA`
+- Source: `git@github.com:QwenLM/FlashQLA.git`
+- Integration mode: reference-only (read-only FlashQLA design/code reference, not linked into the main build)
+
+### Common commands
+
+```powershell
+git submodule update --remote third_party/reference/FlashQLA
+```
+
+### Current pin
+
+- `c9b9827036ffe8731e99bab65c51f86320767b33`
+
 ## PyTorch / Transformers
 
 - Path: optional local virtual environment `.venv-hf-parity`
