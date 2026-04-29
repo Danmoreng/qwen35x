@@ -593,6 +593,11 @@ static bool flashqla_gdr_cuda_prefill_enabled() {
     return enabled;
 }
 
+static bool flashqla_gdr_tc_prefill_enabled() {
+    static const bool enabled = std::getenv("QWEN35X_ENABLE_FLASHQLA_GDR_TC_PREFILL") != nullptr;
+    return enabled;
+}
+
 static void cublas_nvfp4_prefill_gemm_or_bf16(
     cublasHandle_t h,
     const __nv_bfloat16 *A,
@@ -721,7 +726,25 @@ static void pf_deltanet_chunked(
             pf_bf16_matvec<<<rows * DN_GATE, 32, 0, stream>>>(norm_chunk, beta_w, beta_buf, rows, HIDDEN, DN_GATE);
             pf_bf16_matvec<<<rows * DN_GATE, 32, 0, stream>>>(norm_chunk, alpha_w, alpha_buf, rows, HIDDEN, DN_GATE);
         });
-        if (flashqla_gdr_cuda_prefill_enabled()) {
+        if (flashqla_gdr_tc_prefill_enabled()) {
+            profile_phase(profile ? &profile->conv_ms : nullptr, [&]() {
+                pf_deltanet_conv_prepare<<<(DN_CONV_CH + 255) / 256, 256, 0, stream>>>(
+                    proj_buf, dn_qkv_f32, conv_w, conv_state, rows);
+            });
+            profile_phase(profile ? &profile->gate_ms : nullptr, [&]() {
+                constexpr int kNormGateItems = (DN_GATE > DN_HEADS) ? DN_GATE : DN_HEADS;
+                pf_deltanet_prepare_norm_gate<<<(rows * kNormGateItems + 15) / 16, 512, 0, stream>>>(
+                    dn_qkv_f32, beta_buf, alpha_buf, a_log, dt_bias, rows);
+            });
+            profile_phase(profile ? &profile->recurrence_ms : nullptr, [&]() {
+                launch_pf_deltanet_recurrence_flashqla64_tc_tiled(
+                    dn_qkv_f32, beta_buf, alpha_buf, dn_state, dn_out_f32, rows, stream);
+            });
+            profile_phase(profile ? &profile->post_norm_gate_ms : nullptr, [&]() {
+                pf_deltanet_post_norm_gate<<<rows * DN_GATE, 256, 0, stream>>>(
+                    dn_out_f32, proj_buf2, dn_norm, dn_out_buf, rows);
+            });
+        } else if (flashqla_gdr_cuda_prefill_enabled()) {
             profile_phase(profile ? &profile->conv_ms : nullptr, [&]() {
                 pf_deltanet_conv_prepare<<<(DN_CONV_CH + 255) / 256, 256, 0, stream>>>(
                     proj_buf, dn_qkv_f32, conv_w, conv_state, rows);
