@@ -493,11 +493,15 @@ pf_deltanet_recurrence_flashqla64_tc_tiled(
     extern __shared__ float smem[];
     float *kk_shared = smem;
     float *qk_shared = kk_shared + CHUNK * CHUNK;
-    float *chunk_decay_prefix = qk_shared + CHUNK * CHUNK;
-    float *chunk_beta = chunk_decay_prefix + CHUNK * COLS;
-    float *delta = chunk_beta + CHUNK * COLS;
-    __nv_bfloat16 *q_bf16 = reinterpret_cast<__nv_bfloat16 *>(delta + CHUNK * COLS);
+    float *intra_shared = kk_shared;
+    float *a_shared = qk_shared + CHUNK * CHUNK;
+    float *g_shared = a_shared + CHUNK * CHUNK;
+    float *beta_shared = g_shared + CHUNK;
+    float *vnew_shared = beta_shared + CHUNK;
+    __nv_bfloat16 *q_bf16 = reinterpret_cast<__nv_bfloat16 *>(vnew_shared + CHUNK * COLS);
     __nv_bfloat16 *k_bf16 = q_bf16 + CHUNK * DN_KEY;
+    __nv_bfloat16 *a_bf16 = reinterpret_cast<__nv_bfloat16 *>(a_shared);
+    __nv_bfloat16 *w_bf16 = a_bf16 + CHUNK * CHUNK;
 
     const int col = col_base + warp;
     float sreg[RPL] = {};
@@ -532,24 +536,24 @@ pf_deltanet_recurrence_flashqla64_tc_tiled(
             const int vc = col_base + c;
             if (vc < DN_VAL) {
                 const int gate_head = h * DN_VAL_GROUPS + vc / DN_VAL_HEAD_DIM;
-                chunk_beta[idx] = beta_buf[(chunk_start + t) * DN_GATE + gate_head];
+                vnew_shared[idx] = 0.0f;
+                if (c == 0) {
+                    beta_shared[t] = beta_buf[(chunk_start + t) * DN_GATE + gate_head];
+                }
             } else {
-                chunk_beta[idx] = 0.0f;
+                vnew_shared[idx] = 0.0f;
             }
-            delta[idx] = 0.0f;
         }
         __syncthreads();
 
-        if (tid < COLS) {
-            const int vc = col_base + tid;
-            float prefix = 1.0f;
+        if (tid == 0) {
+            const int gate_head = h * DN_VAL_GROUPS + col_base / DN_VAL_HEAD_DIM;
+            float g = 0.0f;
             for (int t = 0; t < rows; ++t) {
-                if (vc < DN_VAL) {
-                    const int gate_head = h * DN_VAL_GROUPS + vc / DN_VAL_HEAD_DIM;
-                    const int gate_off = (chunk_start + t) * DN_GATE + gate_head;
-                    prefix *= fmaxf(alpha_buf[gate_off], 1.0e-20f);
-                }
-                chunk_decay_prefix[t * COLS + tid] = prefix;
+                const int gate_off = (chunk_start + t) * DN_GATE + gate_head;
+                g += logf(fmaxf(alpha_buf[gate_off], 1.0e-20f));
+                g_shared[t] = g;
+                beta_shared[t] = beta_buf[gate_off];
             }
         }
         __syncthreads();
@@ -590,30 +594,133 @@ pf_deltanet_recurrence_flashqla64_tc_tiled(
         }
         __syncthreads();
 
+        for (int idx = tid; idx < CHUNK * CHUNK; idx += blockDim.x) {
+            const int t = idx / CHUNK;
+            const int j = idx - t * CHUNK;
+            float a = 0.0f;
+            if (t < rows && j < t) {
+                a = beta_shared[t] * expf(g_shared[t] - g_shared[j]) * kk_shared[t * CHUNK + j];
+            } else if (j == t) {
+                a = 1.0f;
+            }
+            a_shared[t * CHUNK + j] = a;
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            for (int t = 1; t < rows; ++t) {
+                for (int j = 0; j < t; ++j) {
+                    float sum = a_shared[t * CHUNK + j];
+                    for (int m = j + 1; m < t; ++m) {
+                        sum += a_shared[t * CHUNK + m] * a_shared[m * CHUNK + j];
+                    }
+                    a_shared[t * CHUNK + j] = -sum;
+                }
+            }
+        }
+        __syncthreads();
+
+        for (int idx = tid; idx < CHUNK * CHUNK; idx += blockDim.x) {
+            a_bf16[idx] = __float2bfloat16(a_shared[idx]);
+        }
+        __syncthreads();
+
         if (col < DN_VAL) {
             const int c = warp;
             for (int t = 0; t < rows; ++t) {
                 const float *kt = qkv_f32 + (chunk_start + t) * DN_CONV_CH + DN_QK_SIZE + h * DN_KEY;
-                float k_dot_s0 = 0.0f;
+                float k_dot_state = 0.0f;
 #pragma unroll
                 for (int r = 0; r < RPL; ++r) {
-                    k_dot_s0 += kt[lane + r * 32] * sreg[r];
+                    k_dot_state += kt[lane + r * 32] * sreg[r];
                 }
-                k_dot_s0 = pf_warp_sum(k_dot_s0);
-
+                k_dot_state = pf_warp_sum(k_dot_state);
                 if (lane == 0) {
-                    float correction = 0.0f;
-                    for (int i = 0; i < t; ++i) {
-                        const float ratio = chunk_decay_prefix[t * COLS + c] / fmaxf(chunk_decay_prefix[i * COLS + c], 1.0e-20f);
-                        correction += ratio * kk_shared[t * CHUNK + i] * delta[i * COLS + c];
-                    }
                     const float *v = qkv_f32 + (chunk_start + t) * DN_CONV_CH + 2 * DN_QK_SIZE + h * DN_VAL;
-                    delta[t * COLS + c] =
-                        chunk_beta[t * COLS + c] * (v[col] - chunk_decay_prefix[t * COLS + c] * k_dot_s0 - correction);
+                    const float w = beta_shared[t] * (v[col] - expf(g_shared[t]) * k_dot_state);
+                    w_bf16[t * COLS + c] = __float2bfloat16(w);
                 }
                 __syncwarp();
             }
+        }
+        for (int idx = tid; idx < CHUNK * COLS; idx += blockDim.x) {
+            const int t = idx / COLS;
+            const int c = idx - t * COLS;
+            if (t >= rows || col_base + c >= DN_VAL) {
+                w_bf16[idx] = __float2bfloat16(0.0f);
+            }
+        }
+        __syncthreads();
 
+        for (int tile = warp; tile < TILES * (COLS / WMMA_N); tile += blockDim.x / 32) {
+            const int tile_m = tile / (COLS / WMMA_N);
+            const int tile_n = tile - tile_m * (COLS / WMMA_N);
+
+            wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> a_frag;
+            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> w_frag;
+            wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> vnew_acc;
+            wmma::fill_fragment(vnew_acc, 0.0f);
+
+            for (int k0 = 0; k0 < CHUNK; k0 += WMMA_K) {
+                const __nv_bfloat16 *a_tile = a_bf16 + (tile_m * WMMA_M) * CHUNK + k0;
+                const __nv_bfloat16 *w_tile = w_bf16 + k0 * COLS + tile_n * WMMA_N;
+                wmma::load_matrix_sync(a_frag, a_tile, CHUNK);
+                wmma::load_matrix_sync(w_frag, w_tile, COLS);
+                wmma::mma_sync(vnew_acc, a_frag, w_frag, vnew_acc);
+            }
+
+            wmma::store_matrix_sync(
+                vnew_shared + (tile_m * WMMA_M) * COLS + tile_n * WMMA_N,
+                vnew_acc,
+                COLS,
+                wmma::mem_row_major);
+        }
+        __syncthreads();
+
+        for (int idx = tid; idx < CHUNK * CHUNK; idx += blockDim.x) {
+            const int t = idx / CHUNK;
+            const int j = idx - t * CHUNK;
+            float p = 0.0f;
+            if (t < rows && j <= t) {
+                p = expf(g_shared[t] - g_shared[j]) * qk_shared[t * CHUNK + j];
+            }
+            a_bf16[idx] = __float2bfloat16(p);
+        }
+        for (int idx = tid; idx < CHUNK * COLS; idx += blockDim.x) {
+            const int t = idx / COLS;
+            const int c = idx - t * COLS;
+            const float vnew = (t < rows && col_base + c < DN_VAL) ? vnew_shared[idx] : 0.0f;
+            w_bf16[idx] = __float2bfloat16(vnew);
+        }
+        __syncthreads();
+
+        for (int tile = warp; tile < TILES * (COLS / WMMA_N); tile += blockDim.x / 32) {
+            const int tile_m = tile / (COLS / WMMA_N);
+            const int tile_n = tile - tile_m * (COLS / WMMA_N);
+
+            wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> p_frag;
+            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> vnew_frag;
+            wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> intra_acc;
+            wmma::fill_fragment(intra_acc, 0.0f);
+
+            for (int k0 = 0; k0 < CHUNK; k0 += WMMA_K) {
+                const __nv_bfloat16 *p_tile = a_bf16 + (tile_m * WMMA_M) * CHUNK + k0;
+                const __nv_bfloat16 *vnew_tile = w_bf16 + k0 * COLS + tile_n * WMMA_N;
+                wmma::load_matrix_sync(p_frag, p_tile, CHUNK);
+                wmma::load_matrix_sync(vnew_frag, vnew_tile, COLS);
+                wmma::mma_sync(intra_acc, p_frag, vnew_frag, intra_acc);
+            }
+
+            wmma::store_matrix_sync(
+                intra_shared + (tile_m * WMMA_M) * COLS + tile_n * WMMA_N,
+                intra_acc,
+                COLS,
+                wmma::mem_row_major);
+        }
+        __syncthreads();
+
+        if (col < DN_VAL) {
+            const int c = warp;
             for (int t = 0; t < rows; ++t) {
                 const float *qt = qkv_f32 + (chunk_start + t) * DN_CONV_CH + h * DN_KEY;
                 float q_dot_state = 0.0f;
@@ -624,26 +731,20 @@ pf_deltanet_recurrence_flashqla64_tc_tiled(
                 q_dot_state = pf_warp_sum(q_dot_state);
 
                 if (lane == 0) {
-                    float out_sum = 0.0f;
-                    for (int i = 0; i <= t; ++i) {
-                        const float ratio = (i == t) ? 1.0f : (chunk_decay_prefix[t * COLS + c] / fmaxf(chunk_decay_prefix[i * COLS + c], 1.0e-20f));
-                        out_sum += ratio * qk_shared[t * CHUNK + i] * delta[i * COLS + c];
-                    }
                     output[(chunk_start + t) * DN_V_SIZE + h * DN_VAL + col] =
-                        chunk_decay_prefix[t * COLS + c] * q_dot_state + out_sum;
+                        expf(g_shared[t]) * q_dot_state + intra_shared[t * COLS + c];
                 }
                 __syncwarp();
             }
 
-            const float last_prefix = chunk_decay_prefix[(rows - 1) * COLS + c];
+            const float g_last = g_shared[rows - 1];
 #pragma unroll
             for (int r = 0; r < RPL; ++r) {
                 const int d = lane + r * 32;
-                float new_state = last_prefix * sreg[r];
-                for (int i = 0; i < rows; ++i) {
-                    const float ratio = (i == rows - 1) ? 1.0f : (last_prefix / fmaxf(chunk_decay_prefix[i * COLS + c], 1.0e-20f));
-                    const float kid = qkv_f32[(chunk_start + i) * DN_CONV_CH + DN_QK_SIZE + h * DN_KEY + d];
-                    new_state += ratio * kid * delta[i * COLS + c];
+                float new_state = expf(g_last) * sreg[r];
+                for (int t = 0; t < rows; ++t) {
+                    const float kid = qkv_f32[(chunk_start + t) * DN_CONV_CH + DN_QK_SIZE + h * DN_KEY + d];
+                    new_state += kid * expf(g_last - g_shared[t]) * vnew_shared[t * COLS + c];
                 }
                 sreg[r] = new_state;
             }
@@ -682,8 +783,9 @@ static constexpr std::size_t kFlashqla64TcTiledSharedBytes =
     static_cast<std::size_t>(
         64 * 64 +
         64 * 64 +
-        64 * 32 +
-        64 * 32 +
+        64 * 64 +
+        64 +
+        64 +
         64 * 32) * sizeof(float) +
     static_cast<std::size_t>(2 * 64 * DN_KEY) * sizeof(__nv_bfloat16);
 
