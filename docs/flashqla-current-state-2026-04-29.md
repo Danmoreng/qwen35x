@@ -75,6 +75,14 @@ Optional switches are available for local loops:
 - `-SkipParity`
 - `-SkipBenchmark`
 
+For tighter correctness loops during consumer refactors, use the first-token prefill parity harness:
+
+```powershell
+.\scripts\test-flashqla-prefill-parity.ps1
+```
+
+This script builds `qwen35x`, sets `QWEN35X_ENABLE_FLASHQLA_GDR_TC_PREFILL=1`, and runs the minimal CPU/GPU parity prompts with `-MaxNewTokens 1`. It catches prefill/logit/state regressions at the first generated token before running the full 64k performance harness.
+
 ## Local benchmark snapshot
 
 Benchmarks were run with the repository benchmark scripts, not ad-hoc commands. Comparable settings were `-Runs 3 -WarmupRuns 1 -MaxNewTokens 128 -MaxContext 256`.
