@@ -864,9 +864,10 @@ pf_deltanet_flashqla64_tc_output_chunk(
     const int group = col_base / DN_VAL_HEAD_DIM;
     const std::size_t ws_id =
         (static_cast<std::size_t>(h) * DN_VAL_GROUPS + group) * static_cast<std::size_t>(num_chunks) + chunk_id;
+    const std::size_t decayed_ws_id = static_cast<std::size_t>(h) * static_cast<std::size_t>(num_chunks) + chunk_id;
     const __nv_bfloat16 *a_mat = a_ws + ws_id * CHUNK * CHUNK;
     const __nv_bfloat16 *p_mat = p_ws + ws_id * CHUNK * CHUNK;
-    float *decayed_chunk = decayed_vnew_ws + ws_id * CHUNK * DN_VAL;
+    float *decayed_chunk = decayed_vnew_ws + decayed_ws_id * CHUNK * DN_VAL;
 
     const int col = col_base + warp;
     float sreg[RPL] = {};
@@ -1002,12 +1003,17 @@ pf_deltanet_flashqla64_tc_output_chunk(
         }
     }
 
+    for (int idx = tid; idx < CHUNK; idx += blockDim.x) {
+        beta_shared[idx] = (idx < rows) ? expf(g_last - g_shared[idx]) : 0.0f;
+    }
+    __syncthreads();
+
     for (int idx = tid; idx < CHUNK * COLS; idx += blockDim.x) {
         const int t = idx / COLS;
         const int c = idx - t * COLS;
         const int global_c = col_base + c;
         if (t < rows && global_c < DN_VAL) {
-            decayed_chunk[t * DN_VAL + global_c] = expf(g_last - g_shared[t]) * vnew_shared[idx];
+            decayed_chunk[t * DN_VAL + global_c] = beta_shared[t] * vnew_shared[idx];
         }
     }
 }
@@ -1043,9 +1049,12 @@ pf_deltanet_flashqla64_tc_state_update_chunk(
     const float *g_ws = reinterpret_cast<const float *>(p_ws + head_chunks * CHUNK * CHUNK);
     const float *beta_ws = g_ws + head_chunks * CHUNK;
     const float *decayed_vnew_ws = beta_ws + head_chunks * CHUNK;
-    const std::size_t ws_id = static_cast<std::size_t>(h) * static_cast<std::size_t>(num_chunks) + chunk_id;
-    const float *decayed_chunk = decayed_vnew_ws + ws_id * CHUNK * DN_VAL;
-    const float *g_chunk = g_ws + ws_id * CHUNK;
+    const int group = col / DN_VAL_HEAD_DIM;
+    const std::size_t group_ws_id =
+        (static_cast<std::size_t>(h) * DN_VAL_GROUPS + group) * static_cast<std::size_t>(num_chunks) + chunk_id;
+    const std::size_t decayed_ws_id = static_cast<std::size_t>(h) * static_cast<std::size_t>(num_chunks) + chunk_id;
+    const float *decayed_chunk = decayed_vnew_ws + decayed_ws_id * CHUNK * DN_VAL;
+    const float *g_chunk = g_ws + group_ws_id * CHUNK;
     const float state_scale = expf(g_chunk[rows - 1]);
 
     float *state_col = state + h * DN_KEY * DN_VAL + col * DN_KEY;

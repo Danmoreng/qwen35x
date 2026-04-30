@@ -132,6 +132,7 @@ $env:QWEN35X_ENABLE_FLASHQLA_GDR_TC_PREFILL='1'
 | Consumer scratch/fast-path cleanup | `benchmarks/qwen35x-flashqla-iteration-wiki-ai-64k-gen128-20260430-152345.csv` | `10675.06 ms` | `6126.97` | `654.36 ms` | `195.62` |
 | Rejected 32-lane K-slice staging | `benchmarks/qwen35x-flashqla-iteration-wiki-ai-64k-gen128-20260430-160746.csv` | `10685.69 ms` | `6120.82` | not recorded here | not recorded here |
 | Split consumer, FP32 state update | `benchmarks/qwen35x-flashqla-iteration-wiki-ai-64k-gen128-20260430-210650.csv` | `10462.45 ms` | `6251.43` | `654.97 ms` | `195.45` |
+| Split consumer, per-head `Vnew` scratch + row decay cache | `benchmarks/qwen35x-flashqla-iteration-wiki-ai-64k-gen128-20260430-212324.csv` | `10349.98 ms` | `6319.34` | `654.06 ms` | `195.70` |
 
 The split-workspace change recovered the largest obvious duplicate-work penalty: about 2.1x faster prefill than the previous FlashQLA TC path on 64k. The row-parallel KKT solve then reduced prefill from `13073.39 ms` to `10910.53 ms`. It is still slower than the old custom recurrence by about 15 percent on prefill latency.
 
@@ -162,6 +163,8 @@ A prepare-kernel attempt skipped the six strictly upper off-diagonal `QK^T`/`KK^
 A compact lower-triangle tile enumeration avoided the sparse warp schedule from the first upper-tile skip attempt and also preserved exact prepare-workspace parity. It passed the full minimal parity gate, but still regressed 64k performance: average prefill was `11375.33 ms`, recurrence `4187.68 ms`, prepare `368.24 ms`, and consume `3819.44 ms`. The production change was reverted.
 
 The split-consumer experiment keeps FP32 recurrent state semantics but separates chunk output and state update into per-chunk kernel launches under `QWEN35X_ENABLE_FLASHQLA_SPLIT_CONSUMER=1`. It appends a decayed-`Vnew` buffer to the FlashQLA workspace, writes it from the output chunk kernel, then runs a scalar FP32 state-update kernel before advancing to the next chunk. It passed first-token parity, minimal 4-token parity, and the 64k benchmark. The 64k profile split improved to `3757.76 ms` recurrence total, `365.39 ms` prepare, and `3392.37 ms` consume.
+
+The follow-up split-consumer cleanup makes the decayed-`Vnew` scratch layout per recurrent head instead of per value group, while retaining per-group `A`, `P`, `g`, and `beta` matrices. That reduces workspace pressure and fixes the layout for 4B-style two-value-group heads. The output chunk also computes `exp(g_last - g[t])` once per row before writing decayed `Vnew`, instead of once per value element. The full iteration harness passed minimal parity `5/5`; the 64k CSV above averaged `10349.98 ms` prefill and `6319.34` prefill tok/s.
 
 ## What is still missing versus full FlashQLA
 

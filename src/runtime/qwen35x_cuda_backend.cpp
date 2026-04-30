@@ -1503,7 +1503,8 @@ bool initialize_backend_state(
   const std::size_t flashqla_workspace_bytes =
     flashqla_head_chunks * flashqla_chunk_tokens * flashqla_chunk_tokens * sizeof(std::uint16_t) * 2 +
     flashqla_head_chunks * flashqla_chunk_tokens * sizeof(float) * 2 +
-    flashqla_head_chunks * flashqla_chunk_tokens * static_cast<std::size_t>(descriptor.dn_value_dim) * sizeof(float);
+    static_cast<std::size_t>(descriptor.dn_num_heads) * flashqla_chunks *
+      flashqla_chunk_tokens * static_cast<std::size_t>(descriptor.dn_value_dim) * sizeof(float);
   const int pf_fp4_max_input_cols = std::max({
     descriptor.hidden_size,
     descriptor.intermediate_size,
