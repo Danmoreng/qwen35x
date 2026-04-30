@@ -87,6 +87,31 @@ For tighter correctness loops during consumer refactors, use the first-token pre
 
 This script builds `qwen35x`, sets `QWEN35X_ENABLE_FLASHQLA_GDR_TC_PREFILL=1`, and runs the minimal CPU/GPU parity prompts with `-MaxNewTokens 1`. It catches prefill/logit/state regressions at the first generated token before running the full 64k performance harness.
 
+## Head-to-head CLI
+
+The main `qwen35x` executable can now select the prefill kernel directly without external environment variables:
+
+```powershell
+.\build\qwen35x.exe --infer-gpu --hf-model-dir models\qwen3.5-0.8b --prompt-file benchmarks\inputs\wiki_artificial_intelligence_64k_prompt.txt --max-new-tokens 128 --max-context 65536 --temperature 0 --qwen35x-prefill-mode batched --qwen35x-prefill-kernel traditional --metrics-only
+.\build\qwen35x.exe --infer-gpu --hf-model-dir models\qwen3.5-0.8b --prompt-file benchmarks\inputs\wiki_artificial_intelligence_64k_prompt.txt --max-new-tokens 128 --max-context 65536 --temperature 0 --qwen35x-prefill-mode batched --qwen35x-prefill-kernel flashqla --metrics-only
+```
+
+Supported values:
+
+- `traditional`: clears the FlashQLA environment toggles and uses the established custom prefill recurrence.
+- `flashqla`: enables the current FlashQLA-style BF16 WMMA path with the split consumer.
+- `flashqla-monolithic`: enables the BF16 WMMA path without the split consumer, retained for comparisons.
+
+`--metrics-only` suppresses generated text, token ids, stage breakdowns, transfer counters, and profile details. It prints one line containing only backend, selected prefill kernel, prompt/generated token counts, prefill time/tok/s, and decode time/tok/s.
+
+For sequential size sweeps, use:
+
+```powershell
+.\scripts\benchmark-prefill-kernels.ps1
+```
+
+The script builds `qwen35x`, runs `traditional` and `flashqla` through the same executable, and writes a CSV to `benchmarks/qwen35x-prefill-kernel-head-to-head.csv`. The prompt-size sweep can be customized with `-TargetPromptTokens`, `-Runs`, `-WarmupRuns`, and `-MaxNewTokens`.
+
 ## Local benchmark snapshot
 
 Benchmarks were run with the repository benchmark scripts, not ad-hoc commands. Comparable settings were `-Runs 3 -WarmupRuns 1 -MaxNewTokens 128 -MaxContext 256`.

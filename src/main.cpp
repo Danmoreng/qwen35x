@@ -5,6 +5,7 @@
 #include "qwen35x/weights/modelopt_nvfp4.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -70,6 +71,62 @@ const char * qwen35x_weight_precision_name(const qwen35x::cuda_backend::Qwen35xW
 
 const char * qwen35x_cache_precision_name(const qwen35x::cuda_backend::Qwen35xCachePrecision precision) {
   return qwen35x::cuda_backend::to_string(precision);
+}
+
+bool set_env_var(const char * name, const char * value) {
+#if defined(_WIN32)
+  return _putenv_s(name, value) == 0;
+#else
+  return setenv(name, value, 1) == 0;
+#endif
+}
+
+bool unset_env_var(const char * name) {
+#if defined(_WIN32)
+  return _putenv_s(name, "") == 0;
+#else
+  return unsetenv(name) == 0;
+#endif
+}
+
+bool configure_qwen35x_prefill_kernel(const std::string & kernel, std::string & error_message) {
+  if (kernel.empty()) {
+    return true;
+  }
+
+  const bool clear_ok =
+    unset_env_var("QWEN35X_ENABLE_FLASHQLA_GDR_PREFILL") &&
+    unset_env_var("QWEN35X_ENABLE_FLASHQLA_GDR_TILED_PREFILL") &&
+    unset_env_var("QWEN35X_ENABLE_FLASHQLA_GDR_CUDA_PREFILL") &&
+    unset_env_var("QWEN35X_ENABLE_FLASHQLA_GDR_TC_PREFILL") &&
+    unset_env_var("QWEN35X_ENABLE_FLASHQLA_SPLIT_CONSUMER");
+  if (!clear_ok) {
+    error_message = "failed to clear Qwen35x prefill-kernel environment overrides.";
+    return false;
+  }
+
+  if (kernel == "traditional") {
+    return true;
+  }
+  if (kernel == "flashqla") {
+    if (!set_env_var("QWEN35X_ENABLE_FLASHQLA_GDR_TC_PREFILL", "1") ||
+        !set_env_var("QWEN35X_ENABLE_FLASHQLA_SPLIT_CONSUMER", "1")) {
+      error_message = "failed to enable FlashQLA split prefill environment overrides.";
+      return false;
+    }
+    return true;
+  }
+  if (kernel == "flashqla-monolithic") {
+    if (!set_env_var("QWEN35X_ENABLE_FLASHQLA_GDR_TC_PREFILL", "1")) {
+      error_message = "failed to enable FlashQLA monolithic prefill environment override.";
+      return false;
+    }
+    return true;
+  }
+
+  error_message = "unknown --qwen35x-prefill-kernel value: " + kernel +
+                  " (expected: traditional|flashqla|flashqla-monolithic)";
+  return false;
 }
 
 const char * qwen35x_layer_type_name(const int layer_type) {
@@ -266,6 +323,8 @@ int main(int argc, char ** argv) {
   std::vector<std::string> stop_texts;
   bool stop_on_im_end = false;
   std::string profile_json_path;
+  std::string qwen35x_prefill_kernel;
+  bool metrics_only = false;
   qwen35x::RuntimeTarget target;
   bool bench_bf16 = false;
   bool validate_nvfp4_model = false;
@@ -391,6 +450,8 @@ int main(int argc, char ** argv) {
         std::cerr << "unknown " << arg << " value: " << mode << " (expected: replay|batched)\n";
         return 11;
       }
+    } else if ((arg == "--qwen35x-prefill-kernel" || arg == "--luce-prefill-kernel") && i + 1 < argc) {
+      qwen35x_prefill_kernel = argv[++i];
     } else if (arg == "--qwen35x-weight-precision" && i + 1 < argc) {
       const std::string precision = argv[++i];
       if (precision == "bf16") {
@@ -415,6 +476,8 @@ int main(int argc, char ** argv) {
       infer_options.profile_cuda_sync = true;
     } else if (arg == "--qwen35x-profile" || arg == "--luce-profile") {
       infer_options.profile_qwen35x = true;
+    } else if (arg == "--metrics-only") {
+      metrics_only = true;
     } else if (arg == "--prefill-only") {
       infer_options.prefill_only = true;
     } else if (arg == "--stop-token" && i + 1 < argc) {
@@ -445,7 +508,8 @@ int main(int argc, char ** argv) {
       std::cout << "       qwen35x --infer-gpu --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "               [--temperature <float>] [--top-p <float>] [--top-k <int>] [--repeat-penalty <float>] [--seed <int64>]\n";
       std::cout << "               [--gpu-bf16|--gpu-f32-matvec] [--gpu-decode-backend <default|qwen35x>] [--gpu-decode-blocks <n>] [--qwen35x-prefill-mode <replay|batched>]\n";
-      std::cout << "               [--qwen35x-weight-precision <bf16|nvfp4>] [--qwen35x-cache-precision <bf16|quantized>] [--profile-sync] [--qwen35x-profile] [--prefill-only]\n";
+      std::cout << "               [--qwen35x-prefill-kernel <traditional|flashqla|flashqla-monolithic>]\n";
+      std::cout << "               [--qwen35x-weight-precision <bf16|nvfp4>] [--qwen35x-cache-precision <bf16|quantized>] [--profile-sync] [--qwen35x-profile] [--prefill-only] [--metrics-only]\n";
       std::cout << "               [--stop-token <csv>] [--stop-text <text>] [--stop-on-im-end] [--profile-json <path>]\n";
       return 0;
     }
@@ -453,6 +517,14 @@ int main(int argc, char ** argv) {
 
   if (infer_gpu && !gpu_decode_backend_explicit) {
     infer_options.gpu_decode_backend = qwen35x::GpuDecodeBackend::qwen35x_cuda;
+  }
+
+  if (infer_gpu) {
+    std::string error_message;
+    if (!configure_qwen35x_prefill_kernel(qwen35x_prefill_kernel, error_message)) {
+      std::cerr << "prefill kernel config failed: " << error_message << "\n";
+      return 11;
+    }
   }
 
   if (bench_bf16) {
@@ -822,10 +894,25 @@ int main(int argc, char ** argv) {
       return 13;
     }
 
+    if (metrics_only) {
+      std::cout << std::fixed << std::setprecision(6);
+      std::cout << "backend=" << (infer_options.use_cuda ? "cuda-hybrid" : "cpu-reference")
+                << " decode_backend=" << gpu_decode_backend_name(infer_options.gpu_decode_backend)
+                << " prefill_kernel=" << (qwen35x_prefill_kernel.empty() ? "env-or-default" : qwen35x_prefill_kernel)
+                << " prompt_tokens=" << infer_options.prompt_tokens.size()
+                << " generated_tokens=" << infer_result.generated_tokens.size()
+                << " prefill_time_ms=" << infer_result.prefill_time_ms
+                << " prefill_tps=" << infer_result.prefill_tokens_per_second
+                << " decode_time_ms=" << infer_result.decode_time_ms
+                << " decode_tps=" << infer_result.tokens_per_second << "\n";
+      return 0;
+    }
+
     std::cout << "reference inference\n";
     std::cout << "  backend: " << (infer_options.use_cuda ? "cuda-hybrid" : "cpu-reference") << "\n";
     std::cout << "  decode_backend: " << gpu_decode_backend_name(infer_options.gpu_decode_backend) << "\n";
     std::cout << "  qwen35x_prefill_mode: " << qwen35x_prefill_mode_name(infer_options.qwen35x_prefill_mode) << "\n";
+    std::cout << "  qwen35x_prefill_kernel: " << (qwen35x_prefill_kernel.empty() ? "env-or-default" : qwen35x_prefill_kernel) << "\n";
     std::cout << "  qwen35x_weight_precision: " << qwen35x_weight_precision_name(infer_options.qwen35x_weight_precision) << "\n";
     std::cout << "  qwen35x_cache_precision: " << qwen35x_cache_precision_name(infer_options.qwen35x_cache_precision) << "\n";
     std::cout << "  prefill_only: " << (infer_options.prefill_only ? "on" : "off") << "\n";
