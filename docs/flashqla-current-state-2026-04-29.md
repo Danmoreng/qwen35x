@@ -82,9 +82,10 @@ $env:QWEN35X_ENABLE_FLASHQLA_GDR_TC_PREFILL='1'
 |---|---|---:|---:|---:|---:|
 | Previous FlashQLA TC path | `benchmarks/qwen35x-current-flashqla-wiki-ai-64k-gen128.csv` | `27731.82 ms` | `2358.73` | `735.52 ms` | `174.03` |
 | Split-workspace FlashQLA TC path | `benchmarks/qwen35x-flashqla-split-workspace-wiki-ai-64k-gen128.csv` | `13073.39 ms` | `5004.03` | `645.76 ms` | `198.40` |
+| Split workspace + row-parallel KKT solve | `benchmarks/qwen35x-flashqla-parallel-kkt-wiki-ai-64k-gen128.csv` | `10910.53 ms` | `5994.76` | `650.20 ms` | `196.87` |
 | Old custom recurrence path | `benchmarks/qwen35x-current-old-custom-wiki-ai-64k-gen128.csv` | `9512.08 ms` | `6885.11` | `707.23 ms` | `180.99` |
 
-The split-workspace change recovered the largest obvious duplicate-work penalty: about 2.1x faster prefill than the previous FlashQLA TC path on 64k. It is still slower than the old custom recurrence by about 37 percent on prefill latency.
+The split-workspace change recovered the largest obvious duplicate-work penalty: about 2.1x faster prefill than the previous FlashQLA TC path on 64k. The row-parallel KKT solve then reduced prefill from `13073.39 ms` to `10910.53 ms`. It is still slower than the old custom recurrence by about 15 percent on prefill latency.
 
 ## What is still missing versus full FlashQLA
 
@@ -92,7 +93,7 @@ The current BF16 WMMA path only accelerates the chunk attention-like matrices. I
 
 Main missing pieces:
 
-- The triangular KKT solve for `A` is still serial on one thread per chunk.
+- The triangular KKT solve for `A` is row-parallel, but still row-synchronous and not equivalent to the reference's optimized solve schedule.
 - The path uses a two-kernel global-workspace split instead of the reference's tighter producer/consumer shared-memory schedule.
 - Output accumulation is tensorized through `P @ Vnew`, but final output/state handling still uses scalar warp reductions.
 - State update is still scalar over key lanes and chunk rows.
@@ -102,8 +103,8 @@ Main missing pieces:
 
 ## Next work
 
-1. Parallelize the triangular KKT solve for `A`; the current `tid == 0` solve is the next large structural bottleneck.
-2. Precompute/reuse decay factors used by output and state update so consumers do less scalar transcendental work.
+1. Improve the KKT solve schedule further; the current row-synchronous version is correct and faster, but still conservative.
+2. Reduce consumer-side scalar work without regressing prefill. A tested `exp(g)` workspace variant preserved parity but was slower on 64k, so it was not kept.
 3. Move more value-side work into tensor-core-friendly tiles, especially state/output update surfaces.
 4. Rework shared-memory layout and scheduling toward a producer/consumer structure that avoids global workspace traffic where practical on `sm_120a`.
 5. Add direct comparison tests against the upstream Qwen FlashQLA reference outputs.

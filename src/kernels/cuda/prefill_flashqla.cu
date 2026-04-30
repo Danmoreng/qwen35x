@@ -577,28 +577,25 @@ pf_deltanet_flashqla64_tc_prepare(
     for (int idx = tid; idx < CHUNK * CHUNK; idx += blockDim.x) {
         const int t = idx / CHUNK;
         const int j = idx - t * CHUNK;
-        float a = 0.0f;
+        float lower = 0.0f;
         if (t < rows && j < t) {
-            a = beta_shared[t] * expf(g_shared[t] - g_shared[j]) * kk_shared[t * CHUNK + j];
-        } else if (j == t) {
-            a = 1.0f;
+            lower = beta_shared[t] * expf(g_shared[t] - g_shared[j]) * kk_shared[t * CHUNK + j];
         }
-        a_shared[t * CHUNK + j] = a;
+        kk_shared[t * CHUNK + j] = lower;
+        a_shared[t * CHUNK + j] = (j == t) ? 1.0f : 0.0f;
     }
     __syncthreads();
 
-    if (tid == 0) {
-        for (int t = 1; t < rows; ++t) {
-            for (int j = 0; j < t; ++j) {
-                float sum = a_shared[t * CHUNK + j];
-                for (int m = j + 1; m < t; ++m) {
-                    sum += a_shared[t * CHUNK + m] * a_shared[m * CHUNK + j];
-                }
-                a_shared[t * CHUNK + j] = -sum;
+    for (int t = 1; t < rows; ++t) {
+        for (int j = tid; j < t; j += blockDim.x) {
+            float sum = kk_shared[t * CHUNK + j];
+            for (int m = j + 1; m < t; ++m) {
+                sum += kk_shared[t * CHUNK + m] * a_shared[m * CHUNK + j];
             }
+            a_shared[t * CHUNK + j] = -sum;
         }
+        __syncthreads();
     }
-    __syncthreads();
 
     for (int idx = tid; idx < CHUNK * CHUNK; idx += blockDim.x) {
         const int t = idx / CHUNK;
