@@ -16,6 +16,8 @@ struct Qwen35xLayerProfile {
   double conv_ms = 0.0;
   double gate_ms = 0.0;
   double recurrence_ms = 0.0;
+  double flashqla_prepare_ms = 0.0;
+  double flashqla_consume_ms = 0.0;
   double post_norm_gate_ms = 0.0;
   double qk_norm_rope_ms = 0.0;
   double attention_ms = 0.0;

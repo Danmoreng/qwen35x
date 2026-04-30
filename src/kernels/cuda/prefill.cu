@@ -737,8 +737,12 @@ static void pf_deltanet_chunked(
                 pf_deltanet_prepare_norm_gate<<<(rows * kNormGateItems + 15) / 16, 512, 0, stream>>>(
                     dn_qkv_f32, beta_buf, alpha_buf, a_log, dt_bias, rows);
             });
-            profile_phase(profile ? &profile->recurrence_ms : nullptr, [&]() {
-                launch_pf_deltanet_recurrence_flashqla64_tc_tiled(
+            profile_phase(profile ? &profile->flashqla_prepare_ms : nullptr, [&]() {
+                launch_pf_deltanet_flashqla64_tc_prepare(
+                    dn_qkv_f32, beta_buf, alpha_buf, rows, flashqla_workspace, stream);
+            });
+            profile_phase(profile ? &profile->flashqla_consume_ms : nullptr, [&]() {
+                launch_pf_deltanet_recurrence_flashqla64_tc_consume(
                     dn_qkv_f32, beta_buf, alpha_buf, dn_state, dn_out_f32, rows, flashqla_workspace, stream);
             });
             profile_phase(profile ? &profile->post_norm_gate_ms : nullptr, [&]() {
@@ -1062,6 +1066,10 @@ extern "C" void launch_prefill_bf16(
         cudaEventDestroy(profile_total_stop);
         for (int li = 0; li < NUM_LAYERS; ++li) {
             auto &layer = profile->layers[li];
+            if (layer.recurrence_ms == 0.0 &&
+                (layer.flashqla_prepare_ms != 0.0 || layer.flashqla_consume_ms != 0.0)) {
+                layer.recurrence_ms = layer.flashqla_prepare_ms + layer.flashqla_consume_ms;
+            }
             layer.total_ms =
                 layer.rms_norm_ms +
                 layer.qkv_projection_ms +

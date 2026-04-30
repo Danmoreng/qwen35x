@@ -89,6 +89,8 @@ void write_qwen35x_layer_profile_json(std::ostream & out, const qwen35x::cuda_ba
   out << "        \"conv_ms\": " << layer.conv_ms << ",\n";
   out << "        \"gate_ms\": " << layer.gate_ms << ",\n";
   out << "        \"recurrence_ms\": " << layer.recurrence_ms << ",\n";
+  out << "        \"flashqla_prepare_ms\": " << layer.flashqla_prepare_ms << ",\n";
+  out << "        \"flashqla_consume_ms\": " << layer.flashqla_consume_ms << ",\n";
   out << "        \"post_norm_gate_ms\": " << layer.post_norm_gate_ms << ",\n";
   out << "        \"qk_norm_rope_ms\": " << layer.qk_norm_rope_ms << ",\n";
   out << "        \"attention_ms\": " << layer.attention_ms << ",\n";

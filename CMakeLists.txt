@@ -104,6 +104,8 @@ if (CMAKE_CUDA_COMPILER)
         pf_deltanet_flashqla64_cuda_ref=pf_deltanet_flashqla64_cuda_ref_${variant_name}
         launch_pf_deltanet_flashqla64_cuda_ref=launch_pf_deltanet_flashqla64_cuda_ref_${variant_name}
         pf_deltanet_recurrence_flashqla64_tc_tiled=pf_deltanet_recurrence_flashqla64_tc_tiled_${variant_name}
+        launch_pf_deltanet_flashqla64_tc_prepare=launch_pf_deltanet_flashqla64_tc_prepare_${variant_name}
+        launch_pf_deltanet_recurrence_flashqla64_tc_consume=launch_pf_deltanet_recurrence_flashqla64_tc_consume_${variant_name}
         launch_pf_deltanet_recurrence_flashqla64_tc_tiled=launch_pf_deltanet_recurrence_flashqla64_tc_tiled_${variant_name}
         pf_deltanet_post_norm_gate=pf_deltanet_post_norm_gate_${variant_name}
         pf_qk_norm_rope=pf_qk_norm_rope_${variant_name}

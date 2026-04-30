@@ -4,6 +4,8 @@ This note documents the current FlashQLA-style DeltaNet prefill work after addin
 
 Update 2026-04-30: the TC path now uses a split workspace structure. Chunk-level matrices are prepared once per DeltaNet head/value group/chunk and reused by value-column consumer blocks. This removes the earlier 4x recomputation of `KK`, `QK`, `A`, and `P` for the 0.8B layout.
 
+Update 2026-04-30: the TC path now exposes separate profile timings for the FlashQLA prepare and consume stages. The combined `recurrence_ms` remains the sum of those stages for compatibility with existing reports.
+
 ## Reference
 
 - Reference repository: `third_party/reference/FlashQLA`
@@ -26,6 +28,12 @@ The current tensor-core path is implemented in `src/kernels/cuda/prefill_flashql
 - `pf_deltanet_flashqla64_tc_prepare`: computes per-chunk `A`, `P`, `g`, and `beta` into an arena-backed workspace.
 - `pf_deltanet_recurrence_flashqla64_tc_tiled`: consumes those matrices for `A @ W`, `P @ Vnew`, output, and state update over value-column tiles.
 
+The launch layer now has explicit wrappers for both stages:
+
+- `launch_pf_deltanet_flashqla64_tc_prepare`
+- `launch_pf_deltanet_recurrence_flashqla64_tc_consume`
+- `launch_pf_deltanet_recurrence_flashqla64_tc_tiled`, retained as a compatibility wrapper that calls prepare then consume.
+
 Current properties:
 
 - Uses BF16 WMMA tensor-core operations for the 64 by 64 chunk matrices `K * K^T` and `Q * K^T`.
@@ -42,6 +50,28 @@ Verified build command for the current machine:
 ```powershell
 .\scripts\build.ps1 -UseNinja -EnableCuda -Configuration Release -Target qwen35x -CudaArchitectures 120a -BuildDir build-flashqla-gdr-verify
 ```
+
+## Iteration harness
+
+The one-command FlashQLA iteration harness is:
+
+```powershell
+.\scripts\test-flashqla-iteration.ps1
+```
+
+Default behavior:
+
+1. Builds `qwen35x` with CUDA/Ninja Release.
+2. Sets `QWEN35X_ENABLE_FLASHQLA_GDR_TC_PREFILL=1`.
+3. Runs minimal parity with `scripts/bench/parity_prompts_minimal.txt`.
+4. Runs the 64k Wikipedia benchmark with profiling enabled.
+5. Writes timestamped CSVs under `benchmarks/`.
+
+Optional switches are available for local loops:
+
+- `-SkipBuild`
+- `-SkipParity`
+- `-SkipBenchmark`
 
 ## Local benchmark snapshot
 
@@ -84,8 +114,19 @@ $env:QWEN35X_ENABLE_FLASHQLA_GDR_TC_PREFILL='1'
 | Split-workspace FlashQLA TC path | `benchmarks/qwen35x-flashqla-split-workspace-wiki-ai-64k-gen128.csv` | `13073.39 ms` | `5004.03` | `645.76 ms` | `198.40` |
 | Split workspace + row-parallel KKT solve | `benchmarks/qwen35x-flashqla-parallel-kkt-wiki-ai-64k-gen128.csv` | `10910.53 ms` | `5994.76` | `650.20 ms` | `196.87` |
 | Old custom recurrence path | `benchmarks/qwen35x-current-old-custom-wiki-ai-64k-gen128.csv` | `9512.08 ms` | `6885.11` | `707.23 ms` | `180.99` |
+| Profile-split FlashQLA TC path | `benchmarks/qwen35x-flashqla-iteration-wiki-ai-64k-gen128-20260430-145601.csv` | `10875.03 ms` | `6014.43` | `656.53 ms` | `194.97` |
 
 The split-workspace change recovered the largest obvious duplicate-work penalty: about 2.1x faster prefill than the previous FlashQLA TC path on 64k. The row-parallel KKT solve then reduced prefill from `13073.39 ms` to `10910.53 ms`. It is still slower than the old custom recurrence by about 15 percent on prefill latency.
+
+The profile-split run keeps the same algorithmic structure as the row-parallel KKT path, but records the two FlashQLA sub-stages separately:
+
+| Metric | Avg over 3 measured 64k runs |
+|---|---:|
+| DeltaNet recurrence total | `4313.68 ms` |
+| FlashQLA prepare | `360.63 ms` |
+| FlashQLA consume | `3953.05 ms` |
+
+The consumer stage is therefore the next high-value optimization target.
 
 ## What is still missing versus full FlashQLA
 
@@ -108,4 +149,4 @@ Main missing pieces:
 3. Move more value-side work into tensor-core-friendly tiles, especially state/output update surfaces.
 4. Rework shared-memory layout and scheduling toward a producer/consumer structure that avoids global workspace traffic where practical on `sm_120a`.
 5. Add direct comparison tests against the upstream Qwen FlashQLA reference outputs.
-6. Rebenchmark on the RTX 5080 Laptop GPU with the standard sequential benchmark script after each substantial change.
+6. Rebenchmark on the RTX 5080 Laptop GPU with `scripts/test-flashqla-iteration.ps1` after each substantial change.

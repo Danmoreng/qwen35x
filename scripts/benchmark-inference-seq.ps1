@@ -393,6 +393,8 @@ foreach ($mode in $Modes) {
                 qwen35x_prefill_output_token_download_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xPrefillJson -Name "output_token_download_ms")
                 qwen35x_prefill_deltanet_total_ms = Measure-Qwen35xLayerMs -RuntimeProfile $qwen35xProfileJson -LayerType "deltanet" -Fields @("total_ms")
                 qwen35x_prefill_deltanet_recurrence_ms = Measure-Qwen35xLayerMs -RuntimeProfile $qwen35xProfileJson -LayerType "deltanet" -Fields @("recurrence_ms")
+                qwen35x_prefill_deltanet_flashqla_prepare_ms = Measure-Qwen35xLayerMs -RuntimeProfile $qwen35xProfileJson -LayerType "deltanet" -Fields @("flashqla_prepare_ms")
+                qwen35x_prefill_deltanet_flashqla_consume_ms = Measure-Qwen35xLayerMs -RuntimeProfile $qwen35xProfileJson -LayerType "deltanet" -Fields @("flashqla_consume_ms")
                 qwen35x_prefill_deltanet_projection_ms = Measure-Qwen35xLayerMs -RuntimeProfile $qwen35xProfileJson -LayerType "deltanet" -Fields @("qkv_projection_ms", "z_projection_ms", "beta_alpha_projection_ms", "out_projection_ms")
                 qwen35x_prefill_full_attention_total_ms = Measure-Qwen35xLayerMs -RuntimeProfile $qwen35xProfileJson -LayerType "full_attention" -Fields @("total_ms")
                 qwen35x_prefill_full_attention_attention_ms = Measure-Qwen35xLayerMs -RuntimeProfile $qwen35xProfileJson -LayerType "full_attention" -Fields @("attention_ms")
