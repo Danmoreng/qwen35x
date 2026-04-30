@@ -47,6 +47,16 @@ void launch_pf_deltanet_recurrence_flashqla64_tc_consume(
     const void *workspace,
     cudaStream_t stream);
 
+void launch_pf_deltanet_recurrence_flashqla64_tc_consume_split(
+    const float *qkv_f32,
+    const float *beta_buf,
+    const float *alpha_buf,
+    float *state,
+    float *output,
+    int S,
+    const void *workspace,
+    cudaStream_t stream);
+
 void launch_pf_deltanet_recurrence_flashqla64_tc_tiled(
     const float *qkv_f32,
     const float *beta_buf,

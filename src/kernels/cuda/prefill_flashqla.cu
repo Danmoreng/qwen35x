@@ -818,6 +818,255 @@ pf_deltanet_recurrence_flashqla64_tc_tiled(
     }
 }
 
+static __global__ void __launch_bounds__(1024, 1)
+pf_deltanet_flashqla64_tc_output_chunk(
+    const float *qkv_f32,
+    float *state,
+    float *output,
+    int S,
+    int num_chunks,
+    int chunk_id,
+    const void *workspace)
+{
+    constexpr int CHUNK = 64;
+    constexpr int COLS = 32;
+    constexpr int RPL = DN_KEY / 32;
+    constexpr int WMMA_M = 16;
+    constexpr int WMMA_N = 16;
+    constexpr int WMMA_K = 16;
+    constexpr int TILES = CHUNK / WMMA_M;
+
+    const int h = blockIdx.x;
+    const int col_base = blockIdx.y * COLS;
+    const int tid = threadIdx.x;
+    const int warp = tid / 32;
+    const int lane = tid & 31;
+    if (h >= DN_HEADS || col_base >= DN_VAL || chunk_id >= num_chunks) return;
+
+    const int chunk_start = chunk_id * CHUNK;
+    const int rows = min(CHUNK, S - chunk_start);
+    if (rows <= 0) return;
+
+    extern __shared__ float smem[];
+    float *vnew_shared = smem;
+    float *intra_shared = vnew_shared + CHUNK * COLS;
+    float *g_shared = intra_shared + CHUNK * COLS;
+    float *beta_shared = g_shared + CHUNK;
+    __nv_bfloat16 *w_bf16 = reinterpret_cast<__nv_bfloat16 *>(beta_shared + CHUNK);
+
+    const std::size_t head_chunks = static_cast<std::size_t>(DN_GATE) * static_cast<std::size_t>(num_chunks);
+    const __nv_bfloat16 *a_ws = reinterpret_cast<const __nv_bfloat16 *>(workspace);
+    const __nv_bfloat16 *p_ws = a_ws + head_chunks * CHUNK * CHUNK;
+    const float *g_ws = reinterpret_cast<const float *>(p_ws + head_chunks * CHUNK * CHUNK);
+    const float *beta_ws = g_ws + head_chunks * CHUNK;
+    float *decayed_vnew_ws = const_cast<float *>(beta_ws + head_chunks * CHUNK);
+
+    const int group = col_base / DN_VAL_HEAD_DIM;
+    const std::size_t ws_id =
+        (static_cast<std::size_t>(h) * DN_VAL_GROUPS + group) * static_cast<std::size_t>(num_chunks) + chunk_id;
+    const __nv_bfloat16 *a_mat = a_ws + ws_id * CHUNK * CHUNK;
+    const __nv_bfloat16 *p_mat = p_ws + ws_id * CHUNK * CHUNK;
+    float *decayed_chunk = decayed_vnew_ws + ws_id * CHUNK * DN_VAL;
+
+    const int col = col_base + warp;
+    float sreg[RPL] = {};
+    if (col < DN_VAL) {
+        const float *state_col = state + h * DN_KEY * DN_VAL + col * DN_KEY;
+#pragma unroll
+        for (int r = 0; r < RPL; ++r) {
+            sreg[r] = state_col[lane + r * 32];
+        }
+    }
+
+    for (int idx = tid; idx < CHUNK; idx += blockDim.x) {
+        g_shared[idx] = g_ws[ws_id * CHUNK + idx];
+        beta_shared[idx] = beta_ws[ws_id * CHUNK + idx];
+    }
+    __syncthreads();
+
+    if (col < DN_VAL) {
+        const int c = warp;
+        for (int t = 0; t < rows; ++t) {
+            const float *kt = qkv_f32 + (chunk_start + t) * DN_CONV_CH + DN_QK_SIZE + h * DN_KEY;
+            float k_dot_state = 0.0f;
+#pragma unroll
+            for (int r = 0; r < RPL; ++r) {
+                k_dot_state += kt[lane + r * 32] * sreg[r];
+            }
+            k_dot_state = pf_warp_sum(k_dot_state);
+            if (lane == 0) {
+                const float *v = qkv_f32 + (chunk_start + t) * DN_CONV_CH + 2 * DN_QK_SIZE + h * DN_VAL;
+                const float w = beta_shared[t] * (v[col] - expf(g_shared[t]) * k_dot_state);
+                w_bf16[t * COLS + c] = __float2bfloat16(w);
+            }
+            __syncwarp();
+        }
+    }
+    if (rows < CHUNK || col_base + COLS > DN_VAL) {
+        for (int idx = tid; idx < CHUNK * COLS; idx += blockDim.x) {
+            const int t = idx / COLS;
+            const int c = idx - t * COLS;
+            if (t >= rows || col_base + c >= DN_VAL) {
+                w_bf16[idx] = __float2bfloat16(0.0f);
+            }
+        }
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < CHUNK; idx += blockDim.x) {
+        beta_shared[idx] = expf(g_shared[idx]);
+    }
+    __syncthreads();
+
+    for (int tile = warp; tile < TILES * (COLS / WMMA_N); tile += blockDim.x / 32) {
+        const int tile_m = tile / (COLS / WMMA_N);
+        const int tile_n = tile - tile_m * (COLS / WMMA_N);
+
+        wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> w_frag;
+        wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> vnew_acc;
+        wmma::fill_fragment(vnew_acc, 0.0f);
+
+        for (int k0 = 0; k0 < CHUNK; k0 += WMMA_K) {
+            const __nv_bfloat16 *a_tile = a_mat + (tile_m * WMMA_M) * CHUNK + k0;
+            const __nv_bfloat16 *w_tile = w_bf16 + k0 * COLS + tile_n * WMMA_N;
+            wmma::load_matrix_sync(a_frag, a_tile, CHUNK);
+            wmma::load_matrix_sync(w_frag, w_tile, COLS);
+            wmma::mma_sync(vnew_acc, a_frag, w_frag, vnew_acc);
+        }
+
+        wmma::store_matrix_sync(
+            vnew_shared + (tile_m * WMMA_M) * COLS + tile_n * WMMA_N,
+            vnew_acc,
+            COLS,
+            wmma::mem_row_major);
+    }
+    __syncthreads();
+
+    if (rows == CHUNK && col_base + COLS <= DN_VAL) {
+        for (int idx = tid; idx < CHUNK * COLS; idx += blockDim.x) {
+            w_bf16[idx] = __float2bfloat16(vnew_shared[idx]);
+        }
+    } else {
+        for (int idx = tid; idx < CHUNK * COLS; idx += blockDim.x) {
+            const int t = idx / COLS;
+            const int c = idx - t * COLS;
+            const float vnew = (t < rows && col_base + c < DN_VAL) ? vnew_shared[idx] : 0.0f;
+            w_bf16[idx] = __float2bfloat16(vnew);
+        }
+    }
+    __syncthreads();
+
+    for (int tile = warp; tile < TILES * (COLS / WMMA_N); tile += blockDim.x / 32) {
+        const int tile_m = tile / (COLS / WMMA_N);
+        const int tile_n = tile - tile_m * (COLS / WMMA_N);
+
+        wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> p_frag;
+        wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> vnew_frag;
+        wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> intra_acc;
+        wmma::fill_fragment(intra_acc, 0.0f);
+
+        for (int k0 = 0; k0 < CHUNK; k0 += WMMA_K) {
+            const __nv_bfloat16 *p_tile = p_mat + (tile_m * WMMA_M) * CHUNK + k0;
+            const __nv_bfloat16 *vnew_tile = w_bf16 + k0 * COLS + tile_n * WMMA_N;
+            wmma::load_matrix_sync(p_frag, p_tile, CHUNK);
+            wmma::load_matrix_sync(vnew_frag, vnew_tile, COLS);
+            wmma::mma_sync(intra_acc, p_frag, vnew_frag, intra_acc);
+        }
+
+        wmma::store_matrix_sync(
+            intra_shared + (tile_m * WMMA_M) * COLS + tile_n * WMMA_N,
+            intra_acc,
+            COLS,
+            wmma::mem_row_major);
+    }
+    __syncthreads();
+
+    const float g_last = g_shared[rows - 1];
+    if (col < DN_VAL) {
+        const int c = warp;
+        for (int t = 0; t < rows; ++t) {
+            const float *qt = qkv_f32 + (chunk_start + t) * DN_CONV_CH + h * DN_KEY;
+            float q_dot_state = 0.0f;
+#pragma unroll
+            for (int r = 0; r < RPL; ++r) {
+                q_dot_state += qt[lane + r * 32] * sreg[r];
+            }
+            q_dot_state = pf_warp_sum(q_dot_state);
+
+            if (lane == 0) {
+                output[(chunk_start + t) * DN_V_SIZE + h * DN_VAL + col] =
+                    beta_shared[t] * q_dot_state + intra_shared[t * COLS + c];
+            }
+            __syncwarp();
+        }
+    }
+
+    for (int idx = tid; idx < CHUNK * COLS; idx += blockDim.x) {
+        const int t = idx / COLS;
+        const int c = idx - t * COLS;
+        const int global_c = col_base + c;
+        if (t < rows && global_c < DN_VAL) {
+            decayed_chunk[t * DN_VAL + global_c] = expf(g_last - g_shared[t]) * vnew_shared[idx];
+        }
+    }
+}
+
+static __global__ void __launch_bounds__(1024, 1)
+pf_deltanet_flashqla64_tc_state_update_chunk(
+    const float *qkv_f32,
+    float *state,
+    int S,
+    int num_chunks,
+    int chunk_id,
+    const void *workspace)
+{
+    constexpr int CHUNK = 64;
+    constexpr int COLS = 32;
+    constexpr int RPL = DN_KEY / 32;
+
+    const int h = blockIdx.x;
+    const int col_base = blockIdx.y * COLS;
+    const int tid = threadIdx.x;
+    const int warp = tid / 32;
+    const int lane = tid & 31;
+    const int col = col_base + warp;
+    if (h >= DN_HEADS || col >= DN_VAL || chunk_id >= num_chunks) return;
+
+    const int chunk_start = chunk_id * CHUNK;
+    const int rows = min(CHUNK, S - chunk_start);
+    if (rows <= 0) return;
+
+    const std::size_t head_chunks = static_cast<std::size_t>(DN_GATE) * static_cast<std::size_t>(num_chunks);
+    const __nv_bfloat16 *a_ws = reinterpret_cast<const __nv_bfloat16 *>(workspace);
+    const __nv_bfloat16 *p_ws = a_ws + head_chunks * CHUNK * CHUNK;
+    const float *g_ws = reinterpret_cast<const float *>(p_ws + head_chunks * CHUNK * CHUNK);
+    const float *beta_ws = g_ws + head_chunks * CHUNK;
+    const float *decayed_vnew_ws = beta_ws + head_chunks * CHUNK;
+    const std::size_t ws_id = static_cast<std::size_t>(h) * static_cast<std::size_t>(num_chunks) + chunk_id;
+    const float *decayed_chunk = decayed_vnew_ws + ws_id * CHUNK * DN_VAL;
+    const float *g_chunk = g_ws + ws_id * CHUNK;
+    const float state_scale = expf(g_chunk[rows - 1]);
+
+    float *state_col = state + h * DN_KEY * DN_VAL + col * DN_KEY;
+    float sreg[RPL];
+#pragma unroll
+    for (int r = 0; r < RPL; ++r) {
+        sreg[r] = state_col[lane + r * 32];
+    }
+
+#pragma unroll
+    for (int r = 0; r < RPL; ++r) {
+        const int d = lane + r * 32;
+        float new_state = state_scale * sreg[r];
+        for (int t = 0; t < rows; ++t) {
+            const float kid = qkv_f32[(chunk_start + t) * DN_CONV_CH + DN_QK_SIZE + h * DN_KEY + d];
+            new_state += kid * decayed_chunk[t * DN_VAL + col];
+        }
+        state_col[d] = new_state;
+    }
+}
+
 static constexpr std::size_t kFlashqla64TiledSharedBytes =
     static_cast<std::size_t>(
         64 * DN_KEY +
@@ -942,4 +1191,29 @@ void launch_pf_deltanet_recurrence_flashqla64_tc_consume(
     const int num_chunks = (S + 63) / 64;
     pf_deltanet_recurrence_flashqla64_tc_tiled<<<dim3(DN_HEADS, (DN_VAL + 31) / 32), 1024, kFlashqla64TcTiledSharedBytes, stream>>>(
         qkv_f32, beta_buf, alpha_buf, state, output, S, num_chunks, workspace);
+}
+
+void launch_pf_deltanet_recurrence_flashqla64_tc_consume_split(
+    const float *qkv_f32,
+    const float *beta_buf,
+    const float *alpha_buf,
+    float *state,
+    float *output,
+    int S,
+    const void *workspace,
+    cudaStream_t stream)
+{
+    (void)beta_buf;
+    (void)alpha_buf;
+    cudaFuncSetAttribute(
+        pf_deltanet_flashqla64_tc_output_chunk,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(kFlashqla64TcTiledSharedBytes));
+    const int num_chunks = (S + 63) / 64;
+    for (int chunk_id = 0; chunk_id < num_chunks; ++chunk_id) {
+        pf_deltanet_flashqla64_tc_output_chunk<<<dim3(DN_HEADS, (DN_VAL + 31) / 32), 1024, kFlashqla64TcTiledSharedBytes, stream>>>(
+            qkv_f32, state, output, S, num_chunks, chunk_id, workspace);
+        pf_deltanet_flashqla64_tc_state_update_chunk<<<dim3(DN_HEADS, (DN_VAL + 31) / 32), 1024, 0, stream>>>(
+            qkv_f32, state, S, num_chunks, chunk_id, workspace);
+    }
 }

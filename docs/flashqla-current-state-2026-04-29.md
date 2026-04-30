@@ -131,6 +131,7 @@ $env:QWEN35X_ENABLE_FLASHQLA_GDR_TC_PREFILL='1'
 | Profile-split FlashQLA TC path | `benchmarks/qwen35x-flashqla-iteration-wiki-ai-64k-gen128-20260430-145601.csv` | `10875.03 ms` | `6014.43` | `656.53 ms` | `194.97` |
 | Consumer scratch/fast-path cleanup | `benchmarks/qwen35x-flashqla-iteration-wiki-ai-64k-gen128-20260430-152345.csv` | `10675.06 ms` | `6126.97` | `654.36 ms` | `195.62` |
 | Rejected 32-lane K-slice staging | `benchmarks/qwen35x-flashqla-iteration-wiki-ai-64k-gen128-20260430-160746.csv` | `10685.69 ms` | `6120.82` | not recorded here | not recorded here |
+| Split consumer, FP32 state update | `benchmarks/qwen35x-flashqla-iteration-wiki-ai-64k-gen128-20260430-210650.csv` | `10462.45 ms` | `6251.43` | `654.97 ms` | `195.45` |
 
 The split-workspace change recovered the largest obvious duplicate-work penalty: about 2.1x faster prefill than the previous FlashQLA TC path on 64k. The row-parallel KKT solve then reduced prefill from `13073.39 ms` to `10910.53 ms`. It is still slower than the old custom recurrence by about 15 percent on prefill latency.
 
@@ -159,6 +160,8 @@ A smaller RTX 5080-oriented staging attempt copied one 32-lane `K` slice at a ti
 A prepare-kernel attempt skipped the six strictly upper off-diagonal `QK^T`/`KK^T` WMMA tiles in each 64-token chunk. The new prepare-workspace harness proved the resulting `A`, `P`, `g`, and `beta` buffers were bit-identical to the full-tile schedule for rows `1`, `17`, `63`, and `64`, and the full iteration harness then passed minimal parity. Performance regressed badly on 64k, though: average prefill was `17536.51 ms`, recurrence `5943.91 ms`, prepare `544.59 ms`, and consume `5399.32 ms`. The production change was reverted.
 
 A compact lower-triangle tile enumeration avoided the sparse warp schedule from the first upper-tile skip attempt and also preserved exact prepare-workspace parity. It passed the full minimal parity gate, but still regressed 64k performance: average prefill was `11375.33 ms`, recurrence `4187.68 ms`, prepare `368.24 ms`, and consume `3819.44 ms`. The production change was reverted.
+
+The split-consumer experiment keeps FP32 recurrent state semantics but separates chunk output and state update into per-chunk kernel launches under `QWEN35X_ENABLE_FLASHQLA_SPLIT_CONSUMER=1`. It appends a decayed-`Vnew` buffer to the FlashQLA workspace, writes it from the output chunk kernel, then runs a scalar FP32 state-update kernel before advancing to the next chunk. It passed first-token parity, minimal 4-token parity, and the 64k benchmark. The 64k profile split improved to `3757.76 ms` recurrence total, `365.39 ms` prepare, and `3392.37 ms` consume.
 
 ## What is still missing versus full FlashQLA
 

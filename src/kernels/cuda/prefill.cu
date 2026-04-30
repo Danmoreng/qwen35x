@@ -598,6 +598,11 @@ static bool flashqla_gdr_tc_prefill_enabled() {
     return enabled;
 }
 
+static bool flashqla_split_consumer_enabled() {
+    static const bool enabled = std::getenv("QWEN35X_ENABLE_FLASHQLA_SPLIT_CONSUMER") != nullptr;
+    return enabled;
+}
+
 static void cublas_nvfp4_prefill_gemm_or_bf16(
     cublasHandle_t h,
     const __nv_bfloat16 *A,
@@ -742,8 +747,13 @@ static void pf_deltanet_chunked(
                     dn_qkv_f32, beta_buf, alpha_buf, rows, flashqla_workspace, stream);
             });
             profile_phase(profile ? &profile->flashqla_consume_ms : nullptr, [&]() {
-                launch_pf_deltanet_recurrence_flashqla64_tc_consume(
-                    dn_qkv_f32, beta_buf, alpha_buf, dn_state, dn_out_f32, rows, flashqla_workspace, stream);
+                if (flashqla_split_consumer_enabled()) {
+                    launch_pf_deltanet_recurrence_flashqla64_tc_consume_split(
+                        dn_qkv_f32, beta_buf, alpha_buf, dn_state, dn_out_f32, rows, flashqla_workspace, stream);
+                } else {
+                    launch_pf_deltanet_recurrence_flashqla64_tc_consume(
+                        dn_qkv_f32, beta_buf, alpha_buf, dn_state, dn_out_f32, rows, flashqla_workspace, stream);
+                }
             });
             profile_phase(profile ? &profile->post_norm_gate_ms : nullptr, [&]() {
                 pf_deltanet_post_norm_gate<<<rows * DN_GATE, 256, 0, stream>>>(
