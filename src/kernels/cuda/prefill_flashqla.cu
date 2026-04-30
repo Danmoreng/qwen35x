@@ -752,6 +752,9 @@ pf_deltanet_recurrence_flashqla64_tc_tiled(
         }
         __syncthreads();
 
+        const float g_last = g_shared[rows - 1];
+        const float state_scale = expf(g_last);
+
         if (col < DN_VAL) {
             const int c = warp;
             for (int t = 0; t < rows; ++t) {
@@ -769,15 +772,23 @@ pf_deltanet_recurrence_flashqla64_tc_tiled(
                 }
                 __syncwarp();
             }
+        }
 
-            const float g_last = g_shared[rows - 1];
+        for (int idx = tid; idx < CHUNK * COLS; idx += blockDim.x) {
+            const int t = idx / COLS;
+            intra_shared[idx] = (t < rows) ? expf(g_last - g_shared[t]) * vnew_shared[idx] : 0.0f;
+        }
+        __syncthreads();
+
+        if (col < DN_VAL) {
+            const int c = warp;
 #pragma unroll
             for (int r = 0; r < RPL; ++r) {
                 const int d = lane + r * 32;
-                float new_state = expf(g_last) * sreg[r];
+                float new_state = state_scale * sreg[r];
                 for (int t = 0; t < rows; ++t) {
                     const float kid = qkv_f32[(chunk_start + t) * DN_CONV_CH + DN_QK_SIZE + h * DN_KEY + d];
-                    new_state += kid * expf(g_last - g_shared[t]) * vnew_shared[t * COLS + c];
+                    new_state += kid * intra_shared[t * COLS + c];
                 }
                 sreg[r] = new_state;
             }
