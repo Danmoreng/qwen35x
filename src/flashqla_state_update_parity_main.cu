@@ -24,12 +24,17 @@ constexpr int kWmmaK = 16;
 
 struct Options {
   float tolerance = 1.0e-6f;
+  int warmup_iters = 20;
+  int timing_iters = 200;
 };
 
 struct CaseResult {
   int rows = 0;
   float max_abs = 0.0f;
   float max_abs_vs_f32 = 0.0f;
+  float f32_ms = 0.0f;
+  float bf16_scalar_ms = 0.0f;
+  float bf16_wmma_ms = 0.0f;
   std::size_t max_index = 0;
   std::size_t max_index_vs_f32 = 0;
 };
@@ -180,13 +185,22 @@ bool parse_args(int argc, char **argv, Options &options) {
     const std::string arg = argv[i];
     if (arg == "--tolerance" && i + 1 < argc) {
       options.tolerance = std::strtof(argv[++i], nullptr);
+    } else if (arg == "--warmup-iters" && i + 1 < argc) {
+      options.warmup_iters = std::stoi(argv[++i]);
+    } else if (arg == "--timing-iters" && i + 1 < argc) {
+      options.timing_iters = std::stoi(argv[++i]);
     } else if (arg == "--help") {
       std::cout << "usage: qwen35x_flashqla_state_update_parity [--tolerance <float>]\n";
+      std::cout << "                                               [--warmup-iters <n>] [--timing-iters <n>]\n";
       return false;
     } else {
       std::cerr << "Unknown argument: " << arg << "\n";
       std::exit(2);
     }
+  }
+  if (options.warmup_iters < 0 || options.timing_iters <= 0) {
+    std::cerr << "warmup-iters must be >= 0 and timing-iters must be > 0\n";
+    std::exit(2);
   }
   return true;
 }
@@ -198,7 +212,32 @@ void check_cuda(cudaError_t status, const char *what) {
   }
 }
 
-CaseResult run_case(int rows) {
+float time_kernel_ms(int warmup_iters, int timing_iters, const auto &launch) {
+  for (int i = 0; i < warmup_iters; ++i) {
+    launch();
+  }
+  check_cuda(cudaDeviceSynchronize(), "timing warmup");
+
+  cudaEvent_t start = nullptr;
+  cudaEvent_t stop = nullptr;
+  check_cuda(cudaEventCreate(&start), "cudaEventCreate start");
+  check_cuda(cudaEventCreate(&stop), "cudaEventCreate stop");
+
+  check_cuda(cudaEventRecord(start), "cudaEventRecord start");
+  for (int i = 0; i < timing_iters; ++i) {
+    launch();
+  }
+  check_cuda(cudaEventRecord(stop), "cudaEventRecord stop");
+  check_cuda(cudaEventSynchronize(stop), "cudaEventSynchronize stop");
+
+  float elapsed_ms = 0.0f;
+  check_cuda(cudaEventElapsedTime(&elapsed_ms, start, stop), "cudaEventElapsedTime");
+  check_cuda(cudaEventDestroy(stop), "cudaEventDestroy stop");
+  check_cuda(cudaEventDestroy(start), "cudaEventDestroy start");
+  return elapsed_ms / static_cast<float>(timing_iters);
+}
+
+CaseResult run_case(int rows, const Options &options) {
   const std::size_t k_count = static_cast<std::size_t>(DN_HEADS) * kChunk * DN_KEY;
   const std::size_t v_count = static_cast<std::size_t>(DN_HEADS) * kChunk * DN_VAL;
   const std::size_t state_count = static_cast<std::size_t>(DN_HEADS) * DN_VAL * DN_KEY;
@@ -258,12 +297,23 @@ CaseResult run_case(int rows) {
   const int threads = 256;
   const int total = static_cast<int>(state_count);
   const int blocks = (total + threads - 1) / threads;
-  state_update_f32_reference_kernel<<<blocks, threads>>>(d_k_f32, d_vnew_f32, d_initial, d_scale, d_ref_f32, rows);
+  const dim3 wmma_grid(DN_HEADS, (DN_KEY + kWmmaM - 1) / kWmmaM, (DN_VAL + kWmmaN - 1) / kWmmaN);
+
+  auto launch_f32 = [&]() {
+    state_update_f32_reference_kernel<<<blocks, threads>>>(d_k_f32, d_vnew_f32, d_initial, d_scale, d_ref_f32, rows);
+  };
+  auto launch_bf16_scalar = [&]() {
+    state_update_reference_kernel<<<blocks, threads>>>(d_k, d_vnew, d_initial, d_scale, d_ref, rows);
+  };
+  auto launch_bf16_wmma = [&]() {
+    state_update_candidate_kernel<<<wmma_grid, 32>>>(d_k, d_vnew, d_initial, d_scale, d_candidate, rows);
+  };
+
+  launch_f32();
   check_cuda(cudaGetLastError(), "launch f32 reference");
-  state_update_reference_kernel<<<blocks, threads>>>(d_k, d_vnew, d_initial, d_scale, d_ref, rows);
+  launch_bf16_scalar();
   check_cuda(cudaGetLastError(), "launch reference");
-  state_update_candidate_kernel<<<dim3(DN_HEADS, (DN_KEY + kWmmaM - 1) / kWmmaM, (DN_VAL + kWmmaN - 1) / kWmmaN), 32>>>(
-    d_k, d_vnew, d_initial, d_scale, d_candidate, rows);
+  launch_bf16_wmma();
   check_cuda(cudaGetLastError(), "launch candidate");
   check_cuda(cudaDeviceSynchronize(), "state update kernels");
 
@@ -273,6 +323,11 @@ CaseResult run_case(int rows) {
 
   CaseResult result;
   result.rows = rows;
+  if (rows == kChunk) {
+    result.f32_ms = time_kernel_ms(options.warmup_iters, options.timing_iters, launch_f32);
+    result.bf16_scalar_ms = time_kernel_ms(options.warmup_iters, options.timing_iters, launch_bf16_scalar);
+    result.bf16_wmma_ms = time_kernel_ms(options.warmup_iters, options.timing_iters, launch_bf16_wmma);
+  }
   for (std::size_t i = 0; i < h_ref.size(); ++i) {
     const float diff = std::fabs(h_ref[i] - h_candidate[i]);
     if (diff > result.max_abs) {
@@ -312,10 +367,12 @@ int main(int argc, char **argv) {
 
   std::cout << "FlashQLA state-update parity\n";
   std::cout << "heads=" << DN_HEADS << " key=" << DN_KEY << " value=" << DN_VAL
-            << " chunk=" << kChunk << " tolerance=" << options.tolerance << "\n";
+            << " chunk=" << kChunk << " tolerance=" << options.tolerance
+            << " warmup_iters=" << options.warmup_iters
+            << " timing_iters=" << options.timing_iters << "\n";
 
   for (const int rows : rows_cases) {
-    const CaseResult result = run_case(rows);
+    const CaseResult result = run_case(rows, options);
     const bool pass = result.max_abs <= options.tolerance;
     failed = failed || !pass;
     std::cout << "rows=" << std::setw(2) << rows
@@ -323,7 +380,14 @@ int main(int argc, char **argv) {
               << " max_index=" << std::defaultfloat << result.max_index
               << " max_abs_vs_f32=" << std::scientific << std::setprecision(8) << result.max_abs_vs_f32
               << " max_index_vs_f32=" << std::defaultfloat << result.max_index_vs_f32
-              << " parity=" << (pass ? "PASS" : "FAIL") << "\n";
+              << " parity=" << (pass ? "PASS" : "FAIL");
+    if (rows == kChunk) {
+      std::cout << " f32_ms=" << std::fixed << std::setprecision(6) << result.f32_ms
+                << " bf16_scalar_ms=" << result.bf16_scalar_ms
+                << " bf16_wmma_ms=" << result.bf16_wmma_ms
+                << " wmma_vs_f32_speedup=" << (result.f32_ms / result.bf16_wmma_ms);
+    }
+    std::cout << "\n";
   }
 
   if (failed) {

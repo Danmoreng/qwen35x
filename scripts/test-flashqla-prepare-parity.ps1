@@ -1,10 +1,8 @@
 [CmdletBinding()]
 param(
-    [string]$Executable = "build/qwen35x_flashqla_state_update_parity.exe",
+    [string]$Executable = "build/qwen35x_flashqla_prepare_parity.exe",
     [switch]$SkipBuild,
-    [double]$Tolerance = 1.0e-6,
-    [int]$WarmupIters = 20,
-    [int]$TimingIters = 200
+    [double]$Tolerance = 0.0
 )
 
 Set-StrictMode -Version Latest
@@ -43,35 +41,30 @@ Push-Location $RepoRoot
 try {
     $resolvedExecutable = Resolve-RepoPath -Path $Executable -RepoRoot $RepoRoot
 
-    Write-Host "FlashQLA state-update parity harness" -ForegroundColor Cyan
+    Write-Host "FlashQLA prepare workspace parity harness" -ForegroundColor Cyan
     Write-Host "Repo: $RepoRoot"
     Write-Host "Executable: $resolvedExecutable"
     Write-Host "Tolerance: $Tolerance"
-    Write-Host "Warmup iterations: $WarmupIters"
-    Write-Host "Timing iterations: $TimingIters"
 
     if (-not $SkipBuild) {
-        Invoke-Step -Name "Build state-update parity target" -Action {
+        Invoke-Step -Name "Build prepare parity target" -Action {
             & (Join-Path $ScriptDir "build.ps1") `
                 -UseNinja `
                 -EnableCuda `
                 -Configuration Release `
-                -Target qwen35x_flashqla_state_update_parity
+                -Target qwen35x_flashqla_prepare_parity
         }
     }
 
-    Invoke-Step -Name "State-update parity" -Action {
-        & $resolvedExecutable `
-            --tolerance $Tolerance `
-            --warmup-iters $WarmupIters `
-            --timing-iters $TimingIters
+    Invoke-Step -Name "Prepare workspace parity" -Action {
+        & $resolvedExecutable --tolerance $Tolerance
         if ($LASTEXITCODE -ne 0) {
-            throw "State-update parity failed with exit code $LASTEXITCODE."
+            throw "Prepare workspace parity failed with exit code $LASTEXITCODE."
         }
     }
 
     Write-Host ""
-    Write-Host "FlashQLA state-update parity complete." -ForegroundColor Green
+    Write-Host "FlashQLA prepare workspace parity complete." -ForegroundColor Green
 } finally {
     Pop-Location
 }

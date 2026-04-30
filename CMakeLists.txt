@@ -196,4 +196,20 @@ if (CMAKE_CUDA_COMPILER)
       QWEN35X_VARIANT_0P8B=1
   )
   target_link_libraries(qwen35x_flashqla_state_update_parity PRIVATE CUDA::cudart)
+
+  add_executable(
+    qwen35x_flashqla_prepare_parity
+    src/flashqla_prepare_parity_main.cu
+  )
+  target_include_directories(
+    qwen35x_flashqla_prepare_parity
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda
+  )
+  target_compile_definitions(
+    qwen35x_flashqla_prepare_parity
+    PRIVATE
+      QWEN35X_VARIANT_0P8B=1
+  )
+  target_link_libraries(qwen35x_flashqla_prepare_parity PRIVATE CUDA::cudart)
 endif ()
