@@ -144,25 +144,25 @@ The same binary can run the 4B model:
 
 ## Performance Snapshot
 
-Latest local actual-prompt matrix benchmark (April 25, 2026, RTX 5080 Laptop GPU, `MaxNewTokens=128`). Table cells are `prefill tok/s | generation tok/s`.
+Latest local actual-prompt matrix benchmark (April 30, 2026, RTX 5080 Laptop GPU, `MaxNewTokens=128`). Table cells are `prefill tok/s | generation tok/s`.
 
-| Model | Ctx | qwen35x | llama.cpp + FA | llama.cpp |
-|---|---:|---:|---:|---:|
-| 0.8B | 256 | `17,544.39` \| `325.97` | `7,758.50` \| `244.68` | `3,429.27` \| `252.01` |
-| 0.8B | 512 | `21,726.28` \| `331.72` | `16,240.52` \| `247.80` | `6,868.95` \| `225.39` |
-| 0.8B | 1024 | `22,783.52` \| `312.55` | `14,456.74` \| `243.20` | `9,205.30` \| `247.52` |
-| 0.8B | 2048 | `20,562.67` \| `316.40` | `14,933.44` \| `234.52` | `11,450.36` \| `242.46` |
-| 0.8B | 4096 | `18,446.63` \| `306.01` | `15,315.75` \| `217.94` | `12,615.59` \| `222.91` |
-| 4B | 256 | `4,660.76` \| `61.31` | `1,942.74` \| `52.03` | `1,520.10` \| `52.25` |
-| 4B | 512 | `4,915.72` \| `61.24` | `2,729.85` \| `51.39` | `2,277.65` \| `51.43` |
-| 4B | 1024 | `4,844.64` \| `57.89` | `3,385.12` \| `50.28` | `2,976.50` \| `50.77` |
-| 4B | 2048 | `4,716.04` \| `58.14` | `3,594.46` \| `48.32` | `3,262.50` \| `47.97` |
-| 4B | 4096 | `4,010.30` \| `55.24` | `3,311.87` \| `51.32` | `3,061.02` \| `50.03` |
+| Model | Ctx | qwen35x traditional | qwen35x FlashQLA | llama.cpp + FA | llama.cpp |
+|---|---:|---:|---:|---:|---:|
+| 0.8B | 256 | `15,425.65` \| `312.86` | `10,754.00` \| `313.27` | `6,597.90` \| `236.93` | `2,312.78` \| `233.54` |
+| 0.8B | 512 | `20,562.96` \| `310.56` | `13,037.16` \| `311.60` | `15,139.19` \| `223.73` | `6,898.03` \| `233.83` |
+| 0.8B | 1024 | `22,479.45` \| `304.86` | `14,113.47` \| `309.89` | `14,318.73` \| `226.20` | `8,889.97` \| `232.40` |
+| 0.8B | 2048 | `19,424.57` \| `295.74` | `11,527.92` \| `300.15` | `14,612.88` \| `225.83` | `10,988.26` \| `219.40` |
+| 0.8B | 4096 | `17,611.54` \| `288.02` | `11,170.54` \| `276.78` | `14,807.85` \| `187.08` | `12,277.83` \| `186.43` |
+| 4B | 256 | `3,216.43` \| `61.03` | `2,765.68` \| `61.04` | `1,909.40` \| `46.17` | `1,470.94` \| `45.62` |
+| 4B | 512 | `3,350.45` \| `60.65` | `2,906.29` \| `61.05` | `2,559.61` \| `46.92` | `2,250.88` \| `46.92` |
+| 4B | 1024 | `3,470.07` \| `61.14` | `2,873.28` \| `57.32` | `3,215.34` \| `46.02` | `2,778.73` \| `44.64` |
+| 4B | 2048 | `3,422.09` \| `60.09` | `2,808.46` \| `59.65` | `3,549.90` \| `46.82` | `3,214.38` \| `47.79` |
+| 4B | 4096 | `3,311.12` \| `59.59` | `2,770.94` \| `60.23` | `3,280.07` \| `51.50` | `3,027.31` \| `51.00` |
 
-Source: `benchmarks/model-matrix/qwen35x-vs-llama-matrix-summary.csv`. qwen35x uses the sequential inference harness with real prompt files; llama.cpp uses warmed `llama-completion` actual prompt/eval timings. These actual-run prompt-eval timings are not directly equivalent to synthetic `llama-bench pp*` prefill-only timings, especially at small context sizes. Reproduce with:
+Source: `benchmarks/model-matrix-flashqla/qwen35x-vs-llama-matrix-summary.csv`. qwen35x uses the sequential inference harness with real prompt files; llama.cpp uses warmed `llama-completion` actual prompt/eval timings. The FlashQLA column uses `--qwen35x-prefill-kernel flashqla`, which selects the experimental BF16 WMMA split-consumer DeltaNet prefill path. These actual-run prompt-eval timings are not directly equivalent to synthetic `llama-bench pp*` prefill-only timings, especially at small context sizes. Reproduce with:
 
 ```powershell
-.\scripts\benchmark-qwen35x-vs-llama-matrix.ps1
+.\scripts\benchmark-qwen35x-vs-llama-matrix.ps1 -BuildQwenVariants -QwenPrefillKernels traditional,flashqla -OutDir benchmarks\model-matrix-flashqla -SummaryCsvOut benchmarks\model-matrix-flashqla\qwen35x-vs-llama-matrix-summary.csv
 ```
 
 Latest local long-context Qwen35x CUDA benchmark snapshot (April 25, 2026, RTX 5080 Laptop GPU):

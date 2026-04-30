@@ -25,6 +25,9 @@ param(
     [Alias("LucePrefillMode")]
     [ValidateSet("default", "replay", "batched")]
     [string]$Qwen35xPrefillMode = "default",
+    [Alias("LucePrefillKernel")]
+    [ValidateSet("default", "traditional", "flashqla", "flashqla-monolithic")]
+    [string]$Qwen35xPrefillKernel = "default",
     [ValidateSet("bf16", "nvfp4")]
     [string]$Qwen35xWeightPrecision = "bf16",
     [ValidateSet("bf16", "quantized")]
@@ -190,6 +193,9 @@ function Invoke-BenchmarkRun {
     if ($Mode -ne "cpu-reference" -and $Qwen35xPrefillMode -ne "default") {
         $args += @("--qwen35x-prefill-mode", $Qwen35xPrefillMode)
     }
+    if ($Mode -ne "cpu-reference" -and $Qwen35xPrefillKernel -ne "default") {
+        $args += @("--qwen35x-prefill-kernel", $Qwen35xPrefillKernel)
+    }
     if ($Mode -ne "cpu-reference" -and $Qwen35xWeightPrecision -ne "bf16") {
         $args += @("--qwen35x-weight-precision", $Qwen35xWeightPrecision)
     }
@@ -352,6 +358,7 @@ foreach ($mode in $Modes) {
             if ([string]::IsNullOrWhiteSpace($effectiveQwen35xPrefillMode)) {
                 $effectiveQwen35xPrefillMode = $Qwen35xPrefillMode
             }
+            $effectiveQwen35xPrefillKernel = $Qwen35xPrefillKernel
             $effectiveQwen35xWeightPrecision = [string](Get-JsonProperty -Object $profile -Name "qwen35x_weight_precision")
             if ([string]::IsNullOrWhiteSpace($effectiveQwen35xWeightPrecision)) {
                 $effectiveQwen35xWeightPrecision = $Qwen35xWeightPrecision
@@ -366,6 +373,7 @@ foreach ($mode in $Modes) {
                 run_label        = $RunLabel
                 mode             = $mode
                 qwen35x_prefill_mode = $effectiveQwen35xPrefillMode
+                qwen35x_prefill_kernel = $effectiveQwen35xPrefillKernel
                 qwen35x_weight_precision = $effectiveQwen35xWeightPrecision
                 qwen35x_cache_precision = $effectiveQwen35xCachePrecision
                 qwen35x_decode_blocks_requested = $GpuDecodeBlocks

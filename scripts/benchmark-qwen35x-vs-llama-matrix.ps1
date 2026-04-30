@@ -25,6 +25,8 @@ param(
     [int]$LlamaUBatchSize = 512,
     [int]$LlamaTimeoutSeconds = 1800,
     [switch]$LlamaNoWarmup,
+    [ValidateSet("traditional", "flashqla", "flashqla-monolithic")]
+    [string[]]$QwenPrefillKernels = @("traditional"),
     [switch]$SkipQwen,
     [switch]$SkipLlama,
     [switch]$SummarizeOnly
@@ -85,7 +87,8 @@ function Import-QwenRows {
         [Parameter(Mandatory = $true)][string]$CsvPath,
         [Parameter(Mandatory = $true)][string]$Model,
         [Parameter(Mandatory = $true)][int]$ContextTokens,
-        [Parameter(Mandatory = $true)][string]$Workload
+        [Parameter(Mandatory = $true)][string]$Workload,
+        [string]$PrefillKernel = ""
     )
     $csvRows = @(Import-Csv -LiteralPath $CsvPath)
     if ($csvRows.Count -eq 0) {
@@ -101,7 +104,7 @@ function Import-QwenRows {
     return @([PSCustomObject]@{
         timestamp_utc = (Get-Date).ToUniversalTime().ToString("o")
         model = $Model
-        implementation = "qwen35x"
+        implementation = if ([string]::IsNullOrWhiteSpace($PrefillKernel)) { "qwen35x" } else { "qwen35x-$PrefillKernel" }
         backend = $first.mode
         flash_attention = ""
         workload = $Workload
@@ -324,14 +327,17 @@ function Import-ExistingQwenRows {
     foreach ($model in $Models) {
         $safeModel = $model.name -replace '[^A-Za-z0-9]+', ''
         foreach ($context in $Contexts) {
-            $qwenPrefillCsv = Join-Path $OutDir ("qwen35x-{0}-ctx{1}-prefill.csv" -f $safeModel, $context)
-            if (Test-Path -LiteralPath $qwenPrefillCsv) {
-                $rows += Import-QwenRows -CsvPath $qwenPrefillCsv -Model $model.name -ContextTokens $context -Workload "prefill"
-            }
+            foreach ($kernel in $QwenPrefillKernels) {
+                $kernelSuffix = if ($kernel -eq "traditional") { "" } else { "-$kernel" }
+                $qwenPrefillCsv = Join-Path $OutDir ("qwen35x-{0}{1}-ctx{2}-prefill.csv" -f $safeModel, $kernelSuffix, $context)
+                if (Test-Path -LiteralPath $qwenPrefillCsv) {
+                    $rows += Import-QwenRows -CsvPath $qwenPrefillCsv -Model $model.name -ContextTokens $context -Workload "prefill" -PrefillKernel $kernel
+                }
 
-            $qwenGenCsv = Join-Path $OutDir ("qwen35x-{0}-ctx{1}-gen{2}.csv" -f $safeModel, $context, $MaxNewTokens)
-            if (Test-Path -LiteralPath $qwenGenCsv) {
-                $rows += Import-QwenRows -CsvPath $qwenGenCsv -Model $model.name -ContextTokens $context -Workload "generation"
+                $qwenGenCsv = Join-Path $OutDir ("qwen35x-{0}{1}-ctx{2}-gen{3}.csv" -f $safeModel, $kernelSuffix, $context, $MaxNewTokens)
+                if (Test-Path -LiteralPath $qwenGenCsv) {
+                    $rows += Import-QwenRows -CsvPath $qwenGenCsv -Model $model.name -ContextTokens $context -Workload "generation" -PrefillKernel $kernel
+                }
             }
         }
     }
@@ -447,42 +453,47 @@ foreach ($model in $models) {
         $labelBase = ("{0}-ctx{1}-gen{2}" -f $safeModel, $context, $MaxNewTokens)
 
         if (-not $SkipQwen) {
-            $qwenPrefillCsv = Join-Path $resolvedOutDir ("qwen35x-{0}-ctx{1}-prefill.csv" -f $safeModel, $context)
-            Invoke-Checked -Label ("qwen35x {0} prefill ctx={1}" -f $model.name, $context) -Script {
-                & $qwenBench `
-                    -Executable $model.qwen_exe `
-                    -HFModelDir $model.qwen_model_dir `
-                    -Modes gpu-f32 `
-                    -PromptMode prompt-file `
-                    -PromptName ("{0}_prefill" -f $labelBase) `
-                    -PromptFile $promptFile `
-                    -Runs $Runs `
-                    -WarmupRuns $WarmupRuns `
-                    -MaxNewTokens 0 `
-                    -MaxContext $context `
-                    -PrefillOnly `
-                    -CsvOut $qwenPrefillCsv `
-                    -RunLabel ("qwen35x-{0}-prefill" -f $labelBase)
-            }
-            $summaryRows += Import-QwenRows -CsvPath $qwenPrefillCsv -Model $model.name -ContextTokens $context -Workload "prefill"
+            foreach ($kernel in $QwenPrefillKernels) {
+                $kernelSuffix = if ($kernel -eq "traditional") { "" } else { "-$kernel" }
+                $qwenPrefillCsv = Join-Path $resolvedOutDir ("qwen35x-{0}{1}-ctx{2}-prefill.csv" -f $safeModel, $kernelSuffix, $context)
+                Invoke-Checked -Label ("qwen35x {0} {1} prefill ctx={2}" -f $model.name, $kernel, $context) -Script {
+                    & $qwenBench `
+                        -Executable $model.qwen_exe `
+                        -HFModelDir $model.qwen_model_dir `
+                        -Modes gpu-f32 `
+                        -PromptMode prompt-file `
+                        -PromptName ("{0}_{1}_prefill" -f $labelBase, $kernel) `
+                        -PromptFile $promptFile `
+                        -Runs $Runs `
+                        -WarmupRuns $WarmupRuns `
+                        -MaxNewTokens 0 `
+                        -MaxContext $context `
+                        -PrefillOnly `
+                        -Qwen35xPrefillKernel $kernel `
+                        -CsvOut $qwenPrefillCsv `
+                        -RunLabel ("qwen35x-{0}-{1}-prefill" -f $labelBase, $kernel)
+                }
+                $summaryRows += Import-QwenRows -CsvPath $qwenPrefillCsv -Model $model.name -ContextTokens $context -Workload "prefill" -PrefillKernel $kernel
 
-            $qwenGenCsv = Join-Path $resolvedOutDir ("qwen35x-{0}-ctx{1}-gen{2}.csv" -f $safeModel, $context, $MaxNewTokens)
-            Invoke-Checked -Label ("qwen35x {0} generation ctx={1}" -f $model.name, $context) -Script {
-                & $qwenBench `
-                    -Executable $model.qwen_exe `
-                    -HFModelDir $model.qwen_model_dir `
-                    -Modes gpu-f32 `
-                    -PromptMode prompt-file `
-                    -PromptName ("{0}_generation" -f $labelBase) `
-                    -PromptFile $promptFile `
-                    -Runs $Runs `
-                    -WarmupRuns $WarmupRuns `
-                    -MaxNewTokens $MaxNewTokens `
-                    -MaxContext ($context + $MaxNewTokens) `
-                    -CsvOut $qwenGenCsv `
-                    -RunLabel ("qwen35x-{0}-generation" -f $labelBase)
+                $qwenGenCsv = Join-Path $resolvedOutDir ("qwen35x-{0}{1}-ctx{2}-gen{3}.csv" -f $safeModel, $kernelSuffix, $context, $MaxNewTokens)
+                Invoke-Checked -Label ("qwen35x {0} {1} generation ctx={2}" -f $model.name, $kernel, $context) -Script {
+                    & $qwenBench `
+                        -Executable $model.qwen_exe `
+                        -HFModelDir $model.qwen_model_dir `
+                        -Modes gpu-f32 `
+                        -PromptMode prompt-file `
+                        -PromptName ("{0}_{1}_generation" -f $labelBase, $kernel) `
+                        -PromptFile $promptFile `
+                        -Runs $Runs `
+                        -WarmupRuns $WarmupRuns `
+                        -MaxNewTokens $MaxNewTokens `
+                        -MaxContext ($context + $MaxNewTokens) `
+                        -Qwen35xPrefillKernel $kernel `
+                        -CsvOut $qwenGenCsv `
+                        -RunLabel ("qwen35x-{0}-{1}-generation" -f $labelBase, $kernel)
+                }
+                $summaryRows += Import-QwenRows -CsvPath $qwenGenCsv -Model $model.name -ContextTokens $context -Workload "generation" -PrefillKernel $kernel
             }
-            $summaryRows += Import-QwenRows -CsvPath $qwenGenCsv -Model $model.name -ContextTokens $context -Workload "generation"
         }
 
         if (-not $SkipLlama) {
