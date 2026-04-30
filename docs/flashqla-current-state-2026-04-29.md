@@ -172,10 +172,11 @@ The next session should focus on structural changes, not more small shared-memor
 
 Recommended order:
 
-1. Add a narrow state-update parity harness. It should isolate the final recurrence update for one or more chunks, with fixed incoming state and chunk tensors, and compare the resulting state against the current scalar implementation. This gives faster feedback than full text-generation parity while changing the state-update algorithm.
-2. Tensorize the state update behind an environment flag. The scalar update is mathematically `state += K^T @ Vnew`; implement a BF16 WMMA version of that surface while preserving the current scalar path as the reference fallback.
-3. If shared memory blocks the tensorized state update, split the consumer by responsibility: one kernel for tensor-core `P @ Vnew` output and one kernel for final state update. This may add global traffic, but it can reduce barrier pressure and make each kernel easier to schedule on `sm_120a`.
-4. Retest tile shapes only after the state-update split/tensorization exists. Worth trying first: `CHUNK=32, COLS=32` and `CHUNK=64, COLS=16`, using the iteration harness for 64k comparisons.
-5. Revisit scalar `expf`/`logf` reduction only after the consumer structure changes. The earlier precomputed `exp(g)` workspace variant preserved parity but was slower in the current structure.
-6. Add direct comparison tests against upstream Qwen FlashQLA outputs once the local algorithmic surfaces match: KKT solve, output accumulation, state update, and gating/decay handling.
-7. Rebenchmark on the RTX 5080 Laptop GPU with `scripts/test-flashqla-iteration.ps1` after each substantial change. Keep using `scripts/benchmark-inference-seq.ps1` through the harness for comparable performance tracking.
+1. Add a narrow state-update parity harness. This is now available as `scripts/test-flashqla-state-update-parity.ps1`, which builds `qwen35x_flashqla_state_update_parity` and checks synthetic `state += K^T @ Vnew` cases for chunk row counts `1`, `17`, `63`, and `64`.
+2. Tensorize the state update in the isolated harness first. The BF16 WMMA candidate now matches a BF16 scalar reference with max error around `1.5e-8`; compared with the current FP32 scalar production update, the synthetic per-chunk drift is around `5.0e-5`.
+3. Do not directly drop the BF16 WMMA state update into the current monolithic consumer. A direct gated production attempt passed first-token prefill parity, but failed 4-token minimal generation parity because the recurrent state drift affected decode. The production kernel change was reverted.
+4. If shared memory blocks a parity-preserving tensorized state update, split the consumer by responsibility: one kernel for tensor-core `P @ Vnew` output and one kernel for final state update. This may add global traffic, but it can reduce barrier pressure and make each kernel easier to schedule on `sm_120a`.
+5. Retest tile shapes only after the state-update split/tensorization exists. Worth trying first: `CHUNK=32, COLS=32` and `CHUNK=64, COLS=16`, using the iteration harness for 64k comparisons.
+6. Revisit scalar `expf`/`logf` reduction only after the consumer structure changes. The earlier precomputed `exp(g)` workspace variant preserved parity but was slower in the current structure.
+7. Add direct comparison tests against upstream Qwen FlashQLA outputs once the local algorithmic surfaces match: KKT solve, output accumulation, state update, and gating/decay handling.
+8. Rebenchmark on the RTX 5080 Laptop GPU with `scripts/test-flashqla-iteration.ps1` after each substantial change. Keep using `scripts/benchmark-inference-seq.ps1` through the harness for comparable performance tracking.
