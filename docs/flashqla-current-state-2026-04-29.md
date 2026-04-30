@@ -126,6 +126,7 @@ $env:QWEN35X_ENABLE_FLASHQLA_GDR_TC_PREFILL='1'
 | Old custom recurrence path | `benchmarks/qwen35x-current-old-custom-wiki-ai-64k-gen128.csv` | `9512.08 ms` | `6885.11` | `707.23 ms` | `180.99` |
 | Profile-split FlashQLA TC path | `benchmarks/qwen35x-flashqla-iteration-wiki-ai-64k-gen128-20260430-145601.csv` | `10875.03 ms` | `6014.43` | `656.53 ms` | `194.97` |
 | Consumer scratch/fast-path cleanup | `benchmarks/qwen35x-flashqla-iteration-wiki-ai-64k-gen128-20260430-152345.csv` | `10675.06 ms` | `6126.97` | `654.36 ms` | `195.62` |
+| Rejected 32-lane K-slice staging | `benchmarks/qwen35x-flashqla-iteration-wiki-ai-64k-gen128-20260430-160746.csv` | `10685.69 ms` | `6120.82` | not recorded here | not recorded here |
 
 The split-workspace change recovered the largest obvious duplicate-work penalty: about 2.1x faster prefill than the previous FlashQLA TC path on 64k. The row-parallel KKT solve then reduced prefill from `13073.39 ms` to `10910.53 ms`. It is still slower than the old custom recurrence by about 15 percent on prefill latency.
 
@@ -149,6 +150,8 @@ After the consumer scratch/fast-path cleanup, the 64k profile split was:
 
 The first attempt to stage `Q` and `K` directly in the consumer used extra dynamic shared memory after the `w_bf16` tile. It built, but failed minimal parity for all 5 prompts, so it was reverted. The next producer/consumer refactor should be developed against a narrower prefill parity harness before rerunning full 64k performance.
 
+A smaller RTX 5080-oriented staging attempt copied one 32-lane `K` slice at a time for the final state update while reusing the existing dynamic shared-memory allocation. It preserved minimal parity (`5/5`), but regressed the 64k profile split to `4049.93 ms` recurrence total, `353.65 ms` prepare, and `3696.28 ms` consume. The added staging loops and barriers cost more than the reduced global `K` reloads on this kernel shape, so the code change was reverted.
+
 ## What is still missing versus full FlashQLA
 
 The current BF16 WMMA path only accelerates the chunk attention-like matrices. It does not yet implement the full producer/consumer kernel structure that gives FlashQLA most of its speed.
@@ -165,9 +168,14 @@ Main missing pieces:
 
 ## Next work
 
-1. Improve the KKT solve schedule further; the current row-synchronous version is correct and faster, but still conservative.
-2. Reduce consumer-side scalar work without regressing prefill. A tested `exp(g)` workspace variant preserved parity but was slower on 64k, so it was not kept.
-3. Move more value-side work into tensor-core-friendly tiles, especially state/output update surfaces.
-4. Rework shared-memory layout and scheduling toward a producer/consumer structure that avoids global workspace traffic where practical on `sm_120a`.
-5. Add direct comparison tests against the upstream Qwen FlashQLA reference outputs.
-6. Rebenchmark on the RTX 5080 Laptop GPU with `scripts/test-flashqla-iteration.ps1` after each substantial change.
+The next session should focus on structural changes, not more small shared-memory caching inside the current monolithic consumer. The rejected K-slice staging result suggests that this kernel is limited by synchronization/register/shared-memory scheduling pressure more than by a single obvious global `K` load.
+
+Recommended order:
+
+1. Add a narrow state-update parity harness. It should isolate the final recurrence update for one or more chunks, with fixed incoming state and chunk tensors, and compare the resulting state against the current scalar implementation. This gives faster feedback than full text-generation parity while changing the state-update algorithm.
+2. Tensorize the state update behind an environment flag. The scalar update is mathematically `state += K^T @ Vnew`; implement a BF16 WMMA version of that surface while preserving the current scalar path as the reference fallback.
+3. If shared memory blocks the tensorized state update, split the consumer by responsibility: one kernel for tensor-core `P @ Vnew` output and one kernel for final state update. This may add global traffic, but it can reduce barrier pressure and make each kernel easier to schedule on `sm_120a`.
+4. Retest tile shapes only after the state-update split/tensorization exists. Worth trying first: `CHUNK=32, COLS=32` and `CHUNK=64, COLS=16`, using the iteration harness for 64k comparisons.
+5. Revisit scalar `expf`/`logf` reduction only after the consumer structure changes. The earlier precomputed `exp(g)` workspace variant preserved parity but was slower in the current structure.
+6. Add direct comparison tests against upstream Qwen FlashQLA outputs once the local algorithmic surfaces match: KKT solve, output accumulation, state update, and gating/decay handling.
+7. Rebenchmark on the RTX 5080 Laptop GPU with `scripts/test-flashqla-iteration.ps1` after each substantial change. Keep using `scripts/benchmark-inference-seq.ps1` through the harness for comparable performance tracking.
