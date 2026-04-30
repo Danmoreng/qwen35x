@@ -6,6 +6,8 @@ Update 2026-04-30: the TC path now uses a split workspace structure. Chunk-level
 
 Update 2026-04-30: the TC path now exposes separate profile timings for the FlashQLA prepare and consume stages. The combined `recurrence_ms` remains the sum of those stages for compatibility with existing reports.
 
+Update 2026-04-30: the consumer now reuses the chunk scalar scratch for `exp(g[t])` after beta is dead, and skips per-element bounds work on full 64-token, in-bounds value tiles. A larger shared `Q/K` staging attempt was tested and reverted because minimal parity failed `0/5`.
+
 ## Reference
 
 - Reference repository: `third_party/reference/FlashQLA`
@@ -115,6 +117,7 @@ $env:QWEN35X_ENABLE_FLASHQLA_GDR_TC_PREFILL='1'
 | Split workspace + row-parallel KKT solve | `benchmarks/qwen35x-flashqla-parallel-kkt-wiki-ai-64k-gen128.csv` | `10910.53 ms` | `5994.76` | `650.20 ms` | `196.87` |
 | Old custom recurrence path | `benchmarks/qwen35x-current-old-custom-wiki-ai-64k-gen128.csv` | `9512.08 ms` | `6885.11` | `707.23 ms` | `180.99` |
 | Profile-split FlashQLA TC path | `benchmarks/qwen35x-flashqla-iteration-wiki-ai-64k-gen128-20260430-145601.csv` | `10875.03 ms` | `6014.43` | `656.53 ms` | `194.97` |
+| Consumer scratch/fast-path cleanup | `benchmarks/qwen35x-flashqla-iteration-wiki-ai-64k-gen128-20260430-152345.csv` | `10675.06 ms` | `6126.97` | `654.36 ms` | `195.62` |
 
 The split-workspace change recovered the largest obvious duplicate-work penalty: about 2.1x faster prefill than the previous FlashQLA TC path on 64k. The row-parallel KKT solve then reduced prefill from `13073.39 ms` to `10910.53 ms`. It is still slower than the old custom recurrence by about 15 percent on prefill latency.
 
@@ -127,6 +130,16 @@ The profile-split run keeps the same algorithmic structure as the row-parallel K
 | FlashQLA consume | `3953.05 ms` |
 
 The consumer stage is therefore the next high-value optimization target.
+
+After the consumer scratch/fast-path cleanup, the 64k profile split was:
+
+| Metric | Avg over 3 measured 64k runs |
+|---|---:|
+| DeltaNet recurrence total | `4012.27 ms` |
+| FlashQLA prepare | `358.31 ms` |
+| FlashQLA consume | `3653.96 ms` |
+
+The first attempt to stage `Q` and `K` directly in the consumer used extra dynamic shared memory after the `w_bf16` tile. It built, but failed minimal parity for all 5 prompts, so it was reverted. The next producer/consumer refactor should be developed against a narrower prefill parity harness before rerunning full 64k performance.
 
 ## What is still missing versus full FlashQLA
 

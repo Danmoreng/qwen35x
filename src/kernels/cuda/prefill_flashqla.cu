@@ -685,12 +685,19 @@ pf_deltanet_recurrence_flashqla64_tc_tiled(
                 __syncwarp();
             }
         }
-        for (int idx = tid; idx < CHUNK * COLS; idx += blockDim.x) {
-            const int t = idx / COLS;
-            const int c = idx - t * COLS;
-            if (t >= rows || col_base + c >= DN_VAL) {
-                w_bf16[idx] = __float2bfloat16(0.0f);
+        if (rows < CHUNK || col_base + COLS > DN_VAL) {
+            for (int idx = tid; idx < CHUNK * COLS; idx += blockDim.x) {
+                const int t = idx / COLS;
+                const int c = idx - t * COLS;
+                if (t >= rows || col_base + c >= DN_VAL) {
+                    w_bf16[idx] = __float2bfloat16(0.0f);
+                }
             }
+        }
+        __syncthreads();
+
+        for (int idx = tid; idx < CHUNK; idx += blockDim.x) {
+            beta_shared[idx] = expf(g_shared[idx]);
         }
         __syncthreads();
 
@@ -719,11 +726,17 @@ pf_deltanet_recurrence_flashqla64_tc_tiled(
         }
         __syncthreads();
 
-        for (int idx = tid; idx < CHUNK * COLS; idx += blockDim.x) {
-            const int t = idx / COLS;
-            const int c = idx - t * COLS;
-            const float vnew = (t < rows && col_base + c < DN_VAL) ? vnew_shared[idx] : 0.0f;
-            w_bf16[idx] = __float2bfloat16(vnew);
+        if (rows == CHUNK && col_base + COLS <= DN_VAL) {
+            for (int idx = tid; idx < CHUNK * COLS; idx += blockDim.x) {
+                w_bf16[idx] = __float2bfloat16(vnew_shared[idx]);
+            }
+        } else {
+            for (int idx = tid; idx < CHUNK * COLS; idx += blockDim.x) {
+                const int t = idx / COLS;
+                const int c = idx - t * COLS;
+                const float vnew = (t < rows && col_base + c < DN_VAL) ? vnew_shared[idx] : 0.0f;
+                w_bf16[idx] = __float2bfloat16(vnew);
+            }
         }
         __syncthreads();
 
@@ -768,7 +781,7 @@ pf_deltanet_recurrence_flashqla64_tc_tiled(
 
                 if (lane == 0) {
                     output[(chunk_start + t) * DN_V_SIZE + h * DN_VAL + col] =
-                        expf(g_shared[t]) * q_dot_state + intra_shared[t * COLS + c];
+                        beta_shared[t] * q_dot_state + intra_shared[t * COLS + c];
                 }
                 __syncwarp();
             }
