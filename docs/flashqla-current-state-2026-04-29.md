@@ -2,6 +2,8 @@
 
 This note documents the current FlashQLA-style DeltaNet prefill work after adding the experimental BF16 tensor-core path for the local RTX 5080 Laptop GPU target.
 
+Update 2026-04-30: the TC path now uses a split workspace structure. Chunk-level matrices are prepared once per DeltaNet head/value group/chunk and reused by value-column consumer blocks. This removes the earlier 4x recomputation of `KK`, `QK`, `A`, and `P` for the 0.8B layout.
+
 ## Reference
 
 - Reference repository: `third_party/reference/FlashQLA`
@@ -19,7 +21,10 @@ The FlashQLA experiments are all opt-in. The default prefill path is unchanged u
 | `QWEN35X_ENABLE_FLASHQLA_GDR_CUDA_PREFILL=1` | direct reference-form CUDA implementation | Closest to the FlashQLA math, but very slow. |
 | `QWEN35X_ENABLE_FLASHQLA_GDR_TC_PREFILL=1` | BF16 WMMA tensor-core tiled implementation | Current experimental fast path. |
 
-The current tensor-core path is implemented in `src/kernels/cuda/prefill_flashqla.cu` as `pf_deltanet_recurrence_flashqla64_tc_tiled`.
+The current tensor-core path is implemented in `src/kernels/cuda/prefill_flashqla.cu` as a two-stage path:
+
+- `pf_deltanet_flashqla64_tc_prepare`: computes per-chunk `A`, `P`, `g`, and `beta` into an arena-backed workspace.
+- `pf_deltanet_recurrence_flashqla64_tc_tiled`: consumes those matrices for `A @ W`, `P @ Vnew`, output, and state update over value-column tiles.
 
 Current properties:
 
@@ -27,7 +32,8 @@ Current properties:
 - Does not use NVFP4 or the SM120-only MXF4/NVF4 assembly path.
 - Builds for the local RTX 5080 Laptop GPU with `-CudaArchitectures 120a`.
 - Processes value columns in `COLS=32` groups per block.
-- Is still opt-in because parity is not clean yet.
+- Reuses chunk matrices across value tiles through `pf_flashqla_workspace`.
+- Is still opt-in because it is not yet full FlashQLA-reference structure or faster than the old custom recurrence.
 
 ## Local build command
 
@@ -49,7 +55,36 @@ Benchmarks were run with the repository benchmark scripts, not ad-hoc commands. 
 | FlashQLA BF16 WMMA TC, `COLS=16` | `benchmarks/qwen35x-sm120-pp256-flashqla-tc-cols16-prefill-20260429.csv` | `107.613 ms` | `2379.62` | `92.682 ms` | `83.785 ms` | `4/5` |
 | FlashQLA BF16 WMMA TC, `COLS=32` | `benchmarks/qwen35x-sm120-pp256-flashqla-tc-cols32-prefill-20260429.csv` | `96.814 ms` | `2644.89` | `83.200 ms` | `74.162 ms` | `3/5` |
 
-The `COLS=32` tensor-core path is much faster than the scalar reference-form implementation and the first tiled prototype, but it is still slower than the current baseline prefill path and has parity failures.
+The earlier `COLS=32` tensor-core path was much faster than the scalar reference-form implementation and the first tiled prototype, but it was still slower than the current baseline prefill path and had parity failures.
+
+After the split-workspace change, build and parity were verified with:
+
+```powershell
+.\scripts\build.ps1 -UseNinja -EnableCuda -Configuration Release -Target qwen35x
+$env:QWEN35X_ENABLE_FLASHQLA_GDR_TC_PREFILL='1'
+.\scripts\benchmark-parity.ps1 -Executable build\qwen35x.exe -PromptsFile scripts\bench\parity_prompts_minimal.txt -CsvOut benchmarks\qwen35x-flashqla-split-workspace-minimal-parity.csv -RunLabel flashqla-split-workspace-minimal -MaxNewTokens 4 -MaxContext 256 -GpuMode gpu-f32 -Qwen35xPrefillMode batched
+.\scripts\benchmark-parity.ps1 -Executable build\qwen35x.exe -PromptsFile scripts\bench\parity_prompts.txt -CsvOut benchmarks\qwen35x-flashqla-split-workspace-extended-parity.csv -RunLabel flashqla-split-workspace-extended -MaxNewTokens 4 -MaxContext 256 -GpuMode gpu-f32 -Qwen35xPrefillMode batched
+```
+
+Parity results:
+
+- Minimal parity: `5/5`
+- Extended parity: `12/12`
+
+64k Wikipedia benchmark settings:
+
+```powershell
+$env:QWEN35X_ENABLE_FLASHQLA_GDR_TC_PREFILL='1'
+.\scripts\benchmark-inference-seq.ps1 -Executable build\qwen35x.exe -CsvOut benchmarks\qwen35x-flashqla-split-workspace-wiki-ai-64k-gen128.csv -RunLabel flashqla-split-workspace-wiki-ai-64k-gen128 -Modes gpu-f32 -PromptMode prompt-file -PromptFile benchmarks\inputs\wiki_artificial_intelligence_64k_prompt.txt -PromptName wiki_ai_64k_gen128 -Runs 3 -WarmupRuns 1 -MaxNewTokens 128 -MaxContext 65536 -Qwen35xPrefillMode batched
+```
+
+| Implementation | Source CSV | Avg prefill | Avg prefill tok/s | Avg decode | Avg total tok/s |
+|---|---|---:|---:|---:|---:|
+| Previous FlashQLA TC path | `benchmarks/qwen35x-current-flashqla-wiki-ai-64k-gen128.csv` | `27731.82 ms` | `2358.73` | `735.52 ms` | `174.03` |
+| Split-workspace FlashQLA TC path | `benchmarks/qwen35x-flashqla-split-workspace-wiki-ai-64k-gen128.csv` | `13073.39 ms` | `5004.03` | `645.76 ms` | `198.40` |
+| Old custom recurrence path | `benchmarks/qwen35x-current-old-custom-wiki-ai-64k-gen128.csv` | `9512.08 ms` | `6885.11` | `707.23 ms` | `180.99` |
+
+The split-workspace change recovered the largest obvious duplicate-work penalty: about 2.1x faster prefill than the previous FlashQLA TC path on 64k. It is still slower than the old custom recurrence by about 37 percent on prefill latency.
 
 ## What is still missing versus full FlashQLA
 
@@ -57,19 +92,19 @@ The current BF16 WMMA path only accelerates the chunk attention-like matrices. I
 
 Main missing pieces:
 
-- The triangular solve / delta computation is still scalar per value column.
-- Output accumulation is still scalar over the chunk.
+- The triangular KKT solve for `A` is still serial on one thread per chunk.
+- The path uses a two-kernel global-workspace split instead of the reference's tighter producer/consumer shared-memory schedule.
+- Output accumulation is tensorized through `P @ Vnew`, but final output/state handling still uses scalar warp reductions.
 - State update is still scalar over key lanes and chunk rows.
-- `K * K^T` and `Q * K^T` are recomputed for each value-column tile instead of being amortized more aggressively across the value dimension.
-- The implementation does not yet use a large value tile comparable to the reference kernel's high-throughput layout.
+- Scalar `expf`/`logf` work remains in prepare and consumer loops.
 - Shared-memory layout and scheduling are still simple and not tuned around sustained tensor-core occupancy.
-- Parity needs to be fixed before the path can be considered for default use.
+- Parity against this repository's CPU reference is clean for the current test set, but direct parity against the upstream Qwen FlashQLA reference is still not implemented.
 
 ## Next work
 
-1. Fix parity first, likely by comparing `COLS=16` and `COLS=32` against the clean CUDA reference-form path at intermediate tensors.
-2. Move the lower-triangular delta solve toward a chunk-level implementation that is computed once and reused across value columns where possible.
-3. Tensorize the value-side work: state/output updates should use BF16 MMA over larger value tiles instead of scalar per-column loops.
-4. Rework shared-memory layout to keep chunk matrices and value tiles resident without recomputing them per value tile.
-5. Rebenchmark on the RTX 5080 Laptop GPU with the standard sequential benchmark script after each substantial change.
-
+1. Parallelize the triangular KKT solve for `A`; the current `tid == 0` solve is the next large structural bottleneck.
+2. Precompute/reuse decay factors used by output and state update so consumers do less scalar transcendental work.
+3. Move more value-side work into tensor-core-friendly tiles, especially state/output update surfaces.
+4. Rework shared-memory layout and scheduling toward a producer/consumer structure that avoids global workspace traffic where practical on `sm_120a`.
+5. Add direct comparison tests against the upstream Qwen FlashQLA reference outputs.
+6. Rebenchmark on the RTX 5080 Laptop GPU with the standard sequential benchmark script after each substantial change.

@@ -36,4 +36,5 @@ void launch_pf_deltanet_recurrence_flashqla64_tc_tiled(
     float *state,
     float *output,
     int S,
+    void *workspace,
     cudaStream_t stream);

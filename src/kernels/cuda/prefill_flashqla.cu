@@ -470,10 +470,152 @@ pf_deltanet_flashqla64_cuda_ref(
     }
 }
 
+static __global__ void __launch_bounds__(512, 1)
+pf_deltanet_flashqla64_tc_prepare(
+    const float *qkv_f32, const float *beta_buf, const float *alpha_buf,
+    int S, int num_chunks, void *workspace)
+{
+    constexpr int CHUNK = 64;
+    constexpr int WMMA_M = 16;
+    constexpr int WMMA_N = 16;
+    constexpr int WMMA_K = 16;
+    constexpr int TILES = CHUNK / WMMA_M;
+
+    const int h = blockIdx.x;
+    const int group = blockIdx.y;
+    const int chunk_id = blockIdx.z;
+    const int tid = threadIdx.x;
+    const int warp = tid / 32;
+    if (h >= DN_HEADS || group >= DN_VAL_GROUPS || chunk_id >= num_chunks) return;
+
+    extern __shared__ float smem[];
+    float *kk_shared = smem;
+    float *qk_shared = kk_shared + CHUNK * CHUNK;
+    float *a_shared = qk_shared + CHUNK * CHUNK;
+    float *g_shared = a_shared + CHUNK * CHUNK;
+    float *beta_shared = g_shared + CHUNK;
+    __nv_bfloat16 *q_bf16 = reinterpret_cast<__nv_bfloat16 *>(beta_shared + CHUNK);
+    __nv_bfloat16 *k_bf16 = q_bf16 + CHUNK * DN_KEY;
+
+    const std::size_t head_chunks = static_cast<std::size_t>(DN_GATE) * static_cast<std::size_t>(num_chunks);
+    __nv_bfloat16 *a_ws = reinterpret_cast<__nv_bfloat16 *>(workspace);
+    __nv_bfloat16 *p_ws = a_ws + head_chunks * CHUNK * CHUNK;
+    float *g_ws = reinterpret_cast<float *>(p_ws + head_chunks * CHUNK * CHUNK);
+    float *beta_ws = g_ws + head_chunks * CHUNK;
+    const std::size_t ws_id =
+        (static_cast<std::size_t>(h) * DN_VAL_GROUPS + group) * static_cast<std::size_t>(num_chunks) + chunk_id;
+    __nv_bfloat16 *a_out = a_ws + ws_id * CHUNK * CHUNK;
+    __nv_bfloat16 *p_out = p_ws + ws_id * CHUNK * CHUNK;
+    float *g_out = g_ws + ws_id * CHUNK;
+    float *beta_out = beta_ws + ws_id * CHUNK;
+
+    const int chunk_start = chunk_id * CHUNK;
+    const int rows = min(CHUNK, S - chunk_start);
+    const int gate_head = h * DN_VAL_GROUPS + group;
+
+    for (int idx = tid; idx < CHUNK * DN_KEY; idx += blockDim.x) {
+        const int t = idx / DN_KEY;
+        const int k = idx - t * DN_KEY;
+        float qv = 0.0f;
+        float kv = 0.0f;
+        if (t < rows) {
+            const float *base = qkv_f32 + (chunk_start + t) * DN_CONV_CH;
+            qv = base[h * DN_KEY + k];
+            kv = base[DN_QK_SIZE + h * DN_KEY + k];
+        }
+        q_bf16[idx] = __float2bfloat16(qv);
+        k_bf16[idx] = __float2bfloat16(kv);
+    }
+
+    if (tid == 0) {
+        float g = 0.0f;
+        for (int t = 0; t < CHUNK; ++t) {
+            float gt = 0.0f;
+            float bt = 0.0f;
+            if (t < rows) {
+                const int gate_off = (chunk_start + t) * DN_GATE + gate_head;
+                g += logf(fmaxf(alpha_buf[gate_off], 1.0e-20f));
+                gt = g;
+                bt = beta_buf[gate_off];
+            }
+            g_shared[t] = gt;
+            beta_shared[t] = bt;
+            g_out[t] = gt;
+            beta_out[t] = bt;
+        }
+    }
+    __syncthreads();
+
+    for (int tile = warp; tile < TILES * TILES; tile += blockDim.x / 32) {
+        const int tile_m = tile / TILES;
+        const int tile_n = tile - tile_m * TILES;
+
+        wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> q_frag;
+        wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> k_a_frag;
+        wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::col_major> k_b_frag;
+        wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> kk_acc;
+        wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> qk_acc;
+        wmma::fill_fragment(kk_acc, 0.0f);
+        wmma::fill_fragment(qk_acc, 0.0f);
+
+        for (int k0 = 0; k0 < DN_KEY; k0 += WMMA_K) {
+            const __nv_bfloat16 *q_tile = q_bf16 + (tile_m * WMMA_M) * DN_KEY + k0;
+            const __nv_bfloat16 *k_a_tile = k_bf16 + (tile_m * WMMA_M) * DN_KEY + k0;
+            const __nv_bfloat16 *k_b_tile = k_bf16 + (tile_n * WMMA_N) * DN_KEY + k0;
+            wmma::load_matrix_sync(q_frag, q_tile, DN_KEY);
+            wmma::load_matrix_sync(k_a_frag, k_a_tile, DN_KEY);
+            wmma::load_matrix_sync(k_b_frag, k_b_tile, DN_KEY);
+            wmma::mma_sync(qk_acc, q_frag, k_b_frag, qk_acc);
+            wmma::mma_sync(kk_acc, k_a_frag, k_b_frag, kk_acc);
+        }
+
+        wmma::store_matrix_sync(kk_shared + (tile_m * WMMA_M) * CHUNK + tile_n * WMMA_N, kk_acc, CHUNK, wmma::mem_row_major);
+        wmma::store_matrix_sync(qk_shared + (tile_m * WMMA_M) * CHUNK + tile_n * WMMA_N, qk_acc, CHUNK, wmma::mem_row_major);
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < CHUNK * CHUNK; idx += blockDim.x) {
+        const int t = idx / CHUNK;
+        const int j = idx - t * CHUNK;
+        float a = 0.0f;
+        if (t < rows && j < t) {
+            a = beta_shared[t] * expf(g_shared[t] - g_shared[j]) * kk_shared[t * CHUNK + j];
+        } else if (j == t) {
+            a = 1.0f;
+        }
+        a_shared[t * CHUNK + j] = a;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        for (int t = 1; t < rows; ++t) {
+            for (int j = 0; j < t; ++j) {
+                float sum = a_shared[t * CHUNK + j];
+                for (int m = j + 1; m < t; ++m) {
+                    sum += a_shared[t * CHUNK + m] * a_shared[m * CHUNK + j];
+                }
+                a_shared[t * CHUNK + j] = -sum;
+            }
+        }
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < CHUNK * CHUNK; idx += blockDim.x) {
+        const int t = idx / CHUNK;
+        const int j = idx - t * CHUNK;
+        float p = 0.0f;
+        if (t < rows && j <= t) {
+            p = expf(g_shared[t] - g_shared[j]) * qk_shared[t * CHUNK + j];
+        }
+        a_out[idx] = __float2bfloat16(a_shared[idx]);
+        p_out[idx] = __float2bfloat16(p);
+    }
+}
+
 __global__ void __launch_bounds__(1024, 1)
 pf_deltanet_recurrence_flashqla64_tc_tiled(
     const float *qkv_f32, const float *beta_buf, const float *alpha_buf,
-    float *state, float *output, int S)
+    float *state, float *output, int S, int num_chunks, const void *workspace)
 {
     constexpr int CHUNK = 64;
     constexpr int COLS = 32;
@@ -491,17 +633,17 @@ pf_deltanet_recurrence_flashqla64_tc_tiled(
     if (h >= DN_HEADS || col_base >= DN_VAL) return;
 
     extern __shared__ float smem[];
-    float *kk_shared = smem;
-    float *qk_shared = kk_shared + CHUNK * CHUNK;
-    float *intra_shared = kk_shared;
-    float *a_shared = qk_shared + CHUNK * CHUNK;
-    float *g_shared = a_shared + CHUNK * CHUNK;
+    float *vnew_shared = smem;
+    float *intra_shared = vnew_shared + CHUNK * COLS;
+    float *g_shared = intra_shared + CHUNK * COLS;
     float *beta_shared = g_shared + CHUNK;
-    float *vnew_shared = beta_shared + CHUNK;
-    __nv_bfloat16 *q_bf16 = reinterpret_cast<__nv_bfloat16 *>(vnew_shared + CHUNK * COLS);
-    __nv_bfloat16 *k_bf16 = q_bf16 + CHUNK * DN_KEY;
-    __nv_bfloat16 *a_bf16 = reinterpret_cast<__nv_bfloat16 *>(a_shared);
-    __nv_bfloat16 *w_bf16 = a_bf16 + CHUNK * CHUNK;
+    __nv_bfloat16 *w_bf16 = reinterpret_cast<__nv_bfloat16 *>(beta_shared + CHUNK);
+
+    const std::size_t head_chunks = static_cast<std::size_t>(DN_GATE) * static_cast<std::size_t>(num_chunks);
+    const __nv_bfloat16 *a_ws = reinterpret_cast<const __nv_bfloat16 *>(workspace);
+    const __nv_bfloat16 *p_ws = a_ws + head_chunks * CHUNK * CHUNK;
+    const float *g_ws = reinterpret_cast<const float *>(p_ws + head_chunks * CHUNK * CHUNK);
+    const float *beta_ws = g_ws + head_chunks * CHUNK;
 
     const int col = col_base + warp;
     float sreg[RPL] = {};
@@ -515,113 +657,16 @@ pf_deltanet_recurrence_flashqla64_tc_tiled(
 
     for (int chunk_start = 0; chunk_start < S; chunk_start += CHUNK) {
         const int rows = min(CHUNK, S - chunk_start);
+        const int chunk_id = chunk_start / CHUNK;
+        const int group = col_base / DN_VAL_HEAD_DIM;
+        const std::size_t ws_id =
+            (static_cast<std::size_t>(h) * DN_VAL_GROUPS + group) * static_cast<std::size_t>(num_chunks) + chunk_id;
+        const __nv_bfloat16 *a_mat = a_ws + ws_id * CHUNK * CHUNK;
+        const __nv_bfloat16 *p_mat = p_ws + ws_id * CHUNK * CHUNK;
 
-        for (int idx = tid; idx < CHUNK * DN_KEY; idx += blockDim.x) {
-            const int t = idx / DN_KEY;
-            const int k = idx - t * DN_KEY;
-            float qv = 0.0f;
-            float kv = 0.0f;
-            if (t < rows) {
-                const float *base = qkv_f32 + (chunk_start + t) * DN_CONV_CH;
-                qv = base[h * DN_KEY + k];
-                kv = base[DN_QK_SIZE + h * DN_KEY + k];
-            }
-            q_bf16[idx] = __float2bfloat16(qv);
-            k_bf16[idx] = __float2bfloat16(kv);
-        }
-
-        for (int idx = tid; idx < rows * COLS; idx += blockDim.x) {
-            const int t = idx / COLS;
-            const int c = idx - t * COLS;
-            const int vc = col_base + c;
-            if (vc < DN_VAL) {
-                const int gate_head = h * DN_VAL_GROUPS + vc / DN_VAL_HEAD_DIM;
-                vnew_shared[idx] = 0.0f;
-                if (c == 0) {
-                    beta_shared[t] = beta_buf[(chunk_start + t) * DN_GATE + gate_head];
-                }
-            } else {
-                vnew_shared[idx] = 0.0f;
-            }
-        }
-        __syncthreads();
-
-        if (tid == 0) {
-            const int gate_head = h * DN_VAL_GROUPS + col_base / DN_VAL_HEAD_DIM;
-            float g = 0.0f;
-            for (int t = 0; t < rows; ++t) {
-                const int gate_off = (chunk_start + t) * DN_GATE + gate_head;
-                g += logf(fmaxf(alpha_buf[gate_off], 1.0e-20f));
-                g_shared[t] = g;
-                beta_shared[t] = beta_buf[gate_off];
-            }
-        }
-        __syncthreads();
-
-        for (int tile = warp; tile < TILES * TILES; tile += blockDim.x / 32) {
-            const int tile_m = tile / TILES;
-            const int tile_n = tile - tile_m * TILES;
-
-            wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> q_frag;
-            wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> k_a_frag;
-            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::col_major> k_b_frag;
-            wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> kk_acc;
-            wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> qk_acc;
-            wmma::fill_fragment(kk_acc, 0.0f);
-            wmma::fill_fragment(qk_acc, 0.0f);
-
-            for (int k0 = 0; k0 < DN_KEY; k0 += WMMA_K) {
-                const __nv_bfloat16 *q_tile = q_bf16 + (tile_m * WMMA_M) * DN_KEY + k0;
-                const __nv_bfloat16 *k_a_tile = k_bf16 + (tile_m * WMMA_M) * DN_KEY + k0;
-                const __nv_bfloat16 *k_b_tile = k_bf16 + (tile_n * WMMA_N) * DN_KEY + k0;
-                wmma::load_matrix_sync(q_frag, q_tile, DN_KEY);
-                wmma::load_matrix_sync(k_a_frag, k_a_tile, DN_KEY);
-                wmma::load_matrix_sync(k_b_frag, k_b_tile, DN_KEY);
-                wmma::mma_sync(qk_acc, q_frag, k_b_frag, qk_acc);
-                wmma::mma_sync(kk_acc, k_a_frag, k_b_frag, kk_acc);
-            }
-
-            wmma::store_matrix_sync(
-                kk_shared + (tile_m * WMMA_M) * CHUNK + tile_n * WMMA_N,
-                kk_acc,
-                CHUNK,
-                wmma::mem_row_major);
-            wmma::store_matrix_sync(
-                qk_shared + (tile_m * WMMA_M) * CHUNK + tile_n * WMMA_N,
-                qk_acc,
-                CHUNK,
-                wmma::mem_row_major);
-        }
-        __syncthreads();
-
-        for (int idx = tid; idx < CHUNK * CHUNK; idx += blockDim.x) {
-            const int t = idx / CHUNK;
-            const int j = idx - t * CHUNK;
-            float a = 0.0f;
-            if (t < rows && j < t) {
-                a = beta_shared[t] * expf(g_shared[t] - g_shared[j]) * kk_shared[t * CHUNK + j];
-            } else if (j == t) {
-                a = 1.0f;
-            }
-            a_shared[t * CHUNK + j] = a;
-        }
-        __syncthreads();
-
-        if (tid == 0) {
-            for (int t = 1; t < rows; ++t) {
-                for (int j = 0; j < t; ++j) {
-                    float sum = a_shared[t * CHUNK + j];
-                    for (int m = j + 1; m < t; ++m) {
-                        sum += a_shared[t * CHUNK + m] * a_shared[m * CHUNK + j];
-                    }
-                    a_shared[t * CHUNK + j] = -sum;
-                }
-            }
-        }
-        __syncthreads();
-
-        for (int idx = tid; idx < CHUNK * CHUNK; idx += blockDim.x) {
-            a_bf16[idx] = __float2bfloat16(a_shared[idx]);
+        for (int idx = tid; idx < CHUNK; idx += blockDim.x) {
+            g_shared[idx] = g_ws[ws_id * CHUNK + idx];
+            beta_shared[idx] = beta_ws[ws_id * CHUNK + idx];
         }
         __syncthreads();
 
@@ -662,7 +707,7 @@ pf_deltanet_recurrence_flashqla64_tc_tiled(
             wmma::fill_fragment(vnew_acc, 0.0f);
 
             for (int k0 = 0; k0 < CHUNK; k0 += WMMA_K) {
-                const __nv_bfloat16 *a_tile = a_bf16 + (tile_m * WMMA_M) * CHUNK + k0;
+                const __nv_bfloat16 *a_tile = a_mat + (tile_m * WMMA_M) * CHUNK + k0;
                 const __nv_bfloat16 *w_tile = w_bf16 + k0 * COLS + tile_n * WMMA_N;
                 wmma::load_matrix_sync(a_frag, a_tile, CHUNK);
                 wmma::load_matrix_sync(w_frag, w_tile, COLS);
@@ -677,15 +722,6 @@ pf_deltanet_recurrence_flashqla64_tc_tiled(
         }
         __syncthreads();
 
-        for (int idx = tid; idx < CHUNK * CHUNK; idx += blockDim.x) {
-            const int t = idx / CHUNK;
-            const int j = idx - t * CHUNK;
-            float p = 0.0f;
-            if (t < rows && j <= t) {
-                p = expf(g_shared[t] - g_shared[j]) * qk_shared[t * CHUNK + j];
-            }
-            a_bf16[idx] = __float2bfloat16(p);
-        }
         for (int idx = tid; idx < CHUNK * COLS; idx += blockDim.x) {
             const int t = idx / COLS;
             const int c = idx - t * COLS;
@@ -704,7 +740,7 @@ pf_deltanet_recurrence_flashqla64_tc_tiled(
             wmma::fill_fragment(intra_acc, 0.0f);
 
             for (int k0 = 0; k0 < CHUNK; k0 += WMMA_K) {
-                const __nv_bfloat16 *p_tile = a_bf16 + (tile_m * WMMA_M) * CHUNK + k0;
+                const __nv_bfloat16 *p_tile = p_mat + (tile_m * WMMA_M) * CHUNK + k0;
                 const __nv_bfloat16 *vnew_tile = w_bf16 + k0 * COLS + tile_n * WMMA_N;
                 wmma::load_matrix_sync(p_frag, p_tile, CHUNK);
                 wmma::load_matrix_sync(vnew_frag, vnew_tile, COLS);
@@ -843,12 +879,20 @@ void launch_pf_deltanet_recurrence_flashqla64_tc_tiled(
     float *state,
     float *output,
     int S,
+    void *workspace,
     cudaStream_t stream)
 {
+    const int num_chunks = (S + 63) / 64;
+    cudaFuncSetAttribute(
+        pf_deltanet_flashqla64_tc_prepare,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(kFlashqla64TcTiledSharedBytes));
     cudaFuncSetAttribute(
         pf_deltanet_recurrence_flashqla64_tc_tiled,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         static_cast<int>(kFlashqla64TcTiledSharedBytes));
+    pf_deltanet_flashqla64_tc_prepare<<<dim3(DN_HEADS, DN_VAL_GROUPS, num_chunks), 512, kFlashqla64TcTiledSharedBytes, stream>>>(
+        qkv_f32, beta_buf, alpha_buf, S, num_chunks, workspace);
     pf_deltanet_recurrence_flashqla64_tc_tiled<<<dim3(DN_HEADS, (DN_VAL + 31) / 32), 1024, kFlashqla64TcTiledSharedBytes, stream>>>(
-        qkv_f32, beta_buf, alpha_buf, state, output, S);
+        qkv_f32, beta_buf, alpha_buf, state, output, S, num_chunks, workspace);
 }

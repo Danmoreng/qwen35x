@@ -275,6 +275,7 @@ struct PackedLayerNvfp4Weights {
   void * dn_out_buf, \
   float * dn_qkv_f32, \
   float * dn_out_f32, \
+  void * flashqla_workspace, \
   void * fp4_activation, \
   void * fp4_activation_scales, \
   float * fp4_output_f32, \
@@ -522,6 +523,7 @@ struct BackendState {
   void * pf_dn_out_buf = nullptr;
   float * pf_dn_qkv_f32 = nullptr;
   float * pf_dn_out_f32 = nullptr;
+  void * pf_flashqla_workspace = nullptr;
   std::uint8_t * pf_fp4_activation = nullptr;
   std::uint8_t * pf_fp4_activation_scales = nullptr;
   float * pf_fp4_output_f32 = nullptr;
@@ -1493,6 +1495,14 @@ bool initialize_backend_state(
     std::max(
       static_cast<std::size_t>(prefill_mlp_chunk_tokens) * static_cast<std::size_t>(descriptor_dn_v_size(descriptor)),
       attention_accum_elems);
+  constexpr int flashqla_chunk_tokens = 64;
+  const std::size_t flashqla_chunks =
+    (static_cast<std::size_t>(prefill_mlp_chunk_tokens) + flashqla_chunk_tokens - 1) / flashqla_chunk_tokens;
+  const std::size_t flashqla_head_chunks =
+    static_cast<std::size_t>(descriptor.dn_gate_heads) * flashqla_chunks;
+  const std::size_t flashqla_workspace_bytes =
+    flashqla_head_chunks * flashqla_chunk_tokens * flashqla_chunk_tokens * sizeof(std::uint16_t) * 2 +
+    flashqla_head_chunks * flashqla_chunk_tokens * sizeof(float) * 2;
   const int pf_fp4_max_input_cols = std::max({
     descriptor.hidden_size,
     descriptor.intermediate_size,
@@ -1516,6 +1526,7 @@ bool initialize_backend_state(
       !arena.alloc_bytes(static_cast<std::size_t>(prefill_s) * descriptor_dn_v_size(descriptor) * bf16_bytes, state.pf_dn_out_buf, error_message) ||
       !arena.alloc_bytes(dn_qkv_f32_elems * sizeof(float), reinterpret_cast<void *&>(state.pf_dn_qkv_f32), error_message) ||
       !arena.alloc_bytes(dn_out_f32_elems * sizeof(float), reinterpret_cast<void *&>(state.pf_dn_out_f32), error_message) ||
+      !arena.alloc_bytes(flashqla_workspace_bytes, state.pf_flashqla_workspace, error_message) ||
       !arena.alloc_bytes(pf_fp4_activation_bytes, reinterpret_cast<void *&>(state.pf_fp4_activation), error_message) ||
       !arena.alloc_bytes(pf_fp4_activation_scale_bytes, reinterpret_cast<void *&>(state.pf_fp4_activation_scales), error_message) ||
       !arena.alloc_bytes(proj_buf_elems * sizeof(float), reinterpret_cast<void *&>(state.pf_fp4_output_f32), error_message) ||
@@ -1908,6 +1919,7 @@ void launch_prefill_for_state(
     state.pf_dn_out_buf,
     state.pf_dn_qkv_f32,
     state.pf_dn_out_f32,
+    state.pf_flashqla_workspace,
     state.pf_fp4_activation,
     state.pf_fp4_activation_scales,
     state.pf_fp4_output_f32,

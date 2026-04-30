@@ -699,6 +699,7 @@ static void pf_deltanet_chunked(
     __nv_bfloat16 *dn_out_buf,
     float *dn_qkv_f32,
     float *dn_out_f32,
+    void *flashqla_workspace,
     float *beta_buf,
     float *alpha_buf,
     std::uint8_t *activation_scratch,
@@ -738,7 +739,7 @@ static void pf_deltanet_chunked(
             });
             profile_phase(profile ? &profile->recurrence_ms : nullptr, [&]() {
                 launch_pf_deltanet_recurrence_flashqla64_tc_tiled(
-                    dn_qkv_f32, beta_buf, alpha_buf, dn_state, dn_out_f32, rows, stream);
+                    dn_qkv_f32, beta_buf, alpha_buf, dn_state, dn_out_f32, rows, flashqla_workspace, stream);
             });
             profile_phase(profile ? &profile->post_norm_gate_ms : nullptr, [&]() {
                 pf_deltanet_post_norm_gate<<<rows * DN_GATE, 256, 0, stream>>>(
@@ -973,6 +974,7 @@ extern "C" void launch_prefill_bf16(
     __nv_bfloat16 *attn_buf, __nv_bfloat16 *mlp_buf,
     __nv_bfloat16 *dn_out_buf,
     float *dn_qkv_f32, float *dn_out_f32,
+    void *flashqla_workspace,
     std::uint8_t *fp4_activation, std::uint8_t *fp4_activation_scales,
     float *fp4_output_f32,
     float *beta_buf, float *alpha_buf,
@@ -1146,6 +1148,7 @@ extern "C" void launch_prefill_bf16(
                 dn_out_buf,
                 dn_qkv_f32,
                 dn_out_f32,
+                flashqla_workspace,
                 beta_buf,
                 alpha_buf,
                 fp4_activation,
