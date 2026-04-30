@@ -21,6 +21,7 @@ constexpr int kWmmaM = 16;
 constexpr int kWmmaN = 16;
 constexpr int kWmmaK = 16;
 constexpr int kTiles = kChunk / kWmmaM;
+constexpr int kLowerTiles = kTiles * (kTiles + 1) / 2;
 
 struct Options {
   float tolerance = 0.0f;
@@ -102,13 +103,18 @@ __global__ void prepare_kernel(
   }
   __syncthreads();
 
-  for (int tile = warp; tile < kTiles * kTiles; tile += blockDim.x / 32) {
-    const int tile_m = tile / kTiles;
-    const int tile_n = tile - tile_m * kTiles;
+  const int tile_count = SkipUpperTiles ? kLowerTiles : kTiles * kTiles;
+  for (int tile = warp; tile < tile_count; tile += blockDim.x / 32) {
+    int tile_m = tile / kTiles;
+    int tile_n = tile - tile_m * kTiles;
     if constexpr (SkipUpperTiles) {
-      if (tile_n > tile_m) {
-        continue;
+      int remaining = tile;
+      tile_m = 0;
+      while (remaining > tile_m) {
+        remaining -= tile_m + 1;
+        ++tile_m;
       }
+      tile_n = remaining;
     }
 
     wmma::fragment<wmma::matrix_a, kWmmaM, kWmmaN, kWmmaK, __nv_bfloat16, wmma::row_major> q_frag;

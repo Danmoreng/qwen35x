@@ -8,6 +8,10 @@ Update 2026-04-30: the TC path now exposes separate profile timings for the Flas
 
 Update 2026-04-30: the consumer now reuses the chunk scalar scratch for `exp(g[t])` after beta is dead, and skips per-element bounds work on full 64-token, in-bounds value tiles. A larger shared `Q/K` staging attempt was tested and reverted because minimal parity failed `0/5`.
 
+## Kernel Logic Diagram
+
+![DeltaNet prefill kernel logic comparison](reference/flashqla-vs-traditional-kernel-logic.png)
+
 ## Reference
 
 - Reference repository: `third_party/reference/FlashQLA`
@@ -153,6 +157,8 @@ The first attempt to stage `Q` and `K` directly in the consumer used extra dynam
 A smaller RTX 5080-oriented staging attempt copied one 32-lane `K` slice at a time for the final state update while reusing the existing dynamic shared-memory allocation. It preserved minimal parity (`5/5`), but regressed the 64k profile split to `4049.93 ms` recurrence total, `353.65 ms` prepare, and `3696.28 ms` consume. The added staging loops and barriers cost more than the reduced global `K` reloads on this kernel shape, so the code change was reverted.
 
 A prepare-kernel attempt skipped the six strictly upper off-diagonal `QK^T`/`KK^T` WMMA tiles in each 64-token chunk. The new prepare-workspace harness proved the resulting `A`, `P`, `g`, and `beta` buffers were bit-identical to the full-tile schedule for rows `1`, `17`, `63`, and `64`, and the full iteration harness then passed minimal parity. Performance regressed badly on 64k, though: average prefill was `17536.51 ms`, recurrence `5943.91 ms`, prepare `544.59 ms`, and consume `5399.32 ms`. The production change was reverted.
+
+A compact lower-triangle tile enumeration avoided the sparse warp schedule from the first upper-tile skip attempt and also preserved exact prepare-workspace parity. It passed the full minimal parity gate, but still regressed 64k performance: average prefill was `11375.33 ms`, recurrence `4187.68 ms`, prepare `368.24 ms`, and consume `3819.44 ms`. The production change was reverted.
 
 ## What is still missing versus full FlashQLA
 
