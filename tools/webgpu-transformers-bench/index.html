@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Qwen3.5 0.8B WebGPU Benchmark</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: "Segoe UI", system-ui, sans-serif;
+      }
+
+      body {
+        margin: 0;
+        background: #101418;
+        color: #eef3f7;
+      }
+
+      main {
+        box-sizing: border-box;
+        width: min(980px, 100%);
+        min-height: 100vh;
+        margin: 0 auto;
+        padding: 28px 20px;
+      }
+
+      h1 {
+        margin: 0 0 20px;
+        font-size: 24px;
+        font-weight: 650;
+        letter-spacing: 0;
+      }
+
+      .panel {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+        margin-bottom: 16px;
+      }
+
+      label {
+        display: grid;
+        gap: 6px;
+        font-size: 13px;
+        color: #b9c5cf;
+      }
+
+      input,
+      textarea,
+      button {
+        box-sizing: border-box;
+        width: 100%;
+        border: 1px solid #34414d;
+        border-radius: 6px;
+        background: #182029;
+        color: #eef3f7;
+        font: inherit;
+      }
+
+      input,
+      textarea {
+        padding: 10px 11px;
+      }
+
+      textarea {
+        min-height: 92px;
+        resize: vertical;
+      }
+
+      button {
+        width: auto;
+        min-width: 132px;
+        padding: 10px 14px;
+        border-color: #4d7cff;
+        background: #2857d9;
+        font-weight: 600;
+        cursor: pointer;
+      }
+
+      button:disabled {
+        cursor: progress;
+        opacity: 0.64;
+      }
+
+      .full {
+        grid-column: 1 / -1;
+      }
+
+      .actions {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin: 12px 0 18px;
+      }
+
+      .status {
+        color: #b9c5cf;
+        font-size: 13px;
+      }
+
+      .metrics {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 10px;
+        margin-bottom: 16px;
+      }
+
+      .metric {
+        border: 1px solid #2a3540;
+        border-radius: 6px;
+        padding: 10px;
+        background: #151c24;
+      }
+
+      .metric span {
+        display: block;
+        color: #9daab5;
+        font-size: 12px;
+      }
+
+      .metric strong {
+        display: block;
+        margin-top: 4px;
+        font-size: 18px;
+      }
+
+      pre {
+        min-height: 180px;
+        margin: 0;
+        overflow: auto;
+        white-space: pre-wrap;
+        border: 1px solid #2a3540;
+        border-radius: 6px;
+        padding: 12px;
+        background: #0b0f13;
+        color: #dbe6ee;
+      }
+
+      @media (max-width: 720px) {
+        .panel,
+        .metrics {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Qwen3.5 0.8B WebGPU Benchmark</h1>
+
+      <section class="panel">
+        <label>
+          Model
+          <input id="model" value="onnx-community/Qwen3.5-0.8B-ONNX" />
+        </label>
+        <label>
+          Max new tokens
+          <input id="maxNewTokens" type="number" min="1" max="1024" value="128" />
+        </label>
+        <label class="full">
+          Prompt
+          <textarea id="prompt">Tell me a short joke.</textarea>
+        </label>
+      </section>
+
+      <div class="actions">
+        <button id="run">Run</button>
+        <div id="status" class="status">Idle</div>
+      </div>
+
+      <section class="metrics">
+        <div class="metric"><span>Load</span><strong id="loadMs">-</strong></div>
+        <div class="metric"><span>Generate</span><strong id="generateMs">-</strong></div>
+        <div class="metric"><span>Tokens</span><strong id="tokens">-</strong></div>
+        <div class="metric"><span>Tok/s</span><strong id="tokPerSec">-</strong></div>
+      </section>
+
+      <pre id="adapterInfo">WebGPU adapter: not checked</pre>
+      <br />
+      <pre id="output"></pre>
+    </main>
+
+    <script type="module">
+      import {
+        AutoProcessor,
+        Qwen3_5ForConditionalGeneration,
+        TextStreamer,
+      } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@next";
+
+      const el = {
+        model: document.querySelector("#model"),
+        prompt: document.querySelector("#prompt"),
+        maxNewTokens: document.querySelector("#maxNewTokens"),
+        run: document.querySelector("#run"),
+        status: document.querySelector("#status"),
+        loadMs: document.querySelector("#loadMs"),
+        generateMs: document.querySelector("#generateMs"),
+        tokens: document.querySelector("#tokens"),
+        tokPerSec: document.querySelector("#tokPerSec"),
+        adapterInfo: document.querySelector("#adapterInfo"),
+        output: document.querySelector("#output"),
+      };
+
+      let cachedModelId = "";
+      let processor = null;
+      let model = null;
+
+      function setStatus(text) {
+        el.status.textContent = text;
+      }
+
+      function formatMs(ms) {
+        return `${ms.toFixed(1)} ms`;
+      }
+
+      function resetMetrics() {
+        el.loadMs.textContent = "-";
+        el.generateMs.textContent = "-";
+        el.tokens.textContent = "-";
+        el.tokPerSec.textContent = "-";
+        el.output.textContent = "";
+      }
+
+      async function updateAdapterInfo() {
+        if (!navigator.gpu) {
+          el.adapterInfo.textContent = "WebGPU adapter: navigator.gpu is unavailable";
+          return;
+        }
+
+        const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+        if (!adapter) {
+          el.adapterInfo.textContent = "WebGPU adapter: requestAdapter returned null";
+          return;
+        }
+
+        const info =
+          adapter.info ||
+          (adapter.requestAdapterInfo ? await adapter.requestAdapterInfo() : null) ||
+          {};
+        el.adapterInfo.textContent = `WebGPU adapter:\n${JSON.stringify(info, null, 2)}`;
+      }
+
+      async function ensureModel(modelId) {
+        if (model && processor && cachedModelId === modelId) {
+          return 0;
+        }
+
+        setStatus("Loading model");
+        const started = performance.now();
+        processor = await AutoProcessor.from_pretrained(modelId);
+        model = await Qwen3_5ForConditionalGeneration.from_pretrained(modelId, {
+          dtype: {
+            embed_tokens: "q4",
+            vision_encoder: "fp16",
+            decoder_model_merged: "q4",
+          },
+          device: "webgpu",
+        });
+        cachedModelId = modelId;
+        return performance.now() - started;
+      }
+
+      async function run() {
+        if (!navigator.gpu) {
+          throw new Error("navigator.gpu is unavailable. Use a WebGPU-enabled browser.");
+        }
+
+        resetMetrics();
+        const modelId = el.model.value.trim();
+        const prompt = el.prompt.value;
+        const maxNewTokens = Number.parseInt(el.maxNewTokens.value, 10);
+
+        await updateAdapterInfo();
+        const loadMs = await ensureModel(modelId);
+        if (loadMs > 0) {
+          el.loadMs.textContent = formatMs(loadMs);
+        } else {
+          el.loadMs.textContent = "cached";
+        }
+
+        const messages = [
+          {
+            role: "user",
+            content: [{ type: "text", text: prompt }],
+          },
+        ];
+        const text = processor.apply_chat_template(messages, {
+          tokenize: false,
+          add_generation_prompt: true,
+        });
+        const inputs = await processor(text, null, { padding: true, truncation: false });
+
+        let streamedText = "";
+        const streamer = new TextStreamer(processor.tokenizer, {
+          skip_prompt: true,
+          skip_special_tokens: false,
+          callback_function: (text) => {
+            streamedText += text;
+            el.output.textContent = streamedText;
+          },
+        });
+
+        setStatus("Generating");
+        const started = performance.now();
+        const outputs = await model.generate({
+          ...inputs,
+          do_sample: false,
+          max_new_tokens: maxNewTokens,
+          streamer,
+        });
+        const generateMs = performance.now() - started;
+
+        const inputTokenCount = inputs.input_ids.dims.at(-1);
+        const outputTokens = outputs.dims.at(-1) - inputTokenCount;
+        const decoded = processor.batch_decode(outputs.slice(null, [inputTokenCount, null]), {
+          skip_special_tokens: true,
+        });
+
+        el.output.textContent = decoded[0] || streamedText;
+        el.generateMs.textContent = formatMs(generateMs);
+        el.tokens.textContent = String(outputTokens);
+        el.tokPerSec.textContent = (outputTokens / (generateMs / 1000)).toFixed(2);
+        setStatus("Done");
+      }
+
+      el.run.addEventListener("click", async () => {
+        el.run.disabled = true;
+        try {
+          await run();
+        } catch (error) {
+          console.error(error);
+          setStatus("Failed");
+          el.output.textContent = error instanceof Error ? error.message : String(error);
+        } finally {
+          el.run.disabled = false;
+        }
+      });
+    </script>
+  </body>
+</html>

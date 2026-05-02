@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>qwen35x Custom WebGPU</title>
+    <style>
+      body { margin: 0; background: #101418; color: #eef3f7; font-family: "Segoe UI", system-ui, sans-serif; }
+      main { width: min(980px, 100%); box-sizing: border-box; margin: 0 auto; padding: 24px 18px; }
+      h1 { font-size: 24px; margin: 0 0 18px; letter-spacing: 0; }
+      label { display: grid; gap: 6px; margin: 12px 0; color: #b8c4cf; font-size: 13px; }
+      input, textarea, button { box-sizing: border-box; border: 1px solid #34414d; border-radius: 6px; background: #182029; color: #eef3f7; font: inherit; }
+      input, textarea { width: 100%; padding: 10px 11px; }
+      textarea { min-height: 88px; resize: vertical; }
+      button { padding: 10px 14px; background: #2857d9; border-color: #4d7cff; font-weight: 650; cursor: pointer; }
+      button:disabled { opacity: .65; cursor: progress; }
+      .row { display: grid; grid-template-columns: 1fr 160px; gap: 14px; }
+      .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin: 16px 0; }
+      .metric { border: 1px solid #2a3540; border-radius: 6px; padding: 10px; background: #151c24; }
+      .metric span { display: block; color: #9daab5; font-size: 12px; }
+      .metric strong { display: block; margin-top: 4px; font-size: 18px; }
+      pre { white-space: pre-wrap; overflow: auto; margin: 12px 0 0; min-height: 100px; border: 1px solid #2a3540; border-radius: 6px; padding: 12px; background: #0b0f13; }
+      @media (max-width: 700px) { .row, .metrics { grid-template-columns: 1fr; } }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>qwen35x Custom WebGPU</h1>
+      <div class="row">
+        <label>Model URL <input id="modelUrl" value="/models/webgpu/qwen3.5-0.8b-q8/" /></label>
+        <label>Max new tokens <input id="maxNewTokens" type="number" min="1" max="128" value="1" /></label>
+      </div>
+      <label>Debug layer limit <input id="layerLimit" type="number" min="0" max="24" value="24" /></label>
+      <label>Repeat penalty <input id="repeatPenalty" type="number" min="1" max="2" step="0.01" value="1.05" /></label>
+      <label>Prompt <textarea id="prompt">Tell me a short joke.</textarea></label>
+      <label>Prompt token IDs fallback <input id="promptTokenIds" value="198" /></label>
+      <button id="run">Run</button>
+      <button id="debugSweep">Debug Sweep</button>
+      <button id="copyOutput">Copy Output</button>
+      <span id="status">Idle</span>
+      <section class="metrics">
+        <div class="metric"><span>Load</span><strong id="loadMs">-</strong></div>
+        <div class="metric"><span>Generate</span><strong id="generateMs">-</strong></div>
+        <div class="metric"><span>Tokens</span><strong id="tokens">-</strong></div>
+        <div class="metric"><span>Tok/s</span><strong id="tokps">-</strong></div>
+      </section>
+      <pre id="adapter"></pre>
+      <pre id="output"></pre>
+    </main>
+    <script type="module">
+      import { Qwen35xWebGpu } from "./src/qwen35x-webgpu.js";
+      import { QwenTokenizer } from "./src/qwen-tokenizer.js";
+
+      const $ = (id) => document.querySelector(id);
+      let runtime = null;
+      let tokenizer = null;
+      let loadedUrl = "";
+
+      function numberValue(selector, fallback) {
+        const text = ($(selector).value || "").trim().replace(",", ".");
+        const value = Number.parseFloat(text);
+        return Number.isFinite(value) ? value : fallback;
+      }
+
+      async function ensureLoaded(baseUrl) {
+        if (runtime && tokenizer && loadedUrl === baseUrl) return 0;
+        const started = performance.now();
+        $("#status").textContent = "Loading custom WebGPU runtime";
+        runtime = await Qwen35xWebGpu.create({ baseUrl });
+        tokenizer = await QwenTokenizer.from_pretrained(baseUrl);
+        loadedUrl = baseUrl;
+        $("#adapter").textContent = `Adapter:\n${JSON.stringify(runtime.adapterInfo(), null, 2)}`;
+        return performance.now() - started;
+      }
+
+      $("#run").addEventListener("click", async () => {
+        $("#run").disabled = true;
+        $("#output").textContent = "";
+        try {
+          const baseUrl = $("#modelUrl").value.trim();
+          const loadMs = await ensureLoaded(baseUrl);
+          $("#loadMs").textContent = loadMs ? `${loadMs.toFixed(1)} ms` : "cached";
+          let inputIds;
+          if (tokenizer) {
+            const prompt = tokenizer.applyChatTemplate($("#prompt").value);
+            inputIds = tokenizer.encode(prompt);
+          } else {
+            inputIds = $("#promptTokenIds").value
+              .split(",")
+              .map((part) => Number.parseInt(part.trim(), 10))
+              .filter((id) => Number.isFinite(id));
+          }
+          if (!inputIds.length) {
+            throw new Error("No prompt token IDs available.");
+          }
+          const maxNewTokens = Number.parseInt($("#maxNewTokens").value, 10);
+          const repetitionPenalty = numberValue("#repeatPenalty", 1.05);
+          runtime.setDebugOptions({ layerLimit: Number.parseInt($("#layerLimit").value, 10) });
+          $("#status").textContent = `Generating from ${inputIds.length} prompt tokens`;
+          $("#adapter").textContent = `Adapter:\n${JSON.stringify(runtime.adapterInfo(), null, 2)}\nPrompt tokens: ${inputIds.length}\nPrompt token IDs: ${inputIds.join(",")}`;
+          const started = performance.now();
+          const outIds = await runtime.generate(inputIds, {
+            maxNewTokens,
+            repetitionPenalty,
+            onToken: (id) => { $("#output").textContent += `${id} `; },
+          });
+          const generateMs = performance.now() - started;
+          $("#generateMs").textContent = `${generateMs.toFixed(1)} ms`;
+          $("#tokens").textContent = String(outIds.length);
+          $("#tokps").textContent = (outIds.length / (generateMs / 1000)).toFixed(2);
+          if (tokenizer) {
+            $("#output").textContent += `\n\n${tokenizer.decode(outIds, { skipSpecialTokens: false })}`;
+          }
+          $("#output").textContent += `\n\nTop logits: ${JSON.stringify(await runtime.debugTopLogits(8))}`;
+          $("#status").textContent = "Done";
+        } catch (error) {
+          console.error(error);
+          $("#status").textContent = "Failed";
+          $("#output").textContent = error instanceof Error ? error.stack : String(error);
+        } finally {
+          $("#run").disabled = false;
+        }
+      });
+
+      $("#copyOutput").addEventListener("click", async () => {
+        const text = $("#output").textContent || "";
+        if (!text.trim()) {
+          $("#status").textContent = "Nothing to copy";
+          return;
+        }
+        try {
+          await navigator.clipboard.writeText(text);
+          $("#status").textContent = "Output copied";
+        } catch (error) {
+          console.error(error);
+          $("#status").textContent = "Copy failed";
+        }
+      });
+
+      $("#debugSweep").addEventListener("click", async () => {
+        $("#run").disabled = true;
+        $("#debugSweep").disabled = true;
+        $("#output").textContent = "";
+        try {
+          const baseUrl = $("#modelUrl").value.trim();
+          const loadMs = await ensureLoaded(baseUrl);
+          $("#loadMs").textContent = loadMs ? `${loadMs.toFixed(1)} ms` : "cached";
+          const fallbackPromptTokenIds = $("#promptTokenIds").value
+            .split(",")
+            .map((part) => Number.parseInt(part.trim(), 10))
+            .filter((id) => Number.isFinite(id));
+          if (!fallbackPromptTokenIds.length) {
+            throw new Error("No prompt token IDs available.");
+          }
+          const chatPromptIds = tokenizer ? tokenizer.encode(tokenizer.applyChatTemplate($("#prompt").value)) : fallbackPromptTokenIds;
+
+          const layerLimits = [0, 1, 2, 3, 4, 8, 12, 24];
+          const results = [];
+          for (const layerLimit of layerLimits) {
+            $("#status").textContent = `Debug sweep layerLimit=${layerLimit}`;
+            runtime.setDebugOptions({ layerLimit });
+            const started = performance.now();
+            const outIds = await runtime.generate(chatPromptIds, {
+              maxNewTokens: 1,
+              repetitionPenalty: numberValue("#repeatPenalty", 1.05),
+            });
+            const generateMs = performance.now() - started;
+            const topLogits = await runtime.debugTopLogits(8);
+            results.push({
+              layerLimit,
+              promptTokenIds: chatPromptIds,
+              repetitionPenalty: numberValue("#repeatPenalty", 1.05),
+              outputTokenIds: outIds,
+              outputText: tokenizer ? tokenizer.decode(outIds, { skipSpecialTokens: false }) : "",
+              generateMs,
+              tokps: outIds.length / (generateMs / 1000),
+              topLogits,
+            });
+            $("#output").textContent = JSON.stringify({ status: "running", results }, null, 2);
+          }
+
+          const payload = {
+            mode: "qwen35x-webgpu-debug-sweep",
+            modelUrl: baseUrl,
+            adapter: runtime.adapterInfo(),
+            loadMs,
+            results,
+          };
+          $("#generateMs").textContent = `${results.reduce((sum, r) => sum + r.generateMs, 0).toFixed(1)} ms`;
+          $("#tokens").textContent = String(results.length);
+          $("#tokps").textContent = "-";
+          $("#output").textContent = JSON.stringify(payload, null, 2);
+          $("#status").textContent = "Debug sweep done";
+        } catch (error) {
+          console.error(error);
+          $("#status").textContent = "Debug sweep failed";
+          $("#output").textContent = error instanceof Error ? error.stack : String(error);
+        } finally {
+          $("#run").disabled = false;
+          $("#debugSweep").disabled = false;
+        }
+      });
+    </script>
+  </body>
+</html>
