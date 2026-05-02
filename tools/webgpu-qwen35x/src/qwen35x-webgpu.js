@@ -7,27 +7,6 @@ function align4(n) {
   return (n + 3) & ~3;
 }
 
-function makeUniformBuffer(device, byteSize = 32) {
-  return device.createBuffer({
-    size: align4(byteSize),
-    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-  });
-}
-
-function uploadUniformBuffer(device, data) {
-  const bytes = data instanceof ArrayBuffer
-    ? new Uint8Array(data)
-    : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-  const buffer = device.createBuffer({
-    size: align4(bytes.byteLength),
-    usage: GPUBufferUsage.UNIFORM,
-    mappedAtCreation: true,
-  });
-  new Uint8Array(buffer.getMappedRange()).set(bytes);
-  buffer.unmap();
-  return buffer;
-}
-
 function storageBuffer(device, byteLength, usage = 0) {
   return device.createBuffer({
     size: align4(byteLength),
@@ -61,6 +40,13 @@ function dispatchRows2d(program, pass, bindings, rows) {
   program.dispatch(pass, bindings, x, y);
 }
 
+function bindResource(resource) {
+  if (resource?.buffer && Number.isFinite(resource.offset) && Number.isFinite(resource.size)) {
+    return resource;
+  }
+  return { buffer: resource };
+}
+
 class Program {
   constructor(device, code, entryPoint, layout) {
     this.device = device;
@@ -77,9 +63,9 @@ class Program {
   dispatch(pass, bindings, x, y = 1, z = 1) {
     const entries = bindings.map((item, index) => {
       if (Array.isArray(item)) {
-        return { binding: item[0], resource: { buffer: item[1] } };
+        return { binding: item[0], resource: bindResource(item[1]) };
       }
-      return { binding: index, resource: { buffer: item } };
+      return { binding: index, resource: bindResource(item) };
     });
     const bindGroup = this.device.createBindGroup({
       layout: this.pipeline.getBindGroupLayout(0),
@@ -209,12 +195,13 @@ export class Qwen35xWebGpu {
       size: align4(this.config.vocab_size * f32),
       usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     });
-    this.uVec = makeUniformBuffer(d, 32);
-    this.uNorm = makeUniformBuffer(d, 32);
-    this.uMatvec = makeUniformBuffer(d, 16);
-    this.uAttention = makeUniformBuffer(d, 32);
-    this.uLinear = makeUniformBuffer(d, 32);
-    this.uMask = makeUniformBuffer(d, 16);
+    this.uniformAlignment = Math.max(256, d.limits?.minUniformBufferOffsetAlignment || 256);
+    this.uniformArenaSize = 2 * 1024 * 1024;
+    this.uniformArenaOffset = 0;
+    this.uniformArena = d.createBuffer({
+      size: this.uniformArenaSize,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
 
     const fullKv = this.maxContext * this.config.num_key_value_heads * this.config.head_dim * f32;
     this.fullStates = [];
@@ -279,13 +266,31 @@ export class Qwen35xWebGpu {
     return tensor;
   }
 
+  resetUniformArena() {
+    this.uniformArenaOffset = 0;
+  }
+
+  uploadUniform(data) {
+    const bytes = data instanceof ArrayBuffer
+      ? new Uint8Array(data)
+      : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    const size = align4(bytes.byteLength);
+    const offset = Math.ceil(this.uniformArenaOffset / this.uniformAlignment) * this.uniformAlignment;
+    if (offset + size > this.uniformArenaSize) {
+      throw new Error(`WebGPU uniform arena exhausted: need ${offset + size} bytes, capacity ${this.uniformArenaSize}.`);
+    }
+    this.device.queue.writeBuffer(this.uniformArena, offset, bytes);
+    this.uniformArenaOffset = offset + size;
+    return { buffer: this.uniformArena, offset, size };
+  }
+
   writeVecParams({ n = 0, rows = 0, cols = 0, offset = 0, eps = 0, value = 0, position = 0, seqLen = 0 }) {
     const data = new ArrayBuffer(32);
     const u = new Uint32Array(data);
     const f = new Float32Array(data);
     u[0] = n; u[1] = rows; u[2] = cols; u[3] = offset;
     f[4] = eps; f[5] = value; u[6] = position; u[7] = seqLen;
-    return uploadUniformBuffer(this.device, data);
+    return this.uploadUniform(data);
   }
 
   writeNormParams({ n, heads = 1, headDim = n, xOffset = 0, yOffset = 0, eps = 1e-6 }) {
@@ -293,11 +298,11 @@ export class Qwen35xWebGpu {
     const u = new Uint32Array(data);
     const f = new Float32Array(data);
     u[0] = n; u[1] = heads; u[2] = headDim; u[3] = xOffset; u[4] = yOffset; f[5] = eps;
-    return uploadUniformBuffer(this.device, data);
+    return this.uploadUniform(data);
   }
 
   writeMatvecParams({ rows, cols, xOffset = 0, yOffset = 0 }) {
-    return uploadUniformBuffer(this.device, new Uint32Array([rows, cols, xOffset, yOffset]));
+    return this.uploadUniform(new Uint32Array([rows, cols, xOffset, yOffset]));
   }
 
   writeAttentionParams(position, seqLen) {
@@ -311,7 +316,7 @@ export class Qwen35xWebGpu {
     u[4] = position;
     u[5] = seqLen;
     f[6] = this.config.rope_parameters?.rope_theta || 10000000;
-    return uploadUniformBuffer(this.device, data);
+    return this.uploadUniform(data);
   }
 
   writeLinearParams() {
@@ -326,7 +331,7 @@ export class Qwen35xWebGpu {
     u[5] = 4;
     f[6] = this.config.rms_norm_eps;
     f[7] = 1 / Math.sqrt(128);
-    return uploadUniformBuffer(this.device, data);
+    return this.uploadUniform(data);
   }
 
   matvec(pass, tensor, x, y, xOffset = 0, yOffset = 0) {
@@ -432,8 +437,7 @@ export class Qwen35xWebGpu {
 
   writeMaskParams() {
     const tokens = this.maskTokenIds;
-    return uploadUniformBuffer(
-      this.device,
+    return this.uploadUniform(
       new Uint32Array([
         this.config.vocab_size,
         tokens[0] ?? 0xffffffff,
@@ -444,6 +448,7 @@ export class Qwen35xWebGpu {
   }
 
   async forwardToken(tokenId, position) {
+    this.resetUniformArena();
     const encoder = this.device.createCommandEncoder();
     const pass = encoder.beginComputePass();
     this.gatherEmbedding(pass, tokenId, this.hiddenA);
