@@ -148,6 +148,9 @@ export class Qwen35xWebGpu {
       deltanetUpdate: new Program(d, linearAttentionShaderSource, "deltanet_update"),
       linearGatedRms: new Program(d, linearAttentionShaderSource, "gated_rms"),
       maskTokens: new Program(d, samplingShaderSource, "mask_tokens"),
+      markSeenToken: new Program(d, samplingShaderSource, "mark_seen_token"),
+      argmaxLogits: new Program(d, samplingShaderSource, "argmax_logits"),
+      argmaxPartials: new Program(d, samplingShaderSource, "argmax_partials"),
     };
   }
 
@@ -191,6 +194,15 @@ export class Qwen35xWebGpu {
     this.fullGate = storageBuffer(d, 2048 * f32);
     this.fullAttn = storageBuffer(d, 2048 * f32);
     this.logits = storageBuffer(d, this.config.vocab_size * f32);
+    this.seenTokenMask = storageBuffer(d, this.config.vocab_size * Uint32Array.BYTES_PER_ELEMENT);
+    this.argmaxGroupCount = ceilDiv(this.config.vocab_size, 256);
+    this.argmaxValues = storageBuffer(d, this.argmaxGroupCount * f32);
+    this.argmaxIds = storageBuffer(d, this.argmaxGroupCount * Uint32Array.BYTES_PER_ELEMENT);
+    this.sampledToken = storageBuffer(d, Uint32Array.BYTES_PER_ELEMENT);
+    this.sampledTokenReadback = d.createBuffer({
+      size: align4(Uint32Array.BYTES_PER_ELEMENT),
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    });
     this.readback = d.createBuffer({
       size: align4(this.config.vocab_size * f32),
       usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
@@ -388,19 +400,19 @@ export class Qwen35xWebGpu {
     if (!inputIds.length) throw new Error("No input tokens.");
     this.resetState();
     const generated = [];
-    const seenTokenIds = new Set(inputIds);
     for (let i = 0; i < inputIds.length; ++i) {
       await this.forwardToken(inputIds[i], i, false);
+      await this.markSeenToken(inputIds[i]);
     }
-    let next = await this.sampleGreedy({ seenTokenIds, repetitionPenalty });
+    let next = await this.sampleGreedy({ repetitionPenalty });
     for (let step = 0; step < maxNewTokens; ++step) {
       generated.push(next);
-      seenTokenIds.add(next);
+      await this.markSeenToken(next);
       onToken?.(next);
       if (step + 1 >= maxNewTokens) break;
       const pos = inputIds.length + step;
       await this.forwardToken(next, pos, true);
-      next = await this.sampleGreedy({ seenTokenIds, repetitionPenalty });
+      next = await this.sampleGreedy({ repetitionPenalty });
     }
     return generated;
   }
@@ -428,6 +440,7 @@ export class Qwen35xWebGpu {
       clearBuffer(this.device, encoder, state.conv, 3 * 6144 * f32);
       clearBuffer(this.device, encoder, state.recurrent, 16 * 128 * 128 * f32);
     }
+    clearBuffer(this.device, encoder, this.seenTokenMask, this.config.vocab_size * Uint32Array.BYTES_PER_ELEMENT);
     this.device.queue.submit([encoder.finish()]);
   }
 
@@ -445,6 +458,19 @@ export class Qwen35xWebGpu {
         tokens[2] ?? 0xffffffff,
       ]),
     );
+  }
+
+  writeMarkSeenParams(token) {
+    return this.uploadUniform(new Uint32Array([token]));
+  }
+
+  writeArgmaxParams(n, repetitionPenalty) {
+    const data = new ArrayBuffer(16);
+    const u = new Uint32Array(data);
+    const f = new Float32Array(data);
+    u[0] = n;
+    f[1] = repetitionPenalty;
+    return this.uploadUniform(data);
   }
 
   async forwardToken(tokenId, position) {
@@ -581,26 +607,52 @@ export class Qwen35xWebGpu {
     this.hiddenB = tmp;
   }
 
-  async sampleGreedy({ seenTokenIds = new Set(), repetitionPenalty = 1.0 } = {}) {
+  async markSeenToken(tokenId) {
+    if (tokenId < 0 || tokenId >= this.config.vocab_size) return;
+    this.resetUniformArena();
     const encoder = this.device.createCommandEncoder();
-    encoder.copyBufferToBuffer(this.logits, 0, this.readback, 0, this.config.vocab_size * 4);
+    const pass = encoder.beginComputePass();
+    const params = this.writeMarkSeenParams(tokenId);
+    this.programs.markSeenToken.dispatch(pass, [[2, this.seenTokenMask], [3, params]], 1);
+    pass.end();
     this.device.queue.submit([encoder.finish()]);
-    await this.readback.mapAsync(GPUMapMode.READ);
-    const logits = new Float32Array(this.readback.getMappedRange());
-    let best = 0;
-    let bestValue = -Infinity;
-    for (let i = 0; i < this.config.vocab_size; ++i) {
-      let value = logits[i];
-      if (repetitionPenalty > 1.0 && seenTokenIds.has(i)) {
-        value = value > 0 ? value / repetitionPenalty : value * repetitionPenalty;
-      }
-      if (value > bestValue) {
-        bestValue = value;
-        best = i;
-      }
-    }
-    this.readback.unmap();
-    return best;
+    await this.device.queue.onSubmittedWorkDone();
+  }
+
+  async sampleGreedy({ repetitionPenalty = 1.0 } = {}) {
+    this.resetUniformArena();
+    const encoder = this.device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    const logitsParams = this.writeArgmaxParams(this.config.vocab_size, repetitionPenalty);
+    this.programs.argmaxLogits.dispatch(
+      pass,
+      [
+        [0, this.logits],
+        [2, this.seenTokenMask],
+        [4, this.argmaxValues],
+        [5, this.argmaxIds],
+        [6, logitsParams],
+      ],
+      this.argmaxGroupCount,
+    );
+    const partialParams = this.writeArgmaxParams(this.argmaxGroupCount, 1.0);
+    this.programs.argmaxPartials.dispatch(
+      pass,
+      [
+        [4, this.argmaxValues],
+        [5, this.argmaxIds],
+        [6, partialParams],
+        [7, this.sampledToken],
+      ],
+      1,
+    );
+    pass.end();
+    encoder.copyBufferToBuffer(this.sampledToken, 0, this.sampledTokenReadback, 0, Uint32Array.BYTES_PER_ELEMENT);
+    this.device.queue.submit([encoder.finish()]);
+    await this.sampledTokenReadback.mapAsync(GPUMapMode.READ);
+    const token = new Uint32Array(this.sampledTokenReadback.getMappedRange())[0];
+    this.sampledTokenReadback.unmap();
+    return token;
   }
 
   async debugTopLogits(k = 8) {

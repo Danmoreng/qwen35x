@@ -630,6 +630,15 @@ struct MaskParams {
   token2: u32,
 };
 
+struct MarkSeenParams {
+  token: u32,
+};
+
+struct ArgmaxParams {
+  n: u32,
+  repetition_penalty: f32,
+};
+
 @group(0) @binding(0) var<storage, read_write> logits: array<f32>;
 @group(0) @binding(1) var<uniform> p: MaskParams;
 
@@ -638,5 +647,106 @@ fn mask_tokens() {
   if (p.token0 < p.n) { logits[p.token0] = -3.402823e38; }
   if (p.token1 < p.n) { logits[p.token1] = -3.402823e38; }
   if (p.token2 < p.n) { logits[p.token2] = -3.402823e38; }
+}
+
+@group(0) @binding(2) var<storage, read_write> seen_mask: array<u32>;
+@group(0) @binding(3) var<uniform> mark_p: MarkSeenParams;
+
+@compute @workgroup_size(1)
+fn mark_seen_token() {
+  seen_mask[mark_p.token] = 1u;
+}
+
+@group(0) @binding(4) var<storage, read_write> partial_values: array<f32>;
+@group(0) @binding(5) var<storage, read_write> partial_ids: array<u32>;
+@group(0) @binding(6) var<uniform> argmax_p: ArgmaxParams;
+@group(0) @binding(7) var<storage, read_write> sampled_token: array<u32>;
+
+var<workgroup> wg_values: array<f32, 256>;
+var<workgroup> wg_ids: array<u32, 256>;
+
+fn penalized_logit(id: u32, value: f32) -> f32 {
+  if (argmax_p.repetition_penalty <= 1.0 || seen_mask[id] == 0u) {
+    return value;
+  }
+  if (value > 0.0) {
+    return value / argmax_p.repetition_penalty;
+  }
+  return value * argmax_p.repetition_penalty;
+}
+
+@compute @workgroup_size(256)
+fn argmax_logits(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let local = lid.x;
+  let id = wid.x * 256u + local;
+  var value = -3.402823e38;
+  if (id < argmax_p.n) {
+    value = penalized_logit(id, logits[id]);
+  }
+  wg_values[local] = value;
+  wg_ids[local] = id;
+  workgroupBarrier();
+
+  var stride = 128u;
+  loop {
+    if (stride == 0u) { break; }
+    if (local < stride) {
+      let other_value = wg_values[local + stride];
+      let other_id = wg_ids[local + stride];
+      let this_value = wg_values[local];
+      let this_id = wg_ids[local];
+      if (other_value > this_value || (other_value == this_value && other_id < this_id)) {
+        wg_values[local] = other_value;
+        wg_ids[local] = other_id;
+      }
+    }
+    workgroupBarrier();
+    stride = stride / 2u;
+  }
+  if (local == 0u) {
+    partial_values[wid.x] = wg_values[0];
+    partial_ids[wid.x] = wg_ids[0];
+  }
+}
+
+@compute @workgroup_size(256)
+fn argmax_partials(@builtin(local_invocation_id) lid: vec3<u32>) {
+  let local = lid.x;
+  var best_value = -3.402823e38;
+  var best_id = 0xffffffffu;
+  var i = local;
+  loop {
+    if (i >= argmax_p.n) { break; }
+    let value = partial_values[i];
+    let id = partial_ids[i];
+    if (value > best_value || (value == best_value && id < best_id)) {
+      best_value = value;
+      best_id = id;
+    }
+    i = i + 256u;
+  }
+  wg_values[local] = best_value;
+  wg_ids[local] = best_id;
+  workgroupBarrier();
+
+  var stride = 128u;
+  loop {
+    if (stride == 0u) { break; }
+    if (local < stride) {
+      let other_value = wg_values[local + stride];
+      let other_id = wg_ids[local + stride];
+      let this_value = wg_values[local];
+      let this_id = wg_ids[local];
+      if (other_value > this_value || (other_value == this_value && other_id < this_id)) {
+        wg_values[local] = other_value;
+        wg_ids[local] = other_id;
+      }
+    }
+    workgroupBarrier();
+    stride = stride / 2u;
+  }
+  if (local == 0u) {
+    sampled_token[0] = wg_ids[0];
+  }
 }
 `;
