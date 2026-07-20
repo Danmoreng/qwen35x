@@ -485,10 +485,13 @@ int main(int argc, char ** argv) {
       const std::string execution = argv[++i];
       if (execution == "megakernel") {
         infer_options.qwen35x_decode_execution = qwen35x::cuda_backend::Qwen35xDecodeExecution::megakernel;
+      } else if (execution == "multi-kernel") {
+        infer_options.qwen35x_decode_execution = qwen35x::cuda_backend::Qwen35xDecodeExecution::multi_kernel;
       } else if (execution == "graph") {
         infer_options.qwen35x_decode_execution = qwen35x::cuda_backend::Qwen35xDecodeExecution::cuda_graph;
       } else {
-        std::cerr << "unknown --qwen35x-decode-execution value: " << execution << " (expected: megakernel|graph)\n";
+        std::cerr << "unknown --qwen35x-decode-execution value: " << execution
+                  << " (expected: megakernel|multi-kernel|graph)\n";
         return 11;
       }
     } else if (arg == "--profile-sync") {
@@ -528,7 +531,7 @@ int main(int argc, char ** argv) {
       std::cout << "               [--temperature <float>] [--top-p <float>] [--top-k <int>] [--repeat-penalty <float>] [--seed <int64>]\n";
       std::cout << "               [--gpu-bf16|--gpu-f32-matvec] [--gpu-decode-backend <default|qwen35x>] [--gpu-decode-blocks <n>] [--qwen35x-prefill-mode <replay|batched>]\n";
       std::cout << "               [--qwen35x-prefill-kernel <traditional|flashqla|flashqla-monolithic>]\n";
-      std::cout << "               [--qwen35x-weight-precision <bf16|nvfp4>] [--qwen35x-cache-precision <bf16|quantized>] [--qwen35x-decode-execution <megakernel|graph>]\n";
+      std::cout << "               [--qwen35x-weight-precision <bf16|nvfp4>] [--qwen35x-cache-precision <bf16|quantized>] [--qwen35x-decode-execution <megakernel|multi-kernel|graph>]\n";
       std::cout << "               [--profile-sync] [--qwen35x-profile] [--prefill-only] [--metrics-only]\n";
       std::cout << "               [--stop-token <csv>] [--stop-text <text>] [--stop-on-im-end] [--profile-json <path>]\n";
       return 0;

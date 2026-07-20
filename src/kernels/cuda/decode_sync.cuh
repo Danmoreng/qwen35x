@@ -20,7 +20,9 @@ struct AtomicGridSync {
                 atomicAdd(generation, 1);
             } else {
                 volatile unsigned int *vgen = (volatile unsigned int *)generation;
-                while (*vgen <= my_gen) {}
+                // Every participant waits for exactly one generation advance.
+                // Equality remains correct after unsigned generation wraparound.
+                while (*vgen == my_gen) {}
             }
             local_gen = my_gen + 1;
         }

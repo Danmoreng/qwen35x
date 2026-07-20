@@ -63,13 +63,13 @@ python3 -m pip install --upgrade huggingface_hub
 ```
 
 Install a CUDA 13.x toolkit compatible with the installed NVIDIA driver, CMake,
-Ninja, and a C++20 host compiler. Confirm the GPU before building:
+GNU Make, and a C++20 host compiler. Confirm the GPU before building:
 
 ```bash
 nvidia-smi
 nvcc --version
 cmake --version
-ninja --version
+make --version
 ```
 
 ### Restore the current models
@@ -91,7 +91,7 @@ The Windows copies occupied approximately 1.65 GiB and 8.70 GiB respectively.
 ### Build and smoke test
 
 ```bash
-./scripts/build.sh --ninja --config Release --target qwen35x --arch native
+./scripts/build.sh --config Release --target qwen35x --arch native
 
 ./build/qwen35x --infer-gpu \
   --hf-model-dir models/qwen3.5-4b \
@@ -124,38 +124,38 @@ enabling the native SM120 NVFP4 MMA experiments.
 
 ### Reproduce the 4B benchmark
 
-The sequential harness is PowerShell. Install PowerShell (`pwsh`) on Linux or
-port the harness without changing its CSV schema or execution policy.
+Use the native Bash sequential harness on Linux; it preserves the CSV schema
+and execution policy without requiring PowerShell.
 
-```powershell
-pwsh ./scripts/benchmark-inference-seq.ps1 `
-  -Executable build/qwen35x `
-  -HFModelDir models/qwen3.5-4b `
-  -Modes gpu-f32 `
-  -Runs 3 `
-  -WarmupRuns 1 `
-  -MaxNewTokens 128 `
-  -MaxContext 256 `
-  -Qwen35xDecodeExecution megakernel `
-  -RunLabel 4b-megakernel `
-  -CsvOut benchmarks/qwen35x-4b-decode-execution.csv
+```bash
+./scripts/benchmark-inference-seq.sh \
+  --executable build/qwen35x \
+  --hf-model-dir models/qwen3.5-4b \
+  --mode gpu-f32 \
+  --runs 3 \
+  --warmup-runs 1 \
+  --max-new-tokens 128 \
+  --max-context 256 \
+  --qwen35x-decode-execution megakernel \
+  --run-label 4b-megakernel \
+  --csv-out benchmarks/qwen35x-4b-decode-execution.csv
 
-pwsh ./scripts/benchmark-inference-seq.ps1 `
-  -Executable build/qwen35x `
-  -HFModelDir models/qwen3.5-4b `
-  -Modes gpu-f32 `
-  -Runs 3 `
-  -WarmupRuns 1 `
-  -MaxNewTokens 128 `
-  -MaxContext 256 `
-  -Qwen35xDecodeExecution graph `
-  -RunLabel 4b-graph `
-  -CsvOut benchmarks/qwen35x-4b-decode-execution.csv
+./scripts/benchmark-inference-seq.sh \
+  --executable build/qwen35x \
+  --hf-model-dir models/qwen3.5-4b \
+  --mode gpu-f32 \
+  --runs 3 \
+  --warmup-runs 1 \
+  --max-new-tokens 128 \
+  --max-context 256 \
+  --qwen35x-decode-execution graph \
+  --run-label 4b-graph \
+  --csv-out benchmarks/qwen35x-4b-decode-execution.csv
 ```
 
 ## 4B CUDA Graph Performance Plan
 
-### G0. Add the missing control experiment
+### G0. Add the missing control experiment — completed
 
 Add an uncaptured `multi_kernel` decode execution mode that launches the exact
 same layer sequence and uses the same device buffers as graph mode.
@@ -170,6 +170,24 @@ This separates the launch-overhead savings from the cost of decomposing the
 megakernel. Keep the megakernel, uncaptured, and graph implementations on the
 same mathematical path so token comparisons remain meaningful.
 
+Implemented as `--qwen35x-decode-execution multi-kernel`. It uses the same
+per-layer reset kernel, layer kernels, final norm, LM head, device buffers, and
+decode grid as graph mode, but launches them directly on the stream.
+
+First Linux measurement (RTX 5080 Laptop GPU, `Runs=3`, `WarmupRuns=1`,
+`MaxNewTokens=128`, `MaxContext=256`, prompt token `198`):
+
+| Decode execution | Runs (tok/s) | Mean (tok/s) | Delta vs megakernel |
+|---|---|---:|---:|
+| Megakernel | 52.205, 52.064, 51.869 | 52.046 | — |
+| Uncaptured multi-kernel | 51.660, 51.571, 51.528 | 51.586 | -0.88% |
+| CUDA Graph | 51.396, 50.844, 51.020 | 51.086 | -1.84% |
+
+All three paths were token-exact for deterministic 8-token and 128-token
+runs. The captured path is currently 0.97% slower than the identical
+uncaptured multi-kernel path, so capture alone does not yet recover the cost
+of decomposition.
+
 Deliverables:
 
 - `Qwen35xDecodeExecution::multi_kernel` and CLI/JSON/CSV labels.
@@ -177,7 +195,7 @@ Deliverables:
 - Overall decode timing without per-token profiling synchronization.
 - An Nsight Systems trace showing CPU launch gaps and graph replay duration.
 
-### G1. Collapse barrier reset nodes
+### G1. Collapse barrier reset nodes — completed
 
 The current graph contains two `cudaMemsetAsync` nodes before every layer and
 one before the LM head. These reset nodes account for 65 of the 99 graph nodes.
@@ -193,9 +211,14 @@ Expected graph shape:
 1 reset-all + 32 layers + 1 final norm + 1 LM head = 35 nodes
 ```
 
-Do not rely on different blocks sampling a persistent generation value at
-kernel entry; that can race with the first grid barrier. Per-layer state plus a
-single reset kernel is the simpler correctness-preserving design.
+The graph now has exactly 35 nodes on the Linux 4B run (60 safe decode
+blocks). `launch_decode_graph_reset` initializes the 32 per-layer counter and
+generation slots plus the LM-head counter in one captured reset kernel.
+
+For a persistent generation scheme, seed every block from a stable generation
+value only after the previous group has completed and left its counter at zero.
+Do not allow blocks to sample a generation concurrently with a reset or first
+grid barrier; that can race and deadlock the cooperative synchronization.
 
 Validation gates:
 
@@ -246,6 +269,40 @@ Record for each group size:
 
 Promote the smallest/flexiblest grouping that is statistically faster than the
 megakernel rather than assuming maximum decomposition is desirable.
+
+### Linux experiment log — 2026-07-20
+
+The Linux benchmark harness is now the native Bash script
+`scripts/benchmark-inference-seq.sh`; it preserves the sequential JSON/CSV
+workflow and does not require PowerShell or Ninja. All results below use the
+same deterministic prompt-token benchmark: one warmup, three measured runs,
+128 generated tokens, and context 256 on the RTX 5080 Laptop GPU.
+
+Completed graph-layout experiments:
+
+- Direct DeltaNet/full-attention launchers removed the per-layer schedule scan,
+  but did not beat the grouped path.
+- The natural `3 x DeltaNet + 1 x full-attention` group reduced the captured
+  graph from 35 nodes to 11. Fusing final RMSNorm reduced it to 10, and
+  persistent barrier generations reduced that to 9. All three execution modes
+  remained exact for deterministic 8-token and 128-token runs.
+- A requested 16-block grouped grid exposed that DeltaNet needs its 32 gate
+  heads covered; graph and multi-kernel initialization now clamp to that safe
+  minimum instead of issuing an invalid launch.
+- The current graph layout captures two nodes: a monolithic device-controlled
+  decode kernel followed by the LM head. It initializes the LM reduction inside
+  the decode kernel and carries cooperative barrier generations between graph
+  replays. The captured graph was verified to contain two nodes and to remain
+  token-exact for 128 tokens.
+
+The two-node graph is close to the direct megakernel, but has not yet produced
+a stable win. At 48 decode blocks, one ordered pair measured Graph at 51.503
+tok/s versus megakernel at 51.247 tok/s (+0.50%), while reversing the order
+measured Graph at 51.086 tok/s versus 51.277 tok/s (-0.37%). A further
+BF16-only layer-helper template specialization regressed to about 50.23 tok/s
+and was reverted. The remaining variation is too large to promote graph mode;
+the next experiment should use kernel-level profiling and a material change to
+the BF16 matvec/MLP path rather than further launch-count reductions.
 
 ### G4. Split only operations that gain better hardware utilization
 

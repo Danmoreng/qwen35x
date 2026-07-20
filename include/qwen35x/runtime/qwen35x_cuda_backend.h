@@ -23,7 +23,8 @@ enum class Qwen35xCachePrecision {
 
 enum class Qwen35xDecodeExecution {
   megakernel = 0,
-  cuda_graph = 1,
+  multi_kernel = 1,
+  cuda_graph = 2,
 };
 
 struct Qwen35xModelDescriptor {

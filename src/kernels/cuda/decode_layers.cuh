@@ -1092,4 +1092,3 @@ __device__ void deltanet_layer(
     }
     grid.sync();
 }
-

@@ -48,6 +48,8 @@ const char * to_string(const Qwen35xDecodeExecution execution) {
   switch (execution) {
     case Qwen35xDecodeExecution::megakernel:
       return "megakernel";
+    case Qwen35xDecodeExecution::multi_kernel:
+      return "multi-kernel";
     case Qwen35xDecodeExecution::cuda_graph:
       return "graph";
     default:
@@ -363,12 +365,137 @@ using LaunchDecodeGraphLayerFn = void (*)(
   int max_seq_len,
   int decode_blocks,
   cudaStream_t stream);
+using LaunchDecodeGraphDeltaNetFn = void (*)(
+  const int * decode_control,
+  const void * embed_weight,
+  const PackedLayerWeights * layer_weights,
+  const PackedLayerNvfp4Weights * layer_nvfp4_weights,
+  void * dn_state,
+  void * conv_buf,
+  void * hidden_buffer,
+  void * g_activations,
+  void * g_residual,
+  void * g_qkv_scratch,
+  void * g_attn_out,
+  void * g_mlp_inter,
+  void * g_z_scratch,
+  void * g_beta_scratch,
+  void * g_alpha_scratch,
+  unsigned int * barrier_counter,
+  unsigned int * barrier_generation,
+  int decode_blocks,
+  cudaStream_t stream);
+using LaunchDecodeGraphFullAttentionFn = void (*)(
+  const int * decode_control,
+  const PackedLayerWeights * layer_weights,
+  const PackedLayerNvfp4Weights * layer_nvfp4_weights,
+  void * k_cache,
+  void * v_cache,
+  void * hidden_buffer,
+  void * g_activations,
+  void * g_residual,
+  void * g_qkv_scratch,
+  void * g_kv_scratch,
+  void * g_attn_out,
+  void * g_attn_partials,
+  void * g_mlp_inter,
+  unsigned int * barrier_counter,
+  unsigned int * barrier_generation,
+  int max_seq_len,
+  int decode_blocks,
+  cudaStream_t stream);
+using LaunchDecodeGraphGroup4Fn = void (*)(
+  const int * decode_control,
+  const void * embed_weight,
+  const PackedLayerWeights * layer_weights,
+  const PackedLayerNvfp4Weights * layer_nvfp4_weights,
+  const void * final_norm_weight,
+  void * fa_k_cache,
+  void * fa_v_cache,
+  void * dn_states,
+  void * conv_bufs,
+  void * hidden_buffer,
+  void * g_activations,
+  void * g_residual,
+  void * g_qkv_scratch,
+  void * g_kv_scratch,
+  void * g_attn_out,
+  void * g_attn_partials,
+  void * g_mlp_inter,
+  void * g_z_scratch,
+  void * g_beta_scratch,
+  void * g_alpha_scratch,
+  void * g_normalized,
+  unsigned int * lm_sync_counter,
+  unsigned int * barrier_counter,
+  unsigned int * barrier_generation,
+  int group_start,
+  int max_seq_len,
+  int decode_blocks,
+  cudaStream_t stream);
+using LaunchDecodeGraphMegakernelFn = void (*)(
+  const int * decode_control,
+  const void * embed_weight,
+  const void * final_norm_weight,
+  const PackedLayerWeights * layer_weights,
+  const PackedLayerNvfp4Weights * layer_nvfp4_weights,
+  void * fa_k_cache,
+  void * fa_v_cache,
+  void * dn_states,
+  void * conv_bufs,
+  void * hidden_buffer,
+  void * g_activations,
+  void * g_residual,
+  void * g_qkv_scratch,
+  void * g_kv_scratch,
+  void * g_attn_out,
+  void * g_attn_partials,
+  void * g_mlp_inter,
+  void * g_z_scratch,
+  void * g_beta_scratch,
+  void * g_alpha_scratch,
+  void * g_normalized,
+  unsigned int * barrier_counter,
+  unsigned int * barrier_generation,
+  unsigned int * lm_sync_counter,
+  int max_seq_len,
+  int decode_blocks,
+  cudaStream_t stream);
+using LaunchDecodeGraphResetFn = void (*)(
+  unsigned int * barrier_counter,
+  unsigned int * barrier_generation,
+  unsigned int * lm_sync_counter,
+  int layer_count,
+  cudaStream_t stream);
 using LaunchDecodeFinalLmFn = void (*)(
   int * output_token_id,
   const void * final_norm_weight,
   const void * lm_head_weight,
   void * hidden_buffer,
   void * g_activations,
+  void * g_normalized,
+  float * block_max_vals,
+  int * block_max_idxs,
+  unsigned int * lm_sync_counter,
+  float * seen_token_mask,
+  float repetition_penalty,
+  cudaStream_t stream);
+using LaunchDecodeGraphFinalLmFn = void (*)(
+  int * output_token_id,
+  const void * final_norm_weight,
+  const void * lm_head_weight,
+  void * hidden_buffer,
+  void * g_activations,
+  void * g_normalized,
+  float * block_max_vals,
+  int * block_max_idxs,
+  unsigned int * lm_sync_counter,
+  float * seen_token_mask,
+  float repetition_penalty,
+  cudaStream_t stream);
+using LaunchDecodeGraphLmHeadFn = void (*)(
+  int * output_token_id,
+  const void * lm_head_weight,
   void * g_normalized,
   float * block_max_vals,
   int * block_max_idxs,
@@ -428,10 +555,54 @@ extern "C" void launch_decode_graph_layer_4b(
   const int *, const void *, const PackedLayerWeights *, const PackedLayerNvfp4Weights *, void *, void *, void *, void *,
   void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, unsigned int *, unsigned int *,
   int, int, int, cudaStream_t);
+extern "C" void launch_decode_graph_deltanet_0p8b(
+  const int *, const void *, const PackedLayerWeights *, const PackedLayerNvfp4Weights *, void *, void *, void *, void *,
+  void *, void *, void *, void *, void *, void *, void *, unsigned int *, unsigned int *, int, cudaStream_t);
+extern "C" void launch_decode_graph_deltanet_4b(
+  const int *, const void *, const PackedLayerWeights *, const PackedLayerNvfp4Weights *, void *, void *, void *, void *,
+  void *, void *, void *, void *, void *, void *, void *, unsigned int *, unsigned int *, int, cudaStream_t);
+extern "C" void launch_decode_graph_deltanet_first_0p8b(
+  const int *, const void *, const PackedLayerWeights *, const PackedLayerNvfp4Weights *, void *, void *, void *, void *,
+  void *, void *, void *, void *, void *, void *, void *, unsigned int *, unsigned int *, int, cudaStream_t);
+extern "C" void launch_decode_graph_deltanet_first_4b(
+  const int *, const void *, const PackedLayerWeights *, const PackedLayerNvfp4Weights *, void *, void *, void *, void *,
+  void *, void *, void *, void *, void *, void *, void *, unsigned int *, unsigned int *, int, cudaStream_t);
+extern "C" void launch_decode_graph_full_attention_0p8b(
+  const int *, const PackedLayerWeights *, const PackedLayerNvfp4Weights *, void *, void *, void *, void *, void *, void *,
+  void *, void *, void *, void *, unsigned int *, unsigned int *, int, int, cudaStream_t);
+extern "C" void launch_decode_graph_full_attention_4b(
+  const int *, const PackedLayerWeights *, const PackedLayerNvfp4Weights *, void *, void *, void *, void *, void *, void *,
+  void *, void *, void *, void *, unsigned int *, unsigned int *, int, int, cudaStream_t);
+extern "C" void launch_decode_graph_group4_0p8b(
+  const int *, const void *, const PackedLayerWeights *, const PackedLayerNvfp4Weights *, const void *, void *, void *,
+  void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *,
+  unsigned int *, unsigned int *, unsigned int *, int, int, int, cudaStream_t);
+extern "C" void launch_decode_graph_group4_4b(
+  const int *, const void *, const PackedLayerWeights *, const PackedLayerNvfp4Weights *, const void *, void *, void *,
+  void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *,
+  unsigned int *, unsigned int *, unsigned int *, int, int, int, cudaStream_t);
+extern "C" void launch_decode_graph_megakernel_0p8b(
+  const int *, const void *, const void *, const PackedLayerWeights *, const PackedLayerNvfp4Weights *, void *, void *,
+  void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *,
+  unsigned int *, unsigned int *, unsigned int *, int, int, cudaStream_t);
+extern "C" void launch_decode_graph_megakernel_4b(
+  const int *, const void *, const void *, const PackedLayerWeights *, const PackedLayerNvfp4Weights *, void *, void *,
+  void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *,
+  unsigned int *, unsigned int *, unsigned int *, int, int, cudaStream_t);
+extern "C" void launch_decode_graph_reset_0p8b(unsigned int *, unsigned int *, unsigned int *, int, cudaStream_t);
+extern "C" void launch_decode_graph_reset_4b(unsigned int *, unsigned int *, unsigned int *, int, cudaStream_t);
 extern "C" void launch_decode_final_lm_0p8b(
   int *, const void *, const void *, void *, void *, void *, float *, int *, unsigned int *, float *, float, cudaStream_t);
 extern "C" void launch_decode_final_lm_4b(
   int *, const void *, const void *, void *, void *, void *, float *, int *, unsigned int *, float *, float, cudaStream_t);
+extern "C" void launch_decode_graph_final_lm_0p8b(
+  int *, const void *, const void *, void *, void *, void *, float *, int *, unsigned int *, float *, float, cudaStream_t);
+extern "C" void launch_decode_graph_final_lm_4b(
+  int *, const void *, const void *, void *, void *, void *, float *, int *, unsigned int *, float *, float, cudaStream_t);
+extern "C" void launch_decode_graph_lm_head_0p8b(
+  int *, const void *, void *, float *, int *, unsigned int *, float *, float, cudaStream_t);
+extern "C" void launch_decode_graph_lm_head_4b(
+  int *, const void *, void *, float *, int *, unsigned int *, float *, float, cudaStream_t);
 extern "C" void launch_decode_mlp_only_0p8b(
   const PackedLayerWeights *, const PackedLayerNvfp4Weights *, void *, void *, void *, unsigned int *, unsigned int *, int, int, cudaStream_t);
 extern "C" void launch_decode_mlp_only_4b(
@@ -475,7 +646,15 @@ struct VariantDescriptor {
   LaunchDecodeFn launch_decode;
   LaunchDecodePrefixMlpFn launch_decode_prefix_mlp;
   LaunchDecodeGraphLayerFn launch_decode_graph_layer;
+  LaunchDecodeGraphDeltaNetFn launch_decode_graph_deltanet;
+  LaunchDecodeGraphDeltaNetFn launch_decode_graph_deltanet_first;
+  LaunchDecodeGraphFullAttentionFn launch_decode_graph_full_attention;
+  LaunchDecodeGraphGroup4Fn launch_decode_graph_group4;
+  LaunchDecodeGraphMegakernelFn launch_decode_graph_megakernel;
+  LaunchDecodeGraphResetFn launch_decode_graph_reset;
   LaunchDecodeFinalLmFn launch_decode_final_lm;
+  LaunchDecodeGraphFinalLmFn launch_decode_graph_final_lm;
+  LaunchDecodeGraphLmHeadFn launch_decode_graph_lm_head;
   LaunchDecodeMlpOnlyFn launch_decode_mlp_only;
   LaunchDecodeMlpFromActivationFn launch_decode_mlp_from_activation;
   LaunchDecodeGateUpFromActivationFn launch_decode_gate_up_from_activation;
@@ -495,12 +674,12 @@ struct VariantDescriptor {
 
 const VariantDescriptor kVariant0p8b{
   "0.8b", 24, 1024, 3584, 248320, 8, 2, 256, 64, 16, 16, 128, 128, 4, kLayerType0p8b, 3584,
-  launch_decode_0p8b, launch_decode_prefix_mlp_0p8b, launch_decode_graph_layer_0p8b, launch_decode_final_lm_0p8b, launch_decode_mlp_only_0p8b, launch_decode_mlp_from_activation_0p8b, launch_decode_gate_up_from_activation_0p8b, launch_prefill_bf16_0p8b,
+  launch_decode_0p8b, launch_decode_prefix_mlp_0p8b, launch_decode_graph_layer_0p8b, launch_decode_graph_deltanet_0p8b, launch_decode_graph_deltanet_first_0p8b, launch_decode_graph_full_attention_0p8b, launch_decode_graph_group4_0p8b, launch_decode_graph_megakernel_0p8b, launch_decode_graph_reset_0p8b, launch_decode_final_lm_0p8b, launch_decode_graph_final_lm_0p8b, launch_decode_graph_lm_head_0p8b, launch_decode_mlp_only_0p8b, launch_decode_mlp_from_activation_0p8b, launch_decode_gate_up_from_activation_0p8b, launch_prefill_bf16_0p8b,
   set_decode_blocks_override_0p8b, query_max_safe_decode_blocks_0p8b, query_max_safe_graph_decode_blocks_0p8b
 };
 const VariantDescriptor kVariant4b{
   "4b", 32, 2560, 9216, 248320, 16, 4, 256, 64, 16, 32, 128, 256, 4, kLayerType4b, 64,
-  launch_decode_4b, launch_decode_prefix_mlp_4b, launch_decode_graph_layer_4b, launch_decode_final_lm_4b, launch_decode_mlp_only_4b, launch_decode_mlp_from_activation_4b, launch_decode_gate_up_from_activation_4b, launch_prefill_bf16_4b,
+  launch_decode_4b, launch_decode_prefix_mlp_4b, launch_decode_graph_layer_4b, launch_decode_graph_deltanet_4b, launch_decode_graph_deltanet_first_4b, launch_decode_graph_full_attention_4b, launch_decode_graph_group4_4b, launch_decode_graph_megakernel_4b, launch_decode_graph_reset_4b, launch_decode_final_lm_4b, launch_decode_graph_final_lm_4b, launch_decode_graph_lm_head_4b, launch_decode_mlp_only_4b, launch_decode_mlp_from_activation_4b, launch_decode_gate_up_from_activation_4b, launch_prefill_bf16_4b,
   set_decode_blocks_override_4b, query_max_safe_decode_blocks_4b, query_max_safe_graph_decode_blocks_4b
 };
 const VariantDescriptor * const kVariants[] = {&kVariant0p8b, &kVariant4b};
@@ -610,6 +789,18 @@ struct CudaGraphDecode {
     if (graph != nullptr) {
       cudaGraphDestroy(graph);
     }
+    if (stream != nullptr) {
+      cudaStreamDestroy(stream);
+    }
+  }
+};
+
+struct MultiKernelDecode {
+  cudaStream_t stream = nullptr;
+  int decode_blocks = 0;
+  int max_safe_decode_blocks = 0;
+
+  ~MultiKernelDecode() {
     if (stream != nullptr) {
       cudaStreamDestroy(stream);
     }
@@ -1475,8 +1666,14 @@ bool initialize_backend_state(
       !arena.alloc_bytes(descriptor.dn_gate_heads * f32_bytes, state.g_beta_scratch, error_message) ||
       !arena.alloc_bytes(descriptor.dn_gate_heads * f32_bytes, state.g_alpha_scratch, error_message) ||
       !arena.alloc_bytes(descriptor.hidden_size * f32_bytes, state.g_normalized, error_message) ||
-      !arena.alloc_bytes(sizeof(unsigned int), reinterpret_cast<void *&>(state.barrier_counter), error_message) ||
-      !arena.alloc_bytes(sizeof(unsigned int), reinterpret_cast<void *&>(state.barrier_generation), error_message) ||
+      !arena.alloc_bytes(
+        static_cast<std::size_t>(descriptor.num_layers) * sizeof(unsigned int),
+        reinterpret_cast<void *&>(state.barrier_counter),
+        error_message) ||
+      !arena.alloc_bytes(
+        static_cast<std::size_t>(descriptor.num_layers) * sizeof(unsigned int),
+        reinterpret_cast<void *&>(state.barrier_generation),
+        error_message) ||
       !arena.alloc_bytes(1024 * sizeof(float), reinterpret_cast<void *&>(state.block_max_vals), error_message) ||
       !arena.alloc_bytes(1024 * sizeof(int), reinterpret_cast<void *&>(state.block_max_idxs), error_message) ||
       !arena.alloc_bytes(sizeof(unsigned int), reinterpret_cast<void *&>(state.lm_sync_counter), error_message) ||
@@ -2143,6 +2340,62 @@ bool debug_compare_bf16_buffers(
   int count,
   const std::string & label,
   std::string & error_message);
+void enqueue_specialized_multi_kernel_decode(
+  const Qwen35xModelDescriptor & descriptor,
+  const VariantDescriptor & variant,
+  const BackendState & state,
+  int max_seq_len,
+  float repetition_penalty,
+  int decode_blocks,
+  cudaStream_t stream,
+  bool reset_barrier_state);
+void enqueue_graph_megakernel_decode(
+  const Qwen35xModelDescriptor & descriptor,
+  const VariantDescriptor & variant,
+  const BackendState & state,
+  int max_seq_len,
+  float repetition_penalty,
+  int decode_blocks,
+  cudaStream_t stream) {
+  variant.launch_decode_graph_megakernel(
+    state.graph_decode_control,
+    state.embed_weight,
+    state.final_norm_weight,
+    state.layer_weights,
+    state.layer_nvfp4_weights,
+    state.fa_k_cache,
+    state.fa_v_cache,
+    state.dn_states,
+    state.conv_bufs,
+    state.hidden_buffer,
+    state.g_activations,
+    state.g_residual,
+    state.g_qkv_scratch,
+    state.g_kv_scratch,
+    state.g_attn_out,
+    state.g_attn_partials,
+    state.g_mlp_inter,
+    state.g_z_scratch,
+    state.g_beta_scratch,
+    state.g_alpha_scratch,
+    state.g_normalized,
+    state.barrier_counter,
+    state.barrier_generation,
+    state.lm_sync_counter,
+    max_seq_len,
+    decode_blocks,
+    stream);
+  variant.launch_decode_graph_lm_head(
+    state.output_token,
+    state.lm_head_weight,
+    state.g_normalized,
+    state.block_max_vals,
+    state.block_max_idxs,
+    state.lm_sync_counter,
+    state.seen_token_mask,
+    repetition_penalty,
+    stream);
+}
 
 bool initialize_decode_graph(
   const Qwen35xModelDescriptor & descriptor,
@@ -2151,16 +2404,19 @@ bool initialize_decode_graph(
   const Qwen35xCudaBackendConfig & config,
   CudaGraphDecode & graph_decode,
   std::string & error_message) {
-  graph_decode.max_safe_decode_blocks = variant.query_max_safe_graph_decode_blocks();
+  graph_decode.max_safe_decode_blocks = variant.query_max_safe_decode_blocks();
   graph_decode.decode_blocks = config.decode_blocks > 0
     ? std::min(config.decode_blocks, graph_decode.max_safe_decode_blocks)
     : graph_decode.max_safe_decode_blocks;
-  graph_decode.decode_blocks = std::max(graph_decode.decode_blocks, descriptor.dn_num_heads);
+  graph_decode.decode_blocks = std::max(graph_decode.decode_blocks, descriptor.dn_gate_heads);
   if (graph_decode.decode_blocks <= 0) {
     error_message = "CUDA Graph decode did not find a safe cooperative layer grid size.";
     return false;
   }
-  if (!check_cuda(cudaStreamCreate(&graph_decode.stream), "cudaStreamCreate(graph decode)", error_message) ||
+  const std::size_t barrier_bytes = static_cast<std::size_t>(descriptor.num_layers) * sizeof(unsigned int);
+  if (!check_cuda(cudaMemset(state.barrier_counter, 0, barrier_bytes), "cudaMemset(graph barrier counters)", error_message) ||
+      !check_cuda(cudaMemset(state.barrier_generation, 0, barrier_bytes), "cudaMemset(graph barrier generations)", error_message) ||
+      !check_cuda(cudaStreamCreate(&graph_decode.stream), "cudaStreamCreate(graph decode)", error_message) ||
       !check_cuda(
         cudaStreamBeginCapture(graph_decode.stream, cudaStreamCaptureModeThreadLocal),
         "cudaStreamBeginCapture(graph decode)",
@@ -2168,46 +2424,13 @@ bool initialize_decode_graph(
     return false;
   }
 
-  for (int layer = 0; layer < descriptor.num_layers; ++layer) {
-    variant.launch_decode_graph_layer(
-      state.graph_decode_control,
-      state.embed_weight,
-      state.layer_weights,
-      state.layer_nvfp4_weights,
-      state.fa_k_cache,
-      state.fa_v_cache,
-      state.dn_states,
-      state.conv_bufs,
-      state.hidden_buffer,
-      state.g_activations,
-      state.g_residual,
-      state.g_qkv_scratch,
-      state.g_kv_scratch,
-      state.g_attn_out,
-      state.g_attn_partials,
-      state.g_mlp_inter,
-      state.g_z_scratch,
-      state.g_beta_scratch,
-      state.g_alpha_scratch,
-      state.barrier_counter,
-      state.barrier_generation,
-      layer,
-      config.max_context,
-      graph_decode.decode_blocks,
-      graph_decode.stream);
-  }
-  variant.launch_decode_final_lm(
-    state.output_token,
-    state.final_norm_weight,
-    state.lm_head_weight,
-    state.hidden_buffer,
-    state.g_activations,
-    state.g_normalized,
-    state.block_max_vals,
-    state.block_max_idxs,
-    state.lm_sync_counter,
-    state.seen_token_mask,
+  enqueue_graph_megakernel_decode(
+    descriptor,
+    variant,
+    state,
+    config.max_context,
     config.repetition_penalty,
+    graph_decode.decode_blocks,
     graph_decode.stream);
 
   if (!check_cuda(
@@ -2233,12 +2456,99 @@ bool initialize_decode_graph(
   return true;
 }
 
+bool initialize_multi_kernel_decode(
+  const Qwen35xModelDescriptor & descriptor,
+  const VariantDescriptor & variant,
+  const Qwen35xCudaBackendConfig & config,
+  MultiKernelDecode & multi_kernel_decode,
+  std::string & error_message) {
+  multi_kernel_decode.max_safe_decode_blocks = variant.query_max_safe_graph_decode_blocks();
+  multi_kernel_decode.decode_blocks = config.decode_blocks > 0
+    ? std::min(config.decode_blocks, multi_kernel_decode.max_safe_decode_blocks)
+    : multi_kernel_decode.max_safe_decode_blocks;
+  // DeltaNet's gated recurrence assigns one cooperative block per gate head.
+  // The 4B model has 16 Q/K heads but 32 gate heads, so dn_num_heads is not
+  // a sufficient lower bound for the grouped graph kernels.
+  multi_kernel_decode.decode_blocks = std::max(multi_kernel_decode.decode_blocks, descriptor.dn_gate_heads);
+  if (multi_kernel_decode.decode_blocks <= 0) {
+    error_message = "Multi-kernel decode did not find a safe cooperative layer grid size.";
+    return false;
+  }
+  return check_cuda(
+    cudaStreamCreate(&multi_kernel_decode.stream),
+    "cudaStreamCreate(multi-kernel decode)",
+    error_message);
+}
+
+void enqueue_specialized_multi_kernel_decode(
+  const Qwen35xModelDescriptor & descriptor,
+  const VariantDescriptor & variant,
+  const BackendState & state,
+  int max_seq_len,
+  float repetition_penalty,
+  int decode_blocks,
+  cudaStream_t stream,
+  bool reset_barrier_state) {
+  if (reset_barrier_state) {
+    variant.launch_decode_graph_reset(
+      state.barrier_counter,
+      state.barrier_generation,
+      state.lm_sync_counter,
+      descriptor.num_layers,
+      stream);
+  }
+
+  for (int group_start = 0; group_start < descriptor.num_layers; group_start += 4) {
+    const int group_index = group_start / 4;
+    variant.launch_decode_graph_group4(
+      state.graph_decode_control,
+      state.embed_weight,
+      state.layer_weights,
+      state.layer_nvfp4_weights,
+      state.final_norm_weight,
+      state.fa_k_cache,
+      state.fa_v_cache,
+      state.dn_states,
+      state.conv_bufs,
+      state.hidden_buffer,
+      state.g_activations,
+      state.g_residual,
+      state.g_qkv_scratch,
+      state.g_kv_scratch,
+      state.g_attn_out,
+      state.g_attn_partials,
+      state.g_mlp_inter,
+      state.g_z_scratch,
+      state.g_beta_scratch,
+      state.g_alpha_scratch,
+      state.g_normalized,
+      state.lm_sync_counter,
+      state.barrier_counter + group_index,
+      state.barrier_generation + group_index,
+      group_start,
+      max_seq_len,
+      decode_blocks,
+      stream);
+  }
+  variant.launch_decode_graph_lm_head(
+    state.output_token,
+    state.lm_head_weight,
+    state.g_normalized,
+    state.block_max_vals,
+    state.block_max_idxs,
+    state.lm_sync_counter,
+    state.seen_token_mask,
+    repetition_penalty,
+    stream);
+}
+
 bool run_decode_step_impl(
   const Qwen35xModelDescriptor & descriptor,
   const VariantDescriptor & variant,
   const BackendState & state,
   const Nvfp4BackendState * nvfp4_state,
   CudaGraphDecode * graph_decode,
+  MultiKernelDecode * multi_kernel_decode,
   int input_token,
   int position,
   int max_seq_len,
@@ -2351,6 +2661,43 @@ bool run_decode_step_impl(
                  cudaStreamSynchronize(graph_decode->stream),
                  "cudaStreamSynchronize(graph decode)",
                  error_message)) {
+      return false;
+    }
+  } else if (multi_kernel_decode != nullptr) {
+    const int decode_control[2] = {input_token, position};
+    const auto control_upload_start = std::chrono::steady_clock::now();
+    if (!check_cuda(
+          cudaMemcpyAsync(
+            state.graph_decode_control,
+            decode_control,
+            sizeof(decode_control),
+            cudaMemcpyHostToDevice,
+            multi_kernel_decode->stream),
+          "cudaMemcpyAsync(H2D multi-kernel decode control)",
+          error_message)) {
+      return false;
+    }
+    if (profile != nullptr) {
+      profile->graph_control_upload_ms += elapsed_ms_since(control_upload_start);
+      profile->graph_node_count = 0;
+      profile->decode_blocks = multi_kernel_decode->decode_blocks;
+      profile->max_safe_decode_blocks = multi_kernel_decode->max_safe_decode_blocks;
+    }
+
+    enqueue_specialized_multi_kernel_decode(
+      descriptor,
+      variant,
+      state,
+      max_seq_len,
+      repetition_penalty,
+      multi_kernel_decode->decode_blocks,
+      multi_kernel_decode->stream,
+      true);
+    if (!check_cuda(cudaGetLastError(), "launch multi-kernel decode", error_message) ||
+        !check_cuda(
+          cudaStreamSynchronize(multi_kernel_decode->stream),
+          "cudaStreamSynchronize(multi-kernel decode)",
+          error_message)) {
       return false;
     }
   } else if (use_sm120_mlp_substitution) {
@@ -3244,6 +3591,7 @@ struct Qwen35xCudaBackend::Impl {
   BackendState state;
   Nvfp4BackendState nvfp4_state;
   std::unique_ptr<CudaGraphDecode> graph_decode;
+  std::unique_ptr<MultiKernelDecode> multi_kernel_decode;
   Qwen35xRuntimeProfile profile;
   bool initialized = false;
 };
@@ -3283,15 +3631,15 @@ bool Qwen35xCudaBackend::initialize(const Qwen35xCudaBackendConfig & config, std
   if (variant == nullptr) {
     return false;
   }
-  if (config.decode_execution == Qwen35xDecodeExecution::cuda_graph && variant != &kVariant4b) {
+  if (config.decode_execution != Qwen35xDecodeExecution::megakernel && variant != &kVariant4b) {
     error_message =
-      "CUDA Graph multi-kernel decode is currently enabled only for the Qwen3.5 4B variant; "
+      "Multi-kernel decode is currently enabled only for the Qwen3.5 4B variant; "
       "use decode_execution=megakernel for variant '" + descriptor.variant + "'.";
     return false;
   }
-  if (config.decode_execution == Qwen35xDecodeExecution::cuda_graph &&
+  if (config.decode_execution != Qwen35xDecodeExecution::megakernel &&
       config.weight_precision != Qwen35xWeightPrecision::bf16) {
-    error_message = "CUDA Graph multi-kernel decode currently supports weight_precision=bf16 only.";
+    error_message = "Multi-kernel decode currently supports weight_precision=bf16 only.";
     return false;
   }
 
@@ -3350,6 +3698,17 @@ bool Qwen35xCudaBackend::initialize(const Qwen35xCudaBackendConfig & config, std
           impl_->state,
           config,
           *impl_->graph_decode,
+          error_message)) {
+      impl_ = std::make_unique<Impl>();
+      return false;
+    }
+  } else if (config.decode_execution == Qwen35xDecodeExecution::multi_kernel) {
+    impl_->multi_kernel_decode = std::make_unique<MultiKernelDecode>();
+    if (!initialize_multi_kernel_decode(
+          impl_->descriptor,
+          *variant,
+          config,
+          *impl_->multi_kernel_decode,
           error_message)) {
       impl_ = std::make_unique<Impl>();
       return false;
@@ -3426,6 +3785,7 @@ bool Qwen35xCudaBackend::run_decode_step(
     impl_->state,
     impl_->config.weight_precision == Qwen35xWeightPrecision::nvfp4 ? &impl_->nvfp4_state : nullptr,
     impl_->graph_decode.get(),
+    impl_->multi_kernel_decode.get(),
     input_token,
     position,
     impl_->config.max_context,
