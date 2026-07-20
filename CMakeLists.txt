@@ -74,6 +74,7 @@ if (CMAKE_CUDA_COMPILER)
         LAYER_TYPE=LAYER_TYPE_${variant_name}
         decode_kernel=decode_kernel_${variant_name}
         decode_prefix_mlp_kernel=decode_prefix_mlp_kernel_${variant_name}
+        decode_graph_layer_kernel=decode_graph_layer_kernel_${variant_name}
         decode_mlp_only_kernel=decode_mlp_only_kernel_${variant_name}
         decode_mlp_from_activation_kernel=decode_mlp_from_activation_kernel_${variant_name}
         decode_gate_up_from_activation_kernel=decode_gate_up_from_activation_kernel_${variant_name}
@@ -117,6 +118,7 @@ if (CMAKE_CUDA_COMPILER)
         pf_lm_reduce=pf_lm_reduce_${variant_name}
         launch_decode=launch_decode_${variant_name}
         launch_decode_prefix_mlp=launch_decode_prefix_mlp_${variant_name}
+        launch_decode_graph_layer=launch_decode_graph_layer_${variant_name}
         launch_decode_mlp_only=launch_decode_mlp_only_${variant_name}
         launch_decode_mlp_from_activation=launch_decode_mlp_from_activation_${variant_name}
         launch_decode_gate_up_from_activation=launch_decode_gate_up_from_activation_${variant_name}
@@ -124,6 +126,7 @@ if (CMAKE_CUDA_COMPILER)
         launch_prefill_bf16=launch_prefill_bf16_${variant_name}
         set_decode_blocks_override=set_decode_blocks_override_${variant_name}
         query_max_safe_decode_blocks=query_max_safe_decode_blocks_${variant_name}
+        query_max_safe_graph_decode_blocks=query_max_safe_graph_decode_blocks_${variant_name}
     )
     set_target_properties(qwen35x_cuda_${variant_name} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
   endfunction()

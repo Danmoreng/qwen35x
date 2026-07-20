@@ -132,6 +132,22 @@ The same binary can run the 4B model:
 ./build/qwen35x --infer-gpu --hf-model-dir models/qwen3.5-4b --chat-user "Tell me a short joke." --max-new-tokens 64 --max-context 256 --temperature 0 --stop-on-im-end
 ```
 
+The 4B BF16 decode path also has an opt-in CUDA Graph multi-kernel mode. It
+captures one kernel per transformer layer plus final norm and LM head while
+leaving the megakernel as the default:
+
+```powershell
+.\build\qwen35x.exe --infer-gpu --hf-model-dir models/qwen3.5-4b --chat-user "Tell me a short joke." --max-new-tokens 64 --max-context 256 --temperature 0 --qwen35x-decode-execution graph
+```
+
+Use the sequential harness for comparable measurements (run once with
+`megakernel`, then with `graph`):
+
+```powershell
+.\scripts\benchmark-inference-seq.ps1 -Executable build/qwen35x.exe -HFModelDir models/qwen3.5-4b -Modes gpu-f32 -Runs 3 -WarmupRuns 1 -MaxNewTokens 128 -MaxContext 256 -Qwen35xDecodeExecution megakernel -RunLabel 4b-megakernel -CsvOut benchmarks/qwen35x-4b-decode-execution.csv
+.\scripts\benchmark-inference-seq.ps1 -Executable build/qwen35x.exe -HFModelDir models/qwen3.5-4b -Modes gpu-f32 -Runs 3 -WarmupRuns 1 -MaxNewTokens 128 -MaxContext 256 -Qwen35xDecodeExecution graph -RunLabel 4b-graph -CsvOut benchmarks/qwen35x-4b-decode-execution.csv
+```
+
 5. Run with profiling JSON
 
 ```powershell

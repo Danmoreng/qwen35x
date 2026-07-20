@@ -21,6 +21,11 @@ enum class Qwen35xCachePrecision {
   quantized = 1,
 };
 
+enum class Qwen35xDecodeExecution {
+  megakernel = 0,
+  cuda_graph = 1,
+};
+
 struct Qwen35xModelDescriptor {
   std::string family;
   std::string variant;
@@ -50,6 +55,7 @@ struct Qwen35xCudaBackendConfig {
   float repetition_penalty = 1.0f;
   Qwen35xWeightPrecision weight_precision = Qwen35xWeightPrecision::bf16;
   Qwen35xCachePrecision cache_precision = Qwen35xCachePrecision::bf16;
+  Qwen35xDecodeExecution decode_execution = Qwen35xDecodeExecution::megakernel;
   bool profile_enabled = false;
 };
 
@@ -92,6 +98,7 @@ int query_max_safe_decode_blocks();
 void set_decode_blocks_override(int blocks);
 const char * to_string(Qwen35xWeightPrecision precision);
 const char * to_string(Qwen35xCachePrecision precision);
+const char * to_string(Qwen35xDecodeExecution execution);
 bool build_model_descriptor(
   const qwen35x::ModelProfile & profile,
   Qwen35xModelDescriptor & descriptor,

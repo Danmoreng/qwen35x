@@ -73,6 +73,10 @@ const char * qwen35x_cache_precision_name(const qwen35x::cuda_backend::Qwen35xCa
   return qwen35x::cuda_backend::to_string(precision);
 }
 
+const char * qwen35x_decode_execution_name(const qwen35x::cuda_backend::Qwen35xDecodeExecution execution) {
+  return qwen35x::cuda_backend::to_string(execution);
+}
+
 bool set_env_var(const char * name, const char * value) {
 #if defined(_WIN32)
   return _putenv_s(name, value) == 0;
@@ -193,12 +197,16 @@ void write_qwen35x_profile_json(std::ostream & out, const qwen35x::cuda_backend:
   out << "    },\n";
   out << "    \"decode\": {\n";
   out << "      \"enabled\": " << (profile.decode.enabled ? "true" : "false") << ",\n";
+  out << "      \"cuda_graph\": " << (profile.decode.cuda_graph ? "true" : "false") << ",\n";
+  out << "      \"graph_node_count\": " << profile.decode.graph_node_count << ",\n";
   out << "      \"steps\": " << profile.decode.steps << ",\n";
   out << "      \"last_position\": " << profile.decode.last_position << ",\n";
   out << "      \"decode_blocks\": " << profile.decode.decode_blocks << ",\n";
   out << "      \"max_safe_decode_blocks\": " << profile.decode.max_safe_decode_blocks << ",\n";
   out << "      \"host_total_ms\": " << profile.decode.host_total_ms << ",\n";
   out << "      \"seen_token_upload_ms\": " << profile.decode.seen_token_upload_ms << ",\n";
+  out << "      \"graph_control_upload_ms\": " << profile.decode.graph_control_upload_ms << ",\n";
+  out << "      \"graph_launch_ms\": " << profile.decode.graph_launch_ms << ",\n";
   out << "      \"launch_total_ms\": " << profile.decode.launch_total_ms << ",\n";
   out << "      \"decode_kernel_ms\": " << profile.decode.decode_kernel_ms << ",\n";
   out << "      \"lm_head_ms\": " << profile.decode.lm_head_ms << ",\n";
@@ -228,6 +236,7 @@ bool write_profile_json(
   out << "  \"qwen35x_prefill_mode\": \"" << json_escape(qwen35x_prefill_mode_name(options.qwen35x_prefill_mode)) << "\",\n";
   out << "  \"qwen35x_weight_precision\": \"" << json_escape(qwen35x_weight_precision_name(options.qwen35x_weight_precision)) << "\",\n";
   out << "  \"qwen35x_cache_precision\": \"" << json_escape(qwen35x_cache_precision_name(options.qwen35x_cache_precision)) << "\",\n";
+  out << "  \"qwen35x_decode_execution\": \"" << json_escape(qwen35x_decode_execution_name(options.qwen35x_decode_execution)) << "\",\n";
   out << "  \"prefill_only\": " << (options.prefill_only ? "true" : "false") << ",\n";
   out << "  \"prompt_tokens\": " << options.prompt_tokens.size() << ",\n";
   out << "  \"prompt_token_ids\": [";
@@ -472,6 +481,16 @@ int main(int argc, char ** argv) {
         std::cerr << "unknown --qwen35x-cache-precision value: " << precision << " (expected: bf16|quantized)\n";
         return 11;
       }
+    } else if (arg == "--qwen35x-decode-execution" && i + 1 < argc) {
+      const std::string execution = argv[++i];
+      if (execution == "megakernel") {
+        infer_options.qwen35x_decode_execution = qwen35x::cuda_backend::Qwen35xDecodeExecution::megakernel;
+      } else if (execution == "graph") {
+        infer_options.qwen35x_decode_execution = qwen35x::cuda_backend::Qwen35xDecodeExecution::cuda_graph;
+      } else {
+        std::cerr << "unknown --qwen35x-decode-execution value: " << execution << " (expected: megakernel|graph)\n";
+        return 11;
+      }
     } else if (arg == "--profile-sync") {
       infer_options.profile_cuda_sync = true;
     } else if (arg == "--qwen35x-profile" || arg == "--luce-profile") {
@@ -509,7 +528,8 @@ int main(int argc, char ** argv) {
       std::cout << "               [--temperature <float>] [--top-p <float>] [--top-k <int>] [--repeat-penalty <float>] [--seed <int64>]\n";
       std::cout << "               [--gpu-bf16|--gpu-f32-matvec] [--gpu-decode-backend <default|qwen35x>] [--gpu-decode-blocks <n>] [--qwen35x-prefill-mode <replay|batched>]\n";
       std::cout << "               [--qwen35x-prefill-kernel <traditional|flashqla|flashqla-monolithic>]\n";
-      std::cout << "               [--qwen35x-weight-precision <bf16|nvfp4>] [--qwen35x-cache-precision <bf16|quantized>] [--profile-sync] [--qwen35x-profile] [--prefill-only] [--metrics-only]\n";
+      std::cout << "               [--qwen35x-weight-precision <bf16|nvfp4>] [--qwen35x-cache-precision <bf16|quantized>] [--qwen35x-decode-execution <megakernel|graph>]\n";
+      std::cout << "               [--profile-sync] [--qwen35x-profile] [--prefill-only] [--metrics-only]\n";
       std::cout << "               [--stop-token <csv>] [--stop-text <text>] [--stop-on-im-end] [--profile-json <path>]\n";
       return 0;
     }
@@ -915,6 +935,7 @@ int main(int argc, char ** argv) {
     std::cout << "  qwen35x_prefill_kernel: " << (qwen35x_prefill_kernel.empty() ? "env-or-default" : qwen35x_prefill_kernel) << "\n";
     std::cout << "  qwen35x_weight_precision: " << qwen35x_weight_precision_name(infer_options.qwen35x_weight_precision) << "\n";
     std::cout << "  qwen35x_cache_precision: " << qwen35x_cache_precision_name(infer_options.qwen35x_cache_precision) << "\n";
+    std::cout << "  qwen35x_decode_execution: " << qwen35x_decode_execution_name(infer_options.qwen35x_decode_execution) << "\n";
     std::cout << "  prefill_only: " << (infer_options.prefill_only ? "on" : "off") << "\n";
     std::cout << "  prompt_tokens: " << infer_options.prompt_tokens.size() << "\n";
     std::cout << "  generated_tokens: " << infer_result.generated_tokens.size() << "\n";

@@ -21,6 +21,7 @@ bool init_runtime_decode_backend(
     config.repetition_penalty = options.sampling.repetition_penalty;
     config.weight_precision = options.qwen35x_weight_precision;
     config.cache_precision = options.qwen35x_cache_precision;
+    config.decode_execution = options.qwen35x_decode_execution;
     if (!backend.qwen35x_backend.initialize(config, error_message)) {
       return false;
     }

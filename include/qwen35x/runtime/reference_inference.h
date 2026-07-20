@@ -39,6 +39,7 @@ struct ReferenceInferenceOptions {
   Qwen35xPrefillMode qwen35x_prefill_mode = Qwen35xPrefillMode::batched;
   cuda_backend::Qwen35xWeightPrecision qwen35x_weight_precision = cuda_backend::Qwen35xWeightPrecision::bf16;
   cuda_backend::Qwen35xCachePrecision qwen35x_cache_precision = cuda_backend::Qwen35xCachePrecision::bf16;
+  cuda_backend::Qwen35xDecodeExecution qwen35x_decode_execution = cuda_backend::Qwen35xDecodeExecution::megakernel;
   int gpu_decode_blocks = 0;
   bool profile_cuda_sync = false;
   bool profile_qwen35x = false;

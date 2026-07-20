@@ -56,6 +56,7 @@ bool run_qwen35x_cuda_inference(
   config.repetition_penalty = options.sampling.repetition_penalty;
   config.weight_precision = options.qwen35x_weight_precision;
   config.cache_precision = options.qwen35x_cache_precision;
+  config.decode_execution = options.qwen35x_decode_execution;
   config.profile_enabled = options.profile_qwen35x;
   if (!backend.initialize(config, error_message)) {
     return false;

@@ -32,6 +32,8 @@ param(
     [string]$Qwen35xWeightPrecision = "bf16",
     [ValidateSet("bf16", "quantized")]
     [string]$Qwen35xCachePrecision = "bf16",
+    [ValidateSet("megakernel", "graph")]
+    [string]$Qwen35xDecodeExecution = "megakernel",
     [switch]$PrefillOnly,
     [switch]$ProfileSync,
     [Alias("LuceProfile")]
@@ -137,6 +139,7 @@ function Invoke-BenchmarkRun {
         [Parameter(Mandatory = $true)][string]$Qwen35xPrefillMode,
         [Parameter(Mandatory = $true)][string]$Qwen35xWeightPrecision,
         [Parameter(Mandatory = $true)][string]$Qwen35xCachePrecision,
+        [Parameter(Mandatory = $true)][string]$Qwen35xDecodeExecution,
         [Parameter(Mandatory = $true)][bool]$PrefillOnlyEnabled,
         [Parameter(Mandatory = $true)][bool]$ProfileSyncEnabled,
         [Parameter(Mandatory = $true)][bool]$Qwen35xProfileEnabled,
@@ -201,6 +204,9 @@ function Invoke-BenchmarkRun {
     }
     if ($Mode -ne "cpu-reference" -and $Qwen35xCachePrecision -ne "bf16") {
         $args += @("--qwen35x-cache-precision", $Qwen35xCachePrecision)
+    }
+    if ($Mode -ne "cpu-reference" -and $Qwen35xDecodeExecution -ne "megakernel") {
+        $args += @("--qwen35x-decode-execution", $Qwen35xDecodeExecution)
     }
     if ($Mode -ne "cpu-reference" -and $GpuDecodeBlocks -gt 0) {
         $args += @("--gpu-decode-blocks", "$GpuDecodeBlocks")
@@ -301,6 +307,7 @@ foreach ($mode in $Modes) {
                 -Qwen35xPrefillMode $Qwen35xPrefillMode `
                 -Qwen35xWeightPrecision $Qwen35xWeightPrecision `
                 -Qwen35xCachePrecision $Qwen35xCachePrecision `
+                -Qwen35xDecodeExecution $Qwen35xDecodeExecution `
                 -PrefillOnlyEnabled $PrefillOnly.IsPresent `
                 -ProfileSyncEnabled $ProfileSync.IsPresent `
                 -Qwen35xProfileEnabled $Qwen35xProfile.IsPresent `
@@ -335,6 +342,7 @@ foreach ($mode in $Modes) {
                 -Qwen35xPrefillMode $Qwen35xPrefillMode `
                 -Qwen35xWeightPrecision $Qwen35xWeightPrecision `
                 -Qwen35xCachePrecision $Qwen35xCachePrecision `
+                -Qwen35xDecodeExecution $Qwen35xDecodeExecution `
                 -PrefillOnlyEnabled $PrefillOnly.IsPresent `
                 -ProfileSyncEnabled $ProfileSync.IsPresent `
                 -Qwen35xProfileEnabled $Qwen35xProfile.IsPresent `
@@ -367,6 +375,10 @@ foreach ($mode in $Modes) {
             if ([string]::IsNullOrWhiteSpace($effectiveQwen35xCachePrecision)) {
                 $effectiveQwen35xCachePrecision = $Qwen35xCachePrecision
             }
+            $effectiveQwen35xDecodeExecution = [string](Get-JsonProperty -Object $profile -Name "qwen35x_decode_execution")
+            if ([string]::IsNullOrWhiteSpace($effectiveQwen35xDecodeExecution)) {
+                $effectiveQwen35xDecodeExecution = $Qwen35xDecodeExecution
+            }
 
             $row = [PSCustomObject]@{
                 timestamp_utc    = [DateTime]::UtcNow.ToString("o")
@@ -376,6 +388,7 @@ foreach ($mode in $Modes) {
                 qwen35x_prefill_kernel = $effectiveQwen35xPrefillKernel
                 qwen35x_weight_precision = $effectiveQwen35xWeightPrecision
                 qwen35x_cache_precision = $effectiveQwen35xCachePrecision
+                qwen35x_decode_execution = $effectiveQwen35xDecodeExecution
                 qwen35x_decode_blocks_requested = $GpuDecodeBlocks
                 prefill_only     = [bool]$profile.prefill_only
                 run_index        = $runIndex
@@ -414,10 +427,13 @@ foreach ($mode in $Modes) {
                 qwen35x_prefill_full_attention_projection_ms = Measure-Qwen35xLayerMs -RuntimeProfile $qwen35xProfileJson -LayerType "full_attention" -Fields @("qkv_projection_ms", "kv_projection_ms", "out_projection_ms")
                 qwen35x_prefill_mlp_total_ms = Measure-Qwen35xLayerMs -RuntimeProfile $qwen35xProfileJson -LayerType "" -Fields @("mlp_norm_ms", "mlp_projection_ms", "mlp_activation_ms", "mlp_down_projection_ms", "mlp_residual_ms")
                 qwen35x_decode_steps = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xDecodeJson -Name "steps")
+                qwen35x_decode_graph_node_count = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xDecodeJson -Name "graph_node_count")
                 qwen35x_decode_blocks = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xDecodeJson -Name "decode_blocks")
                 qwen35x_decode_max_safe_blocks = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xDecodeJson -Name "max_safe_decode_blocks")
                 qwen35x_decode_host_total_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xDecodeJson -Name "host_total_ms")
                 qwen35x_decode_seen_token_upload_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xDecodeJson -Name "seen_token_upload_ms")
+                qwen35x_decode_graph_control_upload_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xDecodeJson -Name "graph_control_upload_ms")
+                qwen35x_decode_graph_launch_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xDecodeJson -Name "graph_launch_ms")
                 qwen35x_decode_launch_total_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xDecodeJson -Name "launch_total_ms")
                 qwen35x_decode_kernel_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xDecodeJson -Name "decode_kernel_ms")
                 qwen35x_decode_lm_head_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xDecodeJson -Name "lm_head_ms")
