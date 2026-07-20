@@ -1,0 +1,9 @@
+C:/Development/vibe-inference/build-0p8b-bench/CMakeFiles/qwen35x_core.dir
+C:/Development/vibe-inference/build-0p8b-bench/CMakeFiles/qwen35x_cuda_0p8b.dir
+C:/Development/vibe-inference/build-0p8b-bench/CMakeFiles/qwen35x_cuda_4b.dir
+C:/Development/vibe-inference/build-0p8b-bench/CMakeFiles/qwen35x.dir
+C:/Development/vibe-inference/build-0p8b-bench/CMakeFiles/qwen35x_kernelbench.dir
+C:/Development/vibe-inference/build-0p8b-bench/CMakeFiles/qwen35x_flashqla_state_update_parity.dir
+C:/Development/vibe-inference/build-0p8b-bench/CMakeFiles/qwen35x_flashqla_prepare_parity.dir
+C:/Development/vibe-inference/build-0p8b-bench/CMakeFiles/edit_cache.dir
+C:/Development/vibe-inference/build-0p8b-bench/CMakeFiles/rebuild_cache.dir

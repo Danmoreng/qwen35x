@@ -8,6 +8,12 @@ This is the custom WebGPU inference path for Qwen3.5 0.8B. It does not execute t
 node .\scripts\build-webgpu-qwen35x-weights.mjs --model-dir .\models\qwen3.5-0.8b --out-dir .\models\webgpu\qwen3.5-0.8b-q8
 ```
 
+Or use the browser converter:
+
+```text
+http://127.0.0.1:8790/tools/webgpu-qwen35x-converter/
+```
+
 The converter reads the BF16 safetensors file and writes rowwise-q8 matrices plus f16 vectors into:
 
 ```text

@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/Development/vibe-inference/build-chunked-prefill-4b/CMakeFiles/CheckCUDA/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/Development/vibe-inference/build-chunked-prefill-0p8b/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

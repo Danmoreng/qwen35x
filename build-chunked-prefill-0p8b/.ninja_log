@@ -1,0 +1,25 @@
+# ninja log v7
+15	309	7988455761287036	CMakeFiles/qwen35x_core.dir/src/runtime/cuda_inference_stub.cpp.obj	b71144aa9f43b78c
+11	313	7988455761287036	CMakeFiles/qwen35x_core.dir/src/runtime/cuda_bench_stub.cpp.obj	6498339108dd9f26
+9	459	7988455761287036	CMakeFiles/qwen35x_core.dir/src/kernels/kernel_registry.cpp.obj	fb49366ab5494429
+3	525	7988455761287036	CMakeFiles/qwen35x_core.dir/src/compiler/compiler.cpp.obj	44667db1ce880f3e
+48	1409	7988455761729876	CMakeFiles/qwen35x.dir/src/main.cpp.obj	2b359b429f6deae4
+23	1428	7988455761443630	CMakeFiles/qwen35x_core.dir/src/runtime/runtime.cpp.obj	b39ffa75998dab6d
+29	1763	7988455761443630	CMakeFiles/qwen35x_core.dir/src/weights/safetensors.cpp.obj	12e40fbce27ff476
+3	1350	7988464194532778	CMakeFiles/qwen35x_core.dir/src/runtime/qwen35x_cuda_backend.cpp.obj	bd415fcdfea682ac
+32	2054	7988455761443630	CMakeFiles/qwen35x_core.dir/src/kernels/cuda/qwen35x_decode_stub.cu.obj	7b189a805e93946e
+20	2331	7988455761443630	CMakeFiles/qwen35x_core.dir/src/runtime/reference_inference.cpp.obj	1b7d5821fccf7cff
+26	2354	7988455761443630	CMakeFiles/qwen35x_core.dir/src/tokenizer/tokenizer.cpp.obj	de516176b41c7656
+6	2430	7988455761287036	CMakeFiles/qwen35x_core.dir/src/compiler/profile_loader.cpp.obj	850a8e84c34582d
+41	3072	7988455761612029	CMakeFiles/qwen35x_core.dir/src/runtime/cuda_bench.cu.obj	3743193b2724522b
+3	2866	7988466548025508	CMakeFiles/qwen35x_core.dir/src/kernels/cuda/prefill.cu.obj	27024031bfc6763
+44	4001	7988455761612029	CMakeFiles/qwen35x_core.dir/src/runtime/cuda_inference.cu.obj	c17c588a2ae48753
+35	4362	7988455761606991	CMakeFiles/qwen35x_core.dir/src/kernels/cuda/kernel.cu.obj	e7eca1497bfb52c0
+2867	2924	7988466576765437	qwen35x_core.lib	a1150d3c620fdb91
+2925	4083	7988466577355153	CMakeFiles/qwen35x.dir/cmake_device_link.obj	e7aefe0cc03cbccc
+4083	4184	7988466588929879	qwen35x.exe	ef1256f898ce72b7
+3	1338	7988474960354994	CMakeFiles/qwen35x_core.dir/src/runtime/qwen35x_cuda_backend.cpp.obj	bd415fcdfea682ac
+6	4526	7988474960393462	CMakeFiles/qwen35x_core.dir/src/kernels/cuda/prefill.cu.obj	27024031bfc6763
+4526	4574	7988475005574465	qwen35x_core.lib	a1150d3c620fdb91
+4574	4947	7988475005919459	CMakeFiles/qwen35x.dir/cmake_device_link.obj	e7aefe0cc03cbccc
+4947	5048	7988475009723334	qwen35x.exe	ef1256f898ce72b7
