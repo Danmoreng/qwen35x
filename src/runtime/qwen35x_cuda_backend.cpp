@@ -2416,7 +2416,7 @@ bool initialize_decode_graph(
   // The grouped/graph decode kernels are synchronization-heavy; on the 4B
   // Blackwell target, leaving a small number of SMs idle beats the maximum
   // resident grid. Explicit user overrides still take precedence.
-  constexpr int kPreferredGraphDecodeBlocks = 48;
+  constexpr int kPreferredGraphDecodeBlocks = 32;
   graph_decode.max_safe_decode_blocks = variant.query_max_safe_decode_blocks();
   graph_decode.decode_blocks = config.decode_blocks > 0
     ? std::min(config.decode_blocks, graph_decode.max_safe_decode_blocks)

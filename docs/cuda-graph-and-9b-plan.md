@@ -308,7 +308,7 @@ Follow-up experiments added device-resident decode control: the LM head writes
 the next token and position into the graph-stable control buffer, and the
 monolithic graph decode node marks the current token for repetition penalty.
 After the first decode step, Graph therefore avoids both per-token H2D uploads.
-The default graph grid is now 48 blocks (unless explicitly overridden), while
+The default graph grid is now 32 blocks (unless explicitly overridden), while
 the direct megakernel retains its own safe-grid default. The fixed 4B layer
 schedule also avoids the graph kernel's layer-type lookup, reducing its
 register count from 187 to 186.
@@ -325,6 +325,15 @@ result and does not change the promotion decision. An eight-way variant and a
 for 128 deterministic Graph versus megakernel tokens; the same earlier test
 also passed for multi-kernel mode. Further work should target a Blackwell
 tensor-core or cuBLASLt projection path for the MLP/LM head.
+
+The final occupancy sweep also establishes why Graph uses 32 rather than 48
+blocks: at 32 blocks it measured 51.961 tok/s, versus 51.596 at 48 and 51.309
+at 56. In the immediate confirmation pair, megakernel averaged 51.298 tok/s
+and the 32-block Graph averaged 51.588 tok/s (+0.56%). Reversing that order
+on the rebuilt default measured Graph at 51.919 tok/s and megakernel at 51.119
+(+1.57%). Across both three-run pairs, Graph averaged 51.588 tok/s versus
+51.209 for megakernel (+0.74%). This is the retained default pending a larger
+projection-path improvement.
 
 ### G4. Split only operations that gain better hardware utilization
 
