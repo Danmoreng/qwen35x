@@ -458,6 +458,8 @@ using LaunchDecodeGraphMegakernelFn = void (*)(
   unsigned int * barrier_counter,
   unsigned int * barrier_generation,
   unsigned int * lm_sync_counter,
+  float * seen_token_mask,
+  float repetition_penalty,
   int max_seq_len,
   int decode_blocks,
   cudaStream_t stream);
@@ -502,6 +504,7 @@ using LaunchDecodeGraphLmHeadFn = void (*)(
   unsigned int * lm_sync_counter,
   float * seen_token_mask,
   float repetition_penalty,
+  int * next_decode_control,
   cudaStream_t stream);
 using LaunchDecodeMlpOnlyFn = void (*)(
   const PackedLayerWeights * layer_weights,
@@ -584,11 +587,11 @@ extern "C" void launch_decode_graph_group4_4b(
 extern "C" void launch_decode_graph_megakernel_0p8b(
   const int *, const void *, const void *, const PackedLayerWeights *, const PackedLayerNvfp4Weights *, void *, void *,
   void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *,
-  unsigned int *, unsigned int *, unsigned int *, int, int, cudaStream_t);
+  unsigned int *, unsigned int *, unsigned int *, float *, float, int, int, cudaStream_t);
 extern "C" void launch_decode_graph_megakernel_4b(
   const int *, const void *, const void *, const PackedLayerWeights *, const PackedLayerNvfp4Weights *, void *, void *,
   void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *, void *,
-  unsigned int *, unsigned int *, unsigned int *, int, int, cudaStream_t);
+  unsigned int *, unsigned int *, unsigned int *, float *, float, int, int, cudaStream_t);
 extern "C" void launch_decode_graph_reset_0p8b(unsigned int *, unsigned int *, unsigned int *, int, cudaStream_t);
 extern "C" void launch_decode_graph_reset_4b(unsigned int *, unsigned int *, unsigned int *, int, cudaStream_t);
 extern "C" void launch_decode_final_lm_0p8b(
@@ -600,9 +603,9 @@ extern "C" void launch_decode_graph_final_lm_0p8b(
 extern "C" void launch_decode_graph_final_lm_4b(
   int *, const void *, const void *, void *, void *, void *, float *, int *, unsigned int *, float *, float, cudaStream_t);
 extern "C" void launch_decode_graph_lm_head_0p8b(
-  int *, const void *, void *, float *, int *, unsigned int *, float *, float, cudaStream_t);
+  int *, const void *, void *, float *, int *, unsigned int *, float *, float, int *, cudaStream_t);
 extern "C" void launch_decode_graph_lm_head_4b(
-  int *, const void *, void *, float *, int *, unsigned int *, float *, float, cudaStream_t);
+  int *, const void *, void *, float *, int *, unsigned int *, float *, float, int *, cudaStream_t);
 extern "C" void launch_decode_mlp_only_0p8b(
   const PackedLayerWeights *, const PackedLayerNvfp4Weights *, void *, void *, void *, unsigned int *, unsigned int *, int, int, cudaStream_t);
 extern "C" void launch_decode_mlp_only_4b(
@@ -781,6 +784,9 @@ struct CudaGraphDecode {
   int decode_blocks = 0;
   int max_safe_decode_blocks = 0;
   std::size_t node_count = 0;
+  bool control_initialized = false;
+  int expected_input_token = -1;
+  int expected_position = -1;
 
   ~CudaGraphDecode() {
     if (executable != nullptr) {
@@ -2382,6 +2388,8 @@ void enqueue_graph_megakernel_decode(
     state.barrier_counter,
     state.barrier_generation,
     state.lm_sync_counter,
+    state.seen_token_mask,
+    repetition_penalty,
     max_seq_len,
     decode_blocks,
     stream);
@@ -2394,6 +2402,7 @@ void enqueue_graph_megakernel_decode(
     state.lm_sync_counter,
     state.seen_token_mask,
     repetition_penalty,
+    state.graph_decode_control,
     stream);
 }
 
@@ -2404,10 +2413,14 @@ bool initialize_decode_graph(
   const Qwen35xCudaBackendConfig & config,
   CudaGraphDecode & graph_decode,
   std::string & error_message) {
+  // The grouped/graph decode kernels are synchronization-heavy; on the 4B
+  // Blackwell target, leaving a small number of SMs idle beats the maximum
+  // resident grid. Explicit user overrides still take precedence.
+  constexpr int kPreferredGraphDecodeBlocks = 48;
   graph_decode.max_safe_decode_blocks = variant.query_max_safe_decode_blocks();
   graph_decode.decode_blocks = config.decode_blocks > 0
     ? std::min(config.decode_blocks, graph_decode.max_safe_decode_blocks)
-    : graph_decode.max_safe_decode_blocks;
+    : std::min(kPreferredGraphDecodeBlocks, graph_decode.max_safe_decode_blocks);
   graph_decode.decode_blocks = std::max(graph_decode.decode_blocks, descriptor.dn_gate_heads);
   if (graph_decode.decode_blocks <= 0) {
     error_message = "CUDA Graph decode did not find a safe cooperative layer grid size.";
@@ -2539,6 +2552,7 @@ void enqueue_specialized_multi_kernel_decode(
     state.lm_sync_counter,
     state.seen_token_mask,
     repetition_penalty,
+    state.graph_decode_control,
     stream);
 }
 
@@ -2570,7 +2584,7 @@ bool run_decode_step_impl(
     return false;
   }
 
-  if (repetition_penalty > 1.0f && input_token >= 0 && input_token < descriptor.vocab_size) {
+  if (graph_decode == nullptr && repetition_penalty > 1.0f && input_token >= 0 && input_token < descriptor.vocab_size) {
     const float seen = 1.0f;
     const auto seen_upload_start = std::chrono::steady_clock::now();
     if (!check_cuda(
@@ -2604,21 +2618,30 @@ bool run_decode_step_impl(
     std::getenv("QWEN35X_DEBUG_SCALAR_GATE_UP_SM120_DOWN") != nullptr;
 
   if (graph_decode != nullptr) {
-    const int decode_control[2] = {input_token, position};
-    const auto control_upload_start = std::chrono::steady_clock::now();
-    if (!check_cuda(
-          cudaMemcpyAsync(
-            state.graph_decode_control,
-            decode_control,
-            sizeof(decode_control),
-            cudaMemcpyHostToDevice,
-            graph_decode->stream),
-          "cudaMemcpyAsync(H2D graph decode control)",
-          error_message)) {
-      return false;
+    const bool upload_graph_control =
+      !graph_decode->control_initialized ||
+      graph_decode->expected_input_token != input_token ||
+      graph_decode->expected_position != position;
+    if (upload_graph_control) {
+      const int decode_control[2] = {input_token, position};
+      const auto control_upload_start = std::chrono::steady_clock::now();
+      if (!check_cuda(
+            cudaMemcpyAsync(
+              state.graph_decode_control,
+              decode_control,
+              sizeof(decode_control),
+              cudaMemcpyHostToDevice,
+              graph_decode->stream),
+            "cudaMemcpyAsync(H2D graph decode control)",
+            error_message)) {
+        return false;
+      }
+      graph_decode->control_initialized = true;
+      if (profile != nullptr) {
+        profile->graph_control_upload_ms += elapsed_ms_since(control_upload_start);
+      }
     }
     if (profile != nullptr) {
-      profile->graph_control_upload_ms += elapsed_ms_since(control_upload_start);
       profile->graph_node_count = static_cast<int>(graph_decode->node_count);
       profile->decode_blocks = graph_decode->decode_blocks;
       profile->max_safe_decode_blocks = graph_decode->max_safe_decode_blocks;
@@ -3393,6 +3416,10 @@ bool run_decode_step_impl(
       " at decode position " + std::to_string(position) + ".";
     return false;
   }
+  if (graph_decode != nullptr) {
+    graph_decode->expected_input_token = out_next_token;
+    graph_decode->expected_position = position + 1;
+  }
   if (profile != nullptr) {
     profile->output_token_download_ms += elapsed_ms_since(token_download_start);
     profile->host_total_ms += elapsed_ms_since(host_start);
@@ -3725,7 +3752,13 @@ bool Qwen35xCudaBackend::reset(std::string & error_message) {
     error_message = "Qwen35x CUDA backend reset requested before initialize.";
     return false;
   }
-  return reset_state(impl_->descriptor, impl_->state, impl_->config.max_context, error_message);
+  const bool ok = reset_state(impl_->descriptor, impl_->state, impl_->config.max_context, error_message);
+  if (ok && impl_->graph_decode != nullptr) {
+    impl_->graph_decode->control_initialized = false;
+    impl_->graph_decode->expected_input_token = -1;
+    impl_->graph_decode->expected_position = -1;
+  }
+  return ok;
 }
 
 bool Qwen35xCudaBackend::run_prefill(
@@ -3742,6 +3775,11 @@ bool Qwen35xCudaBackend::run_prefill(
   }
   Qwen35xPrefillProfile * profile = impl_->config.profile_enabled ? &impl_->profile.prefill : nullptr;
   const bool ok = run_prefill_impl(impl_->descriptor, *impl_->variant, impl_->state, impl_->config, tokens, out_first_token, true, profile, error_message);
+  if (ok && impl_->graph_decode != nullptr) {
+    impl_->graph_decode->control_initialized = false;
+    impl_->graph_decode->expected_input_token = -1;
+    impl_->graph_decode->expected_position = -1;
+  }
   if (ok && profile != nullptr) {
     impl_->profile.enabled = true;
     impl_->profile.prefill_runs += 1;

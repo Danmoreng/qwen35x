@@ -12,6 +12,7 @@
 // LM Head: vocab projection + argmax
 // =============================================================================
 
+template <int DOT_ILP = 1>
 __global__ void lm_head_kernel(
     const float *__restrict__ hidden,
     const __nv_bfloat16 *__restrict__ weight,   // [VOCAB, HIDDEN] bf16
@@ -20,7 +21,8 @@ __global__ void lm_head_kernel(
     int *__restrict__ output_token,
     unsigned int *__restrict__ sync_counter,
     const float *__restrict__ seen_token_mask,
-    float repetition_penalty)
+    float repetition_penalty,
+    int *__restrict__ next_decode_control)
 {
     __shared__ float s_hidden[HIDDEN_SIZE];
     for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LM_BLOCK_SIZE) s_hidden[i] = hidden[i];
@@ -34,13 +36,18 @@ __global__ void lm_head_kernel(
     float local_max = -FLT_MAX; int local_max_idx = -1;
     for (int m = rs + warp_id; m < re; m += num_warps) {
         const __nv_bfloat16 *w_row = weight + m * HIDDEN_SIZE;
-        float sum = 0;
+        float partial_sum[DOT_ILP] = {};
 #pragma unroll 4
         for (int k = lane_id * 8; k < HIDDEN_SIZE; k += WARP_SIZE * 8) {
             uint4 w_u4 = load_128bit(reinterpret_cast<const uint4 *>(w_row + k));
             const __nv_bfloat16 *wp = reinterpret_cast<const __nv_bfloat16 *>(&w_u4);
-            for (int i = 0; i < 8; i++) sum += __bfloat162float(wp[i]) * s_hidden[k+i];
+            for (int i = 0; i < 8; i++) {
+                partial_sum[i & (DOT_ILP - 1)] += __bfloat162float(wp[i]) * s_hidden[k+i];
+            }
         }
+        float sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < DOT_ILP; ++i) sum += partial_sum[i];
         sum = warp_reduce_sum(sum);
         if (lane_id == 0 && repetition_penalty > 1.0f && seen_token_mask[m] > 0.0f) {
             sum = (sum > 0.0f) ? (sum / repetition_penalty) : (sum * repetition_penalty);
@@ -73,7 +80,13 @@ __global__ void lm_head_kernel(
         __shared__ float sv[256]; __shared__ int si[256];
         sv[tid] = bv; si[tid] = bi; __syncthreads();
         for (int s = LM_BLOCK_SIZE/2; s > 0; s >>= 1) { if (tid < s && sv[tid+s] > sv[tid]) { sv[tid] = sv[tid+s]; si[tid] = si[tid+s]; } __syncthreads(); }
-        if (tid == 0) *output_token = si[0];
+        if (tid == 0) {
+            const int next_token = si[0];
+            *output_token = next_token;
+            if (next_decode_control != nullptr) {
+                next_decode_control[0] = next_token;
+                next_decode_control[1] += 1;
+            }
+        }
     }
 }
-

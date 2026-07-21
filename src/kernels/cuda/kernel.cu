@@ -511,6 +511,8 @@ decode_graph_megakernel(
     unsigned int *__restrict__ barrier_counter,
     unsigned int *__restrict__ barrier_generation,
     unsigned int *__restrict__ lm_sync_counter,
+    float *__restrict__ seen_token_mask,
+    float repetition_penalty,
     int max_seq_len)
 {
     const unsigned int initial_generation = *barrier_generation;
@@ -519,16 +521,49 @@ decode_graph_megakernel(
     __nv_bfloat16 *shmem_bf16 = reinterpret_cast<__nv_bfloat16 *>(shmem_raw);
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         *lm_sync_counter = 0;
+        if (repetition_penalty > 1.0f) {
+            seen_token_mask[decode_control[0]] = 1.0f;
+        }
     }
 
     const __nv_bfloat16 *embed_row = embed_weight + decode_control[0] * HIDDEN_SIZE;
     const int position = decode_control[1];
     const int fa_kv_stride = FA_NUM_KV_HEADS * max_seq_len * FA_HEAD_DIM;
     const int dn_state_stride = DN_NUM_HEADS * DN_KEY_DIM * DN_VALUE_DIM;
-    int dn_layer_idx = 0;
-    int fa_layer_idx = 0;
+#pragma unroll
     for (int layer = 0; layer < NUM_LAYERS; ++layer) {
         const __nv_bfloat16 *layer_input = layer == 0 ? embed_row : hidden_buffer;
+#if defined(QWEN35X_VARIANT_4B)
+        // The 4B schedule is fixed as three DeltaNet layers followed by one
+        // full-attention layer. This is a graph-only specialization; avoid a
+        // constant-memory layer-type lookup and dynamic slot counters.
+        if ((layer & 3) != 3) {
+            constexpr int DNETS_PER_GROUP = 3;
+            const int dn_layer_idx = (layer / 4) * DNETS_PER_GROUP + (layer & 3);
+            deltanet_layer(
+                grid, layer_weights[layer].dn,
+                USE_NVFP4 ? &layer_nvfp4_weights[layer] : nullptr,
+                layer_input, g_residual, g_activations, g_qkv_scratch, g_z_scratch,
+                g_beta_scratch, g_alpha_scratch, g_attn_out, g_mlp_inter,
+                dn_states + dn_layer_idx * dn_state_stride, conv_bufs, hidden_buffer,
+                dn_layer_idx, shmem_bf16, 0, false);
+        } else {
+            const int fa_layer_idx = layer / 4;
+            full_attention_layer(
+                grid, layer_weights[layer].fa,
+                USE_NVFP4 ? &layer_nvfp4_weights[layer] : nullptr,
+                layer_input, fa_k_cache + fa_layer_idx * fa_kv_stride,
+                fa_v_cache + fa_layer_idx * fa_kv_stride, g_residual, g_activations,
+                g_qkv_scratch, g_kv_scratch, g_attn_out, g_attn_partials, g_mlp_inter,
+                hidden_buffer, position, max_seq_len, shmem_bf16, 0, false);
+        }
+#else
+        int dn_layer_idx = 0;
+        int fa_layer_idx = 0;
+        for (int previous_layer = 0; previous_layer < layer; ++previous_layer) {
+            if (LAYER_TYPE[previous_layer] == 0) ++dn_layer_idx;
+            else ++fa_layer_idx;
+        }
         if (LAYER_TYPE[layer] == 0) {
             deltanet_layer(
                 grid, layer_weights[layer].dn,
@@ -548,6 +583,7 @@ decode_graph_megakernel(
                 hidden_buffer, position, max_seq_len, shmem_bf16, 0, false);
             ++fa_layer_idx;
         }
+#endif
     }
 
     if (blockIdx.x == 0) {
@@ -884,12 +920,12 @@ extern "C" void launch_decode(
 
     cudaMemsetAsync(lm_sync_counter, 0, sizeof(unsigned int), stream);
 
-    lm_head_kernel<<<LM_NUM_BLOCKS, LM_BLOCK_SIZE, 0, stream>>>(
+    lm_head_kernel<1><<<LM_NUM_BLOCKS, LM_BLOCK_SIZE, 0, stream>>>(
         (const float *)g_normalized,
         (const __nv_bfloat16 *)lm_head_weight,
         block_max_vals, block_max_idxs,
         output_token_id, lm_sync_counter,
-        seen_token_mask, repetition_penalty);
+        seen_token_mask, repetition_penalty, nullptr);
 
     if (profile) {
         cudaEventRecord(profile_lm_end, stream);
@@ -1234,6 +1270,8 @@ extern "C" void launch_decode_graph_megakernel(
     unsigned int *barrier_counter,
     unsigned int *barrier_generation,
     unsigned int *lm_sync_counter,
+    float *seen_token_mask,
+    float repetition_penalty,
     int max_seq_len,
     int decode_blocks,
     cudaStream_t stream)
@@ -1255,7 +1293,8 @@ extern "C" void launch_decode_graph_megakernel(
         static_cast<float *>(g_attn_partials), static_cast<float *>(g_mlp_inter),
         static_cast<float *>(g_z_scratch), static_cast<float *>(g_beta_scratch),
         static_cast<float *>(g_alpha_scratch), static_cast<float *>(g_normalized),
-        barrier_counter, barrier_generation, lm_sync_counter, max_seq_len);
+        barrier_counter, barrier_generation, lm_sync_counter,
+        seen_token_mask, repetition_penalty, max_seq_len);
 }
 
 extern "C" void launch_decode_graph_reset(
@@ -1289,12 +1328,12 @@ extern "C" void launch_decode_final_lm(
         (float *)g_activations,
         (float *)g_normalized);
     cudaMemsetAsync(lm_sync_counter, 0, sizeof(unsigned int), stream);
-    lm_head_kernel<<<LM_NUM_BLOCKS, LM_BLOCK_SIZE, 0, stream>>>(
+    lm_head_kernel<1><<<LM_NUM_BLOCKS, LM_BLOCK_SIZE, 0, stream>>>(
         (const float *)g_normalized,
         (const __nv_bfloat16 *)lm_head_weight,
         block_max_vals, block_max_idxs,
         output_token_id, lm_sync_counter,
-        seen_token_mask, repetition_penalty);
+        seen_token_mask, repetition_penalty, nullptr);
 }
 
 extern "C" void launch_decode_graph_final_lm(
@@ -1316,17 +1355,17 @@ extern "C" void launch_decode_graph_final_lm(
         (const __nv_bfloat16 *)final_norm_weight,
         (float *)g_activations,
         (float *)g_normalized);
-    lm_head_kernel<<<LM_NUM_BLOCKS, LM_BLOCK_SIZE, 0, stream>>>(
+    lm_head_kernel<1><<<LM_NUM_BLOCKS, LM_BLOCK_SIZE, 0, stream>>>(
         (const float *)g_normalized,
         (const __nv_bfloat16 *)lm_head_weight,
         block_max_vals, block_max_idxs,
         output_token_id, lm_sync_counter,
-        seen_token_mask, repetition_penalty);
+        seen_token_mask, repetition_penalty, nullptr);
 }
 
 // The final RMSNorm is fused into the final group kernel for graph/multi-kernel
-// decode.  This wrapper launches just the vocabulary projection and consumes
-// the graph reset node's already-cleared reduction counter.
+// decode. This wrapper launches just the vocabulary projection.
+constexpr int GRAPH_LM_NUM_BLOCKS = LM_NUM_BLOCKS;
 extern "C" void launch_decode_graph_lm_head(
     int *output_token_id,
     const void *lm_head_weight,
@@ -1336,14 +1375,15 @@ extern "C" void launch_decode_graph_lm_head(
     unsigned int *lm_sync_counter,
     float *seen_token_mask,
     float repetition_penalty,
+    int *next_decode_control,
     cudaStream_t stream)
 {
-    lm_head_kernel<<<LM_NUM_BLOCKS, LM_BLOCK_SIZE, 0, stream>>>(
+    lm_head_kernel<4><<<GRAPH_LM_NUM_BLOCKS, LM_BLOCK_SIZE, 0, stream>>>(
         static_cast<const float *>(g_normalized),
         static_cast<const __nv_bfloat16 *>(lm_head_weight),
         block_max_vals, block_max_idxs,
         output_token_id, lm_sync_counter,
-        seen_token_mask, repetition_penalty);
+        seen_token_mask, repetition_penalty, next_decode_control);
 }
 
 extern "C" void launch_decode_mlp_only(

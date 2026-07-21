@@ -304,6 +304,28 @@ and was reverted. The remaining variation is too large to promote graph mode;
 the next experiment should use kernel-level profiling and a material change to
 the BF16 matvec/MLP path rather than further launch-count reductions.
 
+Follow-up experiments added device-resident decode control: the LM head writes
+the next token and position into the graph-stable control buffer, and the
+monolithic graph decode node marks the current token for repetition penalty.
+After the first decode step, Graph therefore avoids both per-token H2D uploads.
+The default graph grid is now 48 blocks (unless explicitly overridden), while
+the direct megakernel retains its own safe-grid default. The fixed 4B layer
+schedule also avoids the graph kernel's layer-type lookup, reducing its
+register count from 187 to 186.
+
+The default-path follow-up pairs measured Graph at 51.655 versus megakernel at
+51.270 tok/s (+0.75%), then Graph at 51.314 versus megakernel at 51.265
+tok/s (+0.10%) with the order reversed. The aggregate +0.42% lead is promising
+but remains below the 2–3% promotion target. A Graph-only LM-head dot-product
+variant with four independent partial sums remains token-exact for 128
+deterministic tokens. Its final ordered pair was 51.471 tok/s for Graph versus
+51.190 tok/s for megakernel (+0.55%); this is an encouraging but unreplicated
+result and does not change the promotion decision. An eight-way variant and a
+256-block LM-head grid were slower. Final retained-configuration parity passed
+for 128 deterministic Graph versus megakernel tokens; the same earlier test
+also passed for multi-kernel mode. Further work should target a Blackwell
+tensor-core or cuBLASLt projection path for the MLP/LM head.
+
 ### G4. Split only operations that gain better hardware utilization
 
 After the synchronization and grouping sweeps, split expensive operations only
