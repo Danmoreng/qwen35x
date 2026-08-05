@@ -1,16 +1,25 @@
 {
   "config": {
     "schema_version": 1,
-    "name": "qwen3.5-0.8b-text-1024x512",
-    "description": "Deterministic long-text prefill and decode workload with no image, batching, or prefix-cache reuse.",
+    "name": "qwen3.5-0.8b-wikipedia-summary-1024x512",
+    "description": "Deterministic Wikipedia article summarization workload with no image, batching, or prefix-cache reuse.",
+    "source": {
+      "title": "Apollo 11",
+      "project": "English Wikipedia",
+      "page_id": 662,
+      "revision_id": 1367172634,
+      "revision_timestamp": "2026-08-01T13:18:09Z",
+      "url": "https://en.wikipedia.org/w/index.php?title=Apollo_11&oldid=1367172634",
+      "license": "CC BY-SA 4.0"
+    },
     "model": "Qwen/Qwen3.5-0.8B",
     "model_revision": "2fc06364715b967f1860aea9cf38778875588b17",
     "model_dir": "models/qwen3.5-0.8b",
     "precision": "bfloat16",
     "prompt_file": "configs/qwen3_5_0_8b_text_1024x512_prompt.txt",
-    "prompt_sha256": "6e682c6d927d660a904ffe552f7761c2399d38d00971db82afb8662210ed1729",
+    "prompt_sha256": "19228f2fa2f56dfbbe24b925dbbb12c904f01f9908b129f74922c5f18367729f",
     "prompt_tokens_file": "configs/qwen3_5_0_8b_text_1024x512_tokens.csv",
-    "prompt_tokens_sha256": "16bbc4de0ff077ea71979694ea1d20b6b836bc6a74b1ad61eec83e4d09a5b9d6",
+    "prompt_tokens_sha256": "c4918ac68ea3dc888649fbda93af858932d705a5650d753388961a2b35266495",
     "tokenizer_sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
     "weights_sha256": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696",
     "prompt_tokens": 1024,
@@ -27,25 +36,25 @@
   },
   "results": {
     "qwen35x": {
-      "prefill_tokens_per_second_mean": 25680.83956366051,
-      "steady_state_decode_tokens_per_second_mean": 404.57647819009776,
-      "reported_decode_tokens_per_second_mean": 405.3682129810764,
-      "model_time_ms_mean": 1302.9274618,
-      "startup_or_load_time_ms_mean": 513.5501102
+      "prefill_tokens_per_second_mean": 25623.626138015454,
+      "steady_state_decode_tokens_per_second_mean": 404.79561745265073,
+      "reported_decode_tokens_per_second_mean": 405.5877810875874,
+      "model_time_ms_mean": 1302.3677424,
+      "startup_or_load_time_ms_mean": 521.1011432
     },
     "photon": {
-      "prefill_tokens_per_second_mean": 32716.547379337626,
-      "steady_state_decode_tokens_per_second_mean": 318.41936606176694,
-      "reported_decode_tokens_per_second_mean": 319.0424959366432,
-      "model_time_ms_mean": 1636.1132456002451,
-      "startup_or_load_time_ms_mean": 22512.743649000186
+      "prefill_tokens_per_second_mean": 31998.84575375549,
+      "steady_state_decode_tokens_per_second_mean": 316.9638001914433,
+      "reported_decode_tokens_per_second_mean": 317.5840816008199,
+      "model_time_ms_mean": 1644.1786331999538,
+      "startup_or_load_time_ms_mean": 23492.804497999714
     },
     "vllm": {
-      "prefill_tokens_per_second_mean": 40140.11407993943,
-      "steady_state_decode_tokens_per_second_mean": 349.8976364860144,
-      "reported_decode_tokens_per_second_mean": 350.5823676728755,
-      "model_time_ms_mean": 1485.9438041999965,
-      "startup_or_load_time_ms_mean": 15334.884013000192
+      "prefill_tokens_per_second_mean": 40028.035754752505,
+      "steady_state_decode_tokens_per_second_mean": 348.45040346526287,
+      "reported_decode_tokens_per_second_mean": 349.1323024935706,
+      "model_time_ms_mean": 1492.1196001998396,
+      "startup_or_load_time_ms_mean": 15428.154596999775
     }
   }
 }

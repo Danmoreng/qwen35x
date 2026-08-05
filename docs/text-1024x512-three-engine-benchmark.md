@@ -1,4 +1,4 @@
-# Qwen3.5-0.8B deterministic text benchmark (1024 input / 512 output)
+# Qwen3.5-0.8B Wikipedia summarization benchmark (1024 input / 512 output)
 
 This benchmark compares single-stream, fixed-length BF16 text inference across:
 
@@ -6,7 +6,7 @@ This benchmark compares single-stream, fixed-length BF16 text inference across:
 - Moondream Photon / Kestrel
 - vLLM
 
-It is intentionally different from the image-heavy ChartQA serving benchmark published for Photon 2.0. The goal here is narrower: measure long text prefill followed by sustained text decode without image encoding, batching, early stopping, or prefix-cache reuse.
+It is intentionally different from the image-heavy ChartQA serving benchmark published for Photon 2.0. The goal here is narrower: measure a realistic long-text summarization request followed by sustained text decode without image encoding, batching, early stopping, or prefix-cache reuse.
 
 ## Pinned workload
 
@@ -15,8 +15,10 @@ The workload is defined by `configs/qwen3_5_0_8b_text_1024x512.json`.
 - Model: `Qwen/Qwen3.5-0.8B`
 - Hugging Face revision: `2fc06364715b967f1860aea9cf38778875588b17`
 - Precision: BF16
+- Source text: English Wikipedia, [“Apollo 11”, revision 1367172634](https://en.wikipedia.org/w/index.php?title=Apollo_11&oldid=1367172634), licensed under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/)
+- Task: produce a coherent 450–500-word summary covering the timeline, crew roles, context, achievements, and significance
 - Prompt: exactly 1024 token IDs, including the Qwen chat framing
-- Output: exactly 512 generated tokens
+- Output: exactly 512 generated tokens (the requested summary continues beyond the benchmark limit)
 - Maximum context: 2048
 - Temperature: 0
 - Top-p: 0.8 (irrelevant under greedy decoding, but identical across engines)
@@ -105,20 +107,20 @@ Hardware and software details are in `docs/qwen3_5_0_8b_text_1024x512_rtx5080_la
 
 | Engine | Prefill tokens/s | Steady decode tokens/s | Model time |
 |---|---:|---:|---:|
-| qwen35x | 25,680.84 | **404.58** | **1,302.93 ms** |
-| Photon 2.0.1 | 32,716.55 | 318.42 | 1,636.11 ms |
-| vLLM 0.26.0 | **40,140.11** | 349.90 | 1,485.94 ms |
+| qwen35x | 25,623.63 | **404.80** | **1,302.37 ms** |
+| Photon 2.0.1 | 31,998.85 | 316.96 | 1,644.18 ms |
+| vLLM 0.26.0 | **40,028.04** | 348.45 | 1,492.12 ms |
 
 On this machine and workload:
 
-- `qwen35x` decode was 27.06% faster than Photon.
-- `qwen35x` decode was 15.63% faster than vLLM.
-- `qwen35x` model time was 20.36% lower than Photon.
-- `qwen35x` model time was 12.32% lower than vLLM.
+- `qwen35x` decode was 27.71% faster than Photon.
+- `qwen35x` decode was 16.17% faster than vLLM.
+- `qwen35x` model time was 20.79% lower than Photon.
+- `qwen35x` model time was 12.72% lower than vLLM.
 - vLLM had the fastest long-prompt prefill; `qwen35x` had the fastest sustained decode.
 
 ## Scope and limitations
 
-This result does not disprove Moondream's published H100/ChartQA measurements. It demonstrates that those image-serving request-throughput results do not automatically generalize to sustained text decode on a laptop SM120 GPU.
+This is one deterministic summarization workload, not a comprehensive application benchmark, and it does not evaluate answer quality. The result does not disprove Moondream's published H100/ChartQA measurements. It demonstrates that those image-serving request-throughput results do not automatically generalize to sustained text decode on a laptop SM120 GPU.
 
 For credible comparisons, publish the exact GPU, power state, package versions, prompt/output lengths, cache behavior, concurrency, raw rows, and timing definition. More machines and more measured runs are preferable. The recorded run did not lock GPU clocks or power, so small differences should not be overinterpreted; the observed decode gaps were substantially larger than the run-to-run variation.
