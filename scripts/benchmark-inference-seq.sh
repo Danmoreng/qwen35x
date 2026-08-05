@@ -4,19 +4,36 @@ set -e
 # Simplified benchmark script for Linux
 # usage: ./scripts/benchmark-inference-seq.sh --mode gpu-f32 --max-new-tokens 128 ...
 
-EXECUTABLE="build/qwen35x"
-HF_MODEL_DIR="models/qwen3.5-0.8b-nvfp4"
+EXECUTABLE="${EXECUTABLE:-build/qwen35x}"
+HF_MODEL_DIR="${HF_MODEL_DIR:-models/qwen3.5-0.8b-nvfp4}"
 RUNS=3
 WARMUP_RUNS=1
 MAX_NEW_TOKENS=128
 MAX_CONTEXT=256
 PROMPT_TOKENS="198" # Default to single token prompt
+REPEAT_PENALTY=1.05
 PREFILL_ONLY=false
 MODE="gpu-f32"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
   case $1 in
+    --executable)
+      EXECUTABLE="$2"
+      shift 2
+      ;;
+    --hf-model-dir)
+      HF_MODEL_DIR="$2"
+      shift 2
+      ;;
+    --runs)
+      RUNS="$2"
+      shift 2
+      ;;
+    --warmup-runs)
+      WARMUP_RUNS="$2"
+      shift 2
+      ;;
     --mode)
       MODE="$2"
       shift 2
@@ -29,12 +46,20 @@ while [[ $# -gt 0 ]]; do
       MAX_CONTEXT="$2"
       shift 2
       ;;
+    --repeat-penalty)
+      REPEAT_PENALTY="$2"
+      shift 2
+      ;;
     --prefill-only)
       PREFILL_ONLY=true
       shift
       ;;
     --prompt-tokens)
       PROMPT_TOKENS="$2"
+      shift 2
+      ;;
+    --prompt-tokens-file)
+      PROMPT_TOKENS="$(tr -d '[:space:]' < "$2")"
       shift 2
       ;;
     *)
@@ -45,8 +70,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RESOLVED_EXE="$REPO_ROOT/$EXECUTABLE"
-RESOLVED_MODEL_DIR="$REPO_ROOT/$HF_MODEL_DIR"
+RESOLVED_EXE="$EXECUTABLE"
+[[ "$RESOLVED_EXE" = /* ]] || RESOLVED_EXE="$REPO_ROOT/$RESOLVED_EXE"
+RESOLVED_MODEL_DIR="$HF_MODEL_DIR"
+[[ "$RESOLVED_MODEL_DIR" = /* ]] || RESOLVED_MODEL_DIR="$REPO_ROOT/$RESOLVED_MODEL_DIR"
 BUILD_DIR="$REPO_ROOT/build"
 BENCH_DIR="$BUILD_DIR/bench-profiles"
 mkdir -p "$BENCH_DIR"
@@ -63,6 +90,8 @@ run_once() {
     "--max-new-tokens" "$MAX_NEW_TOKENS"
     "--max-context" "$MAX_CONTEXT"
     "--temperature" "0"
+    "--top-p" "0.8"
+    "--repeat-penalty" "$REPEAT_PENALTY"
     "--seed" "123"
     "--profile-json" "$profile_json"
     "--prompt-tokens" "$PROMPT_TOKENS"
