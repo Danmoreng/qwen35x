@@ -1,0 +1,168 @@
+#include "qwen35x/cpu/q8_0.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <iostream>
+#include <string_view>
+#include <vector>
+
+namespace {
+
+using qwen35x::cpu::Q8_0Backend;
+using qwen35x::cpu::Q8_0Block;
+using qwen35x::cpu::q8_0_values_per_block;
+
+bool expect(const bool condition, const std::string_view message) {
+  if (!condition) {
+    std::cerr << "q8_0 test failure: " << message << '\n';
+  }
+  return condition;
+}
+
+bool near(const float lhs, const float rhs) {
+  const float tolerance = 1.0e-4F + 2.0e-5F * std::max(std::fabs(lhs), std::fabs(rhs));
+  return std::fabs(lhs - rhs) <= tolerance;
+}
+
+std::vector<float> make_values(const std::size_t block_count, const float phase) {
+  std::vector<float> values(block_count * q8_0_values_per_block);
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    const float x = static_cast<float>(index) + phase;
+    values[index] = 3.75F * std::sin(x * 0.37F) + 0.625F * std::cos(x * 0.11F);
+  }
+  if (!values.empty()) {
+    values[0] = 0.0F;
+  }
+  return values;
+}
+
+bool test_known_layout() {
+  std::array<float, q8_0_values_per_block> input{};
+  for (std::size_t index = 0; index < input.size(); ++index) {
+    input[index] = static_cast<float>(static_cast<int>(index) - 16);
+  }
+  input.back() = 127.0F;
+
+  Q8_0Block block{};
+  qwen35x::cpu::q8_0_quantize(input.data(), &block, 1, Q8_0Backend::scalar);
+  bool ok = expect(block.d == 0x3c00U, "GGML binary16 scale must encode 1.0") &&
+    expect(block.qs[0] == -16, "first quant must begin immediately after scale") &&
+    expect(block.qs[16] == 0, "zero quant mismatch") &&
+    expect(block.qs[31] == 127, "positive Q8_0 endpoint mismatch");
+
+  std::array<float, q8_0_values_per_block> output{};
+  qwen35x::cpu::q8_0_dequantize(&block, output.data(), 1, Q8_0Backend::scalar);
+  for (std::size_t index = 0; index < output.size(); ++index) {
+    ok = expect(output[index] == static_cast<float>(block.qs[index]), "known block dequant mismatch") && ok;
+  }
+  return ok;
+}
+
+bool test_zero_block() {
+  std::array<float, q8_0_values_per_block> input{};
+  Q8_0Block block{};
+  std::memset(&block, 0x55, sizeof(block));
+  qwen35x::cpu::q8_0_quantize(input.data(), &block, 1, Q8_0Backend::scalar);
+  bool ok = expect(block.d == 0, "zero block scale must be zero");
+  for (const std::int8_t value : block.qs) {
+    ok = expect(value == 0, "zero block quant must be zero") && ok;
+  }
+  return ok;
+}
+
+bool test_empty_ranges() {
+  qwen35x::cpu::q8_0_quantize(nullptr, nullptr, 0, Q8_0Backend::auto_select);
+  qwen35x::cpu::q8_0_dequantize(nullptr, nullptr, 0, Q8_0Backend::auto_select);
+  bool ok = expect(
+    qwen35x::cpu::q8_0_dot(nullptr, nullptr, 0, Q8_0Backend::auto_select) == 0.0F,
+    "empty dot product must be zero");
+  float output = 1.0F;
+  qwen35x::cpu::q8_0_matvec(nullptr, nullptr, &output, 1, 0, Q8_0Backend::auto_select);
+  return expect(output == 0.0F, "zero-width matvec must produce zero") && ok;
+}
+
+bool test_backend(const Q8_0Backend backend) {
+  constexpr std::size_t blocks = 5;
+  constexpr std::size_t rows = 4;
+  const std::vector<float> lhs_values = make_values(blocks * rows, 0.25F);
+  const std::vector<float> rhs_values = make_values(blocks, 1.75F);
+  std::vector<Q8_0Block> lhs_scalar(blocks * rows);
+  std::vector<Q8_0Block> rhs_scalar(blocks);
+  std::vector<Q8_0Block> lhs_test(blocks * rows);
+  std::vector<Q8_0Block> rhs_test(blocks);
+  qwen35x::cpu::q8_0_quantize(lhs_values.data(), lhs_scalar.data(), lhs_scalar.size(), Q8_0Backend::scalar);
+  qwen35x::cpu::q8_0_quantize(rhs_values.data(), rhs_scalar.data(), rhs_scalar.size(), Q8_0Backend::scalar);
+  qwen35x::cpu::q8_0_quantize(lhs_values.data(), lhs_test.data(), lhs_test.size(), backend);
+  qwen35x::cpu::q8_0_quantize(rhs_values.data(), rhs_test.data(), rhs_test.size(), backend);
+
+  bool ok = expect(
+    std::memcmp(lhs_scalar.data(), lhs_test.data(), lhs_scalar.size() * sizeof(Q8_0Block)) == 0,
+    "quantized matrix differs from deterministic scalar Q8_0") &&
+    expect(
+      std::memcmp(rhs_scalar.data(), rhs_test.data(), rhs_scalar.size() * sizeof(Q8_0Block)) == 0,
+      "quantized vector differs from deterministic scalar Q8_0");
+
+  std::vector<float> dequant_scalar(rhs_values.size());
+  std::vector<float> dequant_test(rhs_values.size());
+  qwen35x::cpu::q8_0_dequantize(rhs_scalar.data(), dequant_scalar.data(), blocks, Q8_0Backend::scalar);
+  qwen35x::cpu::q8_0_dequantize(rhs_test.data(), dequant_test.data(), blocks, backend);
+  for (std::size_t index = 0; index < dequant_scalar.size(); ++index) {
+    ok = expect(dequant_scalar[index] == dequant_test[index], "dequantized value mismatch") && ok;
+  }
+
+  const float scalar_dot = qwen35x::cpu::q8_0_dot(lhs_scalar.data(), rhs_scalar.data(), blocks, Q8_0Backend::scalar);
+  const float test_dot = qwen35x::cpu::q8_0_dot(lhs_test.data(), rhs_test.data(), blocks, backend);
+  ok = expect(near(scalar_dot, test_dot), "dot product mismatch") && ok;
+
+  std::vector<float> dequant_lhs(blocks * q8_0_values_per_block);
+  qwen35x::cpu::q8_0_dequantize(
+    lhs_scalar.data(), dequant_lhs.data(), blocks, Q8_0Backend::scalar);
+  float reference_dot = 0.0F;
+  for (std::size_t index = 0; index < dequant_lhs.size(); ++index) {
+    reference_dot += dequant_lhs[index] * dequant_scalar[index];
+  }
+  ok = expect(near(scalar_dot, reference_dot), "scalar dot differs from dequantized reference") && ok;
+
+  std::array<float, rows> scalar_output{};
+  std::array<float, rows> test_output{};
+  qwen35x::cpu::q8_0_matvec(
+    lhs_scalar.data(), rhs_scalar.data(), scalar_output.data(), rows, blocks, Q8_0Backend::scalar);
+  qwen35x::cpu::q8_0_matvec(
+    lhs_test.data(), rhs_test.data(), test_output.data(), rows, blocks, backend);
+  for (std::size_t row = 0; row < rows; ++row) {
+    ok = expect(near(scalar_output[row], test_output[row]), "matvec row mismatch") && ok;
+  }
+  return ok;
+}
+
+} // namespace
+
+int main() {
+  bool ok = test_known_layout() && test_zero_block() && test_empty_ranges();
+  ok = test_backend(Q8_0Backend::scalar) && ok;
+  ok = test_backend(Q8_0Backend::auto_select) && ok;
+
+  if (qwen35x::cpu::q8_0_backend_available(Q8_0Backend::avx2)) {
+    ok = expect(
+      qwen35x::cpu::q8_0_resolve_backend(Q8_0Backend::avx2) == Q8_0Backend::avx2,
+      "available AVX2 backend did not resolve to AVX2") && ok;
+    ok = test_backend(Q8_0Backend::avx2) && ok;
+  } else {
+    ok = expect(
+      qwen35x::cpu::q8_0_resolve_backend(Q8_0Backend::avx2) == Q8_0Backend::scalar,
+      "unavailable AVX2 backend did not safely fall back") && ok;
+  }
+
+  if (ok) {
+    std::cout << "q8_0 scalar/dispatch tests passed; auto selected "
+              << qwen35x::cpu::q8_0_backend_name(
+                   qwen35x::cpu::q8_0_resolve_backend(Q8_0Backend::auto_select))
+              << '\n';
+    return 0;
+  }
+  return 1;
+}

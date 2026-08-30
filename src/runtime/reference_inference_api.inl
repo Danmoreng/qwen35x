@@ -211,6 +211,14 @@ bool run_reference_qwen35_inference(
     error_message = "seed must be >= -1.";
     return false;
   }
+  if (options.cpu_threads < 0) {
+    error_message = "cpu_threads must be >= 0 (zero selects the automatic default).";
+    return false;
+  }
+  if (options.use_cuda && !options.cpu_gguf_path.empty()) {
+    error_message = "--cpu-gguf is a CPU-only weight path and cannot be combined with GPU inference.";
+    return false;
+  }
 
 #if !QWEN35X_HAS_CUDA
   if (options.use_cuda) {
@@ -243,7 +251,15 @@ bool run_reference_qwen35_inference(
   const bool use_cuda_matvec_bf16 = options.use_cuda && options.use_cuda_matvec_bf16;
 
   ModelWeights weights;
-  if (!load_model_weights(options.model_dir, dims, profile, weights, error_message)) {
+  if (!load_model_weights(
+        options.model_dir,
+        options.cpu_gguf_path,
+        dims,
+        profile,
+        options.cpu_q8_backend,
+        options.cpu_threads,
+        weights,
+        error_message)) {
     return false;
   }
   if (options.use_cuda && !upload_model_weights_to_cuda(weights, use_cuda_matvec_bf16, error_message)) {
@@ -634,6 +650,10 @@ bool run_reference_qwen35_inference(
           break;
         }
 
+        if (i + 1 >= options.max_new_tokens) {
+          break;
+        }
+
         if (!decode_step_with_runtime_backend(
               decode_backend,
               weights,
@@ -709,6 +729,11 @@ bool run_reference_qwen35_inference(
         break;
       }
 
+
+      if (i + 1 >= options.max_new_tokens) {
+        break;
+      }
+
       if (!decode_step_with_runtime_backend(
             decode_backend,
             weights,
@@ -765,4 +790,3 @@ bool run_reference_qwen35_inference(
   release_cuda_resources();
   return true;
 }
-

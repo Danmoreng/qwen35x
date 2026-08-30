@@ -358,9 +358,33 @@ bool run_forward_single_token(
 
   const auto embedding_start = std::chrono::steady_clock::now();
   std::vector<float> x(static_cast<std::size_t>(dims.hidden), 0.0f);
-  const float * emb_row = weights.embed_tokens.data.data() +
-                         static_cast<std::size_t>(token_id) * static_cast<std::size_t>(dims.hidden);
-  std::memcpy(x.data(), emb_row, static_cast<std::size_t>(dims.hidden) * sizeof(float));
+  if (weights.embed_tokens.is_q8_0()) {
+    if ((dims.hidden % static_cast<int>(cpu::q8_0_values_per_block)) != 0) {
+      error_message = "Q8_0 embedding width is not divisible by 32.";
+      return false;
+    }
+    const std::size_t blocks_per_row =
+      static_cast<std::size_t>(dims.hidden) / cpu::q8_0_values_per_block;
+    const std::size_t row_offset = static_cast<std::size_t>(token_id) * blocks_per_row;
+    if (row_offset + blocks_per_row > weights.embed_tokens.q8_0_blocks.size()) {
+      error_message = "Q8_0 embedding row is outside the loaded tensor.";
+      return false;
+    }
+    cpu::q8_0_dequantize(
+      weights.embed_tokens.q8_0_blocks.data() + row_offset,
+      x.data(),
+      blocks_per_row,
+      weights.embed_tokens.q8_0_backend);
+  } else {
+    const std::size_t row_offset =
+      static_cast<std::size_t>(token_id) * static_cast<std::size_t>(dims.hidden);
+    if (row_offset + static_cast<std::size_t>(dims.hidden) > weights.embed_tokens.data.size()) {
+      error_message = "F32 embedding row is outside the loaded tensor.";
+      return false;
+    }
+    const float * emb_row = weights.embed_tokens.data.data() + row_offset;
+    std::memcpy(x.data(), emb_row, static_cast<std::size_t>(dims.hidden) * sizeof(float));
+  }
   if (profiling != nullptr) {
     profiling->embedding_ms += elapsed_ms(embedding_start);
   }
@@ -425,9 +449,23 @@ bool run_forward_single_token(
         return false;
       }
     } else {
-      if (!matvec_2d(layer.mlp_gate, post_norm, mlp_gate, use_cuda, error_message) ||
-          !matvec_2d(layer.mlp_up, post_norm, mlp_up, use_cuda, error_message)) {
-        return false;
+      if (layer.mlp_gate_up_cpu.is_q8_0()) {
+        std::vector<float> packed;
+        if (!matvec_2d(layer.mlp_gate_up_cpu, post_norm, packed, false, error_message)) {
+          return false;
+        }
+        const std::size_t intermediate = static_cast<std::size_t>(dims.intermediate);
+        if (packed.size() != 2 * intermediate) {
+          error_message = "Packed MLP gate/up projection output size mismatch.";
+          return false;
+        }
+        mlp_gate.assign(packed.begin(), packed.begin() + static_cast<std::ptrdiff_t>(intermediate));
+        mlp_up.assign(packed.begin() + static_cast<std::ptrdiff_t>(intermediate), packed.end());
+      } else {
+        if (!matvec_2d(layer.mlp_gate, post_norm, mlp_gate, use_cuda, error_message) ||
+            !matvec_2d(layer.mlp_up, post_norm, mlp_up, use_cuda, error_message)) {
+          return false;
+        }
       }
       mlp_hidden.resize(mlp_gate.size());
       for (std::size_t i = 0; i < mlp_gate.size(); ++i) {

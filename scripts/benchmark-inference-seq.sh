@@ -14,6 +14,9 @@ PROMPT_TOKENS="198" # Default to single token prompt
 REPEAT_PENALTY=1.05
 PREFILL_ONLY=false
 MODE="gpu-f32"
+CPU_GGUF="models/gguf/Qwen3.5-0.8B-Q8_0.gguf"
+CPU_THREADS=0
+CPU_ISA="auto"
 CSV_OUT="benchmarks/qwen35x-inference-seq.csv"
 RUN_LABEL=""
 
@@ -38,6 +41,18 @@ while [[ $# -gt 0 ]]; do
       ;;
     --mode)
       MODE="$2"
+      shift 2
+      ;;
+    --cpu-gguf)
+      CPU_GGUF="$2"
+      shift 2
+      ;;
+    --cpu-threads)
+      CPU_THREADS="$2"
+      shift 2
+      ;;
+    --cpu-isa)
+      CPU_ISA="$2"
       shift 2
       ;;
     --csv-out)
@@ -84,6 +99,8 @@ RESOLVED_EXE="$EXECUTABLE"
 [[ "$RESOLVED_EXE" = /* ]] || RESOLVED_EXE="$REPO_ROOT/$RESOLVED_EXE"
 RESOLVED_MODEL_DIR="$HF_MODEL_DIR"
 [[ "$RESOLVED_MODEL_DIR" = /* ]] || RESOLVED_MODEL_DIR="$REPO_ROOT/$RESOLVED_MODEL_DIR"
+RESOLVED_CPU_GGUF="$CPU_GGUF"
+[[ "$RESOLVED_CPU_GGUF" = /* ]] || RESOLVED_CPU_GGUF="$REPO_ROOT/$RESOLVED_CPU_GGUF"
 RESOLVED_CSV_OUT="$CSV_OUT"
 [[ "$RESOLVED_CSV_OUT" = /* ]] || RESOLVED_CSV_OUT="$REPO_ROOT/$RESOLVED_CSV_OUT"
 BUILD_DIR="$REPO_ROOT/build"
@@ -116,6 +133,13 @@ run_once() {
     args+=("--infer-gpu" "--gpu-bf16")
   elif [ "$MODE" == "nvfp4" ]; then
     args+=("--infer-gpu" "--qwen35x-weight-precision" "nvfp4")
+  elif [ "$MODE" == "cpu-q8" ]; then
+    args+=(
+      "--infer-reference"
+      "--cpu-gguf" "$RESOLVED_CPU_GGUF"
+      "--cpu-threads" "$CPU_THREADS"
+      "--cpu-isa" "$CPU_ISA"
+    )
   else
     args+=("--infer-reference")
   fi
@@ -174,6 +198,8 @@ for run_index, p_path in enumerate(profiles, start=1):
             'run_label': '$RUN_LABEL',
             'run_index': run_index,
             'mode': '$MODE',
+            'cpu_threads': $CPU_THREADS,
+            'cpu_isa': '$CPU_ISA',
             'prompt_tokens': data.get('prompt_tokens', 0),
             'generated_tokens': data.get('generated_tokens', 0),
             'load_time_ms': data.get('load_time_ms', 0),

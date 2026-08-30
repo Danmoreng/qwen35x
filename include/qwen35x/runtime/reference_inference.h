@@ -1,6 +1,7 @@
 #pragma once
 
 #include "qwen35x/common/model_profile.h"
+#include "qwen35x/cpu/q8_0.h"
 #include "qwen35x/runtime/qwen35x_cuda_backend.h"
 #include "qwen35x/runtime/qwen35x_profile.h"
 
@@ -30,6 +31,7 @@ enum class Qwen35xPrefillMode {
 
 struct ReferenceInferenceOptions {
   std::string model_dir;
+  std::string cpu_gguf_path;
   std::vector<std::int32_t> prompt_tokens;
   int max_new_tokens = 1;
   int max_context = 4096;
@@ -43,6 +45,8 @@ struct ReferenceInferenceOptions {
   bool profile_cuda_sync = false;
   bool profile_qwen35x = false;
   bool prefill_only = false;
+  int cpu_threads = 0;
+  cpu::Q8_0Backend cpu_q8_backend = cpu::Q8_0Backend::auto_select;
   SamplingOptions sampling;
   std::vector<std::int32_t> stop_token_ids;
   std::vector<std::vector<std::int32_t>> stop_token_sequences;

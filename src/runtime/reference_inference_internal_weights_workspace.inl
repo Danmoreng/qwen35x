@@ -1,10 +1,22 @@
 namespace {
 
+struct CpuQ8Runtime {
+  std::unique_ptr<cpu::CpuExecutor> executor;
+  std::vector<cpu::Q8_0Block> quantized_input;
+};
+
 struct TensorData {
   std::vector<std::int64_t> shape;
   std::vector<float> data;
+  std::vector<cpu::Q8_0Block> q8_0_blocks;
+  cpu::Q8_0Backend q8_0_backend = cpu::Q8_0Backend::auto_select;
+  CpuQ8Runtime * q8_0_runtime = nullptr;
   cuda::CudaDeviceMatrixF32 device_matrix;
   bool has_device_matrix = false;
+
+  bool is_q8_0() const noexcept {
+    return !q8_0_blocks.empty();
+  }
 };
 
 struct FullAttentionWeights {
@@ -14,6 +26,7 @@ struct FullAttentionWeights {
   TensorData o_proj;
   TensorData q_norm;
   TensorData k_norm;
+  TensorData qkv_proj_cpu;
   cuda::CudaDeviceMatrixF32 qkv_proj_device;
   bool has_device_qkv_proj = false;
   cuda::CudaDeviceMatrixF32 kv_proj_device;
@@ -28,6 +41,7 @@ struct LinearAttentionWeights {
   TensorData in_proj_z;
   TensorData in_proj_b;
   TensorData in_proj_a;
+  TensorData in_proj_all_cpu;
   TensorData conv1d;
   TensorData out_proj;
   TensorData norm;
@@ -48,6 +62,7 @@ struct LayerWeights {
   TensorData mlp_gate;
   TensorData mlp_up;
   TensorData mlp_down;
+  TensorData mlp_gate_up_cpu;
   cuda::CudaDeviceMatrixF32 mlp_gate_up_device;
   bool has_device_mlp_gate_up = false;
   cuda::CudaDeviceBufferF32 input_layernorm_device;
@@ -61,6 +76,7 @@ struct LayerWeights {
 struct ModelWeights {
   TensorData embed_tokens;
   TensorData final_norm;
+  std::unique_ptr<CpuQ8Runtime> cpu_q8_runtime;
   cuda::CudaDeviceBufferF32 final_norm_device;
   bool has_device_final_norm = false;
   std::vector<LayerWeights> layers;
@@ -237,6 +253,7 @@ bool load_tensor_f32(
   }
   out.shape = std::move(tensor.shape);
   out.data = std::move(tensor.data);
+  out.q8_0_blocks.clear();
   return true;
 }
 
@@ -301,6 +318,166 @@ bool load_tensor_checked_conv1d(
   return true;
 }
 
+bool gguf_shape_matches(
+  const std::vector<std::uint64_t> & actual,
+  const std::initializer_list<std::int64_t> expected) {
+  if (actual.size() != expected.size()) {
+    return false;
+  }
+  std::size_t index = 0;
+  for (const std::int64_t dimension : expected) {
+    if (dimension < 0 || actual[index] != static_cast<std::uint64_t>(dimension)) {
+      return false;
+    }
+    ++index;
+  }
+  return true;
+}
+
+bool load_gguf_q8_0_checked(
+  const GgufReader & reader,
+  const std::string & tensor_name,
+  const std::int64_t rows,
+  const std::int64_t cols,
+  const cpu::Q8_0Backend backend,
+  CpuQ8Runtime * runtime,
+  TensorData & out,
+  std::string & error_message) {
+  const GgufTensorInfo * info = reader.find_tensor(tensor_name);
+  if (info == nullptr) {
+    error_message = "Required GGUF tensor '" + tensor_name + "' is missing.";
+    return false;
+  }
+  if (!info->is_q8_0()) {
+    error_message = "GGUF tensor '" + tensor_name + "' is not Q8_0.";
+    return false;
+  }
+  if (!gguf_shape_matches(info->shape, {rows, cols})) {
+    error_message = "GGUF tensor '" + tensor_name + "' shape mismatch.";
+    return false;
+  }
+
+  GgufTensorQ8_0 tensor;
+  if (!reader.read_q8_0_tensor(tensor_name, tensor, error_message)) {
+    return false;
+  }
+  out.shape = {rows, cols};
+  out.data.clear();
+  out.q8_0_blocks = std::move(tensor.blocks);
+  out.q8_0_backend = backend;
+  out.q8_0_runtime = runtime;
+  return true;
+}
+
+bool load_gguf_f32_checked(
+  const GgufReader & reader,
+  const std::string & tensor_name,
+  const std::initializer_list<std::int64_t> expected_shape,
+  const bool subtract_qwen_norm_offset,
+  TensorData & out,
+  std::string & error_message) {
+  const GgufTensorInfo * info = reader.find_tensor(tensor_name);
+  if (info == nullptr) {
+    error_message = "Required GGUF tensor '" + tensor_name + "' is missing.";
+    return false;
+  }
+  if (!info->is_f32()) {
+    error_message = "GGUF tensor '" + tensor_name + "' is not F32.";
+    return false;
+  }
+  if (!gguf_shape_matches(info->shape, expected_shape)) {
+    error_message = "GGUF tensor '" + tensor_name + "' shape mismatch.";
+    return false;
+  }
+
+  GgufTensorF32 tensor;
+  if (!reader.read_f32_tensor(tensor_name, tensor, error_message)) {
+    return false;
+  }
+  out.shape.clear();
+  out.shape.reserve(tensor.shape.size());
+  for (const std::uint64_t dimension : tensor.shape) {
+    out.shape.push_back(static_cast<std::int64_t>(dimension));
+  }
+  out.data = std::move(tensor.data);
+  out.q8_0_blocks.clear();
+  if (subtract_qwen_norm_offset) {
+    for (float & value : out.data) {
+      value -= 1.0f;
+    }
+  }
+  return true;
+}
+
+bool pack_q8_0_row_concat(
+  const std::initializer_list<TensorData *> parts,
+  TensorData & out,
+  std::string & error_message) {
+  if (parts.size() == 0) {
+    error_message = "Q8_0 packed tensor has no source tensors.";
+    return false;
+  }
+
+  std::int64_t cols = -1;
+  std::int64_t total_rows = 0;
+  cpu::Q8_0Backend backend = cpu::Q8_0Backend::auto_select;
+  CpuQ8Runtime * runtime = nullptr;
+  bool first = true;
+  std::size_t total_blocks = 0;
+  for (const TensorData * part : parts) {
+    if (part == nullptr || part->shape.size() != 2 || !part->is_q8_0()) {
+      error_message = "Q8_0 packed tensor expects non-empty 2D Q8_0 source tensors.";
+      return false;
+    }
+    if (first) {
+      cols = part->shape[1];
+      backend = part->q8_0_backend;
+      runtime = part->q8_0_runtime;
+      first = false;
+    } else if (part->shape[1] != cols || part->q8_0_backend != backend ||
+               part->q8_0_runtime != runtime) {
+      error_message = "Q8_0 packed tensor source tensors have incompatible layouts or runtimes.";
+      return false;
+    }
+    if (part->shape[0] <= 0 || total_rows > std::numeric_limits<std::int64_t>::max() - part->shape[0] ||
+        total_blocks > std::numeric_limits<std::size_t>::max() - part->q8_0_blocks.size()) {
+      error_message = "Q8_0 packed tensor dimensions overflow.";
+      return false;
+    }
+    total_rows += part->shape[0];
+    total_blocks += part->q8_0_blocks.size();
+  }
+  if (cols <= 0 || (cols % static_cast<std::int64_t>(cpu::q8_0_values_per_block)) != 0) {
+    error_message = "Q8_0 packed tensor has an invalid column count.";
+    return false;
+  }
+  const std::size_t expected_blocks =
+    static_cast<std::size_t>(total_rows) *
+    (static_cast<std::size_t>(cols) / cpu::q8_0_values_per_block);
+  if (total_blocks != expected_blocks) {
+    error_message = "Q8_0 packed tensor source storage size mismatch.";
+    return false;
+  }
+
+  out.shape = {total_rows, cols};
+  out.data.clear();
+  out.q8_0_blocks.clear();
+  out.q8_0_blocks.reserve(total_blocks);
+  out.q8_0_backend = backend;
+  out.q8_0_runtime = runtime;
+  for (const TensorData * part : parts) {
+    out.q8_0_blocks.insert(
+      out.q8_0_blocks.end(), part->q8_0_blocks.begin(), part->q8_0_blocks.end());
+  }
+
+  // The CPU GGUF path uses the packed tensors exclusively. Release the source
+  // storage so packing does not increase the resident model size.
+  for (TensorData * part : parts) {
+    std::vector<cpu::Q8_0Block>().swap(part->q8_0_blocks);
+  }
+  return true;
+}
+
 bool matvec_2d(
   const TensorData & w,
   const std::vector<float> & x,
@@ -320,6 +497,56 @@ bool matvec_2d(
       return false;
     }
     return cuda::run_matvec_f32(w.device_matrix, x, out, error_message);
+  }
+
+  if (w.is_q8_0()) {
+    if ((cols % static_cast<int>(cpu::q8_0_values_per_block)) != 0) {
+      error_message = "Q8_0 matvec column count is not divisible by 32.";
+      return false;
+    }
+    const std::size_t blocks_per_row =
+      static_cast<std::size_t>(cols) / cpu::q8_0_values_per_block;
+    const std::size_t expected_blocks = static_cast<std::size_t>(rows) * blocks_per_row;
+    if (w.q8_0_blocks.size() != expected_blocks) {
+      error_message = "Q8_0 matvec weight storage size mismatch.";
+      return false;
+    }
+
+    std::vector<cpu::Q8_0Block> local_quantized_input;
+    std::vector<cpu::Q8_0Block> * quantized_input = &local_quantized_input;
+    if (w.q8_0_runtime != nullptr) {
+      quantized_input = &w.q8_0_runtime->quantized_input;
+    }
+    quantized_input->resize(blocks_per_row);
+    cpu::q8_0_quantize(x.data(), quantized_input->data(), blocks_per_row, w.q8_0_backend);
+    out.resize(static_cast<std::size_t>(rows));
+    if (w.q8_0_runtime != nullptr && w.q8_0_runtime->executor != nullptr) {
+      const cpu::CpuExecutorStatus status = w.q8_0_runtime->executor->q8_0_matvec(
+        w.q8_0_blocks.data(),
+        quantized_input->data(),
+        out.data(),
+        static_cast<std::size_t>(rows),
+        blocks_per_row,
+        w.q8_0_backend);
+      if (status != cpu::CpuExecutorStatus::ok) {
+        error_message = std::string("Q8_0 CPU executor failed: ") + cpu::cpu_executor_status_name(status) + ".";
+        return false;
+      }
+    } else {
+      cpu::q8_0_matvec(
+        w.q8_0_blocks.data(),
+        quantized_input->data(),
+        out.data(),
+        static_cast<std::size_t>(rows),
+        blocks_per_row,
+        w.q8_0_backend);
+    }
+    return true;
+  }
+
+  if (w.data.size() != static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols)) {
+    error_message = "F32 matvec weight storage size mismatch.";
+    return false;
   }
 
   out.assign(static_cast<std::size_t>(rows), 0.0f);
@@ -478,7 +705,7 @@ bool build_runtime_dims(const ModelProfile & profile, RuntimeDims & dims, std::s
   return true;
 }
 
-bool load_model_weights(
+bool load_model_weights_from_safetensors(
   const std::string & model_dir,
   const RuntimeDims & dims,
   const ModelProfile & profile,
@@ -550,6 +777,222 @@ bool load_model_weights(
   }
 
   return true;
+}
+
+bool load_model_weights_from_q8_0_gguf(
+  const std::string & gguf_path,
+  const RuntimeDims & dims,
+  const ModelProfile & profile,
+  const cpu::Q8_0Backend backend,
+  const int cpu_threads,
+  ModelWeights & weights,
+  std::string & error_message) {
+  if (dims.linear_num_k_heads != dims.linear_num_v_heads) {
+    error_message =
+      "The direct Q8_0 GGUF path currently requires equal DeltaNet key/value head counts; "
+      "inverse GGML V-head permutation is not implemented.";
+    return false;
+  }
+
+  GgufReader reader;
+  if (!reader.open(gguf_path, error_message)) {
+    return false;
+  }
+
+  cpu::CpuExecutorConfig executor_config;
+  executor_config.thread_count = static_cast<std::size_t>(cpu_threads);
+  executor_config.min_parallel_rows = 256;
+  std::error_code executor_error;
+  weights.cpu_q8_runtime = std::make_unique<CpuQ8Runtime>();
+  weights.cpu_q8_runtime->executor = cpu::CpuExecutor::create(executor_config, executor_error);
+  if (!weights.cpu_q8_runtime->executor) {
+    error_message = "Could not create persistent CPU executor: " + executor_error.message();
+    return false;
+  }
+  CpuQ8Runtime * const runtime = weights.cpu_q8_runtime.get();
+  if (!load_gguf_q8_0_checked(
+        reader,
+        "token_embd.weight",
+        dims.vocab_size,
+        dims.hidden,
+        backend,
+        runtime,
+        weights.embed_tokens,
+        error_message) ||
+      !load_gguf_f32_checked(
+        reader,
+        "output_norm.weight",
+        {dims.hidden},
+        true,
+        weights.final_norm,
+        error_message)) {
+    return false;
+  }
+
+  weights.layers.resize(static_cast<std::size_t>(dims.n_layers));
+  const int full_q_out = dims.n_heads * dims.head_dim * 2;
+  const int full_kv_out = dims.n_kv_heads * dims.head_dim;
+  const int full_o_in = dims.n_heads * dims.head_dim;
+
+  for (int il = 0; il < dims.n_layers; ++il) {
+    LayerWeights & layer = weights.layers[static_cast<std::size_t>(il)];
+    const std::string base = "blk." + std::to_string(il) + ".";
+    layer.is_linear = profile.fingerprint.attention_schedule[static_cast<std::size_t>(il)] == AttentionBlock::linear;
+
+    if (!load_gguf_f32_checked(
+          reader, base + "attn_norm.weight", {dims.hidden}, true, layer.input_layernorm, error_message) ||
+        !load_gguf_f32_checked(
+          reader,
+          base + "post_attention_norm.weight",
+          {dims.hidden},
+          true,
+          layer.post_attention_layernorm,
+          error_message) ||
+        !load_gguf_q8_0_checked(
+          reader, base + "ffn_gate.weight", dims.intermediate, dims.hidden, backend, runtime, layer.mlp_gate, error_message) ||
+        !load_gguf_q8_0_checked(
+          reader, base + "ffn_up.weight", dims.intermediate, dims.hidden, backend, runtime, layer.mlp_up, error_message) ||
+        !load_gguf_q8_0_checked(
+          reader, base + "ffn_down.weight", dims.hidden, dims.intermediate, backend, runtime, layer.mlp_down, error_message)) {
+      return false;
+    }
+
+    if (layer.is_linear) {
+      if (!load_gguf_q8_0_checked(
+            reader,
+            base + "attn_qkv.weight",
+            dims.linear_conv_channels,
+            dims.hidden,
+            backend,
+            runtime,
+            layer.linear.in_proj_qkv,
+            error_message) ||
+          !load_gguf_q8_0_checked(
+            reader,
+            base + "attn_gate.weight",
+            dims.linear_v_dim,
+            dims.hidden,
+            backend,
+            runtime,
+            layer.linear.in_proj_z,
+            error_message) ||
+          !load_gguf_q8_0_checked(
+            reader,
+            base + "ssm_beta.weight",
+            dims.linear_num_v_heads,
+            dims.hidden,
+            backend,
+            runtime,
+            layer.linear.in_proj_b,
+            error_message) ||
+          !load_gguf_q8_0_checked(
+            reader,
+            base + "ssm_alpha.weight",
+            dims.linear_num_v_heads,
+            dims.hidden,
+            backend,
+            runtime,
+            layer.linear.in_proj_a,
+            error_message) ||
+          !load_gguf_f32_checked(
+            reader,
+            base + "ssm_conv1d.weight",
+            {dims.linear_conv_channels, dims.linear_kernel},
+            false,
+            layer.linear.conv1d,
+            error_message) ||
+          !load_gguf_q8_0_checked(
+            reader,
+            base + "ssm_out.weight",
+            dims.hidden,
+            dims.linear_v_dim,
+            backend,
+            runtime,
+            layer.linear.out_proj,
+            error_message) ||
+          !load_gguf_f32_checked(
+            reader,
+            base + "ssm_norm.weight",
+            {dims.linear_head_v_dim},
+            false,
+            layer.linear.norm,
+            error_message) ||
+          !load_gguf_f32_checked(
+            reader,
+            base + "ssm_a",
+            {dims.linear_num_v_heads},
+            false,
+            layer.linear.a_log,
+            error_message) ||
+          !load_gguf_f32_checked(
+            reader,
+            base + "ssm_dt.bias",
+            {dims.linear_num_v_heads},
+            false,
+            layer.linear.dt_bias,
+            error_message)) {
+        return false;
+      }
+      // llama.cpp's converter stores -exp(A_log) directly as ssm_a.
+      layer.linear.ssm_a = layer.linear.a_log.data;
+    } else {
+      if (!load_gguf_q8_0_checked(
+            reader, base + "attn_q.weight", full_q_out, dims.hidden, backend, runtime, layer.full.q_proj, error_message) ||
+          !load_gguf_q8_0_checked(
+            reader, base + "attn_k.weight", full_kv_out, dims.hidden, backend, runtime, layer.full.k_proj, error_message) ||
+          !load_gguf_q8_0_checked(
+            reader, base + "attn_v.weight", full_kv_out, dims.hidden, backend, runtime, layer.full.v_proj, error_message) ||
+          !load_gguf_q8_0_checked(
+            reader, base + "attn_output.weight", dims.hidden, full_o_in, backend, runtime, layer.full.o_proj, error_message) ||
+          !load_gguf_f32_checked(
+            reader, base + "attn_q_norm.weight", {dims.head_dim}, true, layer.full.q_norm, error_message) ||
+          !load_gguf_f32_checked(
+            reader, base + "attn_k_norm.weight", {dims.head_dim}, true, layer.full.k_norm, error_message)) {
+        return false;
+      }
+    }
+
+    if (!pack_q8_0_row_concat(
+          {&layer.mlp_gate, &layer.mlp_up}, layer.mlp_gate_up_cpu, error_message)) {
+      return false;
+    }
+    if (layer.is_linear) {
+      if (!pack_q8_0_row_concat(
+            {
+              &layer.linear.in_proj_qkv,
+              &layer.linear.in_proj_z,
+              &layer.linear.in_proj_b,
+              &layer.linear.in_proj_a,
+            },
+            layer.linear.in_proj_all_cpu,
+            error_message)) {
+        return false;
+      }
+    } else if (!pack_q8_0_row_concat(
+                 {&layer.full.q_proj, &layer.full.k_proj, &layer.full.v_proj},
+                 layer.full.qkv_proj_cpu,
+                 error_message)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool load_model_weights(
+  const std::string & model_dir,
+  const std::string & cpu_gguf_path,
+  const RuntimeDims & dims,
+  const ModelProfile & profile,
+  const cpu::Q8_0Backend backend,
+  const int cpu_threads,
+  ModelWeights & weights,
+  std::string & error_message) {
+  if (!cpu_gguf_path.empty()) {
+    return load_model_weights_from_q8_0_gguf(
+      cpu_gguf_path, dims, profile, backend, cpu_threads, weights, error_message);
+  }
+  return load_model_weights_from_safetensors(model_dir, dims, profile, weights, error_message);
 }
 
 bool upload_tensor_2d_to_cuda(
@@ -948,4 +1391,3 @@ cuda::CudaDeviceBufferF32 buffer_slice_f32(
   out.count = count;
   return out;
 }
-

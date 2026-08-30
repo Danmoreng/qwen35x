@@ -287,6 +287,7 @@ bool run_nvfp4_custom_projection_benchmark(
   int,
   int,
   int,
+  int,
   double &,
   double &,
   std::string & error_message) {
