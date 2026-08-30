@@ -17,6 +17,10 @@ if (QWEN35X_CUDA_ARCHITECTURES MATCHES "(^|[; ,])120[af]($|[; ,])")
   set(QWEN35X_ENABLE_SM120_MXF4NVF4 ON)
 endif ()
 
+# BF16 WMMA is only available on Ampere and newer. Keep the scalar BF16
+# storage/FP32-compute kernels available for older CUDA GPUs such as Pascal.
+set(QWEN35X_ENABLE_BF16_WMMA OFF)
+
 include(CheckLanguage)
 if (QWEN35X_ENABLE_CUDA)
   check_language(CUDA)
@@ -24,6 +28,14 @@ if (QWEN35X_ENABLE_CUDA)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
     set(CMAKE_CUDA_ARCHITECTURES "${QWEN35X_CUDA_ARCHITECTURES}" CACHE STRING "CUDA architectures" FORCE)
+    set(QWEN35X_EFFECTIVE_CUDA_ARCHITECTURES "${QWEN35X_CUDA_ARCHITECTURES}")
+    if (QWEN35X_CUDA_ARCHITECTURES STREQUAL "native" AND CMAKE_CUDA_ARCHITECTURES_NATIVE)
+      set(QWEN35X_EFFECTIVE_CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES_NATIVE}")
+    endif ()
+    if (QWEN35X_EFFECTIVE_CUDA_ARCHITECTURES MATCHES
+        "(^|[; ,])(8[0-9]|9[0-9]|1[0-9][0-9])[af]?(-real|-virtual)?($|[; ,])")
+      set(QWEN35X_ENABLE_BF16_WMMA ON)
+    endif ()
   else ()
     message(WARNING "QWEN35X_ENABLE_CUDA is ON but no CUDA compiler was found. Building CPU-only scaffold.")
   endif ()
@@ -69,6 +81,7 @@ if (CMAKE_CUDA_COMPILER)
         BLOCK_SIZE=${QWEN35X_KERNEL_BENCH_BLOCK_SIZE}
         NUM_BLOCKS=${QWEN35X_KERNEL_BENCH_NUM_BLOCKS}
         ${variant_define}=1
+        $<$<BOOL:${QWEN35X_ENABLE_BF16_WMMA}>:QWEN35X_ENABLE_BF16_WMMA=1>
         $<$<BOOL:${QWEN35X_ENABLE_SM120_MXF4NVF4}>:QWEN35X_ENABLE_SM120_MXF4NVF4=1>
         QWEN35X_CUDA_VARIANT_${variant_name}=1
         LAYER_TYPE=LAYER_TYPE_${variant_name}

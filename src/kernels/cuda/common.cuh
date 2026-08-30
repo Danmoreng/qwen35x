@@ -48,10 +48,14 @@ __device__ __forceinline__ float pf_silu(float x) {
 }
 
 __device__ __forceinline__ uint4 load_128bit(const uint4 *ptr) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     uint4 out;
     asm volatile("ld.global.L1::no_allocate.v4.b32 {%0, %1, %2, %3}, [%4];"
                  : "=r"(out.x), "=r"(out.y), "=r"(out.z), "=r"(out.w) : "l"(ptr));
     return out;
+#else
+    return *ptr;
+#endif
 }
 
 // BF16 dot product: 8 bf16 weights x 8 bf16 activations -> f32

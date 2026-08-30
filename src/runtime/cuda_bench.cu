@@ -950,6 +950,7 @@ bool run_cublaslt_fp4_projection(
   float * d_output,
   double * elapsed_ms,
   std::string & error_message) {
+#if CUDART_VERSION >= 12080
   struct Plan {
     cublasLtHandle_t handle = nullptr;
     cublasLtMatmulDesc_t op_desc = nullptr;
@@ -1051,6 +1052,19 @@ bool run_cublaslt_fp4_projection(
   }
   cleanup_events();
   return true;
+#else
+  (void)d_input;
+  (void)d_input_scales;
+  (void)d_weights;
+  (void)d_weight_scales;
+  (void)weight_scale_2;
+  (void)rows;
+  (void)cols;
+  (void)d_output;
+  (void)elapsed_ms;
+  error_message = "cuBLASLt NVFP4 block-scale matmul requires CUDA 12.8 or newer.";
+  return false;
+#endif
 }
 
 bool run_nvfp4_cublaslt_prefill_projection_device(
@@ -1065,6 +1079,7 @@ bool run_nvfp4_cublaslt_prefill_projection_device(
   float * d_output,
   double * elapsed_ms,
   std::string & error_message) {
+#if CUDART_VERSION >= 12080
   struct Plan {
     cublasLtHandle_t handle = nullptr;
     cublasLtMatmulDesc_t op_desc = nullptr;
@@ -1164,6 +1179,20 @@ bool run_nvfp4_cublaslt_prefill_projection_device(
   }
   cleanup_events();
   return true;
+#else
+  (void)d_input;
+  (void)d_input_scales;
+  (void)d_weights;
+  (void)d_weight_scales;
+  (void)weight_scale_2;
+  (void)sequence_length;
+  (void)rows;
+  (void)cols;
+  (void)d_output;
+  (void)elapsed_ms;
+  error_message = "cuBLASLt NVFP4 prefill requires CUDA 12.8 or newer.";
+  return false;
+#endif
 }
 
 int round_up_to_multiple(const int value, const int multiple) {

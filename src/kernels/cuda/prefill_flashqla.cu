@@ -11,9 +11,11 @@
 #include "variant.cuh"
 
 #include <cstddef>
+#if defined(QWEN35X_ENABLE_BF16_WMMA)
 #include <mma.h>
 
 namespace wmma = nvcuda::wmma;
+#endif
 
 __global__ void __launch_bounds__(32, 2)
 pf_deltanet_recurrence_flashqla64(
@@ -470,6 +472,7 @@ pf_deltanet_flashqla64_cuda_ref(
     }
 }
 
+#if defined(QWEN35X_ENABLE_BF16_WMMA)
 static __global__ void __launch_bounds__(512, 1)
 pf_deltanet_flashqla64_tc_prepare(
     const float *qkv_f32, const float *beta_buf, const float *alpha_buf,
@@ -1075,6 +1078,7 @@ pf_deltanet_flashqla64_tc_state_update_chunk(
         state_col[d] = new_state;
     }
 }
+#endif
 
 static constexpr std::size_t kFlashqla64TiledSharedBytes =
     static_cast<std::size_t>(
@@ -1094,6 +1098,7 @@ static constexpr std::size_t kFlashqla64CudaRefSharedBytes =
         64 +
         64) * sizeof(float);
 
+#if defined(QWEN35X_ENABLE_BF16_WMMA)
 static constexpr std::size_t kFlashqla64TcTiledSharedBytes =
     static_cast<std::size_t>(
         64 * 64 +
@@ -1103,6 +1108,7 @@ static constexpr std::size_t kFlashqla64TcTiledSharedBytes =
         64 +
         64 * 32) * sizeof(float) +
     static_cast<std::size_t>(2 * 64 * DN_KEY) * sizeof(__nv_bfloat16);
+#endif
 
 void launch_pf_deltanet_recurrence_flashqla64(
     const float *qkv_f32,
@@ -1174,6 +1180,7 @@ void launch_pf_deltanet_flashqla64_tc_prepare(
     void *workspace,
     cudaStream_t stream)
 {
+#if defined(QWEN35X_ENABLE_BF16_WMMA)
     cudaFuncSetAttribute(
         pf_deltanet_flashqla64_tc_prepare,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -1181,6 +1188,14 @@ void launch_pf_deltanet_flashqla64_tc_prepare(
     const int num_chunks = (S + 63) / 64;
     pf_deltanet_flashqla64_tc_prepare<<<dim3(DN_HEADS, DN_VAL_GROUPS, num_chunks), 512, kFlashqla64TcTiledSharedBytes, stream>>>(
         qkv_f32, beta_buf, alpha_buf, S, num_chunks, workspace);
+#else
+    (void)qkv_f32;
+    (void)beta_buf;
+    (void)alpha_buf;
+    (void)S;
+    (void)workspace;
+    (void)stream;
+#endif
 }
 
 void launch_pf_deltanet_recurrence_flashqla64_tc_consume(
@@ -1193,6 +1208,7 @@ void launch_pf_deltanet_recurrence_flashqla64_tc_consume(
     const void *workspace,
     cudaStream_t stream)
 {
+#if defined(QWEN35X_ENABLE_BF16_WMMA)
     cudaFuncSetAttribute(
         pf_deltanet_recurrence_flashqla64_tc_tiled,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -1200,6 +1216,11 @@ void launch_pf_deltanet_recurrence_flashqla64_tc_consume(
     const int num_chunks = (S + 63) / 64;
     pf_deltanet_recurrence_flashqla64_tc_tiled<<<dim3(DN_HEADS, (DN_VAL + 31) / 32), 1024, kFlashqla64TcTiledSharedBytes, stream>>>(
         qkv_f32, beta_buf, alpha_buf, state, output, S, num_chunks, workspace);
+#else
+    (void)workspace;
+    launch_pf_deltanet_recurrence_flashqla64_tiled(
+        qkv_f32, beta_buf, alpha_buf, state, output, S, stream);
+#endif
 }
 
 void launch_pf_deltanet_recurrence_flashqla64_tc_consume_split(
@@ -1212,6 +1233,7 @@ void launch_pf_deltanet_recurrence_flashqla64_tc_consume_split(
     const void *workspace,
     cudaStream_t stream)
 {
+#if defined(QWEN35X_ENABLE_BF16_WMMA)
     (void)beta_buf;
     (void)alpha_buf;
     cudaFuncSetAttribute(
@@ -1225,4 +1247,9 @@ void launch_pf_deltanet_recurrence_flashqla64_tc_consume_split(
         pf_deltanet_flashqla64_tc_state_update_chunk<<<dim3(DN_HEADS, (DN_VAL + 31) / 32), 1024, 0, stream>>>(
             qkv_f32, state, S, num_chunks, chunk_id, workspace);
     }
+#else
+    (void)workspace;
+    launch_pf_deltanet_recurrence_flashqla64_tiled(
+        qkv_f32, beta_buf, alpha_buf, state, output, S, stream);
+#endif
 }

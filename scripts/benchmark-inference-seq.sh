@@ -14,6 +14,8 @@ PROMPT_TOKENS="198" # Default to single token prompt
 REPEAT_PENALTY=1.05
 PREFILL_ONLY=false
 MODE="gpu-f32"
+CSV_OUT="benchmarks/qwen35x-inference-seq.csv"
+RUN_LABEL=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -36,6 +38,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --mode)
       MODE="$2"
+      shift 2
+      ;;
+    --csv-out)
+      CSV_OUT="$2"
+      shift 2
+      ;;
+    --run-label)
+      RUN_LABEL="$2"
       shift 2
       ;;
     --max-new-tokens)
@@ -74,9 +84,12 @@ RESOLVED_EXE="$EXECUTABLE"
 [[ "$RESOLVED_EXE" = /* ]] || RESOLVED_EXE="$REPO_ROOT/$RESOLVED_EXE"
 RESOLVED_MODEL_DIR="$HF_MODEL_DIR"
 [[ "$RESOLVED_MODEL_DIR" = /* ]] || RESOLVED_MODEL_DIR="$REPO_ROOT/$RESOLVED_MODEL_DIR"
+RESOLVED_CSV_OUT="$CSV_OUT"
+[[ "$RESOLVED_CSV_OUT" = /* ]] || RESOLVED_CSV_OUT="$REPO_ROOT/$RESOLVED_CSV_OUT"
 BUILD_DIR="$REPO_ROOT/build"
 BENCH_DIR="$BUILD_DIR/bench-profiles"
 mkdir -p "$BENCH_DIR"
+mkdir -p "$(dirname "$RESOLVED_CSV_OUT")"
 
 echo "Starting benchmark: mode=$MODE, runs=$RUNS, warmup=$WARMUP_RUNS, max_new_tokens=$MAX_NEW_TOKENS, max_context=$MAX_CONTEXT"
 
@@ -140,6 +153,7 @@ python3 - <<EOF
 import json
 import sys
 import os
+import csv
 
 profiles = [ "$(echo ${PROFILES[@]} | sed 's/ /", "/g')" ]
 if not profiles:
@@ -147,14 +161,35 @@ if not profiles:
 
 prefill_tps_list = []
 decode_tps_list = []
+rows = []
 
-for p_path in profiles:
+for run_index, p_path in enumerate(profiles, start=1):
     if not p_path: continue
     if not os.path.exists(p_path): continue
     with open(p_path, 'r') as f:
         data = json.load(f)
         prefill_tps_list.append(data.get('prefill_tokens_per_second', 0))
         decode_tps_list.append(data.get('tokens_per_second', 0))
+        rows.append({
+            'run_label': '$RUN_LABEL',
+            'run_index': run_index,
+            'mode': '$MODE',
+            'prompt_tokens': data.get('prompt_tokens', 0),
+            'generated_tokens': data.get('generated_tokens', 0),
+            'load_time_ms': data.get('load_time_ms', 0),
+            'prefill_time_ms': data.get('prefill_time_ms', 0),
+            'prefill_tokens_per_second': data.get('prefill_tokens_per_second', 0),
+            'decode_time_ms': data.get('decode_time_ms', 0),
+            'tokens_per_second': data.get('tokens_per_second', 0),
+            'max_new_tokens': $MAX_NEW_TOKENS,
+            'max_context': $MAX_CONTEXT,
+        })
+
+if rows:
+    with open('$RESOLVED_CSV_OUT', 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
 
 def avg(l):
     return sum(l) / len(l) if l else 0
@@ -163,4 +198,5 @@ print("\nBenchmark Results Summary:")
 print(f"  Prefill tokens/s: {avg(prefill_tps_list):.2f} (avg of {len(prefill_tps_list)} runs)")
 if not $PY_PREFILL_ONLY:
     print(f"  Generation tokens/s: {avg(decode_tps_list):.2f} (avg of {len(decode_tps_list)} runs)")
+print("  CSV: $RESOLVED_CSV_OUT")
 EOF
