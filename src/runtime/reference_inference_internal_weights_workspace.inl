@@ -694,15 +694,9 @@ void rms_norm_qwen3next(
   const TensorData & weight,
   const float eps,
   std::vector<float> & out) {
-  float sq_sum = 0.0f;
-  for (const float v : x) {
-    sq_sum += v * v;
-  }
-  const float inv = 1.0f / std::sqrt(sq_sum / static_cast<float>(x.size()) + eps);
   out.resize(x.size());
-  for (std::size_t i = 0; i < x.size(); ++i) {
-    out[i] = x[i] * inv * (1.0f + weight.data[i]);
-  }
+  cpu::rms_norm_f32(
+    x.data(), weight.data.data(), out.data(), 1, x.size(), eps, 1.0F);
 }
 
 void rms_norm_per_head_qwen3next(
@@ -713,19 +707,9 @@ void rms_norm_per_head_qwen3next(
   const float eps,
   std::vector<float> & out) {
   out.resize(x.size());
-  for (int h = 0; h < num_heads; ++h) {
-    const std::size_t base = static_cast<std::size_t>(h) * static_cast<std::size_t>(head_dim);
-    float sq_sum = 0.0f;
-    for (int d = 0; d < head_dim; ++d) {
-      const float v = x[base + static_cast<std::size_t>(d)];
-      sq_sum += v * v;
-    }
-    const float inv = 1.0f / std::sqrt(sq_sum / static_cast<float>(head_dim) + eps);
-    for (int d = 0; d < head_dim; ++d) {
-      out[base + static_cast<std::size_t>(d)] = x[base + static_cast<std::size_t>(d)] * inv *
-                                                (1.0f + weight.data[static_cast<std::size_t>(d)]);
-    }
-  }
+  cpu::rms_norm_f32(
+    x.data(), weight.data.data(), out.data(), static_cast<std::size_t>(num_heads),
+    static_cast<std::size_t>(head_dim), eps, 1.0F);
 }
 
 void l2_norm_per_head(

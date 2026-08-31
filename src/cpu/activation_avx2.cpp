@@ -9,6 +9,15 @@ namespace qwen35x::cpu::detail {
 
 namespace {
 
+[[nodiscard]] float horizontal_sum_f32(const __m256 value) noexcept {
+  const __m128 low = _mm256_castps256_ps128(value);
+  const __m128 high = _mm256_extractf128_ps(value, 1);
+  __m128 sum = _mm_add_ps(low, high);
+  sum = _mm_hadd_ps(sum, sum);
+  sum = _mm_hadd_ps(sum, sum);
+  return _mm_cvtss_f32(sum);
+}
+
 [[nodiscard]] __m256 exp_f32_avx2(__m256 value) noexcept {
   value = _mm256_min_ps(value, _mm256_set1_ps(88.3762626647949F));
   value = _mm256_max_ps(value, _mm256_set1_ps(-88.3762626647949F));
@@ -33,6 +42,56 @@ namespace {
 }
 
 } // namespace
+
+void rms_norm_f32_avx2(
+  const float * input,
+  const float * weight,
+  float * output,
+  const std::size_t row_count,
+  const std::size_t width,
+  const float eps,
+  const float weight_offset) noexcept {
+  const __m256 offset = _mm256_set1_ps(weight_offset);
+  for (std::size_t row = 0; row < row_count; ++row) {
+    const float * x = input + row * width;
+    float * y = output + row * width;
+    __m256 sum0 = _mm256_setzero_ps();
+    __m256 sum1 = _mm256_setzero_ps();
+    __m256 sum2 = _mm256_setzero_ps();
+    __m256 sum3 = _mm256_setzero_ps();
+    std::size_t column = 0;
+    for (; column + 32 <= width; column += 32) {
+      const __m256 x0 = _mm256_loadu_ps(x + column);
+      const __m256 x1 = _mm256_loadu_ps(x + column + 8);
+      const __m256 x2 = _mm256_loadu_ps(x + column + 16);
+      const __m256 x3 = _mm256_loadu_ps(x + column + 24);
+      sum0 = _mm256_fmadd_ps(x0, x0, sum0);
+      sum1 = _mm256_fmadd_ps(x1, x1, sum1);
+      sum2 = _mm256_fmadd_ps(x2, x2, sum2);
+      sum3 = _mm256_fmadd_ps(x3, x3, sum3);
+    }
+    sum0 = _mm256_add_ps(sum0, sum1);
+    sum2 = _mm256_add_ps(sum2, sum3);
+    float squared_sum = horizontal_sum_f32(_mm256_add_ps(sum0, sum2));
+    for (; column < width; ++column) {
+      squared_sum += x[column] * x[column];
+    }
+    const float inverse_scalar = 1.0F /
+      std::sqrt(squared_sum / static_cast<float>(width) + eps);
+    const __m256 inverse = _mm256_set1_ps(inverse_scalar);
+    column = 0;
+    for (; column + 8 <= width; column += 8) {
+      _mm256_storeu_ps(
+        y + column,
+        _mm256_mul_ps(
+          _mm256_mul_ps(_mm256_loadu_ps(x + column), inverse),
+          _mm256_add_ps(_mm256_loadu_ps(weight + column), offset)));
+    }
+    for (; column < width; ++column) {
+      y[column] = x[column] * inverse_scalar * (weight[column] + weight_offset);
+    }
+  }
+}
 
 void silu_f32_avx2(
   const float * input,

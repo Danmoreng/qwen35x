@@ -114,6 +114,32 @@ bool test_silu_mul(const Q8_0Backend backend) {
   return ok;
 }
 
+bool test_rms_norm(const Q8_0Backend backend) {
+  constexpr std::size_t rows = 3;
+  constexpr std::size_t width = 35;
+  std::array<float, rows * width> input{};
+  std::array<float, width> weight{};
+  for (std::size_t index = 0; index < input.size(); ++index) {
+    input[index] = std::sin(static_cast<float>(index) * 0.17F) * 3.0F;
+  }
+  for (std::size_t index = 0; index < weight.size(); ++index) {
+    weight[index] = std::cos(static_cast<float>(index) * 0.11F) * 0.25F;
+  }
+  std::array<float, rows * width> expected{};
+  std::array<float, rows * width> actual{};
+  qwen35x::cpu::rms_norm_f32(
+    input.data(), weight.data(), expected.data(), rows, width, 1.0e-6F, 1.0F,
+    Q8_0Backend::scalar);
+  qwen35x::cpu::rms_norm_f32(
+    input.data(), weight.data(), actual.data(), rows, width, 1.0e-6F, 1.0F,
+    backend);
+  bool ok = true;
+  for (std::size_t index = 0; index < actual.size(); ++index) {
+    ok = expect(near(expected[index], actual[index]), "RMS norm mismatch") && ok;
+  }
+  return ok;
+}
+
 bool test_backend(const Q8_0Backend backend) {
   constexpr std::size_t blocks = 5;
   constexpr std::size_t rows = 4;
@@ -222,6 +248,7 @@ bool test_backend(const Q8_0Backend backend) {
 int main() {
   bool ok = test_known_layout() && test_zero_block() && test_empty_ranges();
   ok = test_silu_mul(Q8_0Backend::auto_select) && ok;
+  ok = test_rms_norm(Q8_0Backend::auto_select) && ok;
   ok = test_backend(Q8_0Backend::scalar) && ok;
   ok = test_backend(Q8_0Backend::auto_select) && ok;
 

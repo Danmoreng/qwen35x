@@ -6,6 +6,18 @@
 
 namespace qwen35x::cpu {
 
+// Applies RMS normalization to row_count rows. The width-element weight is
+// shared by all rows and weight_offset supports Qwen's (1 + weight) form.
+void rms_norm_f32(
+  const float * input,
+  const float * weight,
+  float * output,
+  std::size_t row_count,
+  std::size_t width,
+  float eps,
+  float weight_offset,
+  Q8_0Backend backend = Q8_0Backend::auto_select) noexcept;
+
 void silu_f32(
   const float * input,
   float * output,

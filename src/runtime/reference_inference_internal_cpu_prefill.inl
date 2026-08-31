@@ -8,18 +8,9 @@ void rms_norm_qwen3next_batch(
   const float eps,
   std::vector<float> & output) {
   output.resize(input.size());
-  for (std::size_t token = 0; token < batch_size; ++token) {
-    const float * x = input.data() + token * width;
-    float * y = output.data() + token * width;
-    float sq_sum = 0.0F;
-    for (std::size_t column = 0; column < width; ++column) {
-      sq_sum += x[column] * x[column];
-    }
-    const float inv = 1.0F / std::sqrt(sq_sum / static_cast<float>(width) + eps);
-    for (std::size_t column = 0; column < width; ++column) {
-      y[column] = x[column] * inv * (1.0F + weight.data[column]);
-    }
-  }
+  cpu::rms_norm_f32(
+    input.data(), weight.data.data(), output.data(), batch_size, width,
+    eps, 1.0F);
 }
 
 void apply_rope_from_tables_inplace(
