@@ -174,3 +174,18 @@ conversions were byte-identical with SHA-256
 `ac3018478e4b0398152870257b23e071464ee503750f39e02708521079abfef9`.
 The artifact is intentionally ignored by Git; only its converter, ABI, tests,
 and reproducibility record belong in the repository.
+
+The first correctness-first runtime integration reuses the existing packed
+Q4×Q8 projection kernels and performs H128 activation transforms in the portable
+scalar implementation. On the six-core i7-8750H, three runs after one warmup
+gave 252.01 tokens/s for prefill-256 and 59.29 tokens/s for 128-token decode.
+The same build and run order gave 319.92 and 62.82 tokens/s respectively for
+the existing Q4_0 artifact. Thus the initial transform costs 21.2% of prefill
+throughput and 5.6% of decode throughput; this is a correctness baseline, not a
+performance acceptance. An AVX2 transform and more aggressive transform reuse
+are the next optimization targets.
+
+On the deliberately small two-position evaluator smoke sample, BF16 versus
+Q4_H128 measured mean KL 1.96881, compared with 1.96188 for the prior Q4_0
+sample. This is statistically insufficient to accept or reject the format and
+does not replace the held-out transcript suite.

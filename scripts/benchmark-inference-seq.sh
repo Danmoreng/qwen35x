@@ -17,6 +17,7 @@ REPEAT_PENALTY=1.05
 PREFILL_ONLY=false
 MODE="gpu-f32"
 CPU_GGUF="models/gguf/Qwen3.5-0.8B-Q8_0.gguf"
+CPU_Q4_H128="models/qwen3.5-0.8b/model-q4-h128.q35h"
 CPU_THREADS=0
 CPU_ISA="auto"
 CPU_MODEL_SESSION_REPLAYS=0
@@ -51,6 +52,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --cpu-gguf)
       CPU_GGUF="$2"
+      shift 2
+      ;;
+    --cpu-q4-h128)
+      CPU_Q4_H128="$2"
       shift 2
       ;;
     --cpu-threads)
@@ -142,6 +147,8 @@ RESOLVED_MODEL_DIR="$HF_MODEL_DIR"
 [[ "$RESOLVED_MODEL_DIR" = /* ]] || RESOLVED_MODEL_DIR="$REPO_ROOT/$RESOLVED_MODEL_DIR"
 RESOLVED_CPU_GGUF="$CPU_GGUF"
 [[ "$RESOLVED_CPU_GGUF" = /* ]] || RESOLVED_CPU_GGUF="$REPO_ROOT/$RESOLVED_CPU_GGUF"
+RESOLVED_CPU_Q4_H128="$CPU_Q4_H128"
+[[ "$RESOLVED_CPU_Q4_H128" = /* ]] || RESOLVED_CPU_Q4_H128="$REPO_ROOT/$RESOLVED_CPU_Q4_H128"
 RESOLVED_CSV_OUT="$CSV_OUT"
 [[ "$RESOLVED_CSV_OUT" = /* ]] || RESOLVED_CSV_OUT="$REPO_ROOT/$RESOLVED_CSV_OUT"
 BUILD_DIR="$REPO_ROOT/build"
@@ -179,6 +186,13 @@ run_once() {
     args+=(
       "--infer-reference"
       "--cpu-gguf" "$RESOLVED_CPU_GGUF"
+      "--cpu-threads" "$CPU_THREADS"
+      "--cpu-isa" "$CPU_ISA"
+    )
+  elif [ "$MODE" == "cpu-q4-h128" ]; then
+    args+=(
+      "--infer-reference"
+      "--cpu-q4-h128" "$RESOLVED_CPU_Q4_H128"
       "--cpu-threads" "$CPU_THREADS"
       "--cpu-isa" "$CPU_ISA"
     )

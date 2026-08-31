@@ -98,6 +98,7 @@ private:
 struct ReferenceInferenceOptions {
   std::string model_dir;
   std::string cpu_gguf_path;
+  std::string cpu_q4_h128_path;
   std::vector<std::int32_t> prompt_tokens;
   int max_new_tokens = 1;
   int max_context = 4096;

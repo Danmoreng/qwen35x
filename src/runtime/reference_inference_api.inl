@@ -62,6 +62,7 @@ bool ensure_cpu_model_session_locked(
   if (!load_model_weights(
         options.model_dir,
         options.cpu_gguf_path,
+        options.cpu_q4_h128_path,
         dims,
         profile,
         options.cpu_q8_backend,
@@ -370,8 +371,13 @@ bool run_reference_qwen35_inference(
     error_message = "Teacher-forced inference cannot be combined with stop conditions.";
     return false;
   }
-  if (options.use_cuda && !options.cpu_gguf_path.empty()) {
-    error_message = "--cpu-gguf is a CPU-only weight path and cannot be combined with GPU inference.";
+  if (!options.cpu_gguf_path.empty() && !options.cpu_q4_h128_path.empty()) {
+    error_message = "--cpu-gguf and --cpu-q4-h128 are mutually exclusive.";
+    return false;
+  }
+  if (options.use_cuda &&
+      (!options.cpu_gguf_path.empty() || !options.cpu_q4_h128_path.empty())) {
+    error_message = "CPU weight artifacts cannot be combined with GPU inference.";
     return false;
   }
 
@@ -436,6 +442,7 @@ bool run_reference_qwen35_inference(
   } else if (!load_model_weights(
                options.model_dir,
                options.cpu_gguf_path,
+               options.cpu_q4_h128_path,
                dims,
                profile,
                options.cpu_q8_backend,
