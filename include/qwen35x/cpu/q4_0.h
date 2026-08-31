@@ -38,8 +38,9 @@ static_assert(offsetof(Q4_0BlockX8, d) == 0);
 static_assert(offsetof(Q4_0BlockX8, qs) == 16);
 static_assert(sizeof(Q4_0BlockX8) == 8 * sizeof(Q4_0Block));
 
-// Four token rows for the same 32-column activation block, interleaved in
-// eight-byte chunks. This is transient prefill scratch, not a GGUF format.
+// Four token rows for the same 32-column activation block. Quant bytes are
+// token-major so both prefill and prepared decode consume each 32-byte row
+// with two contiguous 16-byte loads. This is transient scratch, not GGUF.
 struct Q8_0BlockX4 {
   float scales[4];
   std::int16_t sums[4];
@@ -77,6 +78,14 @@ void q8_0_quantize_vectors_4(
   const float * input,
   Q8_0BlockX4 * packed,
   std::size_t vector_count,
+  std::size_t blocks_per_vector,
+  Q8_0Backend backend = Q8_0Backend::auto_select) noexcept;
+
+// Prepares one decode vector in lane zero of each block. The FP16-rounded
+// scale and exact int8 sum are computed once and reused across all output rows.
+void q8_0_quantize_vector_1(
+  const float * input,
+  Q8_0BlockX4 * packed,
   std::size_t blocks_per_vector,
   Q8_0Backend backend = Q8_0Backend::auto_select) noexcept;
 
@@ -135,6 +144,14 @@ void q4_0_packed_matmul_q8_0(
 void q4_0_packed_matvec_q8_0(
   const Q4_0BlockX8 * matrix,
   const Q8_0Block * vector,
+  float * output,
+  std::size_t row_count,
+  std::size_t blocks_per_row,
+  Q8_0Backend backend = Q8_0Backend::auto_select) noexcept;
+
+void q4_0_packed_matvec_prepared_q8_0(
+  const Q4_0BlockX8 * matrix,
+  const Q8_0BlockX4 * vector,
   float * output,
   std::size_t row_count,
   std::size_t blocks_per_row,

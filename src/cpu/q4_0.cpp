@@ -125,9 +125,9 @@ void q4_0_packed_matmul_q8_0_scalar(
               const std::uint8_t packed = static_cast<std::uint8_t>(
                 weights.qs[chunk * 64 + row * 8 + within_chunk] ^ 0x88U);
               integer_dot += (static_cast<int>(packed & 0x0fU) - 8) *
-                static_cast<int>(activations.qs[chunk * 32 + token * 8 + within_chunk]);
+                static_cast<int>(activations.qs[token * 32 + chunk * 8 + within_chunk]);
               integer_dot += (static_cast<int>(packed >> 4U) - 8) *
-                static_cast<int>(activations.qs[(chunk + 2) * 32 + token * 8 + within_chunk]);
+                static_cast<int>(activations.qs[token * 32 + (chunk + 2) * 8 + within_chunk]);
             }
             accumulators[token][row] +=
               half_to_float(weights.d[row]) * activation_scale *
@@ -169,7 +169,7 @@ void q8_0_quantize_vectors_4_scalar(
           const float rounded = std::round(source[index] * inverse_scale);
           const auto quantized = static_cast<std::int8_t>(
             std::clamp(rounded, -127.0F, 127.0F));
-          destination.qs[(index / 8) * 32 + token * 8 + index % 8] = quantized;
+          destination.qs[token * 32 + index] = quantized;
           sum += quantized;
         }
         destination.sums[token] = static_cast<std::int16_t>(sum);
@@ -202,6 +202,63 @@ void q4_0_packed_matvec_q8_0_scalar(
         }
         accumulators[row] += half_to_float(weights.d[row]) *
           half_to_float(vector[block].d) * static_cast<float>(integer_dot);
+      }
+    }
+    std::copy_n(accumulators, 8, output + row_tile * 8);
+  }
+}
+
+void q8_0_quantize_vector_1_scalar(
+  const float * input,
+  Q8_0BlockX4 * packed,
+  const std::size_t blocks_per_vector) noexcept {
+  for (std::size_t block = 0; block < blocks_per_vector; ++block) {
+    Q8_0BlockX4 & destination = packed[block];
+    const float * source = input + block * 32;
+    float absolute_max = 0.0F;
+    for (std::size_t index = 0; index < 32; ++index) {
+      absolute_max = std::max(absolute_max, std::fabs(source[index]));
+    }
+    const float scale = absolute_max / 127.0F;
+    const float inverse_scale = scale == 0.0F ? 0.0F : 1.0F / scale;
+    destination.scales[0] = half_to_float(float_to_half(scale));
+    std::int32_t sum = 0;
+    for (std::size_t index = 0; index < 32; ++index) {
+      const float rounded = std::round(source[index] * inverse_scale);
+      const auto quantized = static_cast<std::int8_t>(
+        std::clamp(rounded, -127.0F, 127.0F));
+      destination.qs[index] = quantized;
+      sum += quantized;
+    }
+    destination.sums[0] = static_cast<std::int16_t>(sum);
+  }
+}
+
+void q4_0_packed_matvec_prepared_q8_0_scalar(
+  const Q4_0BlockX8 * matrix,
+  const Q8_0BlockX4 * vector,
+  float * output,
+  const std::size_t row_count,
+  const std::size_t blocks_per_row) noexcept {
+  for (std::size_t row_tile = 0; row_tile < row_count / 8; ++row_tile) {
+    float accumulators[8]{};
+    for (std::size_t block = 0; block < blocks_per_row; ++block) {
+      const Q4_0BlockX8 & weights = matrix[row_tile * blocks_per_row + block];
+      const Q8_0BlockX4 & activation = vector[block];
+      for (std::size_t row = 0; row < 8; ++row) {
+        std::int32_t integer_dot = 0;
+        for (std::size_t index = 0; index < 16; ++index) {
+          const std::size_t chunk = index / 8;
+          const std::size_t within_chunk = index % 8;
+          const std::uint8_t packed = static_cast<std::uint8_t>(
+            weights.qs[chunk * 64 + row * 8 + within_chunk] ^ 0x88U);
+          integer_dot += (static_cast<int>(packed & 0x0fU) - 8) *
+            static_cast<int>(activation.qs[index]);
+          integer_dot += (static_cast<int>(packed >> 4U) - 8) *
+            static_cast<int>(activation.qs[index + 16]);
+        }
+        accumulators[row] += half_to_float(weights.d[row]) *
+          activation.scales[0] * static_cast<float>(integer_dot);
       }
     }
     std::copy_n(accumulators, 8, output + row_tile * 8);
@@ -252,7 +309,7 @@ void q8_0_pack_vectors_4(
           std::copy_n(
             source.qs + chunk * 8,
             8,
-            destination.qs + chunk * 32 + token * 8);
+            destination.qs + token * 32 + chunk * 8);
           for (std::size_t index = 0; index < 8; ++index) {
             sum += source.qs[chunk * 8 + index];
           }
@@ -280,6 +337,22 @@ void q8_0_quantize_vectors_4(
 #endif
   detail::q8_0_quantize_vectors_4_scalar(
     input, packed, vector_count, blocks_per_vector);
+}
+
+void q8_0_quantize_vector_1(
+  const float * input,
+  Q8_0BlockX4 * packed,
+  const std::size_t blocks_per_vector,
+  const Q8_0Backend backend) noexcept {
+#if QWEN35X_Q8_0_HAS_AVX2_TU
+  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+    detail::q8_0_quantize_vector_1_avx2(input, packed, blocks_per_vector);
+    return;
+  }
+#else
+  static_cast<void>(backend);
+#endif
+  detail::q8_0_quantize_vector_1_scalar(input, packed, blocks_per_vector);
 }
 
 void q4_0_packed_dequantize_row(
@@ -431,6 +504,26 @@ void q4_0_packed_matvec_q8_0(
   static_cast<void>(backend);
 #endif
   detail::q4_0_packed_matvec_q8_0_scalar(
+    matrix, vector, output, row_count, blocks_per_row);
+}
+
+void q4_0_packed_matvec_prepared_q8_0(
+  const Q4_0BlockX8 * matrix,
+  const Q8_0BlockX4 * vector,
+  float * output,
+  const std::size_t row_count,
+  const std::size_t blocks_per_row,
+  const Q8_0Backend backend) noexcept {
+#if QWEN35X_Q8_0_HAS_AVX2_TU
+  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+    detail::q4_0_packed_matvec_prepared_q8_0_avx2(
+      matrix, vector, output, row_count, blocks_per_row);
+    return;
+  }
+#else
+  static_cast<void>(backend);
+#endif
+  detail::q4_0_packed_matvec_prepared_q8_0_scalar(
     matrix, vector, output, row_count, blocks_per_row);
 }
 

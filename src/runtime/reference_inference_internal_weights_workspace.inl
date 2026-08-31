@@ -3,6 +3,7 @@ namespace {
 struct CpuQ8Runtime {
   std::unique_ptr<cpu::CpuExecutor> executor;
   std::vector<cpu::Q8_0Block> quantized_input;
+  std::vector<cpu::Q8_0BlockX4> prepared_q4_input;
   std::vector<cpu::Q8_0Block> quantized_batch;
   std::vector<float> quantized_batch_scales;
   std::vector<cpu::Q8_0BlockX4> packed_q8_0_batch;
@@ -46,7 +47,7 @@ struct PackedQ4PrefillJob {
 
 struct PackedQ4MatvecJob {
   const cpu::Q4_0BlockX8 * matrix = nullptr;
-  const cpu::Q8_0Block * vector = nullptr;
+  const cpu::Q8_0BlockX4 * vector = nullptr;
   float * output = nullptr;
   std::size_t blocks_per_row = 0;
   cpu::Q8_0Backend backend = cpu::Q8_0Backend::auto_select;
@@ -73,7 +74,7 @@ void run_packed_q4_matvec_tiles(
   const std::size_t tile_begin,
   const std::size_t tile_end) noexcept {
   auto & job = *static_cast<PackedQ4MatvecJob *>(opaque_context);
-  cpu::q4_0_packed_matvec_q8_0(
+  cpu::q4_0_packed_matvec_prepared_q8_0(
     job.matrix + tile_begin * job.blocks_per_row,
     job.vector,
     job.output + tile_begin * cpu::q4_0_packed_rows,
@@ -713,17 +714,18 @@ bool matvec_2d(
       error_message = "Packed Q4_0 matvec weight storage size mismatch.";
       return false;
     }
-    std::vector<cpu::Q8_0Block> local_quantized_input;
-    std::vector<cpu::Q8_0Block> * quantized_input = &local_quantized_input;
+    std::vector<cpu::Q8_0BlockX4> local_prepared_input;
+    std::vector<cpu::Q8_0BlockX4> * prepared_input = &local_prepared_input;
     if (w.q8_0_runtime != nullptr) {
-      quantized_input = &w.q8_0_runtime->quantized_input;
+      prepared_input = &w.q8_0_runtime->prepared_q4_input;
     }
-    quantized_input->resize(blocks_per_row);
-    cpu::q8_0_quantize(x.data(), quantized_input->data(), blocks_per_row, w.q8_0_backend);
+    prepared_input->resize(blocks_per_row);
+    cpu::q8_0_quantize_vector_1(
+      x.data(), prepared_input->data(), blocks_per_row, w.q8_0_backend);
     out.resize(static_cast<std::size_t>(rows));
     if (w.q8_0_runtime != nullptr && w.q8_0_runtime->executor != nullptr) {
       PackedQ4MatvecJob job{
-        w.packed_q4_0_blocks.data(), quantized_input->data(), out.data(),
+        w.packed_q4_0_blocks.data(), prepared_input->data(), out.data(),
         blocks_per_row, w.q8_0_backend,
       };
       const cpu::CpuExecutorStatus status =
@@ -737,8 +739,8 @@ bool matvec_2d(
         return false;
       }
     } else {
-      cpu::q4_0_packed_matvec_q8_0(
-        w.packed_q4_0_blocks.data(), quantized_input->data(), out.data(),
+      cpu::q4_0_packed_matvec_prepared_q8_0(
+        w.packed_q4_0_blocks.data(), prepared_input->data(), out.data(),
         static_cast<std::size_t>(rows), blocks_per_row, w.q8_0_backend);
     }
     return true;
@@ -888,23 +890,20 @@ bool matmul_2d_quantized_batch(
 
     const std::size_t tail_vector_count = batch_size - packed_vector_count;
     if (tail_vector_count != 0) {
-      std::vector<cpu::Q8_0Block> & quantized = w.q8_0_runtime->quantized_batch;
-      std::vector<float> & quantized_scales =
-        w.q8_0_runtime->quantized_batch_scales;
-      quantized.resize(tail_vector_count * blocks_per_row);
-      quantized_scales.resize(quantized.size());
+      std::vector<cpu::Q8_0BlockX4> & prepared =
+        w.q8_0_runtime->prepared_q4_input;
+      prepared.resize(tail_vector_count * blocks_per_row);
       for (std::size_t token = 0; token < tail_vector_count; ++token) {
-        cpu::q8_0_quantize_with_scales(
+        cpu::q8_0_quantize_vector_1(
           inputs.data() + (packed_vector_count + token) * cols,
-          quantized.data() + token * blocks_per_row,
-          quantized_scales.data() + token * blocks_per_row,
+          prepared.data() + token * blocks_per_row,
           blocks_per_row,
           w.q8_0_backend);
       }
       float * tail_output = out.data() + packed_vector_count * rows;
       for (std::size_t token = 0; token < tail_vector_count; ++token) {
-        const cpu::Q8_0Block * tail_vector =
-          quantized.data() + token * blocks_per_row;
+        const cpu::Q8_0BlockX4 * tail_vector =
+          prepared.data() + token * blocks_per_row;
         float * token_output = tail_output + token * rows;
         if (w.q8_0_runtime->executor != nullptr) {
           PackedQ4MatvecJob job{
@@ -922,7 +921,7 @@ bool matmul_2d_quantized_batch(
             return false;
           }
         } else {
-          cpu::q4_0_packed_matvec_q8_0(
+          cpu::q4_0_packed_matvec_prepared_q8_0(
             w.packed_q4_0_blocks.data(), tail_vector, token_output, rows,
             blocks_per_row, w.q8_0_backend);
         }

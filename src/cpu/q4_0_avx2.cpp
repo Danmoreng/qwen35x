@@ -77,18 +77,12 @@ void quantize_q8_block_packed(
   const __m256i packed = _mm256_permutevar8x32_epi32(
     _mm256_packs_epi16(i0, i2),
     _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
-  const __m128i low = _mm256_castsi256_si128(packed);
-  const __m128i high = _mm256_extracti128_si256(packed, 1);
-  _mm_storel_epi64(
-    reinterpret_cast<__m128i *>(output.qs + token * 8), low);
-  _mm_storel_epi64(
-    reinterpret_cast<__m128i *>(output.qs + 32 + token * 8),
-    _mm_srli_si128(low, 8));
-  _mm_storel_epi64(
-    reinterpret_cast<__m128i *>(output.qs + 64 + token * 8), high);
-  _mm_storel_epi64(
-    reinterpret_cast<__m128i *>(output.qs + 96 + token * 8),
-    _mm_srli_si128(high, 8));
+  _mm_storeu_si128(
+    reinterpret_cast<__m128i *>(output.qs + token * 32),
+    _mm256_castsi256_si128(packed));
+  _mm_storeu_si128(
+    reinterpret_cast<__m128i *>(output.qs + token * 32 + 16),
+    _mm256_extracti128_si256(packed, 1));
 }
 
 [[nodiscard]] __m256i unpack_q4_0(const Q4_0Block & block) noexcept {
@@ -141,11 +135,9 @@ void quantize_q8_block_packed(
   const Q8_0BlockX4 & block,
   const std::size_t token,
   const std::size_t half) noexcept {
-  const std::int8_t * base = block.qs + half * 64 + token * 8;
-  const __m128i first = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(base));
-  const __m128i second = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(base + 32));
-  const __m128i combined = _mm_unpacklo_epi64(first, second);
-  return _mm256_broadcastsi128_si256(combined);
+  const std::int8_t * base = block.qs + token * 32 + half * 16;
+  return _mm256_broadcastsi128_si256(
+    _mm_loadu_si128(reinterpret_cast<const __m128i *>(base)));
 }
 
 template <std::size_t TokenCount>
@@ -540,6 +532,15 @@ void q8_0_quantize_vectors_4_avx2(
   }
 }
 
+void q8_0_quantize_vector_1_avx2(
+  const float * input,
+  Q8_0BlockX4 * packed,
+  const std::size_t blocks_per_vector) noexcept {
+  for (std::size_t block = 0; block < blocks_per_vector; ++block) {
+    quantize_q8_block_packed(input + block * 32, packed[block], 0);
+  }
+}
+
 void q4_0_packed_matvec_q8_0_avx2(
   const Q4_0BlockX8 * matrix,
   const Q8_0Block * vector,
@@ -556,7 +557,7 @@ void q4_0_packed_matvec_q8_0_avx2(
       std::int32_t activation_sum = 0;
       for (std::size_t chunk = 0; chunk < 4; ++chunk) {
         _mm_storel_epi64(
-          reinterpret_cast<__m128i *>(packed_activation.qs + chunk * 32),
+          reinterpret_cast<__m128i *>(packed_activation.qs + chunk * 8),
           _mm_loadl_epi64(reinterpret_cast<const __m128i *>(
             vector[block].qs + chunk * 8)));
         for (std::size_t index = 0; index < 8; ++index) {
@@ -566,6 +567,26 @@ void q4_0_packed_matvec_q8_0_avx2(
       packed_activation.sums[0] = static_cast<std::int16_t>(activation_sum);
       accumulate_packed_block_x8<1>(
         row_tile_data[block], packed_activation, nullptr, accumulator);
+    }
+    _mm256_storeu_ps(
+      output + row_tile * 8,
+      _mm256_permutevar8x32_ps(accumulator[0], final_permutation));
+  }
+}
+
+void q4_0_packed_matvec_prepared_q8_0_avx2(
+  const Q4_0BlockX8 * matrix,
+  const Q8_0BlockX4 * vector,
+  float * output,
+  const std::size_t row_count,
+  const std::size_t blocks_per_row) noexcept {
+  const __m256i final_permutation = _mm256_set_epi32(7, 5, 3, 1, 6, 4, 2, 0);
+  for (std::size_t row_tile = 0; row_tile < row_count / 8; ++row_tile) {
+    __m256 accumulator[1] = {_mm256_setzero_ps()};
+    const Q4_0BlockX8 * row_tile_data = matrix + row_tile * blocks_per_row;
+    for (std::size_t block = 0; block < blocks_per_row; ++block) {
+      accumulate_packed_block_x8<1>(
+        row_tile_data[block], vector[block], nullptr, accumulator);
     }
     _mm256_storeu_ps(
       output + row_tile * 8,

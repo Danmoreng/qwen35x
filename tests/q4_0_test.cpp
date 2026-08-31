@@ -120,15 +120,24 @@ bool test_packed_backend(const Q8_0Backend backend) {
 
   std::vector<float> reference_matvec(rows);
   std::vector<float> packed_matvec(rows);
+  std::vector<float> prepared_matvec(rows);
+  std::vector<Q8_0BlockX4> prepared_input(blocks_per_row);
   qwen35x::cpu::q4_0_matvec_q8_0(
     weights.data(), activations.data(), reference_matvec.data(), rows,
     blocks_per_row, Q8_0Backend::scalar);
   qwen35x::cpu::q4_0_packed_matvec_q8_0(
     packed_weights.data(), activations.data(), packed_matvec.data(), rows,
     blocks_per_row, backend);
+  qwen35x::cpu::q8_0_quantize_vector_1(
+    activation_values.data(), prepared_input.data(), blocks_per_row, backend);
+  qwen35x::cpu::q4_0_packed_matvec_prepared_q8_0(
+    packed_weights.data(), prepared_input.data(), prepared_matvec.data(), rows,
+    blocks_per_row, backend);
   for (std::size_t row = 0; row < rows; ++row) {
     ok = expect(near(reference_matvec[row], packed_matvec[row]),
                 "packed matvec mismatch") && ok;
+    ok = expect(near(reference_matvec[row], prepared_matvec[row]),
+                "prepared packed matvec mismatch") && ok;
   }
 
   constexpr std::size_t gather_row = 9;

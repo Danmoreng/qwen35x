@@ -9,13 +9,13 @@ Branch: `codex/cpu-q8-avx2`
 The native Q4_0-weight/Q8-activation path is operational for the complete
 Qwen3.5 0.8B CPU model. On the six-core laptop it now exceeds the saved
 llama.cpp Q4_0 comparison in short prefill and decode, and is approximately
-tied at 2,048-token prefill.
+26% faster at 2,048-token prefill.
 
 | Workload | Native qwen35x | llama.cpp Q4_0 | Native difference |
 | --- | ---: | ---: | ---: |
-| pp256 | 281.52 tok/s mean | 227.90 tok/s | +23.5% |
-| pp2048 | 237.58 tok/s mean | 202.53 tok/s median | +17.3% |
-| prompt-1 / tg128 | 60.57 tok/s mean | 45.50 tok/s | +33.1% |
+| pp256 | 306.26 tok/s mean | 227.90 tok/s | +34.4% |
+| pp2048 | 255.91 tok/s mean | 202.53 tok/s median | +26.4% |
+| prompt-1 / tg128 | 61.41 tok/s mean | 45.50 tok/s | +35.0% |
 
 The qwen35x decode timer includes greedy sampling, while `llama-bench` excludes
 sampling. Timer boundaries therefore favor llama.cpp slightly in that row.
@@ -29,8 +29,12 @@ sampling. Timer boundaries therefore favor llama.cpp slightly in that row.
 - A size-neutral 144-byte `Q4_0BlockX8`: eight FP16 scales plus 128 interleaved
   quant bytes, with nibble sign bits flipped once at load time.
 - Direct four-token F32-to-packed-Q8 quantization for prefill.
+- Token-major prepared-Q8 quant bytes, replacing the former eight-byte
+  interleave and allowing two contiguous 16-byte activation loads.
 - Exact int16 activation sums emitted during packed-Q8 quantization.
 - FP16-rounded activation scales expanded to FP32 once during quantization.
+- A prepared single-vector decode path that computes Q8 bytes, scale, and sum
+  once per projection rather than once per eight output rows.
 - Unsigned Q4 AVX2 dot products with exact `-8 * activation_sum` correction.
 - Retained eight-token x eight-output-row AVX2 prefill kernel.
 - Eight-row-tile executor scheduling, including tail-token packed matvec.
@@ -53,7 +57,14 @@ three measured runs, six threads, and the same pure Q4_0 GGUF.
 | Packed-only weights and decode | 234.73 | 59.01 | Retained |
 | Vector F16C load for eight weight scales | 249.94 | 60.78 | Retained foundation |
 | Unsigned Q4 plus prepared activation sums | 268.86 | 60.68 | Retained foundation |
-| Prepared FP32 activation scales | 281.52 | 60.57 | Current implementation |
+| Prepared FP32 activation scales | 281.52 | 60.57 | Retained foundation |
+| Token-major Q8 plus prepared decode | 306.26 | 61.41 | Current implementation |
+
+The current step also measured 255.91 tok/s at pp2048 versus 237.58 before it
+(+7.7%). Its pp256 gain is +8.8%. The five-run decode confirmation is +1.4%
+over the immediate 60.57 tok/s baseline. A 16-token x 8-row prefill tile was
+rejected before this change: 282.72 pp256 and 239.31 pp2048 were only +0.4%
+and +0.7%, respectively, within normal host variance.
 
 The pre-vector-scale pp256 thread sweep measured 197.94, 218.53, 234.73, and
 188.30 tok/s at 4, 5, 6, and 8 threads. Six physical-core threads remain the
@@ -82,8 +93,6 @@ not by spill count alone.
   Q4_0 file used here.
 - Measure long-context decode, sustained 2,048-input/2,048-output wall time,
   packing time, permanent RSS, and peak load RSS.
-- A/B signed nibble expansion against unsigned nibbles plus activation sums;
-  the latter is the direct bridge to AVX-VNNI `VPDPBUSD`.
 - Inspect Clang assembly and try a lower-spill split kernel only if it improves
   pp256 and pp2048 without reducing decode.
 

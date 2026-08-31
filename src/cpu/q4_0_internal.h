@@ -49,9 +49,21 @@ void q8_0_quantize_vectors_4_scalar(
   std::size_t vector_count,
   std::size_t blocks_per_vector) noexcept;
 
+void q8_0_quantize_vector_1_scalar(
+  const float * input,
+  Q8_0BlockX4 * packed,
+  std::size_t blocks_per_vector) noexcept;
+
 void q4_0_packed_matvec_q8_0_scalar(
   const Q4_0BlockX8 * matrix,
   const Q8_0Block * vector,
+  float * output,
+  std::size_t row_count,
+  std::size_t blocks_per_row) noexcept;
+
+void q4_0_packed_matvec_prepared_q8_0_scalar(
+  const Q4_0BlockX8 * matrix,
+  const Q8_0BlockX4 * vector,
   float * output,
   std::size_t row_count,
   std::size_t blocks_per_row) noexcept;
@@ -100,9 +112,21 @@ void q8_0_quantize_vectors_4_avx2(
   std::size_t vector_count,
   std::size_t blocks_per_vector) noexcept;
 
+void q8_0_quantize_vector_1_avx2(
+  const float * input,
+  Q8_0BlockX4 * packed,
+  std::size_t blocks_per_vector) noexcept;
+
 void q4_0_packed_matvec_q8_0_avx2(
   const Q4_0BlockX8 * matrix,
   const Q8_0Block * vector,
+  float * output,
+  std::size_t row_count,
+  std::size_t blocks_per_row) noexcept;
+
+void q4_0_packed_matvec_prepared_q8_0_avx2(
+  const Q4_0BlockX8 * matrix,
+  const Q8_0BlockX4 * vector,
   float * output,
   std::size_t row_count,
   std::size_t blocks_per_row) noexcept;
