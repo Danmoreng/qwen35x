@@ -240,6 +240,8 @@ bool write_profile_json(
   out << "],\n";
   out << "  \"generated_tokens\": " << result.generated_tokens.size() << ",\n";
   out << "  \"forward_pass_tokens\": " << result.forward_pass_tokens << ",\n";
+  out << "  \"cpu_model_session_hit\": "
+      << (result.cpu_model_session_hit ? "true" : "false") << ",\n";
   out << "  \"cached_prefix_tokens\": " << result.cached_prefix_tokens << ",\n";
   out << "  \"prefix_cache_restore_time_ms\": " << result.prefix_cache_restore_time_ms << ",\n";
   out << "  \"prefix_cache_bytes\": " << result.prefix_cache_bytes << ",\n";
@@ -339,6 +341,7 @@ int main(int argc, char ** argv) {
   bool infer_reference = false;
   bool infer_gpu = false;
   bool gpu_decode_backend_explicit = false;
+  int cpu_model_session_replays = 0;
   int cpu_prefix_cache_replays = 1;
   qwen35x::Bf16TensorBenchOptions bench_options;
   qwen35x::Nvfp4TensorCheckOptions nvfp4_check_options;
@@ -367,6 +370,8 @@ int main(int argc, char ** argv) {
         static_cast<std::size_t>(std::stoull(argv[++i]));
     } else if (arg == "--cpu-prefix-cache-replays" && i + 1 < argc) {
       cpu_prefix_cache_replays = std::stoi(argv[++i]);
+    } else if (arg == "--cpu-model-session-replays" && i + 1 < argc) {
+      cpu_model_session_replays = std::stoi(argv[++i]);
     } else if (arg == "--cpu-isa" && i + 1 < argc) {
       const std::string isa = argv[++i];
       if (isa == "auto") {
@@ -529,7 +534,7 @@ int main(int argc, char ** argv) {
       std::cout << "       qwen35x --bench-nvfp4-projection --hf-model-dir <path> [--nvfp4-tensor <base-name>] [--nvfp4-projection-kernel <row|warp|scale-group|blackwell-fp4>] [--bench-warmup <n>] [--bench-iters <n>]\n";
       std::cout << "       qwen35x --bench-nvfp4-prefill-projection --hf-model-dir <path> [--nvfp4-tensor <base-name>] [--nvfp4-prefill-seq-len <n>] [--bench-warmup <n>] [--bench-iters <n>]\n";
       std::cout << "       qwen35x --bench-nvfp4-gate-up --hf-model-dir <path> [--nvfp4-gate-tensor <base-name>] [--nvfp4-up-tensor <base-name>] [--bench-warmup <n>] [--bench-iters <n>]\n";
-      std::cout << "       qwen35x --infer-reference --hf-model-dir <path> [--cpu-gguf <q8_0.gguf>] [--cpu-threads <n>] [--cpu-isa <auto|scalar|avx2>] (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
+      std::cout << "       qwen35x --infer-reference --hf-model-dir <path> [--cpu-gguf <q4_0-or-q8_0.gguf>] [--cpu-threads <n>] [--cpu-isa <auto|scalar|avx2>] [--cpu-model-session-replays <n>] [--cpu-prefix-cache-tokens <n> --cpu-prefix-cache-replays <n>] (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "       qwen35x --infer-gpu --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "               [--temperature <float>] [--top-p <float>] [--top-k <int>] [--repeat-penalty <float>] [--seed <int64>]\n";
       std::cout << "               [--gpu-bf16|--gpu-f32-matvec] [--gpu-decode-backend <default|qwen35x>] [--gpu-decode-blocks <n>] [--qwen35x-prefill-mode <replay|batched>]\n";
@@ -917,12 +922,33 @@ int main(int argc, char ** argv) {
       std::cerr << "--cpu-prefix-cache-replays must be positive\n";
       return 11;
     }
+    if (cpu_model_session_replays < 0) {
+      std::cerr << "--cpu-model-session-replays must be positive when specified\n";
+      return 11;
+    }
+    if (cpu_model_session_replays > 1 && cpu_prefix_cache_replays > 1 &&
+        cpu_model_session_replays != cpu_prefix_cache_replays) {
+      std::cerr << "CPU model-session and prefix-cache replay counts must match\n";
+      return 11;
+    }
+    const int cpu_inference_replays = std::max(
+      cpu_prefix_cache_replays,
+      cpu_model_session_replays > 0 ? cpu_model_session_replays : 1);
+    qwen35x::ReferenceCpuModelSession cpu_model_session;
+    if (cpu_model_session_replays > 0) {
+      infer_options.cpu_model_session = &cpu_model_session;
+      if (!qwen35x::prepare_reference_cpu_model_session(
+            *profile, infer_options, cpu_model_session, error_message)) {
+        std::cerr << "CPU model-session prepare failed: " << error_message << "\n";
+        return 13;
+      }
+    }
     qwen35x::ReferenceCpuPrefixCache cpu_prefix_cache;
     if (infer_options.cpu_prefix_token_count > 0) {
       infer_options.cpu_prefix_cache = &cpu_prefix_cache;
     }
     qwen35x::ReferenceInferenceResult infer_result;
-    for (int replay = 0; replay < cpu_prefix_cache_replays; ++replay) {
+    for (int replay = 0; replay < cpu_inference_replays; ++replay) {
       if (!qwen35x::run_reference_qwen35_inference(
             *profile, infer_options, infer_result, error_message)) {
         std::cerr << "reference inference failed: " << error_message << "\n";
@@ -940,6 +966,7 @@ int main(int argc, char ** argv) {
                 << " cpu_threads=" << infer_options.cpu_threads
                 << " prefill_kernel=" << (qwen35x_prefill_kernel.empty() ? "env-or-default" : qwen35x_prefill_kernel)
                 << " prompt_tokens=" << infer_options.prompt_tokens.size()
+                << " cpu_model_session_hit=" << (infer_result.cpu_model_session_hit ? 1 : 0)
                 << " cached_prefix_tokens=" << infer_result.cached_prefix_tokens
                 << " prefix_cache_restore_ms=" << infer_result.prefix_cache_restore_time_ms
                 << " generated_tokens=" << infer_result.generated_tokens.size()
@@ -963,6 +990,8 @@ int main(int argc, char ** argv) {
     std::cout << "  cpu_threads: " << infer_options.cpu_threads << "\n";
     std::cout << "  prefill_only: " << (infer_options.prefill_only ? "on" : "off") << "\n";
     std::cout << "  prompt_tokens: " << infer_options.prompt_tokens.size() << "\n";
+    std::cout << "  cpu_model_session_hit: "
+              << (infer_result.cpu_model_session_hit ? "yes" : "no") << "\n";
     std::cout << "  cached_prefix_tokens: " << infer_result.cached_prefix_tokens << "\n";
     std::cout << "  prefix_cache_restore_time_ms: "
               << infer_result.prefix_cache_restore_time_ms << "\n";

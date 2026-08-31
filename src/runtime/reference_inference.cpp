@@ -18,6 +18,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <random>
 #include <sstream>

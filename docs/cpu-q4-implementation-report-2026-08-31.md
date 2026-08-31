@@ -122,9 +122,15 @@ The first in-memory system-prefix cache is now available through the public
 CPU inference options. A 128-token snapshot in a 256-token prompt reduces mean
 prefill wall time from 803.49 to 413.86 ms (-48.5%) over three sequential runs.
 Restore averages 2.22 ms and the compact snapshot occupies 21.77 MB. AVX2 and
-forced-scalar cached runs remain token-identical to uncached runs. Model loading
-is not yet persistent, and disk serialization/content hashing remain future
-work.
+forced-scalar cached runs remain token-identical to uncached runs.
+
+`ReferenceCpuModelSession` now keeps the packed Q4 weights and `CpuExecutor`
+alive across requests. On the six-core laptop, the 64-input/8-output request
+setup stage falls from 728.80 ms to 1.13 ms on a prepared-session hit, reducing
+mean measured load+prefill+decode time from 1,046.58 to 312.52 ms (-70.1%).
+Combining a prepared session with a 128-token prefix in the 256-input/16-output
+workload reduces the same measured stages from 1,777.28 to 655.60 ms (-63.1%).
+Disk serialization and cryptographic content hashing remain future work.
 
 The pre-vector-scale pp256 thread sweep measured 197.94, 218.53, 234.73, and
 188.30 tok/s at 4, 5, 6, and 8 threads. Six physical-core threads remain the

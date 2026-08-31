@@ -123,8 +123,16 @@ keeping a `ReferenceCpuPrefixCache` alive, setting
 `cpu_prefix_token_count` shared by subsequent prompts. For CLI validation,
 `--cpu-prefix-cache-tokens N --cpu-prefix-cache-replays 2` builds the snapshot
 on the first replay and restores it on the second. The cache currently covers
-CPU recurrent and K/V state; model weights are still loaded per API call. A
-cache handle must not be accessed concurrently by multiple inference calls.
+CPU recurrent and K/V state. A cache handle must not be accessed concurrently
+unless all accesses are serialized through the same model session.
+
+Production workers can keep Q4/Q8 weights and the CPU executor loaded with a
+`ReferenceCpuModelSession`. Call `prepare_reference_cpu_model_session()` once,
+then assign the session to `ReferenceInferenceOptions::cpu_model_session` for
+every request. A single session safely serializes concurrent callers because
+its executor scratch is mutable; use one session per worker for parallel
+execution. `--cpu-model-session-replays N` exercises the same lifetime from the
+CLI and can be combined with the prefix-cache replay options.
 
 4. Run chat inference (CUDA / Qwen35x CUDA default)
 

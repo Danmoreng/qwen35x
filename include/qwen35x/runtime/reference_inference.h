@@ -58,6 +58,35 @@ private:
     std::string &);
 };
 
+// Persistent CPU model weights and executor for repeated inference requests.
+// Concurrent callers are safe, but serialize on one session; use one session
+// per worker when parallel request execution is required.
+class ReferenceCpuModelSession {
+public:
+  ReferenceCpuModelSession();
+  ReferenceCpuModelSession(const ReferenceCpuModelSession &) = delete;
+  ReferenceCpuModelSession & operator=(const ReferenceCpuModelSession &) = delete;
+  ReferenceCpuModelSession(ReferenceCpuModelSession &&) noexcept = default;
+  ReferenceCpuModelSession & operator=(ReferenceCpuModelSession &&) noexcept = default;
+
+  void clear();
+  [[nodiscard]] bool empty() const;
+
+private:
+  std::shared_ptr<void> implementation_;
+
+  friend bool prepare_reference_cpu_model_session(
+    const ModelProfile &,
+    const ReferenceInferenceOptions &,
+    ReferenceCpuModelSession &,
+    std::string &);
+  friend bool run_reference_qwen35_inference(
+    const ModelProfile &,
+    const ReferenceInferenceOptions &,
+    ReferenceInferenceResult &,
+    std::string &);
+};
+
 struct ReferenceInferenceOptions {
   std::string model_dir;
   std::string cpu_gguf_path;
@@ -76,6 +105,7 @@ struct ReferenceInferenceOptions {
   bool prefill_only = false;
   int cpu_threads = 0;
   cpu::Q8_0Backend cpu_q8_backend = cpu::Q8_0Backend::auto_select;
+  ReferenceCpuModelSession * cpu_model_session = nullptr;
   ReferenceCpuPrefixCache * cpu_prefix_cache = nullptr;
   std::size_t cpu_prefix_token_count = 0;
   SamplingOptions sampling;
@@ -107,6 +137,7 @@ struct ReferenceInferenceResult {
   double decode_time_ms = 0.0;
   double tokens_per_second = 0.0;
   int forward_pass_tokens = 0;
+  bool cpu_model_session_hit = false;
   int cached_prefix_tokens = 0;
   double prefix_cache_restore_time_ms = 0.0;
   std::size_t prefix_cache_bytes = 0;
@@ -120,6 +151,12 @@ struct ReferenceInferenceResult {
 bool parse_token_list_csv(
   const std::string & csv,
   std::vector<std::int32_t> & out_tokens,
+  std::string & error_message);
+
+bool prepare_reference_cpu_model_session(
+  const ModelProfile & profile,
+  const ReferenceInferenceOptions & options,
+  ReferenceCpuModelSession & session,
   std::string & error_message);
 
 bool run_reference_qwen35_inference(
