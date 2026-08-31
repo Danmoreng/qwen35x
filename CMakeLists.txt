@@ -63,6 +63,7 @@ add_library(qwen35x_core
   src/tokenizer/tokenizer.cpp
   src/weights/gguf.cpp
   src/weights/modelopt_nvfp4.cpp
+  src/weights/q4_h128_artifact.cpp
   src/weights/safetensors.cpp
 )
 
@@ -293,6 +294,10 @@ if (BUILD_TESTING)
   add_executable(qwen35x_q4_h128_test tests/q4_h128_test.cpp)
   target_link_libraries(qwen35x_q4_h128_test PRIVATE qwen35x_core)
   add_test(NAME qwen35x_q4_h128 COMMAND qwen35x_q4_h128_test)
+
+  add_executable(qwen35x_q4_h128_artifact_test tests/q4_h128_artifact_test.cpp)
+  target_link_libraries(qwen35x_q4_h128_artifact_test PRIVATE qwen35x_core)
+  add_test(NAME qwen35x_q4_h128_artifact COMMAND qwen35x_q4_h128_artifact_test)
 
   add_executable(qwen35x_delta_net_test tests/delta_net_test.cpp)
   target_link_libraries(qwen35x_delta_net_test PRIVATE qwen35x_core)

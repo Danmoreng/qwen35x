@@ -50,7 +50,7 @@ The custom artifact is a single little-endian file with:
   payload offset, payload size, and payload checksum;
 - aligned tensor payloads so SIMD readers do not need unaligned metadata
   recovery;
-- a whole-directory checksum and explicit converter/build metadata.
+- explicit model fingerprint and converter ABI metadata.
 
 Projection matrices whose input dimensions can use complete 128-element blocks
 are encoded as Q4_H128. One-dimensional tensors, norms, convolution parameters,
@@ -156,4 +156,3 @@ are final wall-clock checks, not inner-loop tuning runs.
    benchmark-positive and passes the same quality gates.
 6. Run held-out transcript quality and comparable prefill/decode benchmarks;
    record rejected experiments as well as accepted ones.
-
