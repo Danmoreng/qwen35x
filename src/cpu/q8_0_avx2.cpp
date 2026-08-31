@@ -139,6 +139,58 @@ namespace {
   return horizontal_sum_f32(accumulator);
 }
 
+void dot_four_rows_avx2_impl(
+  const Q8_0Block * row0,
+  const Q8_0Block * row1,
+  const Q8_0Block * row2,
+  const Q8_0Block * row3,
+  const Q8_0Block * vector,
+  const std::size_t blocks_per_row,
+  float * output) noexcept {
+  __m256 accumulator0 = _mm256_setzero_ps();
+  __m256 accumulator1 = _mm256_setzero_ps();
+  __m256 accumulator2 = _mm256_setzero_ps();
+  __m256 accumulator3 = _mm256_setzero_ps();
+  for (std::size_t block = 0; block < blocks_per_row; ++block) {
+    const __m256i vector_bytes = _mm256_loadu_si256(
+      reinterpret_cast<const __m256i *>(vector[block].qs));
+    const float vector_scale = _cvtsh_ss(vector[block].d);
+
+    const __m256i weight0 = _mm256_loadu_si256(
+      reinterpret_cast<const __m256i *>(row0[block].qs));
+    const __m256i weight1 = _mm256_loadu_si256(
+      reinterpret_cast<const __m256i *>(row1[block].qs));
+    const __m256i weight2 = _mm256_loadu_si256(
+      reinterpret_cast<const __m256i *>(row2[block].qs));
+    const __m256i weight3 = _mm256_loadu_si256(
+      reinterpret_cast<const __m256i *>(row3[block].qs));
+    accumulator0 = _mm256_fmadd_ps(
+      _mm256_cvtepi32_ps(dot_block_i8x8_loaded_lhs(
+        weight0, _mm256_abs_epi8(weight0), vector_bytes)),
+      _mm256_set1_ps(_cvtsh_ss(row0[block].d) * vector_scale),
+      accumulator0);
+    accumulator1 = _mm256_fmadd_ps(
+      _mm256_cvtepi32_ps(dot_block_i8x8_loaded_lhs(
+        weight1, _mm256_abs_epi8(weight1), vector_bytes)),
+      _mm256_set1_ps(_cvtsh_ss(row1[block].d) * vector_scale),
+      accumulator1);
+    accumulator2 = _mm256_fmadd_ps(
+      _mm256_cvtepi32_ps(dot_block_i8x8_loaded_lhs(
+        weight2, _mm256_abs_epi8(weight2), vector_bytes)),
+      _mm256_set1_ps(_cvtsh_ss(row2[block].d) * vector_scale),
+      accumulator2);
+    accumulator3 = _mm256_fmadd_ps(
+      _mm256_cvtepi32_ps(dot_block_i8x8_loaded_lhs(
+        weight3, _mm256_abs_epi8(weight3), vector_bytes)),
+      _mm256_set1_ps(_cvtsh_ss(row3[block].d) * vector_scale),
+      accumulator3);
+  }
+  output[0] = horizontal_sum_f32(accumulator0);
+  output[1] = horizontal_sum_f32(accumulator1);
+  output[2] = horizontal_sum_f32(accumulator2);
+  output[3] = horizontal_sum_f32(accumulator3);
+}
+
 } // namespace
 
 void q8_0_quantize_avx2(
@@ -224,7 +276,19 @@ void q8_0_matvec_avx2(
     }
     return;
   }
-  for (std::size_t row = 0; row < row_count; ++row) {
+  std::size_t row = 0;
+  for (; row + 4 <= row_count; row += 4) {
+    const Q8_0Block * row0 = matrix + row * blocks_per_row;
+    dot_four_rows_avx2_impl(
+      row0,
+      row0 + blocks_per_row,
+      row0 + 2 * blocks_per_row,
+      row0 + 3 * blocks_per_row,
+      vector,
+      blocks_per_row,
+      output + row);
+  }
+  for (; row < row_count; ++row) {
     output[row] = dot_avx2_impl(
       matrix + row * blocks_per_row,
       vector,
