@@ -3,6 +3,7 @@
 #include "qwen35x/cpu/activation.h"
 
 #include "qwen35x/cpu/q4_0.h"
+#include "qwen35x/cpu/q4_h128.h"
 #include "qwen35x/cpu/q8_0.h"
 #include "qwen35x/cpu/executor.h"
 #include "qwen35x/cpu/delta_net.h"
@@ -10,6 +11,7 @@
 #include "qwen35x/runtime/cuda_inference.h"
 #include "qwen35x/runtime/qwen35x_cuda_backend.h"
 #include "qwen35x/weights/gguf.h"
+#include "qwen35x/weights/q4_h128_artifact.h"
 #include "qwen35x/weights/safetensors.h"
 
 #include <algorithm>

@@ -31,6 +31,14 @@ enum class Qwen35xPrefillMode {
   batched = 1
 };
 
+using ReferenceLogitsCallback = bool (*)(
+  void * context,
+  std::size_t output_index,
+  std::int32_t target_token,
+  const float * logits,
+  std::size_t logit_count,
+  std::string & error_message);
+
 // Reusable in-memory CPU state after an invariant prompt prefix. Keep one
 // instance alive across inference calls that share the same model and prefix.
 // A cache handle is not thread-safe and must not be accessed concurrently.
@@ -90,6 +98,7 @@ private:
 struct ReferenceInferenceOptions {
   std::string model_dir;
   std::string cpu_gguf_path;
+  std::string cpu_q4_h128_path;
   std::vector<std::int32_t> prompt_tokens;
   int max_new_tokens = 1;
   int max_context = 4096;
@@ -109,6 +118,9 @@ struct ReferenceInferenceOptions {
   ReferenceCpuPrefixCache * cpu_prefix_cache = nullptr;
   std::size_t cpu_prefix_token_count = 0;
   int capture_top_logits = 0;
+  std::vector<std::int32_t> forced_output_tokens;
+  ReferenceLogitsCallback logits_callback = nullptr;
+  void * logits_callback_context = nullptr;
   SamplingOptions sampling;
   std::vector<std::int32_t> stop_token_ids;
   std::vector<std::vector<std::int32_t>> stop_token_sequences;
