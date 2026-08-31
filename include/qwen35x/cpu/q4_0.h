@@ -56,6 +56,11 @@ static_assert(sizeof(Q8_0BlockX4) == 152);
 inline constexpr std::size_t q4_0_packed_rows = 8;
 inline constexpr std::size_t q8_0_packed_vectors = 4;
 
+struct Q4_0ArgmaxResult {
+  float value;
+  std::size_t index;
+};
+
 // row_count must be divisible by eight. packed contains
 // (row_count / 8) * blocks_per_row elements.
 void q4_0_pack_rows_8(
@@ -153,6 +158,16 @@ void q4_0_packed_matvec_prepared_q8_0(
   const Q4_0BlockX8 * matrix,
   const Q8_0BlockX4 * vector,
   float * output,
+  std::size_t row_count,
+  std::size_t blocks_per_row,
+  Q8_0Backend backend = Q8_0Backend::auto_select) noexcept;
+
+[[nodiscard]] Q4_0ArgmaxResult q4_0_packed_matvec_prepared_q8_0_argmax(
+  const Q4_0BlockX8 * matrix,
+  const Q8_0BlockX4 * vector,
+  const int * token_counts,
+  float repetition_penalty,
+  std::size_t row_offset,
   std::size_t row_count,
   std::size_t blocks_per_row,
   Q8_0Backend backend = Q8_0Backend::auto_select) noexcept;

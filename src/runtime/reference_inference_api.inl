@@ -409,6 +409,16 @@ bool run_reference_qwen35_inference(
       token_counts[static_cast<std::size_t>(token)] += 1;
     }
   }
+  CpuGreedySamplingState cpu_greedy_sampling{
+    &token_counts,
+    options.sampling.repetition_penalty,
+    -1,
+    !options.use_cuda && options.sampling.temperature <= 1.0e-6F &&
+      weights.embed_tokens.is_q4_0() && weights.cpu_q8_runtime != nullptr &&
+      weights.cpu_q8_runtime->executor != nullptr,
+  };
+  CpuGreedySamplingState * cpu_greedy_sampling_ptr =
+    cpu_greedy_sampling.enabled ? &cpu_greedy_sampling : nullptr;
   std::unordered_set<std::int32_t> stop_token_set;
   stop_token_set.reserve(options.stop_token_ids.size());
   for (const std::int32_t token : options.stop_token_ids) {
@@ -486,6 +496,7 @@ bool run_reference_qwen35_inference(
             position,
             compute_next_logits,
             predicted_logits,
+            cpu_greedy_sampling_ptr,
             &profiling,
             error_message)) {
         release_cuda_resources();
@@ -511,6 +522,7 @@ bool run_reference_qwen35_inference(
             use_cuda_gpu_sampling,
             compute_next_logits,
             cuda_workspace_ptr,
+            cpu_greedy_sampling_ptr,
             &profiling,
             error_message)) {
         release_cuda_resources();
@@ -719,6 +731,7 @@ bool run_reference_qwen35_inference(
               true,
               true,
               cuda_workspace_ptr,
+              cpu_greedy_sampling_ptr,
               &profiling,
               error_message)) {
           release_cuda_decode_buffers();
@@ -737,16 +750,27 @@ bool run_reference_qwen35_inference(
       }
       const auto sampling_start = std::chrono::steady_clock::now();
       int current = 0;
-      if (!sample_token_from_logits(
-            predicted_logits,
-            options.sampling,
-            token_counts,
-            rng,
-            current,
-            error_message)) {
-        release_cuda_decode_buffers();
-        release_cuda_resources();
-        return false;
+      if (cpu_greedy_sampling_ptr != nullptr) {
+        current = cpu_greedy_sampling.next_token;
+        cpu_greedy_sampling.next_token = -1;
+        if (current < 0 || current >= dims.vocab_size) {
+          error_message = "Fused greedy Q4 selection produced an invalid token.";
+          release_cuda_decode_buffers();
+          release_cuda_resources();
+          return false;
+        }
+      } else {
+        if (!sample_token_from_logits(
+              predicted_logits,
+              options.sampling,
+              token_counts,
+              rng,
+              current,
+              error_message)) {
+          release_cuda_decode_buffers();
+          release_cuda_resources();
+          return false;
+        }
       }
       if (!maybe_sync_cuda_for_stage_timing(options.use_cuda, options.profile_cuda_sync, error_message)) {
         release_cuda_decode_buffers();
@@ -799,6 +823,7 @@ bool run_reference_qwen35_inference(
             false,
             true,
             cuda_workspace_ptr,
+            cpu_greedy_sampling_ptr,
             &profiling,
             error_message)) {
         release_cuda_decode_buffers();

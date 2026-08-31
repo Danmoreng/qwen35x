@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -139,6 +140,42 @@ bool test_packed_backend(const Q8_0Backend backend) {
     ok = expect(near(reference_matvec[row], prepared_matvec[row]),
                 "prepared packed matvec mismatch") && ok;
   }
+
+  constexpr std::size_t argmax_offset = 5;
+  std::vector<int> token_counts(argmax_offset + rows, 0);
+  token_counts[argmax_offset + 1] = 1;
+  token_counts[argmax_offset + 9] = 2;
+  constexpr float repetition_penalty = 1.25F;
+  std::size_t expected_index = argmax_offset;
+  float expected_value = -std::numeric_limits<float>::infinity();
+  for (std::size_t row = 0; row < rows; ++row) {
+    float value = prepared_matvec[row];
+    if (token_counts[argmax_offset + row] > 0) {
+      value = value > 0.0F
+        ? value / repetition_penalty
+        : value * repetition_penalty;
+    }
+    if (value > expected_value) {
+      expected_value = value;
+      expected_index = argmax_offset + row;
+    }
+  }
+  const qwen35x::cpu::Q4_0ArgmaxResult argmax =
+    qwen35x::cpu::q4_0_packed_matvec_prepared_q8_0_argmax(
+      packed_weights.data(), prepared_input.data(), token_counts.data(),
+      repetition_penalty, argmax_offset, rows, blocks_per_row, backend);
+  ok = expect(argmax.index == expected_index && near(argmax.value, expected_value),
+              "prepared packed argmax mismatch") && ok;
+
+  std::vector<float> zero_values(blocks_per_row * 32, 0.0F);
+  qwen35x::cpu::q8_0_quantize_vector_1(
+    zero_values.data(), prepared_input.data(), blocks_per_row, backend);
+  const qwen35x::cpu::Q4_0ArgmaxResult tied_argmax =
+    qwen35x::cpu::q4_0_packed_matvec_prepared_q8_0_argmax(
+      packed_weights.data(), prepared_input.data(), nullptr, 1.0F,
+      argmax_offset, rows, blocks_per_row, backend);
+  ok = expect(tied_argmax.index == argmax_offset,
+              "prepared packed argmax tie-breaking mismatch") && ok;
 
   constexpr std::size_t gather_row = 9;
   std::vector<float> reference_row(blocks_per_row * 32);

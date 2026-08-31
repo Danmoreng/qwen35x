@@ -326,6 +326,7 @@ bool run_forward_single_token(
   const bool use_cuda_gpu_sampling,
   const bool compute_next_logits,
   CudaForwardWorkspace * cuda_workspace,
+  CpuGreedySamplingState * greedy_sampling,
   DecodeProfilingAccumulator * profiling,
   std::string & error_message) {
   if (token_id < 0 || token_id >= dims.vocab_size) {
@@ -515,6 +516,13 @@ bool run_forward_single_token(
              cuda_workspace->logits,
              error_message);
     }
+  } else if (greedy_sampling != nullptr && greedy_sampling->enabled &&
+             greedy_sampling->token_counts != nullptr) {
+    ok = greedy_q4_token(
+      weights.embed_tokens, final_hidden, *greedy_sampling->token_counts,
+      greedy_sampling->repetition_penalty, greedy_sampling->next_token,
+      error_message);
+    next_logits.clear();
   } else {
     ok = compute_next_logits_from_embedding(weights.embed_tokens, final_hidden, use_cuda, next_logits, error_message);
   }

@@ -15,7 +15,7 @@ llama.cpp Q4_0 comparison in short prefill and decode, and is approximately
 | --- | ---: | ---: | ---: |
 | pp256 | 306.26 tok/s mean | 227.90 tok/s | +34.4% |
 | pp2048 | 255.91 tok/s mean | 202.53 tok/s median | +26.4% |
-| prompt-1 / tg128 | 61.41 tok/s mean | 45.50 tok/s | +35.0% |
+| prompt-1 / tg128 | 62.75 tok/s mean | 45.50 tok/s | +37.9% |
 
 The qwen35x decode timer includes greedy sampling, while `llama-bench` excludes
 sampling. Timer boundaries therefore favor llama.cpp slightly in that row.
@@ -35,6 +35,8 @@ sampling. Timer boundaries therefore favor llama.cpp slightly in that row.
 - FP16-rounded activation scales expanded to FP32 once during quantization.
 - A prepared single-vector decode path that computes Q8 bytes, scale, and sum
   once per projection rather than once per eight output rows.
+- Greedy-only tied LM-head reduction to one deterministic maximum per executor
+  partition, including repetition penalty and lower-token tie-breaking.
 - Unsigned Q4 AVX2 dot products with exact `-8 * activation_sum` correction.
 - Retained eight-token x eight-output-row AVX2 prefill kernel.
 - Eight-row-tile executor scheduling, including tail-token packed matvec.
@@ -58,13 +60,22 @@ three measured runs, six threads, and the same pure Q4_0 GGUF.
 | Vector F16C load for eight weight scales | 249.94 | 60.78 | Retained foundation |
 | Unsigned Q4 plus prepared activation sums | 268.86 | 60.68 | Retained foundation |
 | Prepared FP32 activation scales | 281.52 | 60.57 | Retained foundation |
-| Token-major Q8 plus prepared decode | 306.26 | 61.41 | Current implementation |
+| Token-major Q8 plus prepared decode | 306.26 | 61.41 | Retained foundation |
+| Fused greedy LM-head/argmax | unchanged | 62.75 | Current implementation |
 
 The current step also measured 255.91 tok/s at pp2048 versus 237.58 before it
 (+7.7%). Its pp256 gain is +8.8%. The five-run decode confirmation is +1.4%
 over the immediate 60.57 tok/s baseline. A 16-token x 8-row prefill tile was
 rejected before this change: 282.72 pp256 and 239.31 pp2048 were only +0.4%
 and +0.7%, respectively, within normal host variance.
+
+Fused greedy selection raises the five-run decode mean from 61.41 to 62.75
+tok/s (+2.2%). Eight earlier fusion runs measured 62.10--62.20 tok/s before
+scratch was reduced from one result per vocabulary tile to one per executor
+partition. A 16-token end-to-end comparison against a separately built
+`12f9ecf` binary produced identical token IDs with repetition penalty enabled.
+The probabilistic temperature path remains on the materialized-logit path and
+also passes a full-model smoke test.
 
 The pre-vector-scale pp256 thread sweep measured 197.94, 218.53, 234.73, and
 188.30 tok/s at 4, 5, 6, and 8 threads. Six physical-core threads remain the

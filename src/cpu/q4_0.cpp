@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 namespace qwen35x::cpu {
 namespace detail {
@@ -263,6 +264,36 @@ void q4_0_packed_matvec_prepared_q8_0_scalar(
     }
     std::copy_n(accumulators, 8, output + row_tile * 8);
   }
+}
+
+Q4_0ArgmaxResult q4_0_packed_matvec_prepared_q8_0_argmax_scalar(
+  const Q4_0BlockX8 * matrix,
+  const Q8_0BlockX4 * vector,
+  const int * token_counts,
+  const float repetition_penalty,
+  const std::size_t row_offset,
+  const std::size_t row_count,
+  const std::size_t blocks_per_row) noexcept {
+  Q4_0ArgmaxResult best{-std::numeric_limits<float>::infinity(), row_offset};
+  for (std::size_t row_tile = 0; row_tile < row_count / 8; ++row_tile) {
+    float logits[8];
+    q4_0_packed_matvec_prepared_q8_0_scalar(
+      matrix + row_tile * blocks_per_row, vector, logits, 8, blocks_per_row);
+    for (std::size_t lane = 0; lane < 8; ++lane) {
+      const std::size_t index = row_offset + row_tile * 8 + lane;
+      float value = logits[lane];
+      if (token_counts != nullptr && token_counts[index] > 0 &&
+          repetition_penalty > 1.0F) {
+        value = value > 0.0F
+          ? value / repetition_penalty
+          : value * repetition_penalty;
+      }
+      if (value > best.value) {
+        best = Q4_0ArgmaxResult{value, index};
+      }
+    }
+  }
+  return best;
 }
 
 } // namespace detail
@@ -525,6 +556,29 @@ void q4_0_packed_matvec_prepared_q8_0(
 #endif
   detail::q4_0_packed_matvec_prepared_q8_0_scalar(
     matrix, vector, output, row_count, blocks_per_row);
+}
+
+Q4_0ArgmaxResult q4_0_packed_matvec_prepared_q8_0_argmax(
+  const Q4_0BlockX8 * matrix,
+  const Q8_0BlockX4 * vector,
+  const int * token_counts,
+  const float repetition_penalty,
+  const std::size_t row_offset,
+  const std::size_t row_count,
+  const std::size_t blocks_per_row,
+  const Q8_0Backend backend) noexcept {
+#if QWEN35X_Q8_0_HAS_AVX2_TU
+  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+    return detail::q4_0_packed_matvec_prepared_q8_0_argmax_avx2(
+      matrix, vector, token_counts, repetition_penalty, row_offset, row_count,
+      blocks_per_row);
+  }
+#else
+  static_cast<void>(backend);
+#endif
+  return detail::q4_0_packed_matvec_prepared_q8_0_argmax_scalar(
+    matrix, vector, token_counts, repetition_penalty, row_offset, row_count,
+    blocks_per_row);
 }
 
 } // namespace qwen35x::cpu

@@ -254,8 +254,8 @@ preserving turbo rather than by reducing a directly timed stage.
 
 ### A6 — Greedy LM-head matvec plus argmax fusion
 
-Status: partially completed; unused embedding/LM-head scale sidecar removed,
-greedy matvec/argmax fusion still pending
+Status: completed for Q4_0; unused scale sidecar removed and greedy
+matvec/argmax fusion retained
 
 Implementation:
 
@@ -659,7 +659,7 @@ Current laptop result (six threads, three measured runs after one warmup):
 | --- | ---: | ---: | ---: |
 | pp256 | 306.26 tok/s | 227.90 tok/s | +34.4% |
 | pp2048 | 255.91 tok/s | 202.53 tok/s | +26.4% |
-| prompt-1 / tg128 | 61.41 tok/s | 45.50 tok/s | +35.0% |
+| prompt-1 / tg128 | 62.75 tok/s | 45.50 tok/s | +37.9% |
 
 The original canonical native-Q4 implementation measured 171.82 tok/s at
 pp256 and 55.30 tok/s at prompt-1/tg128. A row-major 1x8 prefill tile reached
@@ -689,6 +689,12 @@ quant bytes, exact sum, and FP16-rounded FP32 scale once per projection and
 reuses them for every output tile, eliminating repeated repacking and summing.
 This improves pp256 from 281.52 to 306.26 tok/s (+8.8%), pp2048 from 237.58 to
 255.91 tok/s (+7.7%), and five-run decode from 60.57 to 61.41 tok/s (+1.4%).
+
+The subsequent greedy-only tied LM-head reduces each static executor partition
+to one repetition-adjusted `(value, token)` result rather than materializing
+the full vocabulary logits. It improves five-run decode from 61.41 to 62.75
+tok/s (+2.2%) and preserves the complete token sequence in an end-to-end
+differential run. Temperature sampling keeps the original full-logit path.
 
 The Q4-specific external-review plan is incorporated as this ordered checklist:
 
@@ -850,7 +856,7 @@ Update this table in the same commit that lands or rejects each experiment.
 | A3 | Pending | — | Local vectors and model-global quantization scratch remain |
 | A4 | Completed, retained | `4c74dd8` | Three-slot ring state removes decode window copies; kernel-major weights, four-tap AVX2, and fused SiLU are covered by scalar/SIMD state and output tests. Ordered/reverse pp256 pairs averaged 210.48 versus 198.33 tok/s (+6.1%); decode averaged 37.14 versus 36.72 tok/s (+1.2%). pp2048 was 175.48 versus 165.58 tok/s (+6.0%) even though the optimized run was second. A 2,048-token integration run crossed 32 prefill chunk boundaries successfully. |
 | A5 | Pending | — | Global `min_parallel_rows=1` and long spin phase remain |
-| A6 | Partial | `a0524f2` | The embedding/LM-head tensor no longer allocates an unused FP32 scale sidecar, saving 7,946,240 floats (30.31 MiB) for this model. Greedy matvec/argmax fusion remains pending. |
+| A6 | Completed for Q4_0 | this commit | The scale sidecar removal saves 30.31 MiB. Greedy Q4 LM-head workers apply repetition penalty and return deterministic local maxima rather than vocabulary logits. Five-run decode rises from 61.41 to 62.75 tok/s (+2.2%); a 16-token full-runtime differential against `12f9ecf` is exact. Temperature sampling retains full logits. |
 | A7 | Completed, retained | `d49aec4` | Added scalar/AVX2 differential coverage for contexts 1, 7, 8, 9, 63, 64, 65, 255, 256, 257, and 2,048. Softmax probabilities are normalized once and sigmoid uses one vector division. pp256 was 211.31 versus 209.37 tok/s (+0.9%). Ordered/reverse decode pairs averaged 37.44 versus 37.17 tok/s (+0.7%). |
 | A8 | Pending | — | Algebra/row tiling unimplemented |
 | A9 | Pending | — | GQA heads still largely independent |
@@ -858,7 +864,7 @@ Update this table in the same commit that lands or rejects each experiment.
 | B | Pending | — | Prefix state cache not implemented |
 | C1-C6 | Future hardware | — | Requires suitable ISA hosts for validation |
 | D0 | Initial screen completed | `4ca364c` | Seven formats, three alternating-order performance rounds, 56 deterministic rewrite outputs, and a three-run 2k/2k Q8-versus-Q4_0 comparison select Q4_0 for the first native backend; production quality expansion remains open |
-| D1 | Active; laptop throughput target achieved | this commit | Native Q4_0 scalar/AVX2, packed-only model weights, token-major prepared activations with FP32 scales and sums, unsigned Q4 correction, tile scheduling, embedding/LM-head coverage, and 8x8 prefill are implemented. Against llama.cpp Q4_0, pp256 is +34.4%, pp2048 is +26.4%, and decode is +35.0%. Expanded correctness, quality, memory, and long-context gates remain. |
+| D1 | Active; laptop throughput target achieved | `12f9ecf` + this commit | Native Q4_0 scalar/AVX2, packed-only model weights, token-major prepared activations with FP32 scales and sums, unsigned Q4 correction, tile scheduling, fused greedy LM-head, embedding coverage, and 8x8 prefill are implemented. Against llama.cpp Q4_0, pp256 is +34.4%, pp2048 is +26.4%, and decode is +37.9%. Expanded correctness, quality, memory, and long-context gates remain. |
 | D2-D4 | Pending D1 validation | — | IQ4_NL, mixed precision, and calibrated offline rounding follow the validated Q4_0 baseline |
 | D5 | Research target | — | Custom Hadamard-regularized `Q4_H128` is the preferred custom-format direction after simple Q4 baselines |
 | D6-D7 | Deferred/future hardware | — | State quantization is quality-sensitive; dense sub-four-bit research benefits materially from newer SIMD ISAs |

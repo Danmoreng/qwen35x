@@ -415,6 +415,7 @@ bool run_forward_cpu_q8_batch(
   const int position_start,
   const bool compute_next_logits,
   std::vector<float> & next_logits,
+  CpuGreedySamplingState * greedy_sampling,
   DecodeProfilingAccumulator * profiling,
   std::string & error_message) {
   if (weights.cpu_q8_runtime == nullptr || token_ids == nullptr || batch_size == 0) {
@@ -545,8 +546,18 @@ bool run_forward_cpu_q8_batch(
   std::vector<float> final_input(last_hidden, last_hidden + hidden);
   std::vector<float> final_hidden;
   rms_norm_qwen3next(final_input, weights.final_norm, dims.rms_eps, final_hidden);
-  const bool ok = compute_next_logits_from_embedding(
-    weights.embed_tokens, final_hidden, false, next_logits, error_message);
+  bool ok = false;
+  if (greedy_sampling != nullptr && greedy_sampling->enabled &&
+      greedy_sampling->token_counts != nullptr) {
+    ok = greedy_q4_token(
+      weights.embed_tokens, final_hidden, *greedy_sampling->token_counts,
+      greedy_sampling->repetition_penalty, greedy_sampling->next_token,
+      error_message);
+    next_logits.clear();
+  } else {
+    ok = compute_next_logits_from_embedding(
+      weights.embed_tokens, final_hidden, false, next_logits, error_message);
+  }
   if (profiling != nullptr) {
     profiling->logits_ms += elapsed_ms(logits_start);
   }

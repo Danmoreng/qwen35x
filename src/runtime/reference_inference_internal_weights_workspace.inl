@@ -7,6 +7,14 @@ struct CpuQ8Runtime {
   std::vector<cpu::Q8_0Block> quantized_batch;
   std::vector<float> quantized_batch_scales;
   std::vector<cpu::Q8_0BlockX4> packed_q8_0_batch;
+  std::vector<cpu::Q4_0ArgmaxResult> greedy_results;
+};
+
+struct CpuGreedySamplingState {
+  const std::vector<int> * token_counts = nullptr;
+  float repetition_penalty = 1.0F;
+  int next_token = -1;
+  bool enabled = false;
 };
 
 struct TensorData {
@@ -53,6 +61,18 @@ struct PackedQ4MatvecJob {
   cpu::Q8_0Backend backend = cpu::Q8_0Backend::auto_select;
 };
 
+struct PackedQ4ArgmaxJob {
+  const cpu::Q4_0BlockX8 * matrix = nullptr;
+  const cpu::Q8_0BlockX4 * vector = nullptr;
+  const int * token_counts = nullptr;
+  cpu::Q4_0ArgmaxResult * results = nullptr;
+  float repetition_penalty = 1.0F;
+  std::size_t blocks_per_row = 0;
+  std::size_t row_tile_count = 0;
+  std::size_t partition_count = 0;
+  cpu::Q8_0Backend backend = cpu::Q8_0Backend::auto_select;
+};
+
 void run_packed_q4_prefill_tiles(
   void * opaque_context,
   const std::size_t tile_begin,
@@ -81,6 +101,34 @@ void run_packed_q4_matvec_tiles(
     (tile_end - tile_begin) * cpu::q4_0_packed_rows,
     job.blocks_per_row,
     job.backend);
+}
+
+void run_packed_q4_argmax_tiles(
+  void * opaque_context,
+  const std::size_t tile_begin,
+  const std::size_t tile_end) noexcept {
+  auto & job = *static_cast<PackedQ4ArgmaxJob *>(opaque_context);
+  const std::size_t rows_per_partition =
+    job.row_tile_count / job.partition_count;
+  const std::size_t remainder = job.row_tile_count % job.partition_count;
+  std::size_t partition = 0;
+  for (; partition + 1 < job.partition_count; ++partition) {
+    const std::size_t expected_begin =
+      partition * rows_per_partition + std::min(partition, remainder);
+    if (expected_begin == tile_begin) {
+      break;
+    }
+  }
+  job.results[partition] =
+    cpu::q4_0_packed_matvec_prepared_q8_0_argmax(
+      job.matrix + tile_begin * job.blocks_per_row,
+      job.vector,
+      job.token_counts,
+      job.repetition_penalty,
+      tile_begin * cpu::q4_0_packed_rows,
+      (tile_end - tile_begin) * cpu::q4_0_packed_rows,
+      job.blocks_per_row,
+      job.backend);
 }
 
 struct FullAttentionWeights {
@@ -806,6 +854,70 @@ bool matvec_2d(
     out[static_cast<std::size_t>(r)] = sum;
   }
   return true;
+}
+
+bool greedy_q4_token(
+  const TensorData & weights,
+  const std::vector<float> & input,
+  const std::vector<int> & token_counts,
+  const float repetition_penalty,
+  int & out_token,
+  std::string & error_message) {
+  if (!weights.is_q4_0() || weights.q8_0_runtime == nullptr ||
+      weights.q8_0_runtime->executor == nullptr || weights.shape.size() != 2) {
+    error_message = "Fused greedy Q4 selection requires packed weights and a CPU executor.";
+    return false;
+  }
+  const std::size_t rows = static_cast<std::size_t>(weights.shape[0]);
+  const std::size_t cols = static_cast<std::size_t>(weights.shape[1]);
+  if (input.size() != cols || token_counts.size() < rows ||
+      (rows % cpu::q4_0_packed_rows) != 0 ||
+      (cols % cpu::q4_0_values_per_block) != 0) {
+    error_message = "Fused greedy Q4 selection received incompatible dimensions.";
+    return false;
+  }
+  const std::size_t blocks_per_row = cols / cpu::q4_0_values_per_block;
+  const std::size_t row_tiles = rows / cpu::q4_0_packed_rows;
+  if (weights.packed_q4_0_blocks.size() != row_tiles * blocks_per_row) {
+    error_message = "Fused greedy Q4 selection weight storage size mismatch.";
+    return false;
+  }
+
+  CpuQ8Runtime & runtime = *weights.q8_0_runtime;
+  runtime.prepared_q4_input.resize(blocks_per_row);
+  cpu::q8_0_quantize_vector_1(
+    input.data(), runtime.prepared_q4_input.data(), blocks_per_row,
+    weights.q8_0_backend);
+  runtime.greedy_results.assign(
+    runtime.executor->thread_count(),
+    cpu::Q4_0ArgmaxResult{-std::numeric_limits<float>::infinity(), 0});
+  PackedQ4ArgmaxJob job{
+    weights.packed_q4_0_blocks.data(),
+    runtime.prepared_q4_input.data(),
+    token_counts.data(),
+    runtime.greedy_results.data(),
+    repetition_penalty,
+    blocks_per_row,
+    row_tiles,
+    runtime.executor->thread_count(),
+    weights.q8_0_backend,
+  };
+  const cpu::CpuExecutorStatus status = runtime.executor->parallel_for_rows(
+    row_tiles, run_packed_q4_argmax_tiles, &job);
+  if (status != cpu::CpuExecutorStatus::ok) {
+    error_message = std::string("Fused greedy Q4 executor failed: ") +
+      cpu::cpu_executor_status_name(status) + ".";
+    return false;
+  }
+
+  cpu::Q4_0ArgmaxResult best{-std::numeric_limits<float>::infinity(), 0};
+  for (const cpu::Q4_0ArgmaxResult candidate : runtime.greedy_results) {
+    if (candidate.value > best.value) {
+      best = candidate;
+    }
+  }
+  out_token = static_cast<int>(best.index);
+  return out_token >= 0 && static_cast<std::size_t>(out_token) < rows;
 }
 
 bool matmul_2d_quantized_batch(

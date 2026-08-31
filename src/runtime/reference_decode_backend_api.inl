@@ -64,6 +64,7 @@ bool decode_step_with_runtime_backend(
   const bool use_cuda_gpu_sampling,
   const bool compute_next_logits,
   CudaForwardWorkspace * cuda_workspace,
+  CpuGreedySamplingState * greedy_sampling,
   DecodeProfilingAccumulator * profiling,
   std::string & error_message) {
   if (!backend.initialized) {
@@ -85,6 +86,7 @@ bool decode_step_with_runtime_backend(
         use_cuda_gpu_sampling,
         compute_next_logits,
         cuda_workspace,
+        greedy_sampling,
         profiling,
         error_message);
     case RuntimeDecodeBackendKind::qwen35x_cuda: {

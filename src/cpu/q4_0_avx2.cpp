@@ -3,6 +3,7 @@
 #include <immintrin.h>
 
 #include <cstddef>
+#include <limits>
 
 namespace qwen35x::cpu::detail {
 namespace {
@@ -592,6 +593,43 @@ void q4_0_packed_matvec_prepared_q8_0_avx2(
       output + row_tile * 8,
       _mm256_permutevar8x32_ps(accumulator[0], final_permutation));
   }
+}
+
+Q4_0ArgmaxResult q4_0_packed_matvec_prepared_q8_0_argmax_avx2(
+  const Q4_0BlockX8 * matrix,
+  const Q8_0BlockX4 * vector,
+  const int * token_counts,
+  const float repetition_penalty,
+  const std::size_t row_offset,
+  const std::size_t row_count,
+  const std::size_t blocks_per_row) noexcept {
+  const __m256i final_permutation = _mm256_set_epi32(7, 5, 3, 1, 6, 4, 2, 0);
+  Q4_0ArgmaxResult best{-std::numeric_limits<float>::infinity(), row_offset};
+  alignas(32) float logits[8];
+  for (std::size_t row_tile = 0; row_tile < row_count / 8; ++row_tile) {
+    __m256 accumulator[1] = {_mm256_setzero_ps()};
+    const Q4_0BlockX8 * row_tile_data = matrix + row_tile * blocks_per_row;
+    for (std::size_t block = 0; block < blocks_per_row; ++block) {
+      accumulate_packed_block_x8<1>(
+        row_tile_data[block], vector[block], nullptr, accumulator);
+    }
+    _mm256_store_ps(
+      logits, _mm256_permutevar8x32_ps(accumulator[0], final_permutation));
+    for (std::size_t lane = 0; lane < 8; ++lane) {
+      const std::size_t index = row_offset + row_tile * 8 + lane;
+      float value = logits[lane];
+      if (token_counts != nullptr && token_counts[index] > 0 &&
+          repetition_penalty > 1.0F) {
+        value = value > 0.0F
+          ? value / repetition_penalty
+          : value * repetition_penalty;
+      }
+      if (value > best.value) {
+        best = Q4_0ArgmaxResult{value, index};
+      }
+    }
+  }
+  return best;
 }
 
 } // namespace qwen35x::cpu::detail
