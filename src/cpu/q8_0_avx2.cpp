@@ -191,6 +191,47 @@ void dot_four_rows_avx2_impl(
   output[3] = horizontal_sum_f32(accumulator3);
 }
 
+void dot_eight_rows_avx2_impl(
+  const Q8_0Block * matrix,
+  const Q8_0Block * vector,
+  const std::size_t blocks_per_row,
+  float * output) noexcept {
+  __m256 accumulators[8] = {
+    _mm256_setzero_ps(), _mm256_setzero_ps(),
+    _mm256_setzero_ps(), _mm256_setzero_ps(),
+    _mm256_setzero_ps(), _mm256_setzero_ps(),
+    _mm256_setzero_ps(), _mm256_setzero_ps(),
+  };
+  for (std::size_t block = 0; block < blocks_per_row; ++block) {
+    const __m256i vector_bytes = _mm256_loadu_si256(
+      reinterpret_cast<const __m256i *>(vector[block].qs));
+    const float vector_scale = _cvtsh_ss(vector[block].d);
+#if defined(__clang__)
+#pragma clang loop unroll(full)
+#elif defined(__GNUC__)
+#pragma GCC unroll 8
+#endif
+    for (std::size_t lane = 0; lane < 8; ++lane) {
+      const Q8_0Block & weight = matrix[lane * blocks_per_row + block];
+      const __m256i weight_bytes = _mm256_loadu_si256(
+        reinterpret_cast<const __m256i *>(weight.qs));
+      accumulators[lane] = _mm256_fmadd_ps(
+        _mm256_cvtepi32_ps(dot_block_i8x8_loaded_lhs(
+          weight_bytes, _mm256_abs_epi8(weight_bytes), vector_bytes)),
+        _mm256_set1_ps(_cvtsh_ss(weight.d) * vector_scale),
+        accumulators[lane]);
+    }
+  }
+#if defined(__clang__)
+#pragma clang loop unroll(full)
+#elif defined(__GNUC__)
+#pragma GCC unroll 8
+#endif
+  for (std::size_t lane = 0; lane < 8; ++lane) {
+    output[lane] = horizontal_sum_f32(accumulators[lane]);
+  }
+}
+
 } // namespace
 
 void q8_0_quantize_avx2(
@@ -277,6 +318,13 @@ void q8_0_matvec_avx2(
     return;
   }
   std::size_t row = 0;
+  for (; row + 8 <= row_count; row += 8) {
+    dot_eight_rows_avx2_impl(
+      matrix + row * blocks_per_row,
+      vector,
+      blocks_per_row,
+      output + row);
+  }
   for (; row + 4 <= row_count; row += 4) {
     const Q8_0Block * row0 = matrix + row * blocks_per_row;
     dot_four_rows_avx2_impl(
