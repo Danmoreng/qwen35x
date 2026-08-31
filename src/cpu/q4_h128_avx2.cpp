@@ -18,21 +18,15 @@ void q4_h128_transform_block_avx2(
     q4_h128_sign_word(transform_block_index, 0, sign_seed),
     q4_h128_sign_word(transform_block_index, 1, sign_seed),
   };
+  const __m256i sign_shifts = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
   for (std::size_t vector = 0; vector < 16; ++vector) {
     const std::size_t value_base = vector * 8;
     const std::size_t word = value_base / 64;
     const std::size_t bit_base = value_base % 64;
-    const std::uint64_t signs = sign_words[word] >> bit_base;
+    const std::uint32_t signs = static_cast<std::uint32_t>(
+      (sign_words[word] >> bit_base) & UINT64_C(0xff));
     const __m256i sign_mask = _mm256_slli_epi32(
-      _mm256_set_epi32(
-        static_cast<int>((signs >> 7U) & 1U),
-        static_cast<int>((signs >> 6U) & 1U),
-        static_cast<int>((signs >> 5U) & 1U),
-        static_cast<int>((signs >> 4U) & 1U),
-        static_cast<int>((signs >> 3U) & 1U),
-        static_cast<int>((signs >> 2U) & 1U),
-        static_cast<int>((signs >> 1U) & 1U),
-        static_cast<int>(signs & 1U)),
+      _mm256_srlv_epi32(_mm256_set1_epi32(static_cast<int>(signs)), sign_shifts),
       31);
     __m256 values = _mm256_xor_ps(
       _mm256_loadu_ps(input + value_base),
