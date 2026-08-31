@@ -571,6 +571,7 @@ bool run_reference_qwen35_inference(
     options.sampling.repetition_penalty,
     -1,
     !options.use_cuda && options.sampling.temperature <= 1.0e-6F &&
+      options.capture_top_logits == 0 &&
       weights.embed_tokens.is_q4_0() && weights.cpu_q8_runtime != nullptr &&
       weights.cpu_q8_runtime->executor != nullptr,
   };
@@ -632,6 +633,40 @@ bool run_reference_qwen35_inference(
 
   int position = 0;
   std::vector<float> predicted_logits;
+  result.top_logits_by_step.clear();
+  auto capture_top_logits = [&](const int step, const int selected_token) {
+    if (options.capture_top_logits <= 0 || predicted_logits.empty()) {
+      return;
+    }
+    std::vector<float> adjusted_logits = predicted_logits;
+    apply_repetition_penalty_inplace(
+      adjusted_logits, token_counts, options.sampling.repetition_penalty);
+    std::vector<std::int32_t> candidate_ids;
+    candidate_ids.reserve(adjusted_logits.size());
+    for (std::size_t token_id = 0; token_id < adjusted_logits.size(); ++token_id) {
+      candidate_ids.push_back(static_cast<std::int32_t>(token_id));
+    }
+    const std::size_t count = std::min(
+      static_cast<std::size_t>(options.capture_top_logits), candidate_ids.size());
+    std::partial_sort(
+      candidate_ids.begin(), candidate_ids.begin() + static_cast<std::ptrdiff_t>(count),
+      candidate_ids.end(),
+      [&](const std::int32_t lhs, const std::int32_t rhs) {
+        const float lhs_value = adjusted_logits[static_cast<std::size_t>(lhs)];
+        const float rhs_value = adjusted_logits[static_cast<std::size_t>(rhs)];
+        return lhs_value != rhs_value ? lhs_value > rhs_value : lhs < rhs;
+      });
+    ReferenceTopLogitsStep snapshot;
+    snapshot.step = step;
+    snapshot.selected_token_id = selected_token;
+    snapshot.top_logits.reserve(count);
+    for (std::size_t index = 0; index < count; ++index) {
+      const std::int32_t token_id = candidate_ids[index];
+      snapshot.top_logits.push_back(
+        ReferenceTopLogit{token_id, adjusted_logits[static_cast<std::size_t>(token_id)]});
+    }
+    result.top_logits_by_step.push_back(std::move(snapshot));
+  };
   const auto prefill_start = std::chrono::steady_clock::now();
   const std::size_t prefix_token_count = options.cpu_prefix_token_count;
   const std::size_t kv_width =
@@ -999,6 +1034,8 @@ bool run_reference_qwen35_inference(
         return false;
       }
       profiling.sampling_ms += elapsed_ms(sampling_start);
+
+      capture_top_logits(i, current);
 
       result.generated_tokens.push_back(current);
       if (current >= 0 && current < dims.vocab_size) {

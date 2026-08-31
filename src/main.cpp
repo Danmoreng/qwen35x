@@ -289,6 +289,29 @@ bool write_profile_json(
     out << result.generated_tokens[i];
   }
   out << "],\n";
+  out << "  \"top_logits_by_step\": [";
+  if (!result.top_logits_by_step.empty()) {
+    out << "\n";
+  }
+  for (std::size_t step_index = 0; step_index < result.top_logits_by_step.size(); ++step_index) {
+    const auto & step = result.top_logits_by_step[step_index];
+    out << "    {\n";
+    out << "      \"step\": " << step.step << ",\n";
+    out << "      \"selected_token_id\": " << step.selected_token_id << ",\n";
+    out << "      \"top_logits\": [";
+    if (!step.top_logits.empty()) {
+      out << "\n";
+    }
+    for (std::size_t logit_index = 0; logit_index < step.top_logits.size(); ++logit_index) {
+      const auto & entry = step.top_logits[logit_index];
+      out << "        {\"token_id\": " << entry.token_id
+          << ", \"logit\": " << entry.logit << "}";
+      out << (logit_index + 1 < step.top_logits.size() ? ",\n" : "\n");
+    }
+    out << "      ]\n";
+    out << "    }" << (step_index + 1 < result.top_logits_by_step.size() ? ",\n" : "\n");
+  }
+  out << "  ],\n";
   out << "  \"generated_text\": \"" << json_escape(generated_text) << "\"\n";
   out << "}\n";
   if (!out.good()) {
@@ -372,6 +395,8 @@ int main(int argc, char ** argv) {
       cpu_prefix_cache_replays = std::stoi(argv[++i]);
     } else if (arg == "--cpu-model-session-replays" && i + 1 < argc) {
       cpu_model_session_replays = std::stoi(argv[++i]);
+    } else if (arg == "--top-logits" && i + 1 < argc) {
+      infer_options.capture_top_logits = std::stoi(argv[++i]);
     } else if (arg == "--cpu-isa" && i + 1 < argc) {
       const std::string isa = argv[++i];
       if (isa == "auto") {
@@ -541,7 +566,7 @@ int main(int argc, char ** argv) {
       std::cout << "       qwen35x --bench-nvfp4-projection --hf-model-dir <path> [--nvfp4-tensor <base-name>] [--nvfp4-projection-kernel <row|warp|scale-group|blackwell-fp4>] [--bench-warmup <n>] [--bench-iters <n>]\n";
       std::cout << "       qwen35x --bench-nvfp4-prefill-projection --hf-model-dir <path> [--nvfp4-tensor <base-name>] [--nvfp4-prefill-seq-len <n>] [--bench-warmup <n>] [--bench-iters <n>]\n";
       std::cout << "       qwen35x --bench-nvfp4-gate-up --hf-model-dir <path> [--nvfp4-gate-tensor <base-name>] [--nvfp4-up-tensor <base-name>] [--bench-warmup <n>] [--bench-iters <n>]\n";
-      std::cout << "       qwen35x --infer-reference --hf-model-dir <path> [--cpu-gguf <q4_0-or-q8_0.gguf>] [--cpu-threads <n>] [--cpu-isa <auto|scalar|avx2|avx-vnni|avx512|avx512-vnni>] [--cpu-model-session-replays <n>] [--cpu-prefix-cache-tokens <n> --cpu-prefix-cache-replays <n>] (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
+      std::cout << "       qwen35x --infer-reference --hf-model-dir <path> [--cpu-gguf <q4_0-or-q8_0.gguf>] [--cpu-threads <n>] [--cpu-isa <auto|scalar|avx2|avx-vnni|avx512|avx512-vnni>] [--cpu-model-session-replays <n>] [--cpu-prefix-cache-tokens <n> --cpu-prefix-cache-replays <n>] [--top-logits <n>] (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "       qwen35x --infer-gpu --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "               [--temperature <float>] [--top-p <float>] [--top-k <int>] [--repeat-penalty <float>] [--seed <int64>]\n";
       std::cout << "               [--gpu-bf16|--gpu-f32-matvec] [--gpu-decode-backend <default|qwen35x>] [--gpu-decode-blocks <n>] [--qwen35x-prefill-mode <replay|batched>]\n";
@@ -933,6 +958,10 @@ int main(int argc, char ** argv) {
       std::cerr << "--cpu-model-session-replays must be positive when specified\n";
       return 11;
     }
+    if (infer_options.capture_top_logits < 0) {
+      std::cerr << "--top-logits must be non-negative\n";
+      return 11;
+    }
     if (cpu_model_session_replays > 1 && cpu_prefix_cache_replays > 1 &&
         cpu_model_session_replays != cpu_prefix_cache_replays) {
       std::cerr << "CPU model-session and prefix-cache replay counts must match\n";
@@ -1034,6 +1063,14 @@ int main(int argc, char ** argv) {
       std::cout << " " << token;
     }
     std::cout << "\n";
+    for (const auto & step : infer_result.top_logits_by_step) {
+      std::cout << "  top_logits_step_" << step.step
+                << " selected=" << step.selected_token_id << ":";
+      for (const auto & entry : step.top_logits) {
+        std::cout << " " << entry.token_id << "=" << entry.logit;
+      }
+      std::cout << "\n";
+    }
 
     std::string generated_text;
     if (has_tokenizer) {

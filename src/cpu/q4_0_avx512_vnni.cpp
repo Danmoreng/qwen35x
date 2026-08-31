@@ -122,7 +122,8 @@ QWEN35X_FORCE_INLINE void accumulate_tile(
   const Q8_0BlockX4 & vectors0,
   const Q8_0BlockX4 & vectors1,
   const Q8_0BlockX4 & vectors2,
-  __m256 (&accumulators)[12]) noexcept {
+  const Q8_0BlockX4 & vectors3,
+  __m256 (&accumulators)[16]) noexcept {
   accumulate_token<0>(weights, vectors0, accumulators[0]);
   accumulate_token<1>(weights, vectors0, accumulators[1]);
   accumulate_token<2>(weights, vectors0, accumulators[2]);
@@ -135,6 +136,10 @@ QWEN35X_FORCE_INLINE void accumulate_tile(
   accumulate_token<1>(weights, vectors2, accumulators[9]);
   accumulate_token<2>(weights, vectors2, accumulators[10]);
   accumulate_token<3>(weights, vectors2, accumulators[11]);
+  accumulate_token<0>(weights, vectors3, accumulators[12]);
+  accumulate_token<1>(weights, vectors3, accumulators[13]);
+  accumulate_token<2>(weights, vectors3, accumulators[14]);
+  accumulate_token<3>(weights, vectors3, accumulators[15]);
 }
 
 [[nodiscard]] QWEN35X_FORCE_INLINE __m256 final_row_order(
@@ -158,10 +163,10 @@ void q4_0_packed_matmul_q8_0_avx512_vnni(
   const std::size_t row_tiles = row_count / q4_0_packed_rows;
   const std::size_t vector_tiles = vector_count / q8_0_packed_vectors;
   std::size_t vector_tile = 0;
-  for (; vector_tile + 3 <= vector_tiles; vector_tile += 3) {
+  for (; vector_tile + 4 <= vector_tiles; vector_tile += 4) {
     const Q8_0BlockX4 * vector_tile_data = vectors + vector_tile * blocks_per_row;
     for (std::size_t row_tile = 0; row_tile < row_tiles; ++row_tile) {
-      __m256 accumulators[12] = {};
+      __m256 accumulators[16] = {};
       const Q4_0BlockX8 * row_tile_data = matrix + row_tile * blocks_per_row;
       for (std::size_t block = 0; block < blocks_per_row; ++block) {
         const DecodedWeights weights = decode_weights(row_tile_data[block]);
@@ -170,9 +175,10 @@ void q4_0_packed_matmul_q8_0_avx512_vnni(
           vector_tile_data[block],
           vector_tile_data[blocks_per_row + block],
           vector_tile_data[2 * blocks_per_row + block],
+          vector_tile_data[3 * blocks_per_row + block],
           accumulators);
       }
-      for (std::size_t token = 0; token < 12; ++token) {
+      for (std::size_t token = 0; token < 16; ++token) {
         _mm256_storeu_ps(
           output + (vector_tile * 4 + token) * output_row_stride + row_tile * 8,
           final_row_order(accumulators[token]));

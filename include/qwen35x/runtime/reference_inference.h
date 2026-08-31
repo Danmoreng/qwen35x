@@ -108,9 +108,21 @@ struct ReferenceInferenceOptions {
   ReferenceCpuModelSession * cpu_model_session = nullptr;
   ReferenceCpuPrefixCache * cpu_prefix_cache = nullptr;
   std::size_t cpu_prefix_token_count = 0;
+  int capture_top_logits = 0;
   SamplingOptions sampling;
   std::vector<std::int32_t> stop_token_ids;
   std::vector<std::vector<std::int32_t>> stop_token_sequences;
+};
+
+struct ReferenceTopLogit {
+  std::int32_t token_id = 0;
+  float logit = 0.0f;
+};
+
+struct ReferenceTopLogitsStep {
+  int step = 0;
+  std::int32_t selected_token_id = 0;
+  std::vector<ReferenceTopLogit> top_logits;
 };
 
 struct ReferenceTimingBreakdown {
@@ -131,6 +143,7 @@ struct ReferenceTransferBreakdown {
 
 struct ReferenceInferenceResult {
   std::vector<std::int32_t> generated_tokens;
+  std::vector<ReferenceTopLogitsStep> top_logits_by_step;
   double load_time_ms = 0.0;
   double prefill_time_ms = 0.0;
   double prefill_tokens_per_second = 0.0;
