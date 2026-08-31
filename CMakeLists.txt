@@ -77,7 +77,7 @@ if (QWEN35X_SYSTEM_PROCESSOR_LOWER MATCHES "^(x86_64|amd64|i[3-6]86)$" OR
     set(QWEN35X_Q8_0_HAS_AVX2_TU ON)
     set_source_files_properties(
       src/cpu/q8_0_avx2.cpp src/cpu/delta_net_avx2.cpp src/cpu/full_attention_avx2.cpp
-      PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+      PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-mtune=skylake")
   endif ()
 endif ()
 
