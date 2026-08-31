@@ -68,17 +68,48 @@ namespace {
   // Keep eight independent FP32 accumulation lanes across all Q8 blocks and
   // reduce only once per row. Reducing each 32-value block separately creates
   // a long scalar dependency chain and leaves most of AVX2 idle.
-  __m256 accumulator = _mm256_setzero_ps();
-  for (std::size_t block = 0; block < block_count; ++block) {
-    const __m256 integer_dot = _mm256_cvtepi32_ps(dot_block_i8x8(lhs[block].qs, rhs[block].qs));
-    const float lhs_scale = _cvtsh_ss(lhs[block].d);
-    const float rhs_scale = _cvtsh_ss(rhs[block].d);
-    accumulator = _mm256_fmadd_ps(
-      integer_dot,
-      _mm256_set1_ps(lhs_scale * rhs_scale),
-      accumulator);
+  __m256 accumulator0 = _mm256_setzero_ps();
+  __m256 accumulator1 = _mm256_setzero_ps();
+  __m256 accumulator2 = _mm256_setzero_ps();
+  __m256 accumulator3 = _mm256_setzero_ps();
+  std::size_t block = 0;
+  for (; block + 4 <= block_count; block += 4) {
+    const __m256 integer_dot0 = _mm256_cvtepi32_ps(
+      dot_block_i8x8(lhs[block].qs, rhs[block].qs));
+    const __m256 integer_dot1 = _mm256_cvtepi32_ps(
+      dot_block_i8x8(lhs[block + 1].qs, rhs[block + 1].qs));
+    const __m256 integer_dot2 = _mm256_cvtepi32_ps(
+      dot_block_i8x8(lhs[block + 2].qs, rhs[block + 2].qs));
+    const __m256 integer_dot3 = _mm256_cvtepi32_ps(
+      dot_block_i8x8(lhs[block + 3].qs, rhs[block + 3].qs));
+    accumulator0 = _mm256_fmadd_ps(
+      integer_dot0,
+      _mm256_set1_ps(_cvtsh_ss(lhs[block].d) * _cvtsh_ss(rhs[block].d)),
+      accumulator0);
+    accumulator1 = _mm256_fmadd_ps(
+      integer_dot1,
+      _mm256_set1_ps(_cvtsh_ss(lhs[block + 1].d) * _cvtsh_ss(rhs[block + 1].d)),
+      accumulator1);
+    accumulator2 = _mm256_fmadd_ps(
+      integer_dot2,
+      _mm256_set1_ps(_cvtsh_ss(lhs[block + 2].d) * _cvtsh_ss(rhs[block + 2].d)),
+      accumulator2);
+    accumulator3 = _mm256_fmadd_ps(
+      integer_dot3,
+      _mm256_set1_ps(_cvtsh_ss(lhs[block + 3].d) * _cvtsh_ss(rhs[block + 3].d)),
+      accumulator3);
   }
-  return horizontal_sum_f32(accumulator);
+  accumulator0 = _mm256_add_ps(accumulator0, accumulator1);
+  accumulator2 = _mm256_add_ps(accumulator2, accumulator3);
+  for (; block < block_count; ++block) {
+    const __m256 integer_dot = _mm256_cvtepi32_ps(
+      dot_block_i8x8(lhs[block].qs, rhs[block].qs));
+    accumulator0 = _mm256_fmadd_ps(
+      integer_dot,
+      _mm256_set1_ps(_cvtsh_ss(lhs[block].d) * _cvtsh_ss(rhs[block].d)),
+      accumulator0);
+  }
+  return horizontal_sum_f32(_mm256_add_ps(accumulator0, accumulator2));
 }
 
 [[nodiscard]] float dot_row_major_avx2_impl(
