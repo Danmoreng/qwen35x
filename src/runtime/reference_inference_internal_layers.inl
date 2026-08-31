@@ -197,6 +197,41 @@ bool run_full_attention_step_cuda_device(
          cuda::run_matvec_f32_device(layer.full.o_proj.device_matrix, workspace.full_attn, out_hidden, error_message);
 }
 
+struct GatedDeltaNetCpuJob {
+  float * state = nullptr;
+  const float * q = nullptr;
+  const float * k = nullptr;
+  const float * v = nullptr;
+  const float * alpha = nullptr;
+  const float * beta = nullptr;
+  float * output = nullptr;
+  std::size_t head_count = 0;
+  std::size_t key_dim = 0;
+  std::size_t value_dim = 0;
+  cpu::Q8_0Backend backend = cpu::Q8_0Backend::auto_select;
+};
+
+void run_gated_delta_net_cpu_rows(
+  void * opaque_context,
+  const std::size_t row_begin,
+  const std::size_t row_end) noexcept {
+  auto & job = *static_cast<GatedDeltaNetCpuJob *>(opaque_context);
+  cpu::gated_delta_net_update_rows(
+    job.state,
+    job.q,
+    job.k,
+    job.v,
+    job.alpha,
+    job.beta,
+    job.output,
+    job.head_count,
+    job.key_dim,
+    job.value_dim,
+    row_begin,
+    row_end,
+    job.backend);
+}
+
 bool run_linear_attention_step(
   const LayerWeights & layer,
   const RuntimeDims & dims,
@@ -284,11 +319,34 @@ bool run_linear_attention_step(
       return false;
     }
   } else {
-    if (!matvec_2d(layer.linear.in_proj_qkv, x, mixed_qkv, use_cuda, error_message) ||
-        !matvec_2d(layer.linear.in_proj_z, x, z_vec, use_cuda, error_message) ||
-        !matvec_2d(layer.linear.in_proj_b, x, b_vec, use_cuda, error_message) ||
-        !matvec_2d(layer.linear.in_proj_a, x, a_vec, use_cuda, error_message)) {
-      return false;
+    if (layer.linear.in_proj_all_cpu.is_cpu_quantized()) {
+      std::vector<float> packed;
+      if (!matvec_2d(layer.linear.in_proj_all_cpu, x, packed, false, error_message)) {
+        return false;
+      }
+      const std::size_t qkv_count = static_cast<std::size_t>(dims.linear_conv_channels);
+      const std::size_t z_count = static_cast<std::size_t>(dims.linear_v_dim);
+      const std::size_t ba_count = static_cast<std::size_t>(dims.linear_num_v_heads);
+      const std::size_t expected = qkv_count + z_count + 2 * ba_count;
+      if (packed.size() != expected) {
+        error_message = "Packed linear-attention projection output size mismatch.";
+        return false;
+      }
+      auto cursor = packed.begin();
+      mixed_qkv.assign(cursor, cursor + static_cast<std::ptrdiff_t>(qkv_count));
+      cursor += static_cast<std::ptrdiff_t>(qkv_count);
+      z_vec.assign(cursor, cursor + static_cast<std::ptrdiff_t>(z_count));
+      cursor += static_cast<std::ptrdiff_t>(z_count);
+      b_vec.assign(cursor, cursor + static_cast<std::ptrdiff_t>(ba_count));
+      cursor += static_cast<std::ptrdiff_t>(ba_count);
+      a_vec.assign(cursor, cursor + static_cast<std::ptrdiff_t>(ba_count));
+    } else {
+      if (!matvec_2d(layer.linear.in_proj_qkv, x, mixed_qkv, use_cuda, error_message) ||
+          !matvec_2d(layer.linear.in_proj_z, x, z_vec, use_cuda, error_message) ||
+          !matvec_2d(layer.linear.in_proj_b, x, b_vec, use_cuda, error_message) ||
+          !matvec_2d(layer.linear.in_proj_a, x, a_vec, use_cuda, error_message)) {
+        return false;
+      }
     }
   }
 
@@ -300,106 +358,85 @@ bool run_linear_attention_step(
     alpha[static_cast<std::size_t>(h)] = std::exp(pre_gate * layer.linear.ssm_a[static_cast<std::size_t>(h)]);
   }
 
-  const int conv_hist = dims.linear_kernel - 1;
-  std::vector<float> conv_window(static_cast<std::size_t>(dims.linear_kernel * dims.linear_conv_channels));
-  if (conv_hist > 0) {
-    std::memcpy(
-      conv_window.data(),
-      state.conv_state.data(),
-      static_cast<std::size_t>(conv_hist * dims.linear_conv_channels) * sizeof(float));
-  }
-  std::memcpy(
-    conv_window.data() + static_cast<std::size_t>(conv_hist * dims.linear_conv_channels),
-    mixed_qkv.data(),
-    static_cast<std::size_t>(dims.linear_conv_channels) * sizeof(float));
-
-  if (conv_hist > 0) {
-    std::memcpy(
-      state.conv_state.data(),
-      conv_window.data() + static_cast<std::size_t>(dims.linear_conv_channels),
-      static_cast<std::size_t>(conv_hist * dims.linear_conv_channels) * sizeof(float));
-  }
-
   std::vector<float> conv_out(static_cast<std::size_t>(dims.linear_conv_channels), 0.0f);
-  for (int c = 0; c < dims.linear_conv_channels; ++c) {
-    float s = 0.0f;
-    const float * w = layer.linear.conv1d.data.data() +
-                      static_cast<std::size_t>(c) * static_cast<std::size_t>(dims.linear_kernel);
-    for (int k = 0; k < dims.linear_kernel; ++k) {
-      const std::size_t idx = static_cast<std::size_t>(k * dims.linear_conv_channels + c);
-      s += conv_window[idx] * w[k];
-    }
-    conv_out[static_cast<std::size_t>(c)] = siluf(s);
+  const std::size_t conv_channels = static_cast<std::size_t>(dims.linear_conv_channels);
+  const std::size_t conv_kernel = static_cast<std::size_t>(dims.linear_kernel);
+  const std::size_t conv_history = conv_kernel - 1;
+  if (layer.linear.conv1d_kernel_major.size() != conv_kernel * conv_channels) {
+    error_message = "Kernel-major causal-convolution weights are missing.";
+    return false;
+  }
+  cpu::causal_conv1d_silu_f32(
+    state.conv_state.data(), state.conv_ring_index, mixed_qkv.data(), conv_channels,
+    layer.linear.conv1d_kernel_major.data(), conv_out.data(), 1, conv_channels,
+    conv_kernel, 0, conv_channels,
+    layer.linear.out_proj.q8_0_backend);
+  if (conv_history != 0) {
+    state.conv_ring_index = (state.conv_ring_index + 1) % conv_history;
   }
 
   std::vector<float> q(conv_out.begin(), conv_out.begin() + dims.linear_q_dim);
   std::vector<float> k(conv_out.begin() + dims.linear_q_dim, conv_out.begin() + 2 * dims.linear_q_dim);
   std::vector<float> v(conv_out.begin() + 2 * dims.linear_q_dim, conv_out.end());
-  l2_norm_per_head(q, dims.linear_num_k_heads, dims.linear_head_k_dim);
+  const float q_scale = 1.0f / std::sqrt(static_cast<float>(dims.linear_head_k_dim));
+  l2_norm_per_head(
+    q, dims.linear_num_k_heads, dims.linear_head_k_dim, 1.0e-6F, q_scale);
   l2_norm_per_head(k, dims.linear_num_k_heads, dims.linear_head_k_dim);
 
-  const float q_scale = 1.0f / std::sqrt(static_cast<float>(dims.linear_head_k_dim));
-  for (float & qv : q) {
-    qv *= q_scale;
-  }
-
   std::vector<float> core_out(static_cast<std::size_t>(dims.linear_v_dim), 0.0f);
-  for (int h = 0; h < dims.linear_num_v_heads; ++h) {
-    const std::size_t q_base = static_cast<std::size_t>(h * dims.linear_head_k_dim);
-    const std::size_t v_base = static_cast<std::size_t>(h * dims.linear_head_v_dim);
-    const std::size_t s_base =
-      static_cast<std::size_t>(h) * static_cast<std::size_t>(dims.linear_head_v_dim * dims.linear_head_v_dim);
-    float * s = state.recurrent_state.data() + s_base;
-
-    for (int i = 0; i < dims.linear_head_v_dim; ++i) {
-      for (int j = 0; j < dims.linear_head_v_dim; ++j) {
-        s[static_cast<std::size_t>(i * dims.linear_head_v_dim + j)] *= alpha[static_cast<std::size_t>(h)];
-      }
+  const cpu::Q8_0Backend cpu_backend = layer.linear.out_proj.is_cpu_quantized()
+    ? layer.linear.out_proj.q8_0_backend
+    : cpu::Q8_0Backend::auto_select;
+  CpuQ8Runtime * const cpu_runtime = layer.linear.out_proj.q8_0_runtime;
+  if (cpu_runtime != nullptr && cpu_runtime->executor != nullptr) {
+    GatedDeltaNetCpuJob job{
+      state.recurrent_state.data(),
+      q.data(),
+      k.data(),
+      v.data(),
+      alpha.data(),
+      beta.data(),
+      core_out.data(),
+      static_cast<std::size_t>(dims.linear_num_v_heads),
+      static_cast<std::size_t>(dims.linear_head_k_dim),
+      static_cast<std::size_t>(dims.linear_head_v_dim),
+      cpu_backend,
+    };
+    const cpu::CpuExecutorStatus status = cpu_runtime->executor->parallel_for_rows(
+      static_cast<std::size_t>(dims.linear_num_v_heads * dims.linear_head_v_dim),
+      run_gated_delta_net_cpu_rows,
+      &job);
+    if (status != cpu::CpuExecutorStatus::ok) {
+      error_message = std::string("Gated DeltaNet CPU executor failed: ") +
+        cpu::cpu_executor_status_name(status) + ".";
+      return false;
     }
-
-    std::vector<float> sk(static_cast<std::size_t>(dims.linear_head_v_dim), 0.0f);
-    for (int i = 0; i < dims.linear_head_v_dim; ++i) {
-      float sum = 0.0f;
-      const float * s_row = s + static_cast<std::size_t>(i * dims.linear_head_v_dim);
-      for (int j = 0; j < dims.linear_head_v_dim; ++j) {
-        sum += s_row[j] * k[q_base + static_cast<std::size_t>(j)];
-      }
-      sk[static_cast<std::size_t>(i)] = sum;
-    }
-
-    for (int i = 0; i < dims.linear_head_v_dim; ++i) {
-      const float delta = (v[v_base + static_cast<std::size_t>(i)] - sk[static_cast<std::size_t>(i)]) *
-                          beta[static_cast<std::size_t>(h)];
-      float * s_row = s + static_cast<std::size_t>(i * dims.linear_head_v_dim);
-      for (int j = 0; j < dims.linear_head_v_dim; ++j) {
-        s_row[j] += delta * k[q_base + static_cast<std::size_t>(j)];
-      }
-    }
-
-    for (int i = 0; i < dims.linear_head_v_dim; ++i) {
-      float sum = 0.0f;
-      const float * s_row = s + static_cast<std::size_t>(i * dims.linear_head_v_dim);
-      for (int j = 0; j < dims.linear_head_v_dim; ++j) {
-        sum += s_row[j] * q[q_base + static_cast<std::size_t>(j)];
-      }
-      core_out[v_base + static_cast<std::size_t>(i)] = sum;
-    }
+  } else {
+    cpu::gated_delta_net_update_rows(
+      state.recurrent_state.data(),
+      q.data(),
+      k.data(),
+      v.data(),
+      alpha.data(),
+      beta.data(),
+      core_out.data(),
+      static_cast<std::size_t>(dims.linear_num_v_heads),
+      static_cast<std::size_t>(dims.linear_head_k_dim),
+      static_cast<std::size_t>(dims.linear_head_v_dim),
+      0,
+      static_cast<std::size_t>(dims.linear_num_v_heads * dims.linear_head_v_dim),
+      cpu_backend);
   }
 
   std::vector<float> gated_norm(static_cast<std::size_t>(dims.linear_v_dim), 0.0f);
-  for (int h = 0; h < dims.linear_num_v_heads; ++h) {
-    const std::size_t base = static_cast<std::size_t>(h * dims.linear_head_v_dim);
-    float sq_sum = 0.0f;
-    for (int d = 0; d < dims.linear_head_v_dim; ++d) {
-      const float cv = core_out[base + static_cast<std::size_t>(d)];
-      sq_sum += cv * cv;
-    }
-    const float inv = 1.0f / std::sqrt(sq_sum / static_cast<float>(dims.linear_head_v_dim) + dims.rms_eps);
-    for (int d = 0; d < dims.linear_head_v_dim; ++d) {
-      const std::size_t idx = base + static_cast<std::size_t>(d);
-      gated_norm[idx] = core_out[idx] * inv * layer.linear.norm.data[static_cast<std::size_t>(d)] * siluf(z_vec[idx]);
-    }
-  }
+  cpu::rms_norm_f32(
+    core_out.data(), layer.linear.norm.data.data(), gated_norm.data(),
+    static_cast<std::size_t>(dims.linear_num_v_heads),
+    static_cast<std::size_t>(dims.linear_head_v_dim), dims.rms_eps, 0.0F,
+    cpu_backend);
+  cpu::silu_mul_f32(
+    z_vec.data(), gated_norm.data(), gated_norm.data(), gated_norm.size(),
+    cpu_backend);
 
   if (!matvec_2d(layer.linear.out_proj, gated_norm, out, use_cuda, error_message)) {
     return false;
@@ -413,6 +450,8 @@ bool run_full_attention_step(
   FullAttentionState & state,
   const std::vector<float> & x,
   const int position,
+  const float * rope_cosine,
+  const float * rope_sine,
   std::vector<float> & out,
   const bool use_cuda,
   CudaForwardWorkspace * cuda_workspace,
@@ -432,10 +471,29 @@ bool run_full_attention_step(
       return false;
     }
   } else {
-    if (!matvec_2d(layer.full.q_proj, x, q_full, use_cuda, error_message) ||
-        !matvec_2d(layer.full.k_proj, x, k_flat, use_cuda, error_message) ||
-        !matvec_2d(layer.full.v_proj, x, v_flat, use_cuda, error_message)) {
-      return false;
+    if (layer.full.qkv_proj_cpu.is_cpu_quantized()) {
+      std::vector<float> packed;
+      if (!matvec_2d(layer.full.qkv_proj_cpu, x, packed, false, error_message)) {
+        return false;
+      }
+      const std::size_t expected = full_q_out + 2 * full_kv_out;
+      if (packed.size() != expected) {
+        error_message = "Packed full-attention projection output size mismatch.";
+        return false;
+      }
+      q_full.assign(packed.begin(), packed.begin() + static_cast<std::ptrdiff_t>(full_q_out));
+      k_flat.assign(
+        packed.begin() + static_cast<std::ptrdiff_t>(full_q_out),
+        packed.begin() + static_cast<std::ptrdiff_t>(full_q_out + full_kv_out));
+      v_flat.assign(
+        packed.begin() + static_cast<std::ptrdiff_t>(full_q_out + full_kv_out),
+        packed.end());
+    } else {
+      if (!matvec_2d(layer.full.q_proj, x, q_full, use_cuda, error_message) ||
+          !matvec_2d(layer.full.k_proj, x, k_flat, use_cuda, error_message) ||
+          !matvec_2d(layer.full.v_proj, x, v_flat, use_cuda, error_message)) {
+        return false;
+      }
     }
   }
 
@@ -455,8 +513,14 @@ bool run_full_attention_step(
   rms_norm_per_head_qwen3next(q, dims.n_heads, dims.head_dim, layer.full.q_norm, dims.rms_eps, q_normed);
   rms_norm_per_head_qwen3next(k_flat, dims.n_kv_heads, dims.head_dim, layer.full.k_norm, dims.rms_eps, k_normed);
 
-  apply_rope_inplace(q_normed, dims.n_heads, dims.head_dim, dims.rope_dim, position, dims.rope_theta);
-  apply_rope_inplace(k_normed, dims.n_kv_heads, dims.head_dim, dims.rope_dim, position, dims.rope_theta);
+  cpu::rope_f32(
+    q_normed.data(), static_cast<std::size_t>(dims.n_heads),
+    static_cast<std::size_t>(dims.head_dim), static_cast<std::size_t>(dims.rope_dim),
+    rope_cosine, rope_sine, layer.full.o_proj.q8_0_backend);
+  cpu::rope_f32(
+    k_normed.data(), static_cast<std::size_t>(dims.n_kv_heads),
+    static_cast<std::size_t>(dims.head_dim), static_cast<std::size_t>(dims.rope_dim),
+    rope_cosine, rope_sine, layer.full.o_proj.q8_0_backend);
 
   const std::size_t token_stride = static_cast<std::size_t>(dims.n_kv_heads * dims.head_dim);
   std::memcpy(
@@ -471,6 +535,15 @@ bool run_full_attention_step(
   const bool use_cuda_full_kernel =
     use_cuda && state.has_device_state && cuda_workspace != nullptr && cuda_workspace->has_device_buffers &&
     layer.full.o_proj.has_device_matrix;
+  if (!use_cuda_full_kernel && !state.k_cache_f16.empty() && !state.v_cache_f16.empty()) {
+    const std::size_t offset = static_cast<std::size_t>(position) * token_stride;
+    cpu::attention_cache_store_f16(
+      k_normed.data(), state.k_cache_f16.data() + offset, token_stride,
+      layer.full.o_proj.q8_0_backend);
+    cpu::attention_cache_store_f16(
+      v_flat.data(), state.v_cache_f16.data() + offset, token_stride,
+      layer.full.o_proj.q8_0_backend);
+  }
   if (use_cuda_full_kernel) {
     const std::size_t offset = static_cast<std::size_t>(position) * token_stride;
     const std::size_t full_q_count = static_cast<std::size_t>(dims.n_heads * dims.head_dim);
@@ -502,55 +575,45 @@ bool run_full_attention_step(
     return true;
   }
 
-  const int n_rep = dims.n_heads / dims.n_kv_heads;
   const float scale = 1.0f / std::sqrt(static_cast<float>(dims.head_dim));
   const int seq_len = position + 1;
-  std::vector<float> attn_cat(static_cast<std::size_t>(dims.n_heads * dims.head_dim), 0.0f);
-  std::vector<float> scores(static_cast<std::size_t>(seq_len), 0.0f);
-
-  for (int h = 0; h < dims.n_heads; ++h) {
-    const int kvh = h / n_rep;
-    const std::size_t q_base = static_cast<std::size_t>(h * dims.head_dim);
-
-    float max_score = -std::numeric_limits<float>::infinity();
-    for (int t = 0; t < seq_len; ++t) {
-      const float * k_ptr = state.k_cache.data() +
-                           (static_cast<std::size_t>(t) * static_cast<std::size_t>(dims.n_kv_heads) +
-                            static_cast<std::size_t>(kvh)) *
-                             static_cast<std::size_t>(dims.head_dim);
-      float dot = 0.0f;
-      for (int d = 0; d < dims.head_dim; ++d) {
-        dot += q_normed[q_base + static_cast<std::size_t>(d)] * k_ptr[d];
-      }
-      dot *= scale;
-      scores[static_cast<std::size_t>(t)] = dot;
-      if (dot > max_score) {
-        max_score = dot;
-      }
+  const std::size_t query_width =
+    static_cast<std::size_t>(dims.n_heads * dims.head_dim);
+  const std::size_t attention_rows = static_cast<std::size_t>(dims.n_heads);
+  const std::size_t attention_pairs = attention_rows / 2U;
+  const std::size_t context_stride = static_cast<std::size_t>(seq_len);
+  std::vector<float> attn_cat(query_width, 0.0f);
+  std::vector<float> scores(attention_rows * context_stride, 0.0f);
+  FullAttentionBatchCpuJob job{
+    q_normed.data(),
+    gate.data(),
+    state.k_cache.data(),
+    state.v_cache.data(),
+    state.k_cache_f16.empty() ? nullptr : state.k_cache_f16.data(),
+    state.v_cache_f16.empty() ? nullptr : state.v_cache_f16.data(),
+    scores.data(),
+    attn_cat.data(),
+    context_stride,
+    query_width,
+    token_stride,
+    position,
+    dims.n_heads,
+    dims.n_kv_heads,
+    dims.head_dim,
+    scale,
+    layer.full.o_proj.q8_0_backend,
+  };
+  CpuQ8Runtime * const runtime = layer.full.o_proj.q8_0_runtime;
+  if (runtime != nullptr && runtime->executor != nullptr) {
+    const cpu::CpuExecutorStatus status = runtime->executor->parallel_for_rows(
+      attention_pairs, run_full_attention_decode_cpu_pairs, &job);
+    if (status != cpu::CpuExecutorStatus::ok) {
+      error_message = std::string("Full-attention CPU executor failed: ") +
+        cpu::cpu_executor_status_name(status) + ".";
+      return false;
     }
-
-    float denom = 0.0f;
-    for (int t = 0; t < seq_len; ++t) {
-      const float ev = std::exp(scores[static_cast<std::size_t>(t)] - max_score);
-      scores[static_cast<std::size_t>(t)] = ev;
-      denom += ev;
-    }
-    if (denom <= 0.0f) {
-      denom = 1.0f;
-    }
-
-    for (int d = 0; d < dims.head_dim; ++d) {
-      float acc = 0.0f;
-      for (int t = 0; t < seq_len; ++t) {
-        const float p = scores[static_cast<std::size_t>(t)] / denom;
-        const float * v_ptr = state.v_cache.data() +
-                             (static_cast<std::size_t>(t) * static_cast<std::size_t>(dims.n_kv_heads) +
-                              static_cast<std::size_t>(kvh)) *
-                               static_cast<std::size_t>(dims.head_dim);
-        acc += p * v_ptr[d];
-      }
-      attn_cat[q_base + static_cast<std::size_t>(d)] = acc * sigmoidf_stable(gate[q_base + static_cast<std::size_t>(d)]);
-    }
+  } else {
+    run_full_attention_decode_cpu_pairs(&job, 0, attention_pairs);
   }
 
   if (!matvec_2d(layer.full.o_proj, attn_cat, out, use_cuda, error_message)) {
@@ -577,14 +640,8 @@ bool compute_next_logits_from_embedding(
       return false;
     }
   } else {
-    out_logits.assign(static_cast<std::size_t>(vocab), 0.0f);
-    for (int token = 0; token < vocab; ++token) {
-      const float * row = embed.data.data() + static_cast<std::size_t>(token) * static_cast<std::size_t>(dim);
-      float logit = 0.0f;
-      for (int d = 0; d < dim; ++d) {
-        logit += row[d] * hidden[static_cast<std::size_t>(d)];
-      }
-      out_logits[static_cast<std::size_t>(token)] = logit;
+    if (!matvec_2d(embed, hidden, out_logits, false, error_message)) {
+      return false;
     }
   }
 
@@ -651,13 +708,32 @@ bool sample_token_from_logits(
     return false;
   }
 
-  std::vector<float> logits = raw_logits;
-  apply_repetition_penalty_inplace(logits, token_counts, sampling.repetition_penalty);
-
   if (sampling.temperature <= 1.0e-6f) {
-    out_token = argmax_index(logits);
+    if (sampling.repetition_penalty <= 1.0f) {
+      out_token = argmax_index(raw_logits);
+      return true;
+    }
+    int best_idx = 0;
+    float best_value = -std::numeric_limits<float>::infinity();
+    const std::size_t count = std::min(raw_logits.size(), token_counts.size());
+    for (std::size_t index = 0; index < raw_logits.size(); ++index) {
+      float value = raw_logits[index];
+      if (index < count && token_counts[index] > 0) {
+        value = value > 0.0f
+          ? value / sampling.repetition_penalty
+          : value * sampling.repetition_penalty;
+      }
+      if (value > best_value) {
+        best_value = value;
+        best_idx = static_cast<int>(index);
+      }
+    }
+    out_token = best_idx;
     return true;
   }
+
+  std::vector<float> logits = raw_logits;
+  apply_repetition_penalty_inplace(logits, token_counts, sampling.repetition_penalty);
 
   const float inv_temp = 1.0f / sampling.temperature;
   for (float & v : logits) {
@@ -835,4 +911,3 @@ bool run_mlp_block_cuda_hybrid(
 
   return true;
 }
-

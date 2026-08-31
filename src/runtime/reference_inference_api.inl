@@ -1,3 +1,86 @@
+namespace {
+
+struct CpuModelSessionState {
+  mutable std::mutex mutex;
+  std::string model_signature;
+  ModelWeights weights;
+  bool loaded = false;
+};
+
+[[nodiscard]] std::string cpu_model_session_signature(
+  const ReferenceInferenceOptions & options,
+  const ModelProfile & profile,
+  const RuntimeDims & dims) {
+  return cpu_prefix_model_signature(options, profile, dims) +
+    "|backend=" + cpu::q8_0_backend_name(
+      cpu::q8_0_resolve_backend(options.cpu_q8_backend)) +
+    "|threads=" + std::to_string(options.cpu_threads);
+}
+
+} // namespace
+
+ReferenceCpuModelSession::ReferenceCpuModelSession()
+  : implementation_(std::make_shared<CpuModelSessionState>()) {}
+
+void ReferenceCpuModelSession::clear() {
+  if (implementation_ == nullptr) {
+    implementation_ = std::make_shared<CpuModelSessionState>();
+    return;
+  }
+  const auto state = std::static_pointer_cast<CpuModelSessionState>(implementation_);
+  const std::lock_guard<std::mutex> lock(state->mutex);
+  state->weights = ModelWeights{};
+  state->model_signature.clear();
+  state->loaded = false;
+}
+
+bool ReferenceCpuModelSession::empty() const {
+  if (implementation_ == nullptr) {
+    return true;
+  }
+  const auto state = std::static_pointer_cast<CpuModelSessionState>(implementation_);
+  const std::lock_guard<std::mutex> lock(state->mutex);
+  return !state->loaded;
+}
+
+namespace {
+
+bool ensure_cpu_model_session_locked(
+  const ModelProfile & profile,
+  const ReferenceInferenceOptions & options,
+  const RuntimeDims & dims,
+  CpuModelSessionState & session,
+  bool & cache_hit,
+  std::string & error_message) {
+  const std::string signature = cpu_model_session_signature(options, profile, dims);
+  if (session.loaded && session.model_signature == signature) {
+    cache_hit = true;
+    return true;
+  }
+
+  ModelWeights candidate;
+  if (!load_model_weights(
+        options.model_dir,
+        options.cpu_gguf_path,
+        options.cpu_q4_h128_path,
+        dims,
+        profile,
+        options.cpu_q8_backend,
+        options.cpu_threads,
+        candidate,
+        error_message)) {
+    return false;
+  }
+
+  session.weights = std::move(candidate);
+  session.model_signature = signature;
+  session.loaded = true;
+  cache_hit = false;
+  return true;
+}
+
+} // namespace
+
 bool parse_token_list_csv(
   const std::string & csv,
   std::vector<std::int32_t> & out_tokens,
@@ -32,6 +115,42 @@ bool parse_token_list_csv(
   }
 
   return true;
+}
+
+bool prepare_reference_cpu_model_session(
+  const ModelProfile & profile,
+  const ReferenceInferenceOptions & options,
+  ReferenceCpuModelSession & session,
+  std::string & error_message) {
+  if (profile.family != "qwen3.5") {
+    error_message = "Reference CPU model sessions currently support only qwen3.5 family.";
+    return false;
+  }
+  if (options.model_dir.empty()) {
+    error_message = "Reference CPU model session requires --hf-model-dir.";
+    return false;
+  }
+  if (options.use_cuda) {
+    error_message = "Reference CPU model sessions cannot be used with GPU inference.";
+    return false;
+  }
+  if (options.cpu_threads < 0) {
+    error_message = "cpu_threads must be >= 0 (zero selects the automatic default).";
+    return false;
+  }
+
+  RuntimeDims dims;
+  if (!build_runtime_dims(profile, dims, error_message)) {
+    return false;
+  }
+  if (session.implementation_ == nullptr) {
+    session.implementation_ = std::make_shared<CpuModelSessionState>();
+  }
+  const auto state = std::static_pointer_cast<CpuModelSessionState>(session.implementation_);
+  const std::lock_guard<std::mutex> lock(state->mutex);
+  bool cache_hit = false;
+  return ensure_cpu_model_session_locked(
+    profile, options, dims, *state, cache_hit, error_message);
 }
 
 bool run_qwen35x_cuda_inference(
@@ -211,6 +330,56 @@ bool run_reference_qwen35_inference(
     error_message = "seed must be >= -1.";
     return false;
   }
+  if (options.cpu_threads < 0) {
+    error_message = "cpu_threads must be >= 0 (zero selects the automatic default).";
+    return false;
+  }
+  if (options.cpu_prefix_token_count > 0 && options.cpu_prefix_cache == nullptr) {
+    error_message = "cpu_prefix_token_count requires a CPU prefix-cache handle.";
+    return false;
+  }
+  if (options.cpu_prefix_token_count >= options.prompt_tokens.size() &&
+      options.cpu_prefix_token_count > 0) {
+    error_message = "CPU prefix cache must leave at least one uncached prompt token.";
+    return false;
+  }
+  if (options.use_cuda && options.cpu_prefix_token_count > 0) {
+    error_message = "The in-memory prefix cache currently supports CPU inference only.";
+    return false;
+  }
+  if (options.use_cuda && options.cpu_model_session != nullptr) {
+    error_message = "Persistent CPU model sessions cannot be used with GPU inference.";
+    return false;
+  }
+  if ((options.logits_callback != nullptr || !options.forced_output_tokens.empty()) &&
+      options.use_cuda) {
+    error_message = "Teacher-forced logit observation currently supports CPU inference only.";
+    return false;
+  }
+  if (options.logits_callback != nullptr && options.prefill_only) {
+    error_message = "Logit observation cannot be combined with prefill-only inference.";
+    return false;
+  }
+  if (!options.forced_output_tokens.empty() &&
+      options.forced_output_tokens.size() !=
+        static_cast<std::size_t>(options.max_new_tokens)) {
+    error_message = "forced_output_tokens must contain exactly max_new_tokens entries.";
+    return false;
+  }
+  if (!options.forced_output_tokens.empty() &&
+      (!options.stop_token_ids.empty() || !options.stop_token_sequences.empty())) {
+    error_message = "Teacher-forced inference cannot be combined with stop conditions.";
+    return false;
+  }
+  if (!options.cpu_gguf_path.empty() && !options.cpu_q4_h128_path.empty()) {
+    error_message = "--cpu-gguf and --cpu-q4-h128 are mutually exclusive.";
+    return false;
+  }
+  if (options.use_cuda &&
+      (!options.cpu_gguf_path.empty() || !options.cpu_q4_h128_path.empty())) {
+    error_message = "CPU weight artifacts cannot be combined with GPU inference.";
+    return false;
+  }
 
 #if !QWEN35X_HAS_CUDA
   if (options.use_cuda) {
@@ -222,6 +391,12 @@ bool run_reference_qwen35_inference(
   RuntimeDims dims;
   if (!build_runtime_dims(profile, dims, error_message)) {
     return false;
+  }
+  for (const std::int32_t token : options.forced_output_tokens) {
+    if (token < 0 || token >= dims.vocab_size) {
+      error_message = "Teacher-forced output token is outside the model vocabulary.";
+      return false;
+    }
   }
 
   if (options.max_context <= 0) {
@@ -242,16 +417,65 @@ bool run_reference_qwen35_inference(
   const auto load_start = std::chrono::steady_clock::now();
   const bool use_cuda_matvec_bf16 = options.use_cuda && options.use_cuda_matvec_bf16;
 
-  ModelWeights weights;
-  if (!load_model_weights(options.model_dir, dims, profile, weights, error_message)) {
+  ModelWeights request_weights;
+  ModelWeights * weights_ptr = &request_weights;
+  std::shared_ptr<CpuModelSessionState> cpu_model_session_state;
+  std::unique_lock<std::mutex> cpu_model_session_lock;
+  if (options.cpu_model_session != nullptr) {
+    if (options.cpu_model_session->implementation_ == nullptr) {
+      options.cpu_model_session->implementation_ =
+        std::make_shared<CpuModelSessionState>();
+    }
+    cpu_model_session_state = std::static_pointer_cast<CpuModelSessionState>(
+      options.cpu_model_session->implementation_);
+    cpu_model_session_lock = std::unique_lock<std::mutex>(cpu_model_session_state->mutex);
+    if (!ensure_cpu_model_session_locked(
+          profile,
+          options,
+          dims,
+          *cpu_model_session_state,
+          result.cpu_model_session_hit,
+          error_message)) {
+      return false;
+    }
+    weights_ptr = &cpu_model_session_state->weights;
+  } else if (!load_model_weights(
+               options.model_dir,
+               options.cpu_gguf_path,
+               options.cpu_q4_h128_path,
+               dims,
+               profile,
+               options.cpu_q8_backend,
+               options.cpu_threads,
+               request_weights,
+               error_message)) {
     return false;
   }
+  ModelWeights & weights = *weights_ptr;
   if (options.use_cuda && !upload_model_weights_to_cuda(weights, use_cuda_matvec_bf16, error_message)) {
     release_model_weights_cuda(weights);
     return false;
   }
 
   ModelState state;
+  const std::size_t rope_half = static_cast<std::size_t>(dims.rope_dim / 2);
+  state.rope_inverse_frequency.resize(rope_half);
+  for (std::size_t index = 0; index < rope_half; ++index) {
+    state.rope_inverse_frequency[index] = std::pow(
+      dims.rope_theta,
+      -static_cast<float>(2 * index) / static_cast<float>(dims.rope_dim));
+  }
+  state.rope_cosine.resize(static_cast<std::size_t>(required_context) * rope_half);
+  state.rope_sine.resize(static_cast<std::size_t>(required_context) * rope_half);
+  for (int position = 0; position < required_context; ++position) {
+    const std::size_t position_offset = static_cast<std::size_t>(position) * rope_half;
+    for (std::size_t index = 0; index < rope_half; ++index) {
+      const float angle =
+        static_cast<float>(position) * state.rope_inverse_frequency[index];
+      state.rope_cosine[position_offset + index] = std::cos(angle);
+      state.rope_sine[position_offset + index] = std::sin(angle);
+    }
+  }
   int full_layers = 0;
   int linear_layers = 0;
   for (const auto block : profile.fingerprint.attention_schedule) {
@@ -270,6 +494,10 @@ bool run_reference_qwen35_inference(
     fs.v_cache.resize(
       static_cast<std::size_t>(options.max_context) * static_cast<std::size_t>(dims.n_kv_heads) *
       static_cast<std::size_t>(dims.head_dim));
+    if (!options.use_cuda && weights.cpu_q8_runtime != nullptr) {
+      fs.k_cache_f16.resize(fs.k_cache.size());
+      fs.v_cache_f16.resize(fs.v_cache.size());
+    }
     if (options.use_cuda) {
       if (!cuda::allocate_buffer_f32(fs.k_cache.size(), fs.k_cache_device, error_message) ||
           !cuda::allocate_buffer_f32(fs.v_cache.size(), fs.v_cache_device, error_message)) {
@@ -371,6 +599,18 @@ bool run_reference_qwen35_inference(
       token_counts[static_cast<std::size_t>(token)] += 1;
     }
   }
+  CpuGreedySamplingState cpu_greedy_sampling{
+    &token_counts,
+    options.sampling.repetition_penalty,
+    -1,
+    !options.use_cuda && options.sampling.temperature <= 1.0e-6F &&
+      options.capture_top_logits == 0 &&
+      options.logits_callback == nullptr &&
+      weights.embed_tokens.is_q4_0() && weights.cpu_q8_runtime != nullptr &&
+      weights.cpu_q8_runtime->executor != nullptr,
+  };
+  CpuGreedySamplingState * cpu_greedy_sampling_ptr =
+    cpu_greedy_sampling.enabled ? &cpu_greedy_sampling : nullptr;
   std::unordered_set<std::int32_t> stop_token_set;
   stop_token_set.reserve(options.stop_token_ids.size());
   for (const std::int32_t token : options.stop_token_ids) {
@@ -427,35 +667,165 @@ bool run_reference_qwen35_inference(
 
   int position = 0;
   std::vector<float> predicted_logits;
-  const auto prefill_start = std::chrono::steady_clock::now();
-  for (std::size_t prompt_index = 0; prompt_index < options.prompt_tokens.size(); ++prompt_index) {
-    const std::int32_t prompt_token = options.prompt_tokens[prompt_index];
-    const bool compute_next_logits = !options.prefill_only && (prompt_index + 1 == options.prompt_tokens.size());
-    if (!decode_step_with_runtime_backend(
-          decode_backend,
-          weights,
-          dims,
-          state,
-          prompt_token,
-          position,
-          options.use_cuda,
-          options.profile_cuda_sync,
-          predicted_logits,
-          use_cuda_gpu_sampling,
-          compute_next_logits,
-          cuda_workspace_ptr,
-          &profiling,
-          error_message)) {
-      release_cuda_resources();
-      return false;
+  result.top_logits_by_step.clear();
+  auto capture_top_logits = [&](const int step, const int selected_token) {
+    if (options.capture_top_logits <= 0 || predicted_logits.empty()) {
+      return;
     }
-    ++position;
+    std::vector<float> adjusted_logits = predicted_logits;
+    apply_repetition_penalty_inplace(
+      adjusted_logits, token_counts, options.sampling.repetition_penalty);
+    std::vector<std::int32_t> candidate_ids;
+    candidate_ids.reserve(adjusted_logits.size());
+    for (std::size_t token_id = 0; token_id < adjusted_logits.size(); ++token_id) {
+      candidate_ids.push_back(static_cast<std::int32_t>(token_id));
+    }
+    const std::size_t count = std::min(
+      static_cast<std::size_t>(options.capture_top_logits), candidate_ids.size());
+    std::partial_sort(
+      candidate_ids.begin(), candidate_ids.begin() + static_cast<std::ptrdiff_t>(count),
+      candidate_ids.end(),
+      [&](const std::int32_t lhs, const std::int32_t rhs) {
+        const float lhs_value = adjusted_logits[static_cast<std::size_t>(lhs)];
+        const float rhs_value = adjusted_logits[static_cast<std::size_t>(rhs)];
+        return lhs_value != rhs_value ? lhs_value > rhs_value : lhs < rhs;
+      });
+    ReferenceTopLogitsStep snapshot;
+    snapshot.step = step;
+    snapshot.selected_token_id = selected_token;
+    snapshot.top_logits.reserve(count);
+    for (std::size_t index = 0; index < count; ++index) {
+      const std::int32_t token_id = candidate_ids[index];
+      snapshot.top_logits.push_back(
+        ReferenceTopLogit{token_id, adjusted_logits[static_cast<std::size_t>(token_id)]});
+    }
+    result.top_logits_by_step.push_back(std::move(snapshot));
+  };
+  const auto prefill_start = std::chrono::steady_clock::now();
+  const std::size_t prefix_token_count = options.cpu_prefix_token_count;
+  const std::size_t kv_width =
+    static_cast<std::size_t>(dims.n_kv_heads) * static_cast<std::size_t>(dims.head_dim);
+  const std::string prefix_model_signature = prefix_token_count > 0
+    ? cpu_prefix_model_signature(options, profile, dims) : std::string{};
+  bool prefix_cache_hit = false;
+  if (prefix_token_count > 0 && options.cpu_prefix_cache != nullptr &&
+      options.cpu_prefix_cache->implementation_ != nullptr) {
+    const auto restore_start = std::chrono::steady_clock::now();
+    const auto snapshot = std::static_pointer_cast<CpuPrefixCacheSnapshot>(
+      options.cpu_prefix_cache->implementation_);
+    const bool tokens_match = snapshot->prefix_tokens.size() == prefix_token_count &&
+      std::equal(
+        snapshot->prefix_tokens.begin(), snapshot->prefix_tokens.end(),
+        options.prompt_tokens.begin());
+    if (snapshot->state_abi_version == kCpuPrefixCacheStateAbiVersion &&
+        snapshot->model_signature == prefix_model_signature && tokens_match &&
+        snapshot->backend == cpu::q8_0_resolve_backend(options.cpu_q8_backend) &&
+        snapshot->prefill_mode == options.qwen35x_prefill_mode &&
+        snapshot->hidden == dims.hidden && snapshot->head_dim == dims.head_dim &&
+        snapshot->kv_heads == dims.n_kv_heads &&
+        restore_cpu_prefix_state(
+          *snapshot, state, prefix_token_count, kv_width)) {
+      position = static_cast<int>(prefix_token_count);
+      prefix_cache_hit = true;
+      result.cached_prefix_tokens = position;
+      result.prefix_cache_restore_time_ms = elapsed_ms(restore_start);
+      result.prefix_cache_bytes = cpu_prefix_cache_size_bytes(*snapshot);
+    } else {
+      options.cpu_prefix_cache->clear();
+    }
+  }
+  auto capture_prefix_if_ready = [&]() {
+    if (prefix_token_count == 0 || prefix_cache_hit ||
+        position != static_cast<int>(prefix_token_count) ||
+        options.cpu_prefix_cache == nullptr) {
+      return;
+    }
+    auto snapshot = std::make_shared<CpuPrefixCacheSnapshot>();
+    snapshot->model_signature = prefix_model_signature;
+    snapshot->prefix_tokens.assign(
+      options.prompt_tokens.begin(),
+      options.prompt_tokens.begin() + static_cast<std::ptrdiff_t>(prefix_token_count));
+    snapshot->backend = cpu::q8_0_resolve_backend(options.cpu_q8_backend);
+    snapshot->prefill_mode = options.qwen35x_prefill_mode;
+    snapshot->hidden = dims.hidden;
+    snapshot->head_dim = dims.head_dim;
+    snapshot->kv_heads = dims.n_kv_heads;
+    capture_cpu_prefix_state(
+      state, prefix_token_count, kv_width,
+      snapshot->backend == cpu::Q8_0Backend::avx2, *snapshot);
+    result.prefix_cache_bytes = cpu_prefix_cache_size_bytes(*snapshot);
+    options.cpu_prefix_cache->implementation_ = std::move(snapshot);
+  };
+  const bool use_cpu_q8_batch_prefill =
+    !options.use_cuda && weights.cpu_q8_runtime != nullptr &&
+    options.qwen35x_prefill_mode == Qwen35xPrefillMode::batched;
+  if (use_cpu_q8_batch_prefill) {
+    constexpr std::size_t cpu_prefill_chunk_size = 64;
+    for (std::size_t chunk_begin = static_cast<std::size_t>(position);
+         chunk_begin < options.prompt_tokens.size();) {
+      std::size_t chunk_size = std::min(
+        cpu_prefill_chunk_size, options.prompt_tokens.size() - chunk_begin);
+      if (!prefix_cache_hit && chunk_begin < prefix_token_count &&
+          chunk_begin + chunk_size > prefix_token_count) {
+        chunk_size = prefix_token_count - chunk_begin;
+      }
+      const bool compute_next_logits =
+        !options.prefill_only && (chunk_begin + chunk_size == options.prompt_tokens.size());
+      if (!run_forward_cpu_q8_batch(
+            weights,
+            dims,
+            state,
+            options.prompt_tokens.data() + chunk_begin,
+            chunk_size,
+            position,
+            compute_next_logits,
+            predicted_logits,
+            cpu_greedy_sampling_ptr,
+            &profiling,
+            error_message)) {
+        release_cuda_resources();
+        return false;
+      }
+      position += static_cast<int>(chunk_size);
+      chunk_begin += chunk_size;
+      capture_prefix_if_ready();
+    }
+  } else {
+    for (std::size_t prompt_index = static_cast<std::size_t>(position);
+         prompt_index < options.prompt_tokens.size(); ++prompt_index) {
+      const std::int32_t prompt_token = options.prompt_tokens[prompt_index];
+      const bool compute_next_logits =
+        !options.prefill_only && (prompt_index + 1 == options.prompt_tokens.size());
+      if (!decode_step_with_runtime_backend(
+            decode_backend,
+            weights,
+            dims,
+            state,
+            prompt_token,
+            position,
+            options.use_cuda,
+            options.profile_cuda_sync,
+            predicted_logits,
+            use_cuda_gpu_sampling,
+            compute_next_logits,
+            cuda_workspace_ptr,
+            cpu_greedy_sampling_ptr,
+            &profiling,
+            error_message)) {
+        release_cuda_resources();
+        return false;
+      }
+      ++position;
+      capture_prefix_if_ready();
+    }
   }
   const auto prefill_end = std::chrono::steady_clock::now();
   result.prefill_time_ms = std::chrono::duration<double, std::milli>(prefill_end - prefill_start).count();
   result.prefill_tokens_per_second =
     (result.prefill_time_ms > 0.0)
-      ? (static_cast<double>(options.prompt_tokens.size()) * 1000.0 / result.prefill_time_ms)
+      ? (static_cast<double>(options.prompt_tokens.size() -
+          static_cast<std::size_t>(result.cached_prefix_tokens)) * 1000.0 /
+          result.prefill_time_ms)
       : 0.0;
 
   result.generated_tokens.clear();
@@ -634,6 +1004,10 @@ bool run_reference_qwen35_inference(
           break;
         }
 
+        if (i + 1 >= options.max_new_tokens) {
+          break;
+        }
+
         if (!decode_step_with_runtime_backend(
               decode_backend,
               weights,
@@ -647,6 +1021,7 @@ bool run_reference_qwen35_inference(
               true,
               true,
               cuda_workspace_ptr,
+              cpu_greedy_sampling_ptr,
               &profiling,
               error_message)) {
           release_cuda_decode_buffers();
@@ -657,7 +1032,31 @@ bool run_reference_qwen35_inference(
       }
     }
   } else {
+    auto observe_logits = [&](const int output_index) {
+      if (options.logits_callback == nullptr) {
+        return true;
+      }
+      if (predicted_logits.size() != static_cast<std::size_t>(dims.vocab_size)) {
+        error_message = "Observed CPU logits do not match the model vocabulary size.";
+        return false;
+      }
+      const std::int32_t target_token = options.forced_output_tokens.empty()
+        ? -1
+        : options.forced_output_tokens[static_cast<std::size_t>(output_index)];
+      return options.logits_callback(
+        options.logits_callback_context,
+        static_cast<std::size_t>(output_index),
+        target_token,
+        predicted_logits.data(),
+        predicted_logits.size(),
+        error_message);
+    };
     for (int i = 0; i < options.max_new_tokens; ++i) {
+      if (!observe_logits(i)) {
+        release_cuda_decode_buffers();
+        release_cuda_resources();
+        return false;
+      }
       if (!maybe_sync_cuda_for_stage_timing(options.use_cuda, options.profile_cuda_sync, error_message)) {
         release_cuda_decode_buffers();
         release_cuda_resources();
@@ -665,16 +1064,29 @@ bool run_reference_qwen35_inference(
       }
       const auto sampling_start = std::chrono::steady_clock::now();
       int current = 0;
-      if (!sample_token_from_logits(
-            predicted_logits,
-            options.sampling,
-            token_counts,
-            rng,
-            current,
-            error_message)) {
-        release_cuda_decode_buffers();
-        release_cuda_resources();
-        return false;
+      if (!options.forced_output_tokens.empty()) {
+        current = options.forced_output_tokens[static_cast<std::size_t>(i)];
+      } else if (cpu_greedy_sampling_ptr != nullptr) {
+        current = cpu_greedy_sampling.next_token;
+        cpu_greedy_sampling.next_token = -1;
+        if (current < 0 || current >= dims.vocab_size) {
+          error_message = "Fused greedy Q4 selection produced an invalid token.";
+          release_cuda_decode_buffers();
+          release_cuda_resources();
+          return false;
+        }
+      } else {
+        if (!sample_token_from_logits(
+              predicted_logits,
+              options.sampling,
+              token_counts,
+              rng,
+              current,
+              error_message)) {
+          release_cuda_decode_buffers();
+          release_cuda_resources();
+          return false;
+        }
       }
       if (!maybe_sync_cuda_for_stage_timing(options.use_cuda, options.profile_cuda_sync, error_message)) {
         release_cuda_decode_buffers();
@@ -682,6 +1094,8 @@ bool run_reference_qwen35_inference(
         return false;
       }
       profiling.sampling_ms += elapsed_ms(sampling_start);
+
+      capture_top_logits(i, current);
 
       result.generated_tokens.push_back(current);
       if (current >= 0 && current < dims.vocab_size) {
@@ -709,6 +1123,11 @@ bool run_reference_qwen35_inference(
         break;
       }
 
+
+      if (i + 1 >= options.max_new_tokens) {
+        break;
+      }
+
       if (!decode_step_with_runtime_backend(
             decode_backend,
             weights,
@@ -722,6 +1141,7 @@ bool run_reference_qwen35_inference(
             false,
             true,
             cuda_workspace_ptr,
+            cpu_greedy_sampling_ptr,
             &profiling,
             error_message)) {
         release_cuda_decode_buffers();
@@ -765,4 +1185,3 @@ bool run_reference_qwen35_inference(
   release_cuda_resources();
   return true;
 }
-
