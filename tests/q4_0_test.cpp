@@ -54,7 +54,8 @@ std::vector<Q4_0Block> make_q4(const std::size_t block_count) {
 bool test_packed_backend(const Q8_0Backend backend) {
   constexpr std::size_t blocks_per_row = 5;
   constexpr std::size_t rows = 16;
-  constexpr std::size_t vectors = 8;
+  // Exercise one 12-vector AVX-512 VNNI tile plus the 8-vector remainder.
+  constexpr std::size_t vectors = 20;
   constexpr std::size_t output_stride = rows + 5;
   const std::vector<Q4_0Block> weights = make_q4(rows * blocks_per_row);
   const std::vector<float> activation_values = make_values(vectors * blocks_per_row, -0.27F);
@@ -280,6 +281,10 @@ int main() {
   if (qwen35x::cpu::q8_0_backend_available(Q8_0Backend::avx512)) {
     ok = test_backend(Q8_0Backend::avx512) &&
       test_packed_backend(Q8_0Backend::avx512) && ok;
+  }
+  if (qwen35x::cpu::q8_0_backend_available(Q8_0Backend::avx512_vnni)) {
+    ok = test_backend(Q8_0Backend::avx512_vnni) &&
+      test_packed_backend(Q8_0Backend::avx512_vnni) && ok;
   }
   if (ok) {
     std::cout << "q4_0 tests passed\n";

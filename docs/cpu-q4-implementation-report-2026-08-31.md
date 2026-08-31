@@ -130,6 +130,21 @@ The pre-vector-scale pp256 thread sweep measured 197.94, 218.53, 234.73, and
 188.30 tok/s at 4, 5, 6, and 8 threads. Six physical-core threads remain the
 default for this host.
 
+## Modern ISA results on Zen 5
+
+The portable runtime now adds isolated AVX-VNNI and AVX-512-VNNI Q4 kernels
+without changing the baseline of the rest of the binary. At 12 threads, the
+256-bit AVX-VNNI packed kernel improves pp256 from 1081.15 to 1205.46 tok/s
+(+11.5%) versus AVX2. Prompt-1/tg128 is effectively unchanged at 138.20 versus
+139.18 tok/s, so decode remains on the compact 256-bit path.
+
+For prefill, the AVX-512-VNNI/VL translation unit uses EVEX-encoded 256-bit
+`vpdpbusd`, registers above YMM15, and a 12-token by 8-row output tile. The
+pp256 ABBA comparison measures 1332.77 versus 1133.96 tok/s (+17.5%); the
+baseline's final block visibly drifted, so the longer pp2048 confirmation is
+the stronger result at 1051.23 versus 958.14 tok/s (+9.7%). Runtime ISA checks
+retain safe AVX-512 FP32, AVX-VNNI, AVX2, and scalar fallbacks.
+
 ## Correctness and assembly observations
 
 The test suite covers canonical and packed layouts, nibble ordering, negative
@@ -140,6 +155,10 @@ ASan/UBSan builds. Decode-GQA additionally compares the paired path against the
 established row kernel at eleven context boundaries, head dimensions 17 and
 256, and FP16 cache storage. A forced-scalar full-model smoke run also completes
 using the same packed model representation.
+
+The modern-ISA test additionally exercises one 12-vector AVX-512-VNNI tile and
+an 8-vector remainder against the scalar result. MSVC disassembly confirms
+EVEX `vpdpbusd` and use of the expanded vector-register file.
 
 GCC keeps the hot AVX2 arithmetic free of function calls, but the 8x8 kernel
 does spill YMM values because AVX2 exposes only sixteen vector registers. The

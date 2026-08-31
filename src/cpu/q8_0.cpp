@@ -271,6 +271,27 @@ bool avx512_runtime_available() noexcept {
 #endif
 }
 
+bool avx512_vnni_runtime_available() noexcept {
+#if !QWEN35X_Q8_0_HAS_AVX512_VNNI_TU
+  return false;
+#elif defined(_MSC_VER)
+  if (!avx512_runtime_available()) {
+    return false;
+  }
+  int registers[4] = {};
+  __cpuidex(registers, 7, 0);
+  constexpr int avx512_vnni_bit = 1 << 11;
+  return (registers[2] & avx512_vnni_bit) != 0;
+#elif defined(__GNUC__) || defined(__clang__)
+  __builtin_cpu_init();
+  return avx512_runtime_available() &&
+    __builtin_cpu_supports("avx512vnni") &&
+    __builtin_cpu_supports("avx512vl");
+#else
+  return false;
+#endif
+}
+
 } // namespace
 
 bool q8_0_backend_available(const Q8_0Backend backend) noexcept {
@@ -290,6 +311,10 @@ bool q8_0_backend_available(const Q8_0Backend backend) noexcept {
       static const bool available = avx512_runtime_available();
       return available;
     }
+    case Q8_0Backend::avx512_vnni: {
+      static const bool available = avx512_vnni_runtime_available();
+      return available;
+    }
   }
   return false;
 }
@@ -298,12 +323,18 @@ Q8_0Backend q8_0_resolve_backend(const Q8_0Backend requested) noexcept {
   if (requested == Q8_0Backend::scalar) {
     return Q8_0Backend::scalar;
   }
-  if ((requested == Q8_0Backend::auto_select || requested == Q8_0Backend::avx512) &&
+  if ((requested == Q8_0Backend::auto_select ||
+       requested == Q8_0Backend::avx512_vnni) &&
+      q8_0_backend_available(Q8_0Backend::avx512_vnni)) {
+    return Q8_0Backend::avx512_vnni;
+  }
+  if ((requested == Q8_0Backend::auto_select || requested == Q8_0Backend::avx512 ||
+       requested == Q8_0Backend::avx512_vnni) &&
       q8_0_backend_available(Q8_0Backend::avx512)) {
     return Q8_0Backend::avx512;
   }
   if ((requested == Q8_0Backend::auto_select || requested == Q8_0Backend::avx_vnni ||
-       requested == Q8_0Backend::avx512) &&
+       requested == Q8_0Backend::avx512 || requested == Q8_0Backend::avx512_vnni) &&
       q8_0_backend_available(Q8_0Backend::avx_vnni)) {
     return Q8_0Backend::avx_vnni;
   }
@@ -315,11 +346,12 @@ Q8_0Backend q8_0_resolve_backend(const Q8_0Backend requested) noexcept {
 bool q8_0_backend_uses_avx2(const Q8_0Backend backend) noexcept {
   const Q8_0Backend resolved = q8_0_resolve_backend(backend);
   return resolved == Q8_0Backend::avx2 || resolved == Q8_0Backend::avx_vnni ||
-    resolved == Q8_0Backend::avx512;
+    resolved == Q8_0Backend::avx512 || resolved == Q8_0Backend::avx512_vnni;
 }
 
 bool q8_0_backend_uses_avx512(const Q8_0Backend backend) noexcept {
-  return q8_0_resolve_backend(backend) == Q8_0Backend::avx512;
+  const Q8_0Backend resolved = q8_0_resolve_backend(backend);
+  return resolved == Q8_0Backend::avx512 || resolved == Q8_0Backend::avx512_vnni;
 }
 
 const char * q8_0_backend_name(const Q8_0Backend backend) noexcept {
@@ -334,6 +366,8 @@ const char * q8_0_backend_name(const Q8_0Backend backend) noexcept {
       return "avx-vnni+avx2+fma+f16c";
     case Q8_0Backend::avx512:
       return "avx512-fp32+avx-vnni+avx2";
+    case Q8_0Backend::avx512_vnni:
+      return "avx512-vnni-q4+avx512-fp32+avx-vnni-q8";
   }
   return "unknown";
 }
@@ -402,8 +436,9 @@ float q8_0_dot(
   const std::size_t block_count,
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX_VNNI_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx_vnni ||
-      q8_0_resolve_backend(backend) == Q8_0Backend::avx512) {
+  const Q8_0Backend resolved = q8_0_resolve_backend(backend);
+  if (resolved == Q8_0Backend::avx_vnni || resolved == Q8_0Backend::avx512 ||
+      resolved == Q8_0Backend::avx512_vnni) {
     return detail::q8_0_dot_avx_vnni(lhs, rhs, block_count);
   }
 #endif
@@ -425,8 +460,9 @@ void q8_0_matvec(
   const std::size_t blocks_per_row,
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX_VNNI_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx_vnni ||
-      q8_0_resolve_backend(backend) == Q8_0Backend::avx512) {
+  const Q8_0Backend resolved = q8_0_resolve_backend(backend);
+  if (resolved == Q8_0Backend::avx_vnni || resolved == Q8_0Backend::avx512 ||
+      resolved == Q8_0Backend::avx512_vnni) {
     detail::q8_0_matvec_avx_vnni(matrix, vector, output, row_count, blocks_per_row);
     return;
   }
@@ -454,8 +490,9 @@ void q8_0_matmul(
   const float * vector_scales,
   const float * matrix_scales) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX_VNNI_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx_vnni ||
-      q8_0_resolve_backend(backend) == Q8_0Backend::avx512) {
+  const Q8_0Backend resolved = q8_0_resolve_backend(backend);
+  if (resolved == Q8_0Backend::avx_vnni || resolved == Q8_0Backend::avx512 ||
+      resolved == Q8_0Backend::avx512_vnni) {
     detail::q8_0_matmul_avx_vnni(
       matrix,
       vectors,

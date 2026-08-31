@@ -490,8 +490,8 @@ In an alternating-order six-run comparison at 12 threads, pp256 improved from
 
 ### C3 — AVX-512 FP32 kernels and 256-bit EVEX/VNNI tiling
 
-Status: first FP32 activation slice completed; attention, DeltaNet, and
-256-bit EVEX/VNNI tiling pending
+Status: first FP32 activation slice and Q4 EVEX/VNNI tiling completed;
+attention, DeltaNet, and Q8 EVEX/VNNI tiling pending
 
 Use AVX-512 where it naturally benefits normalization, residuals, SiLU, RoPE,
 convolution, attention, and DeltaNet. For Q8, first evaluate 256-bit EVEX/VNNI
@@ -505,6 +505,18 @@ level, pp256 improved by 3.15% for Q8 and 3.07% for Q4; Q8 prompt-1/tg128 was
 neutral at +0.20%, with no observed wide-vector frequency penalty. Full
 attention, DeltaNet, 256-bit EVEX/VNNI larger-register tiling, and native ZMM
 Q8 remain separate experiments. Commit: `6ef1218`.
+
+The Q4 packed path now has two additional runtime-gated slices. First, a
+256-bit AVX-VNNI kernel replaces the AVX2 multiply-add sequence and improves
+pp256 from 1081.15 to 1205.46 tok/s (+11.5%) at 12 threads; prompt-1/tg128 is
+neutral at 138.20 versus 139.18 tok/s. Second, an AVX-512-VNNI/VL translation
+unit uses EVEX-encoded 256-bit dots, the larger register file, and a 12-token
+by 8-row prefill tile. Against the same AVX-512 FP32 level with the 8-token Q4
+tile, pp256 improves from 1133.96 to 1332.77 tok/s (+17.5%, with visible drift
+in the baseline block) and pp2048 from 958.14 to 1051.23 tok/s (+9.7%). Decode
+continues to use the same 256-bit AVX-VNNI matvec because larger prefill tiles
+cannot help a single token. Runtime CPUID and XCR0 checks preserve AVX2 and
+scalar fallback on older CPUs.
 
 ### C4 — Replacing Q8 weight layout
 
@@ -941,10 +953,10 @@ Update this table in the same commit that lands or rejects each experiment.
 | B | In-memory CPU slice completed | this commit | A 128-token snapshot cuts 256-token prompt prefill from 803.49 to 413.86 ms (-48.5%); restore is 2.22 ms, storage is 21.77 MB, and AVX2/scalar output sequences are exact. Persistent model ownership, content hashing, and disk serialization remain. |
 | C1 | Pending | — | Replace the coarse backend enum with one resolved immutable per-operation kernel table |
 | C2 | Completed, retained | `476a43d` | 256-bit AVX-VNNI raises Q8 pp256 by 8.45%; short decode is neutral; CPUID fallback keeps the binary portable |
-| C3 | Partial, retained | `6ef1218` | AVX-512 FP32 activation kernels add 3.15% Q8 and 3.07% Q4 pp256 over VNNI; attention, DeltaNet, and EVEX/VNNI tiling remain |
+| C3 | Partial, retained | `6ef1218`, this commit | AVX-512 FP32 activation kernels add 3.15% Q8 and 3.07% Q4 pp256 over VNNI. Q4 AVX-VNNI adds 11.5% pp256 over AVX2, and its 12x8 EVEX/VNNI tile adds 9.7% pp2048 over the 8x8 VEX tile. Q8 EVEX tiling, attention, and DeltaNet remain. |
 | C4-C6 | Pending/deferred | — | Q8 layout replacement and native ZMM Q8 remain modern-host experiments; AMX needs a supported host; pre-AVX2 SIMD is product-scope dependent |
 | D0 | Initial screen completed | `4ca364c` | Seven formats, three alternating-order performance rounds, 56 deterministic rewrite outputs, and a three-run 2k/2k Q8-versus-Q4_0 comparison select Q4_0 for the first native backend; production quality expansion remains open |
-| D1 | Active; laptop throughput target achieved | `12f9ecf`, `8e3614c` + this commit | Native Q4_0 scalar/AVX2, packed-only model weights, token-major prepared activations, fused greedy LM-head, 8x8 projection prefill, batched DeltaNet row tiling, and paired GQA decode are implemented. Against llama.cpp Q4_0, pp256 is +40.0%, pp2048 is +30.8%, and short decode is +37.9%; paired GQA adds +5.3% at context 2,048 over the prior native path. Expanded correctness, quality, memory, and long-context gates remain. |
+| D1 | Active; laptop throughput target achieved | `12f9ecf`, `8e3614c` + this commit | Native Q4_0 scalar/AVX2, packed-only model weights, token-major prepared activations, fused greedy LM-head, 8x8 projection prefill, batched DeltaNet row tiling, paired GQA decode, AVX-VNNI, and a 12x8 AVX-512-VNNI prefill tile are implemented. Against llama.cpp Q4_0, the original laptop result is +40.0% pp256, +30.8% pp2048, and +37.9% short decode. On Zen 5, AVX-VNNI adds 11.5% pp256 over AVX2 and the EVEX tile adds another 9.7% pp2048 over the 8x8 VEX tile. Expanded correctness, quality, memory, and long-context gates remain. |
 | D2-D4 | Pending D1 validation | — | IQ4_NL, mixed precision, and calibrated offline rounding follow the validated Q4_0 baseline |
 | D5 | Research target | — | Custom Hadamard-regularized `Q4_H128` is the preferred custom-format direction after simple Q4 baselines |
 | D6-D7 | Deferred/future hardware | — | State quantization is quality-sensitive; dense sub-four-bit research benefits materially from newer SIMD ISAs |

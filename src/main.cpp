@@ -379,9 +379,11 @@ int main(int argc, char ** argv) {
         infer_options.cpu_q8_backend = qwen35x::cpu::Q8_0Backend::avx_vnni;
       } else if (isa == "avx512" || isa == "avx-512") {
         infer_options.cpu_q8_backend = qwen35x::cpu::Q8_0Backend::avx512;
+      } else if (isa == "avx512-vnni" || isa == "avx-512-vnni") {
+        infer_options.cpu_q8_backend = qwen35x::cpu::Q8_0Backend::avx512_vnni;
       } else {
         std::cerr << "unknown --cpu-isa value: " << isa
-                  << " (expected: auto|scalar|avx2|avx-vnni|avx512)\n";
+                  << " (expected: auto|scalar|avx2|avx-vnni|avx512|avx512-vnni)\n";
         return 11;
       }
     } else if (arg == "--bench-bf16") {

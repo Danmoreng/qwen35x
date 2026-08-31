@@ -8,7 +8,7 @@ param(
     [string[]]$Modes = @("gpu-bf16", "gpu-f32"),
     [string]$CpuGguf = "",
     [int]$CpuThreads = 0,
-    [ValidateSet("auto", "scalar", "avx2", "avx-vnni", "avx512")]
+    [ValidateSet("auto", "scalar", "avx2", "avx-vnni", "avx512", "avx512-vnni")]
     [string]$CpuIsa = "auto",
     [int]$CpuPrefixCacheTokens = 0,
     [int]$CpuPrefixCacheReplays = 1,

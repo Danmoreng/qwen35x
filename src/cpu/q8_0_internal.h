@@ -17,6 +17,10 @@
 #define QWEN35X_Q8_0_HAS_AVX512_TU 0
 #endif
 
+#ifndef QWEN35X_Q8_0_HAS_AVX512_VNNI_TU
+#define QWEN35X_Q8_0_HAS_AVX512_VNNI_TU 0
+#endif
+
 namespace qwen35x::cpu::detail {
 
 [[nodiscard]] std::uint16_t float_to_half(float value) noexcept;

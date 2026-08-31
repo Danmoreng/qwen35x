@@ -503,9 +503,20 @@ void q4_0_packed_matmul_q8_0(
   const std::size_t blocks_per_row,
   const std::size_t output_row_stride,
   const Q8_0Backend backend) noexcept {
-#if QWEN35X_Q8_0_HAS_AVX_VNNI_TU
+#if QWEN35X_Q8_0_HAS_AVX_VNNI_TU || QWEN35X_Q8_0_HAS_AVX512_VNNI_TU
   const Q8_0Backend resolved = q8_0_resolve_backend(backend);
-  if (resolved == Q8_0Backend::avx_vnni || resolved == Q8_0Backend::avx512) {
+#endif
+#if QWEN35X_Q8_0_HAS_AVX512_VNNI_TU
+  if (resolved == Q8_0Backend::avx512_vnni) {
+    detail::q4_0_packed_matmul_q8_0_avx512_vnni(
+      matrix, vectors, output, row_count, vector_count, blocks_per_row,
+      output_row_stride);
+    return;
+  }
+#endif
+#if QWEN35X_Q8_0_HAS_AVX_VNNI_TU
+  if (resolved == Q8_0Backend::avx_vnni || resolved == Q8_0Backend::avx512 ||
+      resolved == Q8_0Backend::avx512_vnni) {
     detail::q4_0_packed_matmul_q8_0_avx_vnni(
       matrix, vectors, output, row_count, vector_count, blocks_per_row,
       output_row_stride);
@@ -536,7 +547,8 @@ void q4_0_packed_matvec_q8_0(
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX_VNNI_TU
   const Q8_0Backend resolved = q8_0_resolve_backend(backend);
-  if (resolved == Q8_0Backend::avx_vnni || resolved == Q8_0Backend::avx512) {
+  if (resolved == Q8_0Backend::avx_vnni || resolved == Q8_0Backend::avx512 ||
+      resolved == Q8_0Backend::avx512_vnni) {
     detail::q4_0_packed_matvec_q8_0_avx_vnni(
       matrix, vector, output, row_count, blocks_per_row);
     return;
@@ -564,7 +576,8 @@ void q4_0_packed_matvec_prepared_q8_0(
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX_VNNI_TU
   const Q8_0Backend resolved = q8_0_resolve_backend(backend);
-  if (resolved == Q8_0Backend::avx_vnni || resolved == Q8_0Backend::avx512) {
+  if (resolved == Q8_0Backend::avx_vnni || resolved == Q8_0Backend::avx512 ||
+      resolved == Q8_0Backend::avx512_vnni) {
     detail::q4_0_packed_matvec_prepared_q8_0_avx_vnni(
       matrix, vector, output, row_count, blocks_per_row);
     return;
@@ -594,7 +607,8 @@ Q4_0ArgmaxResult q4_0_packed_matvec_prepared_q8_0_argmax(
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX_VNNI_TU
   const Q8_0Backend resolved = q8_0_resolve_backend(backend);
-  if (resolved == Q8_0Backend::avx_vnni || resolved == Q8_0Backend::avx512) {
+  if (resolved == Q8_0Backend::avx_vnni || resolved == Q8_0Backend::avx512 ||
+      resolved == Q8_0Backend::avx512_vnni) {
     return detail::q4_0_packed_matvec_prepared_q8_0_argmax_avx_vnni(
       matrix, vector, token_counts, repetition_penalty, row_offset, row_count,
       blocks_per_row);

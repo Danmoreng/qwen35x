@@ -187,4 +187,15 @@ q4_0_packed_matvec_prepared_q8_0_argmax_avx_vnni(
   std::size_t blocks_per_row) noexcept;
 #endif
 
+#if QWEN35X_Q8_0_HAS_AVX512_VNNI_TU
+void q4_0_packed_matmul_q8_0_avx512_vnni(
+  const Q4_0BlockX8 * matrix,
+  const Q8_0BlockX4 * vectors,
+  float * output,
+  std::size_t row_count,
+  std::size_t vector_count,
+  std::size_t blocks_per_row,
+  std::size_t output_row_stride) noexcept;
+#endif
+
 } // namespace qwen35x::cpu::detail
