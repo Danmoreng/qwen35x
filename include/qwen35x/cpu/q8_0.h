@@ -24,14 +24,19 @@ enum class Q8_0Backend : std::uint8_t {
   auto_select = 0,
   scalar = 1,
   avx2 = 2,
+  avx_vnni = 3,
 };
 
-// Explicit AVX2 requests remain safe on unsupported CPUs and resolve to the
-// scalar implementation. Call q8_0_backend_available() when a hard requirement
-// (for example, an ISA-specific test) must be enforced by the caller.
+// Explicit ISA requests remain safe on unsupported CPUs and resolve to the
+// next supported implementation. Call q8_0_backend_available() when a hard
+// requirement (for example, an ISA-specific test) must be enforced.
 [[nodiscard]] bool q8_0_backend_available(Q8_0Backend backend) noexcept;
 [[nodiscard]] Q8_0Backend q8_0_resolve_backend(Q8_0Backend requested) noexcept;
 [[nodiscard]] const char * q8_0_backend_name(Q8_0Backend backend) noexcept;
+
+// AVX-VNNI specializes integer Q8 projection dots but deliberately reuses the
+// AVX2 implementation for FP32 activation, attention, DeltaNet, and Q4 kernels.
+[[nodiscard]] bool q8_0_backend_uses_avx2(Q8_0Backend backend) noexcept;
 
 // Each operation works on complete 32-value Q8_0 blocks. Source and destination
 // ranges must not overlap. A block_count of zero is valid.

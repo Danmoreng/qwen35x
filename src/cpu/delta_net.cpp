@@ -138,7 +138,7 @@ void gated_delta_net_update_rows(
   }
   const std::size_t bounded_end = row_end < total_rows ? row_end : total_rows;
 #if QWEN35X_Q8_0_HAS_AVX2_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+  if (q8_0_backend_uses_avx2(backend)) {
     detail::gated_delta_net_update_rows_avx2(
       state, q, k, v, alpha, beta, output, key_dim, value_dim, row_begin, bounded_end);
     return;
@@ -170,7 +170,7 @@ void gated_delta_net_update_batch_rows(
   }
   const std::size_t bounded_end = row_end < head_count ? row_end : head_count;
 #if QWEN35X_Q8_0_HAS_AVX2_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+  if (q8_0_backend_uses_avx2(backend)) {
     detail::gated_delta_net_update_batch_rows_avx2(
       state,
       q,

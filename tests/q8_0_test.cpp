@@ -512,6 +512,27 @@ int main() {
       "unavailable AVX2 backend did not safely fall back") && ok;
   }
 
+  if (qwen35x::cpu::q8_0_backend_available(Q8_0Backend::avx_vnni)) {
+    ok = expect(
+      qwen35x::cpu::q8_0_resolve_backend(Q8_0Backend::avx_vnni) ==
+        Q8_0Backend::avx_vnni,
+      "available AVX-VNNI backend did not resolve to AVX-VNNI") && ok;
+    ok = test_backend(Q8_0Backend::avx_vnni) && ok;
+    ok = test_rope(Q8_0Backend::avx_vnni) && ok;
+    ok = test_causal_conv1d_silu(Q8_0Backend::avx_vnni) && ok;
+    ok = test_full_attention(Q8_0Backend::avx_vnni) && ok;
+    ok = test_full_attention_decode_pairs(Q8_0Backend::avx_vnni) && ok;
+  } else {
+    const Q8_0Backend expected_fallback =
+      qwen35x::cpu::q8_0_backend_available(Q8_0Backend::avx2)
+      ? Q8_0Backend::avx2
+      : Q8_0Backend::scalar;
+    ok = expect(
+      qwen35x::cpu::q8_0_resolve_backend(Q8_0Backend::avx_vnni) ==
+        expected_fallback,
+      "unavailable AVX-VNNI backend did not safely fall back") && ok;
+  }
+
   if (ok) {
     std::cout << "q8_0 scalar/dispatch tests passed; auto selected "
               << qwen35x::cpu::q8_0_backend_name(

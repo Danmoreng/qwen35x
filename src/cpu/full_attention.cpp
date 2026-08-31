@@ -174,7 +174,7 @@ void attention_cache_store_f16(
   const std::size_t count,
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX2_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+  if (q8_0_backend_uses_avx2(backend)) {
     detail::attention_cache_store_f16_avx2(input, output, count);
     return;
   }
@@ -214,7 +214,7 @@ void causal_attention_batch_rows(
     return;
   }
 #if QWEN35X_Q8_0_HAS_AVX2_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+  if (q8_0_backend_uses_avx2(backend)) {
     detail::causal_attention_batch_rows_avx2(
       queries, gates, k_cache, v_cache, k_cache_f16, v_cache_f16, scores, output, context_stride,
       query_width, kv_width, position_start, head_count, kv_head_count,
@@ -262,7 +262,7 @@ void causal_attention_decode_gqa_pairs(
     return;
   }
 #if QWEN35X_Q8_0_HAS_AVX2_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+  if (q8_0_backend_uses_avx2(backend)) {
     detail::causal_attention_decode_gqa_pairs_avx2(
       queries, gates, k_cache, v_cache, k_cache_f16, v_cache_f16,
       scores, output, context_stride, query_width, kv_width,

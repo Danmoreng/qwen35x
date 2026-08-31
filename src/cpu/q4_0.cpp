@@ -358,7 +358,7 @@ void q8_0_quantize_vectors_4(
   const std::size_t blocks_per_vector,
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX2_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+  if (q8_0_backend_uses_avx2(backend)) {
     detail::q8_0_quantize_vectors_4_avx2(
       input, packed, vector_count, blocks_per_vector);
     return;
@@ -376,7 +376,7 @@ void q8_0_quantize_vector_1(
   const std::size_t blocks_per_vector,
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX2_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+  if (q8_0_backend_uses_avx2(backend)) {
     detail::q8_0_quantize_vector_1_avx2(input, packed, blocks_per_vector);
     return;
   }
@@ -416,7 +416,7 @@ void q4_0_dequantize(
   const std::size_t block_count,
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX2_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+  if (q8_0_backend_uses_avx2(backend)) {
     detail::q4_0_dequantize_avx2(input, output, block_count);
     return;
   }
@@ -441,7 +441,7 @@ float q4_0_dot_q8_0(
   const std::size_t block_count,
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX2_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+  if (q8_0_backend_uses_avx2(backend)) {
     return detail::q4_0_dot_q8_0_avx2(weights, activations, block_count);
   }
 #else
@@ -458,7 +458,7 @@ void q4_0_matvec_q8_0(
   const std::size_t blocks_per_row,
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX2_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+  if (q8_0_backend_uses_avx2(backend)) {
     detail::q4_0_matvec_q8_0_avx2(matrix, vector, output, row_count, blocks_per_row);
     return;
   }
@@ -480,7 +480,7 @@ void q4_0_matmul_q8_0(
   const float * vector_scales,
   const float * matrix_scales) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX2_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+  if (q8_0_backend_uses_avx2(backend)) {
     detail::q4_0_matmul_q8_0_avx2(
       matrix, vectors, output, row_count, vector_count, blocks_per_row,
       output_row_stride, vector_scales, matrix_scales);
@@ -504,7 +504,7 @@ void q4_0_packed_matmul_q8_0(
   const std::size_t output_row_stride,
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX2_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+  if (q8_0_backend_uses_avx2(backend)) {
     detail::q4_0_packed_matmul_q8_0_avx2(
       matrix, vectors, output, row_count, vector_count, blocks_per_row,
       output_row_stride);
@@ -526,7 +526,7 @@ void q4_0_packed_matvec_q8_0(
   const std::size_t blocks_per_row,
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX2_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+  if (q8_0_backend_uses_avx2(backend)) {
     detail::q4_0_packed_matvec_q8_0_avx2(
       matrix, vector, output, row_count, blocks_per_row);
     return;
@@ -546,7 +546,7 @@ void q4_0_packed_matvec_prepared_q8_0(
   const std::size_t blocks_per_row,
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX2_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+  if (q8_0_backend_uses_avx2(backend)) {
     detail::q4_0_packed_matvec_prepared_q8_0_avx2(
       matrix, vector, output, row_count, blocks_per_row);
     return;
@@ -568,7 +568,7 @@ Q4_0ArgmaxResult q4_0_packed_matvec_prepared_q8_0_argmax(
   const std::size_t blocks_per_row,
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX2_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+  if (q8_0_backend_uses_avx2(backend)) {
     return detail::q4_0_packed_matvec_prepared_q8_0_argmax_avx2(
       matrix, vector, token_counts, repetition_penalty, row_offset, row_count,
       blocks_per_row);

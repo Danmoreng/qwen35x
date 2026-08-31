@@ -76,7 +76,7 @@ void add_f32(
   const std::size_t count,
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX2_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+  if (q8_0_backend_uses_avx2(backend)) {
     detail::add_f32_avx2(lhs, rhs, output, count);
     return;
   }
@@ -100,7 +100,7 @@ void rope_f32(
     return;
   }
 #if QWEN35X_Q8_0_HAS_AVX2_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+  if (q8_0_backend_uses_avx2(backend)) {
     detail::rope_f32_avx2(
       values, head_count, head_dim, rope_dim, cosine, sine);
     return;
@@ -138,7 +138,7 @@ void causal_conv1d_silu_f32(
     return;
   }
 #if QWEN35X_Q8_0_HAS_AVX2_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+  if (q8_0_backend_uses_avx2(backend)) {
     detail::causal_conv1d_silu_f32_avx2(
       state, ring_index, input, input_stride, kernel_major_weights, output,
       batch_size, channel_count, kernel_size, channel_begin, channel_end);
@@ -183,7 +183,7 @@ void rms_norm_f32(
   const float weight_offset,
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX2_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+  if (q8_0_backend_uses_avx2(backend)) {
     detail::rms_norm_f32_avx2(
       input, weight, output, row_count, width, eps, weight_offset);
     return;
@@ -214,7 +214,7 @@ void l2_normalize_f32(
   const float output_scale,
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX2_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+  if (q8_0_backend_uses_avx2(backend)) {
     detail::l2_normalize_f32_avx2(
       values, row_count, width, eps, output_scale);
     return;
@@ -241,7 +241,7 @@ void silu_f32(
   const std::size_t count,
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX2_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+  if (q8_0_backend_uses_avx2(backend)) {
     detail::silu_f32_avx2(input, output, count);
     return;
   }
@@ -265,7 +265,7 @@ void silu_mul_f32(
   const std::size_t count,
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX2_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+  if (q8_0_backend_uses_avx2(backend)) {
     detail::silu_mul_f32_avx2(gate, up, output, count);
     return;
   }

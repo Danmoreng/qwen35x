@@ -225,6 +225,29 @@ bool avx2_runtime_available() noexcept {
 #endif
 }
 
+bool avx_vnni_runtime_available() noexcept {
+#if !QWEN35X_Q8_0_HAS_AVX_VNNI_TU
+  return false;
+#elif defined(_MSC_VER)
+  if (!avx2_runtime_available()) {
+    return false;
+  }
+  int registers[4] = {};
+  __cpuidex(registers, 7, 0);
+  if (registers[0] < 1) {
+    return false;
+  }
+  __cpuidex(registers, 7, 1);
+  constexpr int avx_vnni_bit = 1 << 4;
+  return (registers[0] & avx_vnni_bit) != 0;
+#elif defined(__GNUC__) || defined(__clang__)
+  __builtin_cpu_init();
+  return avx2_runtime_available() && __builtin_cpu_supports("avxvnni");
+#else
+  return false;
+#endif
+}
+
 } // namespace
 
 bool q8_0_backend_available(const Q8_0Backend backend) noexcept {
@@ -236,6 +259,10 @@ bool q8_0_backend_available(const Q8_0Backend backend) noexcept {
       static const bool available = avx2_runtime_available();
       return available;
     }
+    case Q8_0Backend::avx_vnni: {
+      static const bool available = avx_vnni_runtime_available();
+      return available;
+    }
   }
   return false;
 }
@@ -244,9 +271,18 @@ Q8_0Backend q8_0_resolve_backend(const Q8_0Backend requested) noexcept {
   if (requested == Q8_0Backend::scalar) {
     return Q8_0Backend::scalar;
   }
+  if ((requested == Q8_0Backend::auto_select || requested == Q8_0Backend::avx_vnni) &&
+      q8_0_backend_available(Q8_0Backend::avx_vnni)) {
+    return Q8_0Backend::avx_vnni;
+  }
   return q8_0_backend_available(Q8_0Backend::avx2)
     ? Q8_0Backend::avx2
     : Q8_0Backend::scalar;
+}
+
+bool q8_0_backend_uses_avx2(const Q8_0Backend backend) noexcept {
+  const Q8_0Backend resolved = q8_0_resolve_backend(backend);
+  return resolved == Q8_0Backend::avx2 || resolved == Q8_0Backend::avx_vnni;
 }
 
 const char * q8_0_backend_name(const Q8_0Backend backend) noexcept {
@@ -257,6 +293,8 @@ const char * q8_0_backend_name(const Q8_0Backend backend) noexcept {
       return "scalar";
     case Q8_0Backend::avx2:
       return "avx2+fma+f16c";
+    case Q8_0Backend::avx_vnni:
+      return "avx-vnni+avx2+fma+f16c";
   }
   return "unknown";
 }
@@ -267,7 +305,7 @@ void q8_0_quantize(
   const std::size_t block_count,
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX2_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+  if (q8_0_backend_uses_avx2(backend)) {
     detail::q8_0_quantize_avx2(input, output, nullptr, block_count);
     return;
   }
@@ -284,7 +322,7 @@ void q8_0_quantize_with_scales(
   const std::size_t block_count,
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX2_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+  if (q8_0_backend_uses_avx2(backend)) {
     detail::q8_0_quantize_avx2(input, output, scales, block_count);
     return;
   }
@@ -300,7 +338,7 @@ void q8_0_dequantize(
   const std::size_t block_count,
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX2_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+  if (q8_0_backend_uses_avx2(backend)) {
     detail::q8_0_dequantize_avx2(input, output, block_count);
     return;
   }
@@ -324,6 +362,11 @@ float q8_0_dot(
   const Q8_0Block * rhs,
   const std::size_t block_count,
   const Q8_0Backend backend) noexcept {
+#if QWEN35X_Q8_0_HAS_AVX_VNNI_TU
+  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx_vnni) {
+    return detail::q8_0_dot_avx_vnni(lhs, rhs, block_count);
+  }
+#endif
 #if QWEN35X_Q8_0_HAS_AVX2_TU
   if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
     return detail::q8_0_dot_avx2(lhs, rhs, block_count);
@@ -341,6 +384,12 @@ void q8_0_matvec(
   const std::size_t row_count,
   const std::size_t blocks_per_row,
   const Q8_0Backend backend) noexcept {
+#if QWEN35X_Q8_0_HAS_AVX_VNNI_TU
+  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx_vnni) {
+    detail::q8_0_matvec_avx_vnni(matrix, vector, output, row_count, blocks_per_row);
+    return;
+  }
+#endif
 #if QWEN35X_Q8_0_HAS_AVX2_TU
   if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
     detail::q8_0_matvec_avx2(matrix, vector, output, row_count, blocks_per_row);
@@ -363,6 +412,21 @@ void q8_0_matmul(
   const Q8_0Backend backend,
   const float * vector_scales,
   const float * matrix_scales) noexcept {
+#if QWEN35X_Q8_0_HAS_AVX_VNNI_TU
+  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx_vnni) {
+    detail::q8_0_matmul_avx_vnni(
+      matrix,
+      vectors,
+      output,
+      row_count,
+      vector_count,
+      blocks_per_row,
+      output_row_stride,
+      vector_scales,
+      matrix_scales);
+    return;
+  }
+#endif
 #if QWEN35X_Q8_0_HAS_AVX2_TU
   if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
     detail::q8_0_matmul_avx2(

@@ -9,6 +9,10 @@
 #define QWEN35X_Q8_0_HAS_AVX2_TU 0
 #endif
 
+#ifndef QWEN35X_Q8_0_HAS_AVX_VNNI_TU
+#define QWEN35X_Q8_0_HAS_AVX_VNNI_TU 0
+#endif
+
 namespace qwen35x::cpu::detail {
 
 [[nodiscard]] std::uint16_t float_to_half(float value) noexcept;
@@ -73,6 +77,31 @@ void q8_0_matvec_avx2(
   std::size_t blocks_per_row) noexcept;
 
 void q8_0_matmul_avx2(
+  const Q8_0Block * matrix,
+  const Q8_0Block * vectors,
+  float * output,
+  std::size_t row_count,
+  std::size_t vector_count,
+  std::size_t blocks_per_row,
+  std::size_t output_row_stride,
+  const float * vector_scales,
+  const float * matrix_scales) noexcept;
+#endif
+
+#if QWEN35X_Q8_0_HAS_AVX_VNNI_TU
+[[nodiscard]] float q8_0_dot_avx_vnni(
+  const Q8_0Block * lhs,
+  const Q8_0Block * rhs,
+  std::size_t block_count) noexcept;
+
+void q8_0_matvec_avx_vnni(
+  const Q8_0Block * matrix,
+  const Q8_0Block * vector,
+  float * output,
+  std::size_t row_count,
+  std::size_t blocks_per_row) noexcept;
+
+void q8_0_matmul_avx_vnni(
   const Q8_0Block * matrix,
   const Q8_0Block * vectors,
   float * output,

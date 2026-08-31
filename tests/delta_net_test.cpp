@@ -155,9 +155,13 @@ int main() {
   if (qwen35x::cpu::q8_0_backend_available(Q8_0Backend::avx2)) {
     ok = test_backend(Q8_0Backend::avx2) && test_batch_backend(Q8_0Backend::avx2) && ok;
   }
+  if (qwen35x::cpu::q8_0_backend_available(Q8_0Backend::avx_vnni)) {
+    ok = test_backend(Q8_0Backend::avx_vnni) &&
+      test_batch_backend(Q8_0Backend::avx_vnni) && ok;
+  }
   if (!ok) {
     return 1;
   }
-  std::cout << "gated DeltaNet scalar/AVX2 tests passed\n";
+  std::cout << "gated DeltaNet scalar/runtime-dispatch tests passed\n";
   return 0;
 }

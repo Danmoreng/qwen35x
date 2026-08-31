@@ -8,7 +8,7 @@ param(
     [string[]]$Modes = @("gpu-bf16", "gpu-f32"),
     [string]$CpuGguf = "",
     [int]$CpuThreads = 0,
-    [ValidateSet("auto", "scalar", "avx2")]
+    [ValidateSet("auto", "scalar", "avx2", "avx-vnni")]
     [string]$CpuIsa = "auto",
     [ValidateSet("chat-user", "prompt-text", "prompt-file", "prompt-tokens")]
     [string]$PromptMode = "chat-user",
