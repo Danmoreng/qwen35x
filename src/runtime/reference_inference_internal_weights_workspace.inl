@@ -76,6 +76,28 @@ struct PackedQ4ArgmaxJob {
   cpu::Q8_0Backend backend = cpu::Q8_0Backend::auto_select;
 };
 
+struct Q4H128TransformJob {
+  const float * input = nullptr;
+  float * output = nullptr;
+  std::size_t columns = 0;
+  std::uint64_t sign_seed = 0;
+  cpu::Q8_0Backend backend = cpu::Q8_0Backend::auto_select;
+};
+
+void run_q4_h128_transform_rows(
+  void * opaque_context,
+  const std::size_t row_begin,
+  const std::size_t row_end) noexcept {
+  auto & job = *static_cast<Q4H128TransformJob *>(opaque_context);
+  static_cast<void>(cpu::q4_h128_transform_rows(
+    job.input + row_begin * job.columns,
+    job.output + row_begin * job.columns,
+    row_end - row_begin,
+    job.columns,
+    job.sign_seed,
+    job.backend));
+}
+
 void run_packed_q4_prefill_tiles(
   void * opaque_context,
   const std::size_t tile_begin,
@@ -1278,9 +1300,22 @@ bool matmul_2d_quantized_batch(
   if (w.uses_q4_h128_transform) {
     std::vector<float> & transformed = w.q8_0_runtime->q4_h128_transform_scratch;
     transformed.resize(batch_size * cols);
-    if (!cpu::q4_h128_transform_rows(
-          inputs.data(), transformed.data(), batch_size, cols,
-          w.q4_h128_sign_seed, w.q8_0_backend)) {
+    if (w.q8_0_runtime->executor != nullptr && batch_size > 1) {
+      Q4H128TransformJob transform_job{
+        inputs.data(), transformed.data(), cols, w.q4_h128_sign_seed,
+        w.q8_0_backend,
+      };
+      const cpu::CpuExecutorStatus status =
+        w.q8_0_runtime->executor->parallel_for_rows(
+          batch_size, run_q4_h128_transform_rows, &transform_job);
+      if (status != cpu::CpuExecutorStatus::ok) {
+        error_message = std::string("Q4_H128 activation transform executor failed: ") +
+          cpu::cpu_executor_status_name(status) + ".";
+        return false;
+      }
+    } else if (!cpu::q4_h128_transform_rows(
+                 inputs.data(), transformed.data(), batch_size, cols,
+                 w.q4_h128_sign_seed, w.q8_0_backend)) {
       error_message = "Q4_H128 batched activation transform failed.";
       return false;
     }

@@ -197,6 +197,11 @@ tokens/s and 61.99 decode tokens/s. Relative to the original scalar transform,
 that is +21.0% prefill and +4.6% decode. The remaining gap to the contemporaneous
 Q4_0 measurements is 4.7% prefill and 1.3% decode.
 
+Distributing independent prompt-token transforms over the existing persistent
+CPU executor raises prefill again to 317.58 tokens/s. That is within 0.7% of the
+319.92-token/s Q4_0 run while preserving the exact transform and logits. Decode
+is unaffected because its batch contains one activation row.
+
 On the deliberately small two-position evaluator smoke sample, BF16 versus
 Q4_H128 measured mean KL 1.96881, compared with 1.96188 for the prior Q4_0
 sample. This is statistically insufficient to accept or reject the format and
