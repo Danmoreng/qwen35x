@@ -34,6 +34,28 @@ namespace {
 
 } // namespace
 
+void silu_f32_avx2(
+  const float * input,
+  float * output,
+  const std::size_t count) noexcept {
+  const __m256 one = _mm256_set1_ps(1.0F);
+  std::size_t index = 0;
+  for (; index + 8 <= count; index += 8) {
+    const __m256 value = _mm256_loadu_ps(input + index);
+    const __m256 sigmoid = _mm256_div_ps(
+      one, _mm256_add_ps(one, exp_f32_avx2(_mm256_sub_ps(_mm256_setzero_ps(), value))));
+    _mm256_storeu_ps(output + index, _mm256_mul_ps(value, sigmoid));
+  }
+  for (; index < count; ++index) {
+    const float value = input[index];
+    const float exponential = std::exp(-std::fabs(value));
+    const float sigmoid = value >= 0.0F
+      ? 1.0F / (1.0F + exponential)
+      : exponential / (1.0F + exponential);
+    output[index] = value * sigmoid;
+  }
+}
+
 void silu_mul_f32_avx2(
   const float * gate,
   const float * up,
@@ -51,9 +73,10 @@ void silu_mul_f32_avx2(
   }
   for (; index < count; ++index) {
     const float value = gate[index];
+    const float exponential = std::exp(-std::fabs(value));
     const float sigmoid = value >= 0.0F
-      ? 1.0F / (1.0F + std::exp(-value))
-      : std::exp(value) / (1.0F + std::exp(value));
+      ? 1.0F / (1.0F + exponential)
+      : exponential / (1.0F + exponential);
     output[index] = value * sigmoid * up[index];
   }
 }

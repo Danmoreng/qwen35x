@@ -387,8 +387,11 @@ bool run_linear_attention_step(
       const std::size_t idx = static_cast<std::size_t>(k * dims.linear_conv_channels + c);
       s += conv_window[idx] * w[k];
     }
-    conv_out[static_cast<std::size_t>(c)] = siluf(s);
+    conv_out[static_cast<std::size_t>(c)] = s;
   }
+  cpu::silu_f32(
+    conv_out.data(), conv_out.data(), conv_out.size(),
+    layer.linear.out_proj.q8_0_backend);
 
   std::vector<float> q(conv_out.begin(), conv_out.begin() + dims.linear_q_dim);
   std::vector<float> k(conv_out.begin() + dims.linear_q_dim, conv_out.begin() + 2 * dims.linear_q_dim);
@@ -457,8 +460,14 @@ bool run_linear_attention_step(
     const float inv = 1.0f / std::sqrt(sq_sum / static_cast<float>(dims.linear_head_v_dim) + dims.rms_eps);
     for (int d = 0; d < dims.linear_head_v_dim; ++d) {
       const std::size_t idx = base + static_cast<std::size_t>(d);
-      gated_norm[idx] = core_out[idx] * inv * layer.linear.norm.data[static_cast<std::size_t>(d)] * siluf(z_vec[idx]);
+      gated_norm[idx] = core_out[idx] * inv * layer.linear.norm.data[static_cast<std::size_t>(d)];
     }
+    cpu::silu_mul_f32(
+      z_vec.data() + base,
+      gated_norm.data() + base,
+      gated_norm.data() + base,
+      static_cast<std::size_t>(dims.linear_head_v_dim),
+      cpu_backend);
   }
 
   if (!matvec_2d(layer.linear.out_proj, gated_norm, out, use_cuda, error_message)) {

@@ -96,12 +96,19 @@ bool test_silu_mul(const Q8_0Backend backend) {
   }
   std::array<float, count> expected{};
   std::array<float, count> actual{};
+  std::array<float, count> expected_silu{};
+  std::array<float, count> actual_silu{};
+  qwen35x::cpu::silu_f32(
+    gate.data(), expected_silu.data(), count, Q8_0Backend::scalar);
+  qwen35x::cpu::silu_f32(
+    gate.data(), actual_silu.data(), count, backend);
   qwen35x::cpu::silu_mul_f32(
     gate.data(), up.data(), expected.data(), count, Q8_0Backend::scalar);
   qwen35x::cpu::silu_mul_f32(
     gate.data(), up.data(), actual.data(), count, backend);
   bool ok = true;
   for (std::size_t index = 0; index < count; ++index) {
+    ok = expect(near(expected_silu[index], actual_silu[index]), "SiLU mismatch") && ok;
     ok = expect(near(expected[index], actual[index]), "SiLU multiply mismatch") && ok;
   }
   return ok;

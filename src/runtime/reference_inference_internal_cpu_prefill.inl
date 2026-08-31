@@ -94,7 +94,7 @@ void run_causal_conv_batch_cpu_channels(
         job.state[static_cast<std::size_t>(history - 1) * job.channel_count + channel] =
           input_value;
       }
-      job.output[token * job.channel_count + channel] = siluf(sum);
+      job.output[token * job.channel_count + channel] = sum;
     }
   }
 }
@@ -197,6 +197,9 @@ bool run_linear_attention_batch_cpu_q8(
   } else {
     run_causal_conv_batch_cpu_channels(&conv_job, 0, conv_channels);
   }
+  cpu::silu_f32(
+    conv_batch.data(), conv_batch.data(), conv_batch.size(),
+    layer.linear.out_proj.q8_0_backend);
 
   for (std::size_t token = 0; token < batch_size; ++token) {
     const float * projection = projected.data() + token * projection_width;
@@ -295,9 +298,11 @@ bool run_linear_attention_batch_cpu_q8(
         std::sqrt(sq_sum / static_cast<float>(value_dim) + dims.rms_eps);
       for (std::size_t column = 0; column < value_dim; ++column) {
         const std::size_t index = base + column;
-        gated_token[index] = core_out[index] * inv * layer.linear.norm.data[column] *
-          siluf(z[index]);
+        gated_token[index] = core_out[index] * inv * layer.linear.norm.data[column];
       }
+      cpu::silu_mul_f32(
+        z + base, gated_token + base, gated_token + base, value_dim,
+        layer.linear.out_proj.q8_0_backend);
     }
   }
 
