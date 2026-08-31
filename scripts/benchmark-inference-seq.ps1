@@ -10,6 +10,8 @@ param(
     [int]$CpuThreads = 0,
     [ValidateSet("auto", "scalar", "avx2", "avx-vnni", "avx512")]
     [string]$CpuIsa = "auto",
+    [int]$CpuPrefixCacheTokens = 0,
+    [int]$CpuPrefixCacheReplays = 1,
     [ValidateSet("chat-user", "prompt-text", "prompt-file", "prompt-tokens")]
     [string]$PromptMode = "chat-user",
     [string]$PromptName = "chat_short_joke",
@@ -129,6 +131,8 @@ function Invoke-BenchmarkRun {
         [Parameter(Mandatory = $false)][string]$CpuGguf,
         [Parameter(Mandatory = $true)][int]$CpuThreads,
         [Parameter(Mandatory = $true)][string]$CpuIsa,
+        [Parameter(Mandatory = $true)][int]$CpuPrefixCacheTokens,
+        [Parameter(Mandatory = $true)][int]$CpuPrefixCacheReplays,
         [Parameter(Mandatory = $true)][string]$PromptMode,
         [Parameter(Mandatory = $true)][string]$PromptText,
         [Parameter(Mandatory = $false)][string]$PromptFile,
@@ -187,6 +191,12 @@ function Invoke-BenchmarkRun {
             "--cpu-threads", "$CpuThreads",
             "--cpu-isa", $CpuIsa
         )
+        if ($CpuPrefixCacheTokens -gt 0) {
+            $args += @(
+                "--cpu-prefix-cache-tokens", "$CpuPrefixCacheTokens",
+                "--cpu-prefix-cache-replays", "$CpuPrefixCacheReplays"
+            )
+        }
     }
 
     if ($PromptMode -eq "chat-user") {
@@ -273,6 +283,12 @@ if ($Modes -contains "cpu-gguf") {
     if ($CpuThreads -lt 1) {
         throw "CpuThreads must be >= 1 for cpu-gguf mode."
     }
+    if ($CpuPrefixCacheTokens -lt 0) {
+        throw "CpuPrefixCacheTokens must be >= 0."
+    }
+    if ($CpuPrefixCacheReplays -lt 1) {
+        throw "CpuPrefixCacheReplays must be >= 1."
+    }
 }
 if ($Runs -lt 1) {
     throw "Runs must be >= 1."
@@ -319,6 +335,8 @@ foreach ($mode in $Modes) {
                 -CpuGguf $resolvedCpuGguf `
                 -CpuThreads $CpuThreads `
                 -CpuIsa $CpuIsa `
+                -CpuPrefixCacheTokens $CpuPrefixCacheTokens `
+                -CpuPrefixCacheReplays $CpuPrefixCacheReplays `
                 -PromptMode $PromptMode `
                 -PromptText $PromptText `
                 -PromptFile $resolvedPromptFile `
@@ -356,6 +374,8 @@ foreach ($mode in $Modes) {
                 -CpuGguf $resolvedCpuGguf `
                 -CpuThreads $CpuThreads `
                 -CpuIsa $CpuIsa `
+                -CpuPrefixCacheTokens $CpuPrefixCacheTokens `
+                -CpuPrefixCacheReplays $CpuPrefixCacheReplays `
                 -PromptMode $PromptMode `
                 -PromptText $PromptText `
                 -PromptFile $resolvedPromptFile `
@@ -411,6 +431,9 @@ foreach ($mode in $Modes) {
                 cpu_gguf         = if ($mode -eq "cpu-gguf") { $resolvedCpuGguf } else { "" }
                 cpu_threads      = if ($mode -eq "cpu-gguf") { $CpuThreads } else { "" }
                 cpu_isa          = if ($mode -eq "cpu-gguf") { $CpuIsa } else { "" }
+                cached_prefix_tokens = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "cached_prefix_tokens")
+                prefix_cache_restore_time_ms = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "prefix_cache_restore_time_ms")
+                prefix_cache_bytes = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "prefix_cache_bytes")
                 qwen35x_prefill_mode = $effectiveQwen35xPrefillMode
                 qwen35x_prefill_kernel = $effectiveQwen35xPrefillKernel
                 qwen35x_weight_precision = $effectiveQwen35xWeightPrecision
