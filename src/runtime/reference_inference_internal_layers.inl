@@ -450,25 +450,14 @@ bool run_linear_attention_step(
   }
 
   std::vector<float> gated_norm(static_cast<std::size_t>(dims.linear_v_dim), 0.0f);
-  for (int h = 0; h < dims.linear_num_v_heads; ++h) {
-    const std::size_t base = static_cast<std::size_t>(h * dims.linear_head_v_dim);
-    float sq_sum = 0.0f;
-    for (int d = 0; d < dims.linear_head_v_dim; ++d) {
-      const float cv = core_out[base + static_cast<std::size_t>(d)];
-      sq_sum += cv * cv;
-    }
-    const float inv = 1.0f / std::sqrt(sq_sum / static_cast<float>(dims.linear_head_v_dim) + dims.rms_eps);
-    for (int d = 0; d < dims.linear_head_v_dim; ++d) {
-      const std::size_t idx = base + static_cast<std::size_t>(d);
-      gated_norm[idx] = core_out[idx] * inv * layer.linear.norm.data[static_cast<std::size_t>(d)];
-    }
-    cpu::silu_mul_f32(
-      z_vec.data() + base,
-      gated_norm.data() + base,
-      gated_norm.data() + base,
-      static_cast<std::size_t>(dims.linear_head_v_dim),
-      cpu_backend);
-  }
+  cpu::rms_norm_f32(
+    core_out.data(), layer.linear.norm.data.data(), gated_norm.data(),
+    static_cast<std::size_t>(dims.linear_num_v_heads),
+    static_cast<std::size_t>(dims.linear_head_v_dim), dims.rms_eps, 0.0F,
+    cpu_backend);
+  cpu::silu_mul_f32(
+    z_vec.data(), gated_norm.data(), gated_norm.data(), gated_norm.size(),
+    cpu_backend);
 
   if (!matvec_2d(layer.linear.out_proj, gated_norm, out, use_cuda, error_message)) {
     return false;

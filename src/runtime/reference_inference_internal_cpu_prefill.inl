@@ -278,23 +278,13 @@ bool run_linear_attention_batch_cpu_q8(
     const float * z = projection + conv_channels;
     const float * core_out = core_batch.data() + token * value_width;
     float * gated_token = gated.data() + token * value_width;
-    for (std::size_t head = 0; head < head_count; ++head) {
-      const std::size_t base = head * value_dim;
-      float sq_sum = 0.0F;
-      for (std::size_t column = 0; column < value_dim; ++column) {
-        const float value = core_out[base + column];
-        sq_sum += value * value;
-      }
-      const float inv = 1.0F /
-        std::sqrt(sq_sum / static_cast<float>(value_dim) + dims.rms_eps);
-      for (std::size_t column = 0; column < value_dim; ++column) {
-        const std::size_t index = base + column;
-        gated_token[index] = core_out[index] * inv * layer.linear.norm.data[column];
-      }
-      cpu::silu_mul_f32(
-        z + base, gated_token + base, gated_token + base, value_dim,
-        layer.linear.out_proj.q8_0_backend);
-    }
+    cpu::rms_norm_f32(
+      core_out, layer.linear.norm.data.data(), gated_token,
+      head_count, value_dim, dims.rms_eps, 0.0F,
+      layer.linear.out_proj.q8_0_backend);
+    cpu::silu_mul_f32(
+      z, gated_token, gated_token, value_width,
+      layer.linear.out_proj.q8_0_backend);
   }
 
   return matmul_2d_q8_batch(
