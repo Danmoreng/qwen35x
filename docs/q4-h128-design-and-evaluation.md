@@ -185,7 +185,20 @@ throughput and 5.6% of decode throughput; this is a correctness baseline, not a
 performance acceptance. An AVX2 transform and more aggressive transform reuse
 are the next optimization targets.
 
+The first isolated AVX2 H128 implementation preserves bit-exact scalar output
+and raises Q4_H128 to 282.33 prefill tokens/s and 59.95 decode tokens/s. This is
++12.0% prefill and +1.1% decode over the scalar-transform baseline, while still
+trailing Q4_0 by 11.8% and 4.6% respectively. Transform reuse/fusion remains
+necessary before claiming throughput parity.
+
 On the deliberately small two-position evaluator smoke sample, BF16 versus
 Q4_H128 measured mean KL 1.96881, compared with 1.96188 for the prior Q4_0
 sample. This is statistically insufficient to accept or reject the format and
 does not replace the held-out transcript suite.
+
+An additional arithmetic smoke prompt, `What is 2 + 2? Answer with only the
+number.`, generated token ID 19 (`4`) after the four-token empty thinking block
+with both the local Q4_0 and Q4_H128 artifacts. That reconstructed prompt has 22
+input tokens, whereas the independently reported failing prompt has 23, so it
+does not yet reproduce or close that exact regression. The exact prompt-token
+sequence must be retained as a permanent gate once it is available.

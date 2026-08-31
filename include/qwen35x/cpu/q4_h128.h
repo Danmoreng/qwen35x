@@ -21,12 +21,14 @@ void q4_h128_transform_block(
   const float * input,
   float * output,
   std::size_t transform_block_index,
-  std::uint64_t sign_seed = q4_h128_default_sign_seed) noexcept;
+  std::uint64_t sign_seed = q4_h128_default_sign_seed,
+  Q8_0Backend backend = Q8_0Backend::scalar) noexcept;
 
 void q4_h128_transform_block_inplace(
   float * values,
   std::size_t transform_block_index,
-  std::uint64_t sign_seed = q4_h128_default_sign_seed) noexcept;
+  std::uint64_t sign_seed = q4_h128_default_sign_seed,
+  Q8_0Backend backend = Q8_0Backend::scalar) noexcept;
 
 // rows are row-major and columns must be a non-zero multiple of 128. The
 // transform block index restarts at zero for each row.
@@ -35,7 +37,8 @@ void q4_h128_transform_block_inplace(
   float * output,
   std::size_t row_count,
   std::size_t column_count,
-  std::uint64_t sign_seed = q4_h128_default_sign_seed) noexcept;
+  std::uint64_t sign_seed = q4_h128_default_sign_seed,
+  Q8_0Backend backend = Q8_0Backend::scalar) noexcept;
 
 // Quantizes already-transformed values into the engine's signed Q4 nibble
 // layout with one binary16 symmetric scale per 32 values.

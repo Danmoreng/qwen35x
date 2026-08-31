@@ -1057,7 +1057,8 @@ bool matvec_2d(
       transform_scratch->resize(static_cast<std::size_t>(cols));
       if (!cpu::q4_h128_transform_rows(
             x.data(), transform_scratch->data(), 1,
-            static_cast<std::size_t>(cols), w.q4_h128_sign_seed)) {
+            static_cast<std::size_t>(cols), w.q4_h128_sign_seed,
+            w.q8_0_backend)) {
         error_message = "Q4_H128 matvec activation transform failed.";
         return false;
       }
@@ -1190,7 +1191,7 @@ bool greedy_q4_token(
     runtime.q4_h128_transform_scratch.resize(cols);
     if (!cpu::q4_h128_transform_rows(
           input.data(), runtime.q4_h128_transform_scratch.data(), 1, cols,
-          weights.q4_h128_sign_seed)) {
+          weights.q4_h128_sign_seed, weights.q8_0_backend)) {
       error_message = "Q4_H128 greedy activation transform failed.";
       return false;
     }
@@ -1279,7 +1280,7 @@ bool matmul_2d_quantized_batch(
     transformed.resize(batch_size * cols);
     if (!cpu::q4_h128_transform_rows(
           inputs.data(), transformed.data(), batch_size, cols,
-          w.q4_h128_sign_seed)) {
+          w.q4_h128_sign_seed, w.q8_0_backend)) {
       error_message = "Q4_H128 batched activation transform failed.";
       return false;
     }

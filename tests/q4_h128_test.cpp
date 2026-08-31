@@ -86,6 +86,28 @@ bool test_rows_and_rejection() {
   return ok;
 }
 
+bool test_avx2_parity() {
+  if (!qwen35x::cpu::q8_0_backend_available(
+        qwen35x::cpu::Q8_0Backend::avx2)) {
+    return true;
+  }
+  const std::vector<float> input = make_values(4 * 256, -0.41F);
+  std::vector<float> scalar(input.size());
+  std::vector<float> avx2(input.size());
+  bool ok = expect(qwen35x::cpu::q4_h128_transform_rows(
+                     input.data(), scalar.data(), 4, 256,
+                     qwen35x::cpu::q4_h128_default_sign_seed,
+                     qwen35x::cpu::Q8_0Backend::scalar),
+                   "scalar parity transform failed");
+  ok = expect(qwen35x::cpu::q4_h128_transform_rows(
+                input.data(), avx2.data(), 4, 256,
+                qwen35x::cpu::q4_h128_default_sign_seed,
+                qwen35x::cpu::Q8_0Backend::avx2),
+              "AVX2 parity transform failed") && ok;
+  ok = expect(scalar == avx2, "AVX2 transform differs from scalar ABI") && ok;
+  return ok;
+}
+
 bool test_quantized_projection() {
   constexpr std::size_t rows = 8;
   constexpr std::size_t columns = 256;
@@ -133,6 +155,7 @@ int main() {
   bool ok = true;
   ok = test_orthogonality() && ok;
   ok = test_rows_and_rejection() && ok;
+  ok = test_avx2_parity() && ok;
   ok = test_quantized_projection() && ok;
   if (ok) {
     std::cout << "Q4_H128 tests passed\n";

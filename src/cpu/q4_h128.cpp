@@ -1,5 +1,6 @@
 #include "qwen35x/cpu/q4_h128.h"
 
+#include "q4_h128_internal.h"
 #include "q8_0_internal.h"
 
 #include <algorithm>
@@ -8,7 +9,7 @@
 #include <cstdint>
 
 namespace qwen35x::cpu {
-namespace {
+namespace detail {
 
 constexpr float kInverseSqrt128 = 0.08838834764831844055F;
 constexpr std::uint64_t kBlockStride = UINT64_C(0x9e3779b97f4a7c15);
@@ -21,14 +22,22 @@ constexpr std::uint64_t kWordStride = UINT64_C(0xd1b54a32d192ed03);
   return value ^ (value >> 31U);
 }
 
+std::uint64_t q4_h128_sign_word(
+  const std::size_t transform_block_index,
+  const std::size_t word_index,
+  const std::uint64_t sign_seed) noexcept {
+  const std::uint64_t block_key =
+    sign_seed + static_cast<std::uint64_t>(transform_block_index) * kBlockStride;
+  return splitmix64(block_key + static_cast<std::uint64_t>(word_index) * kWordStride);
+}
+
 void apply_signs(
   float * values,
   const std::size_t transform_block_index,
   const std::uint64_t sign_seed) noexcept {
-  const std::uint64_t block_key =
-    sign_seed + static_cast<std::uint64_t>(transform_block_index) * kBlockStride;
   for (std::size_t word = 0; word < 2; ++word) {
-    const std::uint64_t signs = splitmix64(block_key + word * kWordStride);
+    const std::uint64_t signs = q4_h128_sign_word(
+      transform_block_index, word, sign_seed);
     for (std::size_t bit = 0; bit < 64; ++bit) {
       if (((signs >> bit) & 1U) != 0U) {
         values[word * 64 + bit] = -values[word * 64 + bit];
@@ -53,23 +62,46 @@ void hadamard_128_inplace(float * values) noexcept {
   }
 }
 
-} // namespace
-
-void q4_h128_transform_block(
+void q4_h128_transform_block_scalar(
   const float * input,
   float * output,
   const std::size_t transform_block_index,
   const std::uint64_t sign_seed) noexcept {
   std::copy_n(input, q4_h128_transform_size, output);
-  q4_h128_transform_block_inplace(output, transform_block_index, sign_seed);
+  apply_signs(output, transform_block_index, sign_seed);
+  hadamard_128_inplace(output);
+}
+
+} // namespace detail
+
+void q4_h128_transform_block(
+  const float * input,
+  float * output,
+  const std::size_t transform_block_index,
+  const std::uint64_t sign_seed,
+  const Q8_0Backend backend) noexcept {
+#if QWEN35X_Q8_0_HAS_AVX2_TU
+  if (q8_0_backend_uses_avx2(backend)) {
+    detail::q4_h128_transform_block_avx2(
+      input, output, transform_block_index, sign_seed);
+    return;
+  }
+#else
+  static_cast<void>(backend);
+#endif
+  detail::q4_h128_transform_block_scalar(
+    input, output, transform_block_index, sign_seed);
 }
 
 void q4_h128_transform_block_inplace(
   float * values,
   const std::size_t transform_block_index,
-  const std::uint64_t sign_seed) noexcept {
-  apply_signs(values, transform_block_index, sign_seed);
-  hadamard_128_inplace(values);
+  const std::uint64_t sign_seed,
+  const Q8_0Backend backend) noexcept {
+  alignas(32) float transformed[q4_h128_transform_size];
+  q4_h128_transform_block(
+    values, transformed, transform_block_index, sign_seed, backend);
+  std::copy_n(transformed, q4_h128_transform_size, values);
 }
 
 bool q4_h128_transform_rows(
@@ -77,7 +109,8 @@ bool q4_h128_transform_rows(
   float * output,
   const std::size_t row_count,
   const std::size_t column_count,
-  const std::uint64_t sign_seed) noexcept {
+  const std::uint64_t sign_seed,
+  const Q8_0Backend backend) noexcept {
   if (input == nullptr || output == nullptr || column_count == 0 ||
       column_count % q4_h128_transform_size != 0) {
     return false;
@@ -86,7 +119,8 @@ bool q4_h128_transform_rows(
   for (std::size_t row = 0; row < row_count; ++row) {
     for (std::size_t block = 0; block < transform_blocks; ++block) {
       const std::size_t offset = row * column_count + block * q4_h128_transform_size;
-      q4_h128_transform_block(input + offset, output + offset, block, sign_seed);
+      q4_h128_transform_block(
+        input + offset, output + offset, block, sign_seed, backend);
     }
   }
   return true;
@@ -153,7 +187,7 @@ bool q4_h128_prepare_activation(
   const std::uint64_t sign_seed,
   const Q8_0Backend backend) noexcept {
   if (!q4_h128_transform_rows(
-        input, transformed_scratch, 1, column_count, sign_seed)) {
+        input, transformed_scratch, 1, column_count, sign_seed, backend)) {
     return false;
   }
   q8_0_quantize(
