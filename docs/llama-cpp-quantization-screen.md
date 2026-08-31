@@ -88,6 +88,28 @@ tokenization, sampling, and chat-template time. It is optimistic because the
 decode context grows from roughly 2,000 to 4,000 tokens. A separate long
 end-to-end run is required for absolute latency.
 
+### Measured 2,048 input / 2,048 output model compute
+
+A subsequent three-repetition long run compared the selected format with Q8_0
+under the same six-thread llama-bench settings:
+
+| Format | pp2048 | Decode after 2048 context | Combined 2048 + 2048 | Combined throughput |
+| --- | ---: | ---: | ---: | ---: |
+| Q8_0 | 11.286 s | 78.889 s | 91.425 s | 44.80 tok/s |
+| **Q4_0** | **10.522 s** | **58.081 s** | **68.477 s** | **59.82 tok/s** |
+
+Q4_0 therefore removes 22.948 seconds, or 25.1%, from the long combined
+model-compute latency and raises combined throughput by 33.5%. Its fixed-depth
+long decode is 26.4% lower latency / 35.8% higher throughput. Model load,
+tokenization, sampling, and chat-template time remain outside llama-bench's
+timer, so application wall clock will be slightly higher.
+
+The dedicated sustained run measured only a 7.3% Q4_0 pp2048 advantage
+(194.72 versus 181.47 tok/s), smaller than the alternating format sweep's 23.7%
+median advantage. Q4_0 won in both measurements, but prompt-processing gains
+should be reported with this run-order/thermal sensitivity rather than as one
+universal percentage.
+
 Relative to Q8_0, Q4_0 measured:
 
 - +45.1% decode at context 1;
