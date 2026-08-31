@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <iostream>
 #include <vector>
 
@@ -108,6 +109,41 @@ bool test_avx2_parity() {
   return ok;
 }
 
+bool test_unscaled_q8_preparation() {
+  constexpr std::size_t columns = 3584;
+  const std::vector<float> input = make_values(columns, 0.77F);
+  std::vector<float> normalized(columns);
+  std::vector<float> unscaled(columns);
+  const std::size_t block_count = columns / qwen35x::cpu::q8_0_values_per_block;
+  std::vector<qwen35x::cpu::Q8_0BlockX4> reference(block_count);
+  std::vector<qwen35x::cpu::Q8_0BlockX4> folded(block_count);
+  bool ok = expect(qwen35x::cpu::q4_h128_transform_rows(
+                     input.data(), normalized.data(), 1, columns,
+                     qwen35x::cpu::q4_h128_default_sign_seed,
+                     qwen35x::cpu::Q8_0Backend::avx2),
+                   "normalized preparation transform failed");
+  ok = expect(qwen35x::cpu::q4_h128_transform_rows_unscaled(
+                input.data(), unscaled.data(), 1, columns,
+                qwen35x::cpu::q4_h128_default_sign_seed,
+                qwen35x::cpu::Q8_0Backend::avx2),
+              "unscaled preparation transform failed") && ok;
+  qwen35x::cpu::q8_0_quantize_vector_1(
+    normalized.data(), reference.data(), block_count,
+    qwen35x::cpu::Q8_0Backend::avx2);
+  qwen35x::cpu::q8_0_quantize_vector_1(
+    unscaled.data(), folded.data(), block_count,
+    qwen35x::cpu::Q8_0Backend::avx2);
+  for (std::size_t block = 0; block < block_count; ++block) {
+    folded[block].scales[0] *= qwen35x::cpu::q4_h128_inverse_sqrt_size;
+    ok = expect(reference[block].sums[0] == folded[block].sums[0] &&
+                  std::memcmp(reference[block].qs, folded[block].qs, 32) == 0,
+                "folded normalization changed Q8 integers") && ok;
+    ok = expect(near(reference[block].scales[0], folded[block].scales[0], 6.0e-4F),
+                "folded normalization changed Q8 scale excessively") && ok;
+  }
+  return ok;
+}
+
 bool test_quantized_projection() {
   constexpr std::size_t rows = 8;
   constexpr std::size_t columns = 256;
@@ -159,7 +195,7 @@ bool test_fused_packed_activation() {
   std::vector<qwen35x::cpu::Q8_0BlockX4> reference(
     (vectors / qwen35x::cpu::q8_0_packed_vectors) * blocks_per_vector);
   std::vector<qwen35x::cpu::Q8_0BlockX4> fused(reference.size());
-  bool ok = expect(qwen35x::cpu::q4_h128_transform_rows(
+  bool ok = expect(qwen35x::cpu::q4_h128_transform_rows_unscaled(
                      input.data(), transformed.data(), vectors, columns,
                      qwen35x::cpu::q4_h128_default_sign_seed,
                      qwen35x::cpu::Q8_0Backend::avx2),
@@ -167,6 +203,11 @@ bool test_fused_packed_activation() {
   qwen35x::cpu::q8_0_quantize_vectors_4(
     transformed.data(), reference.data(), vectors, blocks_per_vector,
     qwen35x::cpu::Q8_0Backend::avx2);
+  for (qwen35x::cpu::Q8_0BlockX4 & block : reference) {
+    for (float & scale : block.scales) {
+      scale *= qwen35x::cpu::q4_h128_inverse_sqrt_size;
+    }
+  }
   ok = expect(qwen35x::cpu::q4_h128_prepare_activations_4(
                 input.data(), fused.data(), vectors, columns,
                 qwen35x::cpu::q4_h128_default_sign_seed,
@@ -176,7 +217,7 @@ bool test_fused_packed_activation() {
                 reinterpret_cast<const unsigned char *>(reference.data()),
                 reinterpret_cast<const unsigned char *>(reference.data() + reference.size()),
                 reinterpret_cast<const unsigned char *>(fused.data())),
-              "fused packed activation differs from two-pass preparation") && ok;
+              "fused packed activation differs from unscaled two-pass preparation") && ok;
   ok = expect(!qwen35x::cpu::q4_h128_prepare_activations_4(
                 input.data(), fused.data(), 6, columns),
               "invalid packed vector count was accepted") && ok;
@@ -190,6 +231,7 @@ int main() {
   ok = test_orthogonality() && ok;
   ok = test_rows_and_rejection() && ok;
   ok = test_avx2_parity() && ok;
+  ok = test_unscaled_q8_preparation() && ok;
   ok = test_quantized_projection() && ok;
   ok = test_fused_packed_activation() && ok;
   if (ok) {

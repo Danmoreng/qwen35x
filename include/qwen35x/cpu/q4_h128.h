@@ -10,6 +10,7 @@ namespace qwen35x::cpu {
 inline constexpr std::size_t q4_h128_transform_size = 128;
 inline constexpr std::size_t q4_h128_q4_blocks_per_transform =
   q4_h128_transform_size / q4_0_values_per_block;
+inline constexpr float q4_h128_inverse_sqrt_size = 0.08838834764831844055F;
 inline constexpr std::uint64_t q4_h128_default_sign_seed =
   UINT64_C(0x5148333548313238);
 
@@ -33,6 +34,16 @@ void q4_h128_transform_block_inplace(
 // rows are row-major and columns must be a non-zero multiple of 128. The
 // transform block index restarts at zero for each row.
 [[nodiscard]] bool q4_h128_transform_rows(
+  const float * input,
+  float * output,
+  std::size_t row_count,
+  std::size_t column_count,
+  std::uint64_t sign_seed = q4_h128_default_sign_seed,
+  Q8_0Backend backend = Q8_0Backend::scalar) noexcept;
+
+// Runtime-only variant that omits 1/sqrt(128). The caller must fold
+// q4_h128_inverse_sqrt_size into the subsequent activation scales.
+[[nodiscard]] bool q4_h128_transform_rows_unscaled(
   const float * input,
   float * output,
   std::size_t row_count,

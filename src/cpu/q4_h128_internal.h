@@ -20,8 +20,19 @@ void q4_h128_transform_block_scalar(
   std::size_t transform_block_index,
   std::uint64_t sign_seed) noexcept;
 
+void q4_h128_transform_block_scalar_unscaled(
+  const float * input,
+  float * output,
+  std::size_t transform_block_index,
+  std::uint64_t sign_seed) noexcept;
+
 #if QWEN35X_Q8_0_HAS_AVX2_TU
 void q4_h128_transform_block_avx2(
+  const float * input,
+  float * output,
+  std::size_t transform_block_index,
+  std::uint64_t sign_seed) noexcept;
+void q4_h128_transform_block_avx2_unscaled(
   const float * input,
   float * output,
   std::size_t transform_block_index,
