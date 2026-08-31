@@ -191,6 +191,12 @@ and raises Q4_H128 to 282.33 prefill tokens/s and 59.95 decode tokens/s. This is
 trailing Q4_0 by 11.8% and 4.6% respectively. Transform reuse/fusion remains
 necessary before claiming throughput parity.
 
+Vectorizing the remaining eight-lane butterflies and computing each 64-bit
+sign word only once per H128 block raises the result again to 304.99 prefill
+tokens/s and 61.99 decode tokens/s. Relative to the original scalar transform,
+that is +21.0% prefill and +4.6% decode. The remaining gap to the contemporaneous
+Q4_0 measurements is 4.7% prefill and 1.3% decode.
+
 On the deliberately small two-position evaluator smoke sample, BF16 versus
 Q4_H128 measured mean KL 1.96881, compared with 1.96188 for the prior Q4_0
 sample. This is statistically insufficient to accept or reject the format and
