@@ -273,6 +273,9 @@ endif ()
 add_executable(qwen35x src/main.cpp)
 target_link_libraries(qwen35x PRIVATE qwen35x_core)
 
+add_executable(qwen35x_q4_h128_convert src/q4_h128_convert_main.cpp)
+target_link_libraries(qwen35x_q4_h128_convert PRIVATE qwen35x_core)
+
 include(CTest)
 if (BUILD_TESTING)
   add_executable(qwen35x_cpu_executor_test tests/cpu_executor_test.cpp)

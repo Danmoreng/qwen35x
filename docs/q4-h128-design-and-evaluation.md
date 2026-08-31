@@ -156,3 +156,21 @@ are final wall-clock checks, not inner-loop tuning runs.
    benchmark-positive and passes the same quality gates.
 6. Run held-out transcript quality and comparable prefill/decode benchmarks;
    record rejected experiments as well as accepted ones.
+
+## Initial laptop artifact
+
+The first deterministic conversion completed on the i7-8750H with:
+
+```bash
+build-cpu-q8/qwen35x_q4_h128_convert \
+  --hf-model-dir models/qwen3.5-0.8b \
+  --output models/qwen3.5-0.8b/model-q4-h128.q35h
+```
+
+It writes 320 text-model tensors, excludes unused vision and MTP tensors, and
+produces a 424,976,960-byte engine artifact. Conversion plus a full payload
+checksum pass took 13.12 seconds and peaked at 1,494,688 KiB RSS. Two independent
+conversions were byte-identical with SHA-256
+`ac3018478e4b0398152870257b23e071464ee503750f39e02708521079abfef9`.
+The artifact is intentionally ignored by Git; only its converter, ABI, tests,
+and reproducibility record belong in the repository.
