@@ -30,13 +30,15 @@ struct GatedDeltaNetBatchCpuJob {
 
 struct CausalConvBatchCpuJob {
   float * state = nullptr;
+  std::size_t ring_index = 0;
   const float * input = nullptr;
   const float * weights = nullptr;
   float * output = nullptr;
   std::size_t batch_size = 0;
   std::size_t input_stride = 0;
   std::size_t channel_count = 0;
-  int kernel_size = 0;
+  std::size_t kernel_size = 0;
+  cpu::Q8_0Backend backend = cpu::Q8_0Backend::auto_select;
 };
 
 void run_causal_conv_batch_cpu_channels(
@@ -44,28 +46,10 @@ void run_causal_conv_batch_cpu_channels(
   const std::size_t channel_begin,
   const std::size_t channel_end) noexcept {
   auto & job = *static_cast<CausalConvBatchCpuJob *>(opaque_context);
-  const int history = job.kernel_size - 1;
-  for (std::size_t channel = channel_begin; channel < channel_end; ++channel) {
-    const float * weight =
-      job.weights + channel * static_cast<std::size_t>(job.kernel_size);
-    for (std::size_t token = 0; token < job.batch_size; ++token) {
-      const float input_value = job.input[token * job.input_stride + channel];
-      float sum = input_value * weight[static_cast<std::size_t>(history)];
-      for (int kernel = 0; kernel < history; ++kernel) {
-        sum += job.state[static_cast<std::size_t>(kernel) * job.channel_count + channel] *
-          weight[static_cast<std::size_t>(kernel)];
-      }
-      for (int kernel = 0; kernel + 1 < history; ++kernel) {
-        job.state[static_cast<std::size_t>(kernel) * job.channel_count + channel] =
-          job.state[static_cast<std::size_t>(kernel + 1) * job.channel_count + channel];
-      }
-      if (history > 0) {
-        job.state[static_cast<std::size_t>(history - 1) * job.channel_count + channel] =
-          input_value;
-      }
-      job.output[token * job.channel_count + channel] = sum;
-    }
-  }
+  cpu::causal_conv1d_silu_f32(
+    job.state, job.ring_index, job.input, job.input_stride, job.weights,
+    job.output, job.batch_size, job.channel_count, job.kernel_size,
+    channel_begin, channel_end, job.backend);
 }
 
 void run_gated_delta_net_batch_cpu_rows(
@@ -114,7 +98,9 @@ bool run_linear_attention_batch_cpu_q8(
   if (dims.linear_num_k_heads != dims.linear_num_v_heads || key_dim != value_dim ||
       state.recurrent_state.size() != expected_state ||
       state.conv_state.size() !=
-        static_cast<std::size_t>(dims.linear_kernel - 1) * conv_channels) {
+        static_cast<std::size_t>(dims.linear_kernel - 1) * conv_channels ||
+      layer.linear.conv1d_kernel_major.size() !=
+        static_cast<std::size_t>(dims.linear_kernel) * conv_channels) {
     error_message = "Batched CPU DeltaNet state dimensions are unsupported or inconsistent.";
     return false;
   }
@@ -147,13 +133,15 @@ bool run_linear_attention_batch_cpu_q8(
 
   CausalConvBatchCpuJob conv_job{
     state.conv_state.data(),
+    state.conv_ring_index,
     projected.data(),
-    layer.linear.conv1d.data.data(),
+    layer.linear.conv1d_kernel_major.data(),
     conv_batch.data(),
     batch_size,
     projection_width,
     conv_channels,
-    dims.linear_kernel,
+    static_cast<std::size_t>(dims.linear_kernel),
+    layer.linear.out_proj.q8_0_backend,
   };
   if (runtime != nullptr && runtime->executor != nullptr) {
     const cpu::CpuExecutorStatus status = runtime->executor->parallel_for_rows(
@@ -166,9 +154,11 @@ bool run_linear_attention_batch_cpu_q8(
   } else {
     run_causal_conv_batch_cpu_channels(&conv_job, 0, conv_channels);
   }
-  cpu::silu_f32(
-    conv_batch.data(), conv_batch.data(), conv_batch.size(),
-    layer.linear.out_proj.q8_0_backend);
+  const std::size_t conv_history = static_cast<std::size_t>(dims.linear_kernel - 1);
+  if (conv_history != 0) {
+    state.conv_ring_index =
+      (state.conv_ring_index + batch_size % conv_history) % conv_history;
+  }
 
   for (std::size_t token = 0; token < batch_size; ++token) {
     const float * projection = projected.data() + token * projection_width;

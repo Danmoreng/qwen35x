@@ -202,7 +202,7 @@ single unreviewable commit.
 
 ### A4 — Ring-buffer causal convolution with kernel-major AVX2
 
-Status: pending
+Status: completed; retained with a clear prefill gain and a smaller decode gain
 
 Implementation:
 
@@ -486,7 +486,7 @@ Update this table in the same commit that lands or rejects each experiment.
 | A1 | Completed, neutral | pending commit | F16C conversion and loaded-YMM reuse verified in disassembly; fused scale sidecar removes the second pass. All tests pass. Ordered/reverse A/B pairs were dominated by laptop drift: combined pp256 was 198.59 versus 199.63 tok/s, decode 36.61 versus 36.74 tok/s, and pp2048 168.22 versus 169.56 tok/s (A1 versus baseline). No speedup is claimed. |
 | A2 | Completed, neutral | pending commit | Request tables are sized to the required context, shared by all full-attention layers, and consumed by tested AVX2 rotation. pp256 was 198.32 versus 198.12 tok/s. Ordered/reverse decode pairs averaged 36.88 versus 36.90 tok/s (A2 versus immediate baseline), so no laptop throughput gain is claimed. The cache removes redundant transcendental work and prepares prefix-state caching. |
 | A3 | Pending | — | Local vectors and model-global quantization scratch remain |
-| A4 | Pending | — | Current decode creates/copies a convolution window; clean redesign required |
+| A4 | Completed, retained | pending commit | Three-slot ring state removes decode window copies; kernel-major weights, four-tap AVX2, and fused SiLU are covered by scalar/SIMD state and output tests. Ordered/reverse pp256 pairs averaged 210.48 versus 198.33 tok/s (+6.1%); decode averaged 37.14 versus 36.72 tok/s (+1.2%). pp2048 was 175.48 versus 165.58 tok/s (+6.0%) even though the optimized run was second. A 2,048-token integration run crossed 32 prefill chunk boundaries successfully. |
 | A5 | Pending | — | Global `min_parallel_rows=1` and long spin phase remain |
 | A6 | Pending | — | Greedy path avoids a copy but still materializes and scans all logits |
 | A7 | Pending | — | Attention test and low-risk normalization/division fixes remain |

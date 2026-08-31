@@ -101,6 +101,70 @@ void rope_f32_avx2(
   }
 }
 
+void causal_conv1d_silu_f32_avx2(
+  float * state,
+  std::size_t ring_index,
+  const float * input,
+  const std::size_t input_stride,
+  const float * kernel_major_weights,
+  float * output,
+  const std::size_t batch_size,
+  const std::size_t channel_count,
+  const std::size_t kernel_size,
+  const std::size_t channel_begin,
+  const std::size_t channel_end) noexcept {
+  const std::size_t history = kernel_size - 1;
+  const __m256 one = _mm256_set1_ps(1.0F);
+  const __m256 zero = _mm256_setzero_ps();
+  for (std::size_t token = 0; token < batch_size; ++token) {
+    std::size_t channel = channel_begin;
+    for (; channel + 8 <= channel_end; channel += 8) {
+      const __m256 input_value = _mm256_loadu_ps(
+        input + token * input_stride + channel);
+      __m256 sum = _mm256_mul_ps(
+        input_value,
+        _mm256_loadu_ps(kernel_major_weights + history * channel_count + channel));
+      for (std::size_t kernel = 0; kernel < history; ++kernel) {
+        const std::size_t slot = (ring_index + kernel) % history;
+        sum = _mm256_fmadd_ps(
+          _mm256_loadu_ps(state + slot * channel_count + channel),
+          _mm256_loadu_ps(kernel_major_weights + kernel * channel_count + channel),
+          sum);
+      }
+      if (history != 0) {
+        _mm256_storeu_ps(
+          state + ring_index * channel_count + channel, input_value);
+      }
+      const __m256 sigmoid = _mm256_div_ps(
+        one, _mm256_add_ps(one, exp_f32_avx2(_mm256_sub_ps(zero, sum))));
+      _mm256_storeu_ps(
+        output + token * channel_count + channel,
+        _mm256_mul_ps(sum, sigmoid));
+    }
+    for (; channel < channel_end; ++channel) {
+      const float input_value = input[token * input_stride + channel];
+      float sum = input_value *
+        kernel_major_weights[history * channel_count + channel];
+      for (std::size_t kernel = 0; kernel < history; ++kernel) {
+        const std::size_t slot = history == 0 ? 0 : (ring_index + kernel) % history;
+        sum += state[slot * channel_count + channel] *
+          kernel_major_weights[kernel * channel_count + channel];
+      }
+      if (history != 0) {
+        state[ring_index * channel_count + channel] = input_value;
+      }
+      const float exponential = std::exp(-std::fabs(sum));
+      const float sigmoid = sum >= 0.0F
+        ? 1.0F / (1.0F + exponential)
+        : exponential / (1.0F + exponential);
+      output[token * channel_count + channel] = sum * sigmoid;
+    }
+    if (history != 0) {
+      ring_index = (ring_index + 1) % history;
+    }
+  }
+}
+
 void rms_norm_f32_avx2(
   const float * input,
   const float * weight,

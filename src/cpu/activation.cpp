@@ -26,6 +26,19 @@ void rope_f32_avx2(
   const float * cosine,
   const float * sine) noexcept;
 
+void causal_conv1d_silu_f32_avx2(
+  float * state,
+  std::size_t ring_index,
+  const float * input,
+  std::size_t input_stride,
+  const float * kernel_major_weights,
+  float * output,
+  std::size_t batch_size,
+  std::size_t channel_count,
+  std::size_t kernel_size,
+  std::size_t channel_begin,
+  std::size_t channel_end) noexcept;
+
 void rms_norm_f32_avx2(
   const float * input,
   const float * weight,
@@ -104,6 +117,58 @@ void rope_f32(
       const float x1 = second[index];
       first[index] = x0 * cosine[index] - x1 * sine[index];
       second[index] = x1 * cosine[index] + x0 * sine[index];
+    }
+  }
+}
+
+void causal_conv1d_silu_f32(
+  float * state,
+  std::size_t ring_index,
+  const float * input,
+  const std::size_t input_stride,
+  const float * kernel_major_weights,
+  float * output,
+  const std::size_t batch_size,
+  const std::size_t channel_count,
+  const std::size_t kernel_size,
+  const std::size_t channel_begin,
+  const std::size_t channel_end,
+  const Q8_0Backend backend) noexcept {
+  if (kernel_size == 0 || channel_begin >= channel_end) {
+    return;
+  }
+#if QWEN35X_Q8_0_HAS_AVX2_TU
+  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+    detail::causal_conv1d_silu_f32_avx2(
+      state, ring_index, input, input_stride, kernel_major_weights, output,
+      batch_size, channel_count, kernel_size, channel_begin, channel_end);
+    return;
+  }
+#else
+  static_cast<void>(backend);
+#endif
+  const std::size_t history = kernel_size - 1;
+  for (std::size_t token = 0; token < batch_size; ++token) {
+    for (std::size_t channel = channel_begin; channel < channel_end; ++channel) {
+      const float input_value = input[token * input_stride + channel];
+      float sum = input_value *
+        kernel_major_weights[history * channel_count + channel];
+      for (std::size_t kernel = 0; kernel < history; ++kernel) {
+        const std::size_t slot = history == 0 ? 0 : (ring_index + kernel) % history;
+        sum += state[slot * channel_count + channel] *
+          kernel_major_weights[kernel * channel_count + channel];
+      }
+      if (history != 0) {
+        state[ring_index * channel_count + channel] = input_value;
+      }
+      const float exponential = std::exp(-std::fabs(sum));
+      const float sigmoid = sum >= 0.0F
+        ? 1.0F / (1.0F + exponential)
+        : exponential / (1.0F + exponential);
+      output[token * channel_count + channel] = sum * sigmoid;
+    }
+    if (history != 0) {
+      ring_index = (ring_index + 1) % history;
     }
   }
 }

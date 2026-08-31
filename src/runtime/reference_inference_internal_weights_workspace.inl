@@ -46,6 +46,7 @@ struct LinearAttentionWeights {
   TensorData in_proj_a;
   TensorData in_proj_all_cpu;
   TensorData conv1d;
+  std::vector<float> conv1d_kernel_major;
   TensorData out_proj;
   TensorData norm;
   TensorData a_log;
@@ -121,6 +122,7 @@ struct FullAttentionState {
 struct LinearAttentionState {
   std::vector<float> conv_state;
   std::vector<float> recurrent_state;
+  std::size_t conv_ring_index = 0;
   cuda::CudaDeviceBufferF32 conv_state_device;
   cuda::CudaDeviceBufferF32 recurrent_state_device;
   bool has_device_state = false;
@@ -133,6 +135,20 @@ struct ModelState {
   std::vector<float> rope_cosine;
   std::vector<float> rope_sine;
 };
+
+void pack_conv1d_kernel_major(
+  LinearAttentionWeights & weights,
+  const RuntimeDims & dims) {
+  weights.conv1d_kernel_major.resize(weights.conv1d.data.size());
+  for (int kernel = 0; kernel < dims.linear_kernel; ++kernel) {
+    for (int channel = 0; channel < dims.linear_conv_channels; ++channel) {
+      weights.conv1d_kernel_major[
+        static_cast<std::size_t>(kernel * dims.linear_conv_channels + channel)] =
+        weights.conv1d.data[
+          static_cast<std::size_t>(channel * dims.linear_kernel + kernel)];
+    }
+  }
+}
 
 struct FullAttentionBatchCpuJob {
   const float * queries = nullptr;
@@ -838,6 +854,7 @@ bool load_model_weights_from_safetensors(
       for (int i = 0; i < dims.linear_num_v_heads; ++i) {
         layer.linear.ssm_a[static_cast<std::size_t>(i)] = -std::exp(layer.linear.a_log.data[static_cast<std::size_t>(i)]);
       }
+      pack_conv1d_kernel_major(layer.linear, dims);
     } else {
       if (!load_tensor_checked_2d(model_dir, base + "self_attn.q_proj.weight", full_q_out, dims.hidden, layer.full.q_proj, error_message) ||
           !load_tensor_checked_2d(model_dir, base + "self_attn.k_proj.weight", full_kv_out, dims.hidden, layer.full.k_proj, error_message) ||
@@ -1009,6 +1026,7 @@ bool load_model_weights_from_q8_0_gguf(
       }
       // llama.cpp's converter stores -exp(A_log) directly as ssm_a.
       layer.linear.ssm_a = layer.linear.a_log.data;
+      pack_conv1d_kernel_major(layer.linear, dims);
     } else {
       if (!load_gguf_q8_0_checked(
             reader, base + "attn_q.weight", full_q_out, dims.hidden, backend, runtime, layer.full.q_proj, error_message) ||

@@ -358,40 +358,22 @@ bool run_linear_attention_step(
     alpha[static_cast<std::size_t>(h)] = std::exp(pre_gate * layer.linear.ssm_a[static_cast<std::size_t>(h)]);
   }
 
-  const int conv_hist = dims.linear_kernel - 1;
-  std::vector<float> conv_window(static_cast<std::size_t>(dims.linear_kernel * dims.linear_conv_channels));
-  if (conv_hist > 0) {
-    std::memcpy(
-      conv_window.data(),
-      state.conv_state.data(),
-      static_cast<std::size_t>(conv_hist * dims.linear_conv_channels) * sizeof(float));
-  }
-  std::memcpy(
-    conv_window.data() + static_cast<std::size_t>(conv_hist * dims.linear_conv_channels),
-    mixed_qkv.data(),
-    static_cast<std::size_t>(dims.linear_conv_channels) * sizeof(float));
-
-  if (conv_hist > 0) {
-    std::memcpy(
-      state.conv_state.data(),
-      conv_window.data() + static_cast<std::size_t>(dims.linear_conv_channels),
-      static_cast<std::size_t>(conv_hist * dims.linear_conv_channels) * sizeof(float));
-  }
-
   std::vector<float> conv_out(static_cast<std::size_t>(dims.linear_conv_channels), 0.0f);
-  for (int c = 0; c < dims.linear_conv_channels; ++c) {
-    float s = 0.0f;
-    const float * w = layer.linear.conv1d.data.data() +
-                      static_cast<std::size_t>(c) * static_cast<std::size_t>(dims.linear_kernel);
-    for (int k = 0; k < dims.linear_kernel; ++k) {
-      const std::size_t idx = static_cast<std::size_t>(k * dims.linear_conv_channels + c);
-      s += conv_window[idx] * w[k];
-    }
-    conv_out[static_cast<std::size_t>(c)] = s;
+  const std::size_t conv_channels = static_cast<std::size_t>(dims.linear_conv_channels);
+  const std::size_t conv_kernel = static_cast<std::size_t>(dims.linear_kernel);
+  const std::size_t conv_history = conv_kernel - 1;
+  if (layer.linear.conv1d_kernel_major.size() != conv_kernel * conv_channels) {
+    error_message = "Kernel-major causal-convolution weights are missing.";
+    return false;
   }
-  cpu::silu_f32(
-    conv_out.data(), conv_out.data(), conv_out.size(),
+  cpu::causal_conv1d_silu_f32(
+    state.conv_state.data(), state.conv_ring_index, mixed_qkv.data(), conv_channels,
+    layer.linear.conv1d_kernel_major.data(), conv_out.data(), 1, conv_channels,
+    conv_kernel, 0, conv_channels,
     layer.linear.out_proj.q8_0_backend);
+  if (conv_history != 0) {
+    state.conv_ring_index = (state.conv_ring_index + 1) % conv_history;
+  }
 
   std::vector<float> q(conv_out.begin(), conv_out.begin() + dims.linear_q_dim);
   std::vector<float> k(conv_out.begin() + dims.linear_q_dim, conv_out.begin() + 2 * dims.linear_q_dim);

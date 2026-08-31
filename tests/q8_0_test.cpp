@@ -189,6 +189,48 @@ bool test_rope(const Q8_0Backend backend) {
   return ok;
 }
 
+bool test_causal_conv1d_silu(const Q8_0Backend backend) {
+  constexpr std::size_t batch = 5;
+  constexpr std::size_t channels = 19;
+  constexpr std::size_t input_stride = 23;
+  constexpr std::size_t kernel = 4;
+  constexpr std::size_t history = kernel - 1;
+  constexpr std::size_t ring_index = 2;
+  std::array<float, batch * input_stride> input{};
+  std::array<float, kernel * channels> weights{};
+  std::array<float, history * channels> expected_state{};
+  for (std::size_t index = 0; index < input.size(); ++index) {
+    input[index] = std::sin(static_cast<float>(index) * 0.07F) * 1.5F;
+  }
+  for (std::size_t index = 0; index < weights.size(); ++index) {
+    weights[index] = std::cos(static_cast<float>(index) * 0.09F) * 0.25F;
+  }
+  for (std::size_t index = 0; index < expected_state.size(); ++index) {
+    expected_state[index] = std::sin(static_cast<float>(index) * 0.05F);
+  }
+  auto actual_state = expected_state;
+  std::array<float, batch * channels> expected{};
+  std::array<float, batch * channels> actual{};
+  qwen35x::cpu::causal_conv1d_silu_f32(
+    expected_state.data(), ring_index, input.data(), input_stride,
+    weights.data(), expected.data(), batch, channels, kernel, 0, channels,
+    Q8_0Backend::scalar);
+  qwen35x::cpu::causal_conv1d_silu_f32(
+    actual_state.data(), ring_index, input.data(), input_stride,
+    weights.data(), actual.data(), batch, channels, kernel, 0, channels,
+    backend);
+  bool ok = true;
+  for (std::size_t index = 0; index < actual.size(); ++index) {
+    ok = expect(near(expected[index], actual[index]), "causal convolution output mismatch") && ok;
+  }
+  for (std::size_t index = 0; index < actual_state.size(); ++index) {
+    ok = expect(
+      expected_state[index] == actual_state[index],
+      "causal convolution ring state mismatch") && ok;
+  }
+  return ok;
+}
+
 bool test_l2_normalize(const Q8_0Backend backend) {
   constexpr std::size_t rows = 3;
   constexpr std::size_t width = 37;
@@ -337,6 +379,7 @@ int main() {
   ok = test_rms_norm(Q8_0Backend::auto_select) && ok;
   ok = test_add(Q8_0Backend::auto_select) && ok;
   ok = test_rope(Q8_0Backend::auto_select) && ok;
+  ok = test_causal_conv1d_silu(Q8_0Backend::auto_select) && ok;
   ok = test_l2_normalize(Q8_0Backend::auto_select) && ok;
   ok = test_backend(Q8_0Backend::scalar) && ok;
   ok = test_backend(Q8_0Backend::auto_select) && ok;
@@ -347,6 +390,7 @@ int main() {
       "available AVX2 backend did not resolve to AVX2") && ok;
     ok = test_backend(Q8_0Backend::avx2) && ok;
     ok = test_rope(Q8_0Backend::avx2) && ok;
+    ok = test_causal_conv1d_silu(Q8_0Backend::avx2) && ok;
   } else {
     ok = expect(
       qwen35x::cpu::q8_0_resolve_backend(Q8_0Backend::avx2) == Q8_0Backend::scalar,
