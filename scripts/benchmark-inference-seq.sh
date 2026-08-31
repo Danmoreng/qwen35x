@@ -19,6 +19,8 @@ MODE="gpu-f32"
 CPU_GGUF="models/gguf/Qwen3.5-0.8B-Q8_0.gguf"
 CPU_THREADS=0
 CPU_ISA="auto"
+CPU_PREFIX_CACHE_TOKENS=0
+CPU_PREFIX_CACHE_REPLAYS=1
 PREFILL_MODE="batched"
 CSV_OUT="benchmarks/qwen35x-inference-seq.csv"
 RUN_LABEL=""
@@ -56,6 +58,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --cpu-isa)
       CPU_ISA="$2"
+      shift 2
+      ;;
+    --cpu-prefix-cache-tokens)
+      CPU_PREFIX_CACHE_TOKENS="$2"
+      shift 2
+      ;;
+    --cpu-prefix-cache-replays)
+      CPU_PREFIX_CACHE_REPLAYS="$2"
       shift 2
       ;;
     --prefill-mode)
@@ -170,6 +180,13 @@ run_once() {
   else
     args+=("--infer-reference")
   fi
+
+  if [ "$CPU_PREFIX_CACHE_TOKENS" -gt 0 ]; then
+    args+=(
+      "--cpu-prefix-cache-tokens" "$CPU_PREFIX_CACHE_TOKENS"
+      "--cpu-prefix-cache-replays" "$CPU_PREFIX_CACHE_REPLAYS"
+    )
+  fi
   
   if [ "$PREFILL_ONLY" == true ]; then
     args+=("--prefill-only")
@@ -227,6 +244,9 @@ for run_index, p_path in enumerate(profiles, start=1):
             'mode': '$MODE',
             'cpu_threads': $CPU_THREADS,
             'cpu_isa': '$CPU_ISA',
+            'cached_prefix_tokens': data.get('cached_prefix_tokens', 0),
+            'prefix_cache_restore_time_ms': data.get('prefix_cache_restore_time_ms', 0),
+            'prefix_cache_bytes': data.get('prefix_cache_bytes', 0),
             'prefill_mode': '$PREFILL_MODE',
             'prompt_tokens': data.get('prompt_tokens', 0),
             'generated_tokens': data.get('generated_tokens', 0),

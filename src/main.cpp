@@ -240,6 +240,9 @@ bool write_profile_json(
   out << "],\n";
   out << "  \"generated_tokens\": " << result.generated_tokens.size() << ",\n";
   out << "  \"forward_pass_tokens\": " << result.forward_pass_tokens << ",\n";
+  out << "  \"cached_prefix_tokens\": " << result.cached_prefix_tokens << ",\n";
+  out << "  \"prefix_cache_restore_time_ms\": " << result.prefix_cache_restore_time_ms << ",\n";
+  out << "  \"prefix_cache_bytes\": " << result.prefix_cache_bytes << ",\n";
   out << "  \"load_time_ms\": " << result.load_time_ms << ",\n";
   out << "  \"prefill_time_ms\": " << result.prefill_time_ms << ",\n";
   out << "  \"prefill_tokens_per_second\": " << result.prefill_tokens_per_second << ",\n";
@@ -336,6 +339,7 @@ int main(int argc, char ** argv) {
   bool infer_reference = false;
   bool infer_gpu = false;
   bool gpu_decode_backend_explicit = false;
+  int cpu_prefix_cache_replays = 1;
   qwen35x::Bf16TensorBenchOptions bench_options;
   qwen35x::Nvfp4TensorCheckOptions nvfp4_check_options;
   qwen35x::Nvfp4ProjectionBenchOptions nvfp4_projection_bench_options;
@@ -358,6 +362,11 @@ int main(int argc, char ** argv) {
       infer_options.cpu_gguf_path = argv[++i];
     } else if (arg == "--cpu-threads" && i + 1 < argc) {
       infer_options.cpu_threads = std::stoi(argv[++i]);
+    } else if (arg == "--cpu-prefix-cache-tokens" && i + 1 < argc) {
+      infer_options.cpu_prefix_token_count =
+        static_cast<std::size_t>(std::stoull(argv[++i]));
+    } else if (arg == "--cpu-prefix-cache-replays" && i + 1 < argc) {
+      cpu_prefix_cache_replays = std::stoi(argv[++i]);
     } else if (arg == "--cpu-isa" && i + 1 < argc) {
       const std::string isa = argv[++i];
       if (isa == "auto") {
@@ -909,10 +918,21 @@ int main(int argc, char ** argv) {
       return 12;
     }
 
+    if (cpu_prefix_cache_replays <= 0) {
+      std::cerr << "--cpu-prefix-cache-replays must be positive\n";
+      return 11;
+    }
+    qwen35x::ReferenceCpuPrefixCache cpu_prefix_cache;
+    if (infer_options.cpu_prefix_token_count > 0) {
+      infer_options.cpu_prefix_cache = &cpu_prefix_cache;
+    }
     qwen35x::ReferenceInferenceResult infer_result;
-    if (!qwen35x::run_reference_qwen35_inference(*profile, infer_options, infer_result, error_message)) {
-      std::cerr << "reference inference failed: " << error_message << "\n";
-      return 13;
+    for (int replay = 0; replay < cpu_prefix_cache_replays; ++replay) {
+      if (!qwen35x::run_reference_qwen35_inference(
+            *profile, infer_options, infer_result, error_message)) {
+        std::cerr << "reference inference failed: " << error_message << "\n";
+        return 13;
+      }
     }
 
     if (metrics_only) {
@@ -925,6 +945,8 @@ int main(int argc, char ** argv) {
                 << " cpu_threads=" << infer_options.cpu_threads
                 << " prefill_kernel=" << (qwen35x_prefill_kernel.empty() ? "env-or-default" : qwen35x_prefill_kernel)
                 << " prompt_tokens=" << infer_options.prompt_tokens.size()
+                << " cached_prefix_tokens=" << infer_result.cached_prefix_tokens
+                << " prefix_cache_restore_ms=" << infer_result.prefix_cache_restore_time_ms
                 << " generated_tokens=" << infer_result.generated_tokens.size()
                 << " prefill_time_ms=" << infer_result.prefill_time_ms
                 << " prefill_tps=" << infer_result.prefill_tokens_per_second
@@ -946,6 +968,10 @@ int main(int argc, char ** argv) {
     std::cout << "  cpu_threads: " << infer_options.cpu_threads << "\n";
     std::cout << "  prefill_only: " << (infer_options.prefill_only ? "on" : "off") << "\n";
     std::cout << "  prompt_tokens: " << infer_options.prompt_tokens.size() << "\n";
+    std::cout << "  cached_prefix_tokens: " << infer_result.cached_prefix_tokens << "\n";
+    std::cout << "  prefix_cache_restore_time_ms: "
+              << infer_result.prefix_cache_restore_time_ms << "\n";
+    std::cout << "  prefix_cache_bytes: " << infer_result.prefix_cache_bytes << "\n";
     std::cout << "  generated_tokens: " << infer_result.generated_tokens.size() << "\n";
     std::cout << "  load_time_ms: " << infer_result.load_time_ms << "\n";
     std::cout << "  prefill_time_ms: " << infer_result.prefill_time_ms << "\n";

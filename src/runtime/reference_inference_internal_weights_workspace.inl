@@ -245,6 +245,160 @@ struct ModelState {
   std::vector<float> rope_sine;
 };
 
+constexpr std::uint32_t kCpuPrefixCacheStateAbiVersion = 1;
+
+struct CpuPrefixCacheSnapshot {
+  std::uint32_t state_abi_version = kCpuPrefixCacheStateAbiVersion;
+  std::string model_signature;
+  std::vector<std::int32_t> prefix_tokens;
+  cpu::Q8_0Backend backend = cpu::Q8_0Backend::auto_select;
+  Qwen35xPrefillMode prefill_mode = Qwen35xPrefillMode::batched;
+  int hidden = 0;
+  int head_dim = 0;
+  int kv_heads = 0;
+  std::vector<FullAttentionState> full_states;
+  std::vector<LinearAttentionState> linear_states;
+};
+
+[[nodiscard]] std::string cpu_prefix_model_signature(
+  const ReferenceInferenceOptions & options,
+  const ModelProfile & profile,
+  const RuntimeDims & dims) {
+  std::error_code error;
+  const std::filesystem::path gguf_path =
+    std::filesystem::weakly_canonical(options.cpu_gguf_path, error);
+  const std::filesystem::path effective_path = error
+    ? std::filesystem::path(options.cpu_gguf_path) : gguf_path;
+  error.clear();
+  const std::uintmax_t size = std::filesystem::file_size(effective_path, error);
+  const std::uintmax_t safe_size = error ? 0 : size;
+  error.clear();
+  const auto write_time = std::filesystem::last_write_time(effective_path, error);
+  const auto write_ticks = error ? 0 : write_time.time_since_epoch().count();
+
+  error.clear();
+  const std::filesystem::path canonical_model_dir =
+    std::filesystem::weakly_canonical(options.model_dir, error);
+  const std::filesystem::path effective_model_dir = error
+    ? std::filesystem::path(options.model_dir) : canonical_model_dir;
+
+  std::ostringstream signature;
+  signature << "cpu-prefix-state-v" << kCpuPrefixCacheStateAbiVersion
+            << "|gguf=" << effective_path.string()
+            << "|size=" << safe_size
+            << "|mtime=" << write_ticks
+            << "|model-dir=" << effective_model_dir.string()
+            << "|model=" << profile.family << ':' << profile.model_id << ':' << profile.variant
+            << "|dims=" << dims.n_layers << ',' << dims.hidden << ',' << dims.intermediate
+            << ',' << dims.vocab_size << ',' << dims.n_heads << ',' << dims.n_kv_heads
+            << ',' << dims.head_dim << ',' << dims.rope_dim << ',' << dims.linear_kernel
+            << ',' << dims.linear_num_k_heads << ',' << dims.linear_num_v_heads
+            << ',' << dims.linear_head_k_dim << ',' << dims.linear_head_v_dim
+            << ',' << dims.linear_conv_channels
+            << "|rope=" << dims.rope_theta << "|rms=" << dims.rms_eps
+            << "|schedule=";
+  for (const AttentionBlock block : profile.fingerprint.attention_schedule) {
+    signature << (block == AttentionBlock::linear ? 'L' : 'F');
+  }
+  return signature.str();
+}
+
+void capture_cpu_prefix_state(
+  const ModelState & state,
+  const std::size_t prefix_tokens,
+  const std::size_t kv_width,
+  const bool use_f16_cache,
+  CpuPrefixCacheSnapshot & snapshot) {
+  const std::size_t cache_values = prefix_tokens * kv_width;
+  snapshot.full_states.resize(state.full_states.size());
+  for (std::size_t layer = 0; layer < state.full_states.size(); ++layer) {
+    const FullAttentionState & source = state.full_states[layer];
+    FullAttentionState & destination = snapshot.full_states[layer];
+    if (use_f16_cache && !source.k_cache_f16.empty()) {
+      destination.k_cache_f16.assign(
+        source.k_cache_f16.begin(), source.k_cache_f16.begin() +
+          static_cast<std::ptrdiff_t>(cache_values));
+      destination.v_cache_f16.assign(
+        source.v_cache_f16.begin(), source.v_cache_f16.begin() +
+          static_cast<std::ptrdiff_t>(cache_values));
+    } else {
+      destination.k_cache.assign(source.k_cache.begin(), source.k_cache.begin() +
+        static_cast<std::ptrdiff_t>(cache_values));
+      destination.v_cache.assign(source.v_cache.begin(), source.v_cache.begin() +
+        static_cast<std::ptrdiff_t>(cache_values));
+    }
+  }
+  snapshot.linear_states.resize(state.linear_states.size());
+  for (std::size_t layer = 0; layer < state.linear_states.size(); ++layer) {
+    snapshot.linear_states[layer].conv_state = state.linear_states[layer].conv_state;
+    snapshot.linear_states[layer].recurrent_state = state.linear_states[layer].recurrent_state;
+    snapshot.linear_states[layer].conv_ring_index = state.linear_states[layer].conv_ring_index;
+  }
+}
+
+[[nodiscard]] bool restore_cpu_prefix_state(
+  const CpuPrefixCacheSnapshot & snapshot,
+  ModelState & state,
+  const std::size_t prefix_tokens,
+  const std::size_t kv_width) {
+  const std::size_t cache_values = prefix_tokens * kv_width;
+  if (snapshot.full_states.size() != state.full_states.size() ||
+      snapshot.linear_states.size() != state.linear_states.size()) {
+    return false;
+  }
+  for (std::size_t layer = 0; layer < state.full_states.size(); ++layer) {
+    const FullAttentionState & source = snapshot.full_states[layer];
+    FullAttentionState & destination = state.full_states[layer];
+    const bool has_f32 = !source.k_cache.empty();
+    const bool has_f16 = !source.k_cache_f16.empty();
+    if (has_f32 == has_f16 || source.k_cache.size() != source.v_cache.size() ||
+        source.k_cache_f16.size() != source.v_cache_f16.size() ||
+        (has_f32 &&
+          (source.k_cache.size() != cache_values ||
+           destination.k_cache.size() < cache_values ||
+           destination.v_cache.size() < cache_values)) ||
+        (has_f16 &&
+          (source.k_cache_f16.size() != cache_values ||
+           destination.k_cache_f16.size() < cache_values ||
+           destination.v_cache_f16.size() < cache_values))) {
+      return false;
+    }
+    if (has_f16) {
+      std::copy_n(source.k_cache_f16.data(), cache_values, destination.k_cache_f16.data());
+      std::copy_n(source.v_cache_f16.data(), cache_values, destination.v_cache_f16.data());
+    } else {
+      std::copy_n(source.k_cache.data(), cache_values, destination.k_cache.data());
+      std::copy_n(source.v_cache.data(), cache_values, destination.v_cache.data());
+    }
+  }
+  for (std::size_t layer = 0; layer < state.linear_states.size(); ++layer) {
+    const LinearAttentionState & source = snapshot.linear_states[layer];
+    LinearAttentionState & destination = state.linear_states[layer];
+    if (source.conv_state.size() != destination.conv_state.size() ||
+        source.recurrent_state.size() != destination.recurrent_state.size()) {
+      return false;
+    }
+    destination.conv_state = source.conv_state;
+    destination.recurrent_state = source.recurrent_state;
+    destination.conv_ring_index = source.conv_ring_index;
+  }
+  return true;
+}
+
+[[nodiscard]] std::size_t cpu_prefix_cache_size_bytes(
+  const CpuPrefixCacheSnapshot & snapshot) noexcept {
+  std::size_t bytes = snapshot.prefix_tokens.size() * sizeof(std::int32_t);
+  for (const FullAttentionState & state : snapshot.full_states) {
+    bytes += (state.k_cache.size() + state.v_cache.size()) * sizeof(float);
+    bytes += (state.k_cache_f16.size() + state.v_cache_f16.size()) *
+      sizeof(std::uint16_t);
+  }
+  for (const LinearAttentionState & state : snapshot.linear_states) {
+    bytes += (state.conv_state.size() + state.recurrent_state.size()) * sizeof(float);
+  }
+  return bytes;
+}
+
 void pack_conv1d_kernel_major(
   LinearAttentionWeights & weights,
   const RuntimeDims & dims) {

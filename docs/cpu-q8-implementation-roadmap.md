@@ -102,7 +102,7 @@ changes.
 
 ### A0 — Establish repeatable baselines
 
-Status: pending
+Status: pending expanded controlled baseline capture
 
 - Preserve the current `bac3e6d` implementation binary or rebuild it in a
   separate baseline directory.
@@ -333,8 +333,8 @@ rewrite despite slightly higher prompt throughput.
 
 ### A9 — Grouped-query attention and online softmax
 
-Status: decode pair grouping retained; four-head grouping and online softmax
-pending
+Status: decode pair grouping retained; four-head grouping and normalization
+fusion rejected on the laptop; full online softmax deferred
 
 Implementation order:
 
@@ -361,9 +361,18 @@ tok/s. Differential coverage uses FP16 caches, contexts 1, 7, 8, 9, 63, 64,
 65, 255, 256, 257, and 2,048, plus head dimensions 17 and 256. A 128-token
 full-model generation is token-identical to the pre-A9 binary.
 
+The four-head variant reduced execution to two tasks and regressed short
+decode to 61.62 tok/s and context-2048/tg128 to 53.47 tok/s. It was reverted.
+A probability-normalization/first-V-tile fusion was also reverted: after one
+noisy favorable run, the controlled baseline/new pair measured 54.96 versus
+54.10 tok/s. A fully online algorithm would either recompute QK for each
+output tile or repeatedly spill and rescale 512 FP32 output accumulators on
+AVX2; defer it until a wider-register implementation or a profile changes
+that tradeoff.
+
 ### A10 — Producer-to-Q8 fusion
 
-Status: pending
+Status: evaluated; neutral on the laptop and not retained
 
 Candidates:
 
@@ -381,9 +390,18 @@ Validation: fused versus unfused Q8 blocks, logits, selected tokens, and longer
 quality runs. Measurement must include the removed FP32 traffic as well as any
 extra recomputation needed for the local maximum pass.
 
+Laptop result: final RMSNorm-to-Q8 measured 62.68 versus 62.65 tok/s over five
+runs. Extending direct RMSNorm-to-Q8 to every combined attention and MLP input
+projection measured 62.94 versus 62.96 tok/s. Direct SiLU-multiply-to-Q8 for
+every MLP down projection measured 62.98 versus 62.96 tok/s. The fused Q8
+blocks and a 128-token generation matched their unfused references, but all
+three results are within noise. The prototypes were reverted: packed-Q4 weight
+traffic, rather than FP32 activation materialization, dominates this host.
+
 ## Workstream B: system-prompt state cache
 
-Status: pending
+Status: first in-memory CPU snapshot/restore slice implemented; persistent
+model sessions and disk serialization pending
 
 This is likely the largest product-level latency gain for repeated transcript
 cleanup requests and can proceed independently of newer ISA work.
@@ -409,6 +427,26 @@ First implement an in-memory clone/restore API. Add disk serialization only
 after state ownership and invalidation are proven. Measure restore/copy time,
 memory cost, saved prefill tokens, time to first generated token, and total
 cleanup latency.
+
+Laptop result: `ReferenceCpuPrefixCache` now snapshots the convolution ring
+state, every DeltaNet recurrent matrix, and only the occupied full-attention
+K/V prefix. AVX2 caches retain only the active FP16 K/V representation; scalar
+caches retain FP32. The handle validates the exact prefix tokens, resolved CPU
+backend, prefill mode, state ABI, architecture/profile, model dimensions, and
+canonical GGUF path/size/modification time. A handle must not be accessed by
+concurrent inference calls.
+For a 128-token cached prefix inside a 256-token prompt, three sequential runs
+reduced mean measured prefill from 803.49 ms to 413.86 ms (48.5%). Restore
+itself averaged 2.22 ms and the snapshot occupied 21,774,848 bytes. A varied
+256-token prompt plus 64 generated tokens is token-identical with and without
+the cache; the forced-scalar restore path is also token-identical.
+
+This first API slice intentionally does not claim a cryptographic content key:
+the in-memory cache uses file identity/metadata and is invalidated on mismatch.
+Disk persistence must add a model-content hash and a portable serialization
+header carrying the state ABI and layout constraints. The next product-level
+step is a persistent loaded-model session so repeated requests also avoid the
+approximately 0.6-second GGUF load seen on this laptop.
 
 ## Workstream C: future modern x86 backends
 
@@ -882,9 +920,9 @@ Update this table in the same commit that lands or rejects each experiment.
 | A6 | Completed for Q4_0 | this commit | The scale sidecar removal saves 30.31 MiB. Greedy Q4 LM-head workers apply repetition penalty and return deterministic local maxima rather than vocabulary logits. Five-run decode rises from 61.41 to 62.75 tok/s (+2.2%); a 16-token full-runtime differential against `12f9ecf` is exact. Temperature sampling retains full logits. |
 | A7 | Completed, retained | `d49aec4` | Added scalar/AVX2 differential coverage for contexts 1, 7, 8, 9, 63, 64, 65, 255, 256, 257, and 2,048. Softmax probabilities are normalized once and sigmoid uses one vector division. pp256 was 211.31 versus 209.37 tok/s (+0.9%). Ordered/reverse decode pairs averaged 37.44 versus 37.17 tok/s (+0.7%). |
 | A8 | Batched prefill completed | this commit | Four-row AVX2 tiling reuses Q/K and removes the intermediate state store/reload without changing output reduction order. pp256 is +4.2% and pp2048 +3.5%; reverse-order decode A/B is neutral. The faster algebraic-output variant was rejected on transcript quality. |
-| A9 | Decode pair grouping retained | this commit | Two query heads reuse shared K/V loads while preserving four executor tasks. Context-2048/tg128 rises from 52.20 to 54.98 tok/s (+5.3%), confirmed at 55.12 after the baseline run; context-one is neutral and a 128-token generation is exact. Four-head grouping and online softmax remain to evaluate. |
-| A10 | Pending | — | FP32 producer buffers still precede Q8 quantization |
-| B | Pending | — | Prefix state cache not implemented |
+| A9 | Decode pair grouping retained | `cc83dec` | Two query heads reuse shared K/V loads while preserving four executor tasks. Context-2048/tg128 rises from 52.20 to 54.98 tok/s (+5.3%), confirmed at 55.12 after the baseline run; context-one is neutral and a 128-token generation is exact. Four-head grouping regressed to 53.47 tok/s and normalization fusion regressed to 54.10 versus 54.96 tok/s. |
+| A10 | Completed, neutral on laptop | — | Final RMS-to-Q8 was 62.68 versus 62.65 tok/s; all-layer RMS-to-Q8 was 62.94 versus 62.96; MLP SiLU-multiply-to-Q8 was 62.98 versus 62.96. Exact-output prototypes were reverted because packed-Q4 weight traffic dominates. |
+| B | In-memory CPU slice completed | this commit | A 128-token snapshot cuts 256-token prompt prefill from 803.49 to 413.86 ms (-48.5%); restore is 2.22 ms, storage is 21.77 MB, and AVX2/scalar output sequences are exact. Persistent model ownership, content hashing, and disk serialization remain. |
 | C1-C6 | Future hardware | — | Requires suitable ISA hosts for validation |
 | D0 | Initial screen completed | `4ca364c` | Seven formats, three alternating-order performance rounds, 56 deterministic rewrite outputs, and a three-run 2k/2k Q8-versus-Q4_0 comparison select Q4_0 for the first native backend; production quality expansion remains open |
 | D1 | Active; laptop throughput target achieved | `12f9ecf`, `8e3614c` + this commit | Native Q4_0 scalar/AVX2, packed-only model weights, token-major prepared activations, fused greedy LM-head, 8x8 projection prefill, batched DeltaNet row tiling, and paired GQA decode are implemented. Against llama.cpp Q4_0, pp256 is +40.0%, pp2048 is +30.8%, and short decode is +37.9%; paired GQA adds +5.3% at context 2,048 over the prior native path. Expanded correctness, quality, memory, and long-context gates remain. |

@@ -5,7 +5,9 @@
 #include "qwen35x/runtime/qwen35x_cuda_backend.h"
 #include "qwen35x/runtime/qwen35x_profile.h"
 
+#include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -29,6 +31,33 @@ enum class Qwen35xPrefillMode {
   batched = 1
 };
 
+// Reusable in-memory CPU state after an invariant prompt prefix. Keep one
+// instance alive across inference calls that share the same model and prefix.
+// A cache handle is not thread-safe and must not be accessed concurrently.
+struct ReferenceInferenceOptions;
+struct ReferenceInferenceResult;
+
+class ReferenceCpuPrefixCache {
+public:
+  ReferenceCpuPrefixCache() = default;
+  ReferenceCpuPrefixCache(const ReferenceCpuPrefixCache &) = delete;
+  ReferenceCpuPrefixCache & operator=(const ReferenceCpuPrefixCache &) = delete;
+  ReferenceCpuPrefixCache(ReferenceCpuPrefixCache &&) noexcept = default;
+  ReferenceCpuPrefixCache & operator=(ReferenceCpuPrefixCache &&) noexcept = default;
+
+  void clear() noexcept { implementation_.reset(); }
+  [[nodiscard]] bool empty() const noexcept { return implementation_ == nullptr; }
+
+private:
+  std::shared_ptr<void> implementation_;
+
+  friend bool run_reference_qwen35_inference(
+    const ModelProfile &,
+    const ReferenceInferenceOptions &,
+    ReferenceInferenceResult &,
+    std::string &);
+};
+
 struct ReferenceInferenceOptions {
   std::string model_dir;
   std::string cpu_gguf_path;
@@ -47,6 +76,8 @@ struct ReferenceInferenceOptions {
   bool prefill_only = false;
   int cpu_threads = 0;
   cpu::Q8_0Backend cpu_q8_backend = cpu::Q8_0Backend::auto_select;
+  ReferenceCpuPrefixCache * cpu_prefix_cache = nullptr;
+  std::size_t cpu_prefix_token_count = 0;
   SamplingOptions sampling;
   std::vector<std::int32_t> stop_token_ids;
   std::vector<std::vector<std::int32_t>> stop_token_sequences;
@@ -76,6 +107,9 @@ struct ReferenceInferenceResult {
   double decode_time_ms = 0.0;
   double tokens_per_second = 0.0;
   int forward_pass_tokens = 0;
+  int cached_prefix_tokens = 0;
+  double prefix_cache_restore_time_ms = 0.0;
+  std::size_t prefix_cache_bytes = 0;
   double host_to_device_bytes_per_forward_token = 0.0;
   double device_to_host_bytes_per_forward_token = 0.0;
   ReferenceTimingBreakdown timing_breakdown;
