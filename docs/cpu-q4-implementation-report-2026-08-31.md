@@ -103,6 +103,21 @@ new differential test covers contexts 1 through 2,048 with both odd and native
 head dimensions, F16 caches, and scalar/AVX2 dispatch. A 128-token end-to-end
 generation remains token-identical to the pre-A9 binary.
 
+Two follow-up A9 variants were rejected. Grouping all four query heads per KV
+head reduced the executor to two tasks and measured 61.62 tok/s at short
+context and 53.47 tok/s at context 2,048, both below the retained pair kernel.
+Fusing probability normalization into the first V tile initially produced a
+noisy 55.81 tok/s result, but the controlled baseline/new pair measured 54.96
+versus 54.10 tok/s. The original normalization pass is retained.
+
+A10 producer-to-Q8 fusion was tested at three scopes without a retained gain.
+Final RMSNorm-to-Q8 measured 62.68 versus 62.65 tok/s over five runs. Direct
+RMSNorm-to-Q8 before all combined layer projections measured 62.94 versus
+62.96 tok/s. Direct SiLU(gate)-times-up-to-Q8 before every MLP down projection
+measured 62.98 versus 62.96 tok/s. All produced the same 128-token sequence,
+but packed-Q4 weight traffic dominates enough that removing these FP32 stores
+does not change end-to-end decode on this host. All prototypes were reverted.
+
 The pre-vector-scale pp256 thread sweep measured 197.94, 218.53, 234.73, and
 188.30 tok/s at 4, 5, 6, and 8 threads. Six physical-core threads remain the
 default for this host.
