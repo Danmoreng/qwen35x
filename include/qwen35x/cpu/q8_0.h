@@ -41,6 +41,16 @@ void q8_0_quantize(
   std::size_t block_count,
   Q8_0Backend backend = Q8_0Backend::auto_select) noexcept;
 
+// Quantizes blocks and emits the exact binary16-rounded block scale as F32 in
+// the same pass. This avoids rereading Q8_0 blocks before batched matrix
+// multiplication. scales contains block_count elements.
+void q8_0_quantize_with_scales(
+  const float * input,
+  Q8_0Block * output,
+  float * scales,
+  std::size_t block_count,
+  Q8_0Backend backend = Q8_0Backend::auto_select) noexcept;
+
 void q8_0_dequantize(
   const Q8_0Block * input,
   float * output,

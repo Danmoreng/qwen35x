@@ -640,19 +640,16 @@ bool matmul_2d_q8_batch(
 
   std::vector<cpu::Q8_0Block> & quantized = w.q8_0_runtime->quantized_batch;
   quantized.resize(batch_size * blocks_per_row);
+  std::vector<float> & quantized_scales = w.q8_0_runtime->quantized_batch_scales;
+  quantized_scales.resize(quantized.size());
   for (std::size_t token = 0; token < batch_size; ++token) {
-    cpu::q8_0_quantize(
+    cpu::q8_0_quantize_with_scales(
       inputs.data() + token * cols,
       quantized.data() + token * blocks_per_row,
+      quantized_scales.data() + token * blocks_per_row,
       blocks_per_row,
       w.q8_0_backend);
   }
-  std::vector<float> & quantized_scales = w.q8_0_runtime->quantized_batch_scales;
-  quantized_scales.resize(quantized.size());
-  cpu::q8_0_scales_to_f32(
-    quantized.data(),
-    quantized_scales.data(),
-    quantized.size());
   out.resize(batch_size * rows);
   if (batch_size == 0 || rows == 0) {
     return true;

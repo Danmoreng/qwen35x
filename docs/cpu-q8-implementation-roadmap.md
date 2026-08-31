@@ -119,7 +119,8 @@ retained commits against the stable baseline.
 
 ### A1 — Remove redundant activation-quantization work
 
-Status: pending
+Status: completed; retained as a neutral cleanup with no claimed end-to-end
+throughput gain
 
 Implementation:
 
@@ -482,7 +483,7 @@ Update this table in the same commit that lands or rejects each experiment.
 | ID | Status | Commit | Evidence / decision |
 | --- | --- | --- | --- |
 | A0 | Pending | — | Stable reference figures exist; expanded controlled baseline still required |
-| A1 | Pending | — | External review identified F16C call/reloads and a second scale pass |
+| A1 | Completed, neutral | pending commit | F16C conversion and loaded-YMM reuse verified in disassembly; fused scale sidecar removes the second pass. All tests pass. Ordered/reverse A/B pairs were dominated by laptop drift: combined pp256 was 198.59 versus 199.63 tok/s, decode 36.61 versus 36.74 tok/s, and pp2048 168.22 versus 169.56 tok/s (A1 versus baseline). No speedup is claimed. |
 | A2 | Pending | — | Decode and each full-attention prefill layer currently recompute trigonometry |
 | A3 | Pending | — | Local vectors and model-global quantization scratch remain |
 | A4 | Pending | — | Current decode creates/copies a convolution window; clean redesign required |

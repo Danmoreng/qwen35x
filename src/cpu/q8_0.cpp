@@ -86,6 +86,7 @@ float half_to_float(const std::uint16_t value) noexcept {
 void q8_0_quantize_scalar(
   const float * input,
   Q8_0Block * output,
+  float * scales,
   const std::size_t block_count) noexcept {
   for (std::size_t block = 0; block < block_count; ++block) {
     const float * x = input + block * q8_0_values_per_block;
@@ -97,6 +98,9 @@ void q8_0_quantize_scalar(
     const float scale = absolute_max / 127.0F;
     const float inverse_scale = scale == 0.0F ? 0.0F : 1.0F / scale;
     output[block].d = float_to_half(scale);
+    if (scales != nullptr) {
+      scales[block] = half_to_float(output[block].d);
+    }
     for (std::size_t index = 0; index < q8_0_values_per_block; ++index) {
       const float rounded = std::round(x[index] * inverse_scale);
       output[block].qs[index] = static_cast<std::int8_t>(
@@ -264,13 +268,30 @@ void q8_0_quantize(
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX2_TU
   if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
-    detail::q8_0_quantize_avx2(input, output, block_count);
+    detail::q8_0_quantize_avx2(input, output, nullptr, block_count);
     return;
   }
 #else
   static_cast<void>(backend);
 #endif
-  detail::q8_0_quantize_scalar(input, output, block_count);
+  detail::q8_0_quantize_scalar(input, output, nullptr, block_count);
+}
+
+void q8_0_quantize_with_scales(
+  const float * input,
+  Q8_0Block * output,
+  float * scales,
+  const std::size_t block_count,
+  const Q8_0Backend backend) noexcept {
+#if QWEN35X_Q8_0_HAS_AVX2_TU
+  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+    detail::q8_0_quantize_avx2(input, output, scales, block_count);
+    return;
+  }
+#else
+  static_cast<void>(backend);
+#endif
+  detail::q8_0_quantize_scalar(input, output, scales, block_count);
 }
 
 void q8_0_dequantize(

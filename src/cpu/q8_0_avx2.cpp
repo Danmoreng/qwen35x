@@ -62,9 +62,9 @@ namespace {
 }
 
 [[nodiscard]] __m256 quantize_eight(
-  const float * values,
+  const __m256 values,
   const __m256 inverse_scale) noexcept {
-  const __m256 scaled = _mm256_mul_ps(_mm256_loadu_ps(values), inverse_scale);
+  const __m256 scaled = _mm256_mul_ps(values, inverse_scale);
   const __m256 sign = _mm256_and_ps(scaled, _mm256_set1_ps(-0.0F));
   const __m256 half_away_from_zero = _mm256_or_ps(_mm256_set1_ps(0.5F), sign);
   return _mm256_add_ps(scaled, half_away_from_zero);
@@ -248,6 +248,7 @@ void dot_eight_rows_avx2_impl(
 void q8_0_quantize_avx2(
   const float * input,
   Q8_0Block * output,
+  float * scales,
   const std::size_t block_count) noexcept {
   const __m256 sign_bit = _mm256_set1_ps(-0.0F);
   const __m256i pack_order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
@@ -271,13 +272,18 @@ void q8_0_quantize_avx2(
     const float max_scalar = _mm_cvtss_f32(max4);
     const float scale = max_scalar / 127.0F;
     const float inverse_scale_scalar = scale == 0.0F ? 0.0F : 1.0F / scale;
-    output[block].d = float_to_half(scale);
+    const std::uint16_t half_scale = static_cast<std::uint16_t>(_cvtss_sh(
+      scale, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+    output[block].d = half_scale;
+    if (scales != nullptr) {
+      scales[block] = _cvtsh_ss(half_scale);
+    }
     const __m256 inverse_scale = _mm256_set1_ps(inverse_scale_scalar);
 
-    __m256i i0 = _mm256_cvttps_epi32(quantize_eight(x, inverse_scale));
-    __m256i i1 = _mm256_cvttps_epi32(quantize_eight(x + 8, inverse_scale));
-    __m256i i2 = _mm256_cvttps_epi32(quantize_eight(x + 16, inverse_scale));
-    __m256i i3 = _mm256_cvttps_epi32(quantize_eight(x + 24, inverse_scale));
+    __m256i i0 = _mm256_cvttps_epi32(quantize_eight(x0, inverse_scale));
+    __m256i i1 = _mm256_cvttps_epi32(quantize_eight(x1, inverse_scale));
+    __m256i i2 = _mm256_cvttps_epi32(quantize_eight(x2, inverse_scale));
+    __m256i i3 = _mm256_cvttps_epi32(quantize_eight(x3, inverse_scale));
     const __m256i minimum = _mm256_set1_epi32(-127);
     const __m256i maximum = _mm256_set1_epi32(127);
     i0 = _mm256_min_epi32(_mm256_max_epi32(i0, minimum), maximum);

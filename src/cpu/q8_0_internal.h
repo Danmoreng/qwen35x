@@ -17,6 +17,7 @@ namespace qwen35x::cpu::detail {
 void q8_0_quantize_scalar(
   const float * input,
   Q8_0Block * output,
+  float * scales,
   std::size_t block_count) noexcept;
 
 void q8_0_dequantize_scalar(
@@ -51,6 +52,7 @@ void q8_0_matmul_scalar(
 void q8_0_quantize_avx2(
   const float * input,
   Q8_0Block * output,
+  float * scales,
   std::size_t block_count) noexcept;
 
 void q8_0_dequantize_avx2(

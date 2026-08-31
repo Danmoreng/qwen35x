@@ -77,6 +77,8 @@ bool test_zero_block() {
 
 bool test_empty_ranges() {
   qwen35x::cpu::q8_0_quantize(nullptr, nullptr, 0, Q8_0Backend::auto_select);
+  qwen35x::cpu::q8_0_quantize_with_scales(
+    nullptr, nullptr, nullptr, 0, Q8_0Backend::auto_select);
   qwen35x::cpu::q8_0_dequantize(nullptr, nullptr, 0, Q8_0Backend::auto_select);
   bool ok = expect(
     qwen35x::cpu::q8_0_dot(nullptr, nullptr, 0, Q8_0Backend::auto_select) == 0.0F,
@@ -191,12 +193,30 @@ bool test_backend(const Q8_0Backend backend) {
   qwen35x::cpu::q8_0_quantize(lhs_values.data(), lhs_test.data(), lhs_test.size(), backend);
   qwen35x::cpu::q8_0_quantize(rhs_values.data(), rhs_test.data(), rhs_test.size(), backend);
 
+  std::vector<Q8_0Block> lhs_with_scales(lhs_test.size());
+  std::vector<float> fused_scales(lhs_test.size());
+  std::vector<float> expanded_scales(lhs_test.size());
+  qwen35x::cpu::q8_0_quantize_with_scales(
+    lhs_values.data(),
+    lhs_with_scales.data(),
+    fused_scales.data(),
+    lhs_with_scales.size(),
+    backend);
+  qwen35x::cpu::q8_0_scales_to_f32(
+    lhs_with_scales.data(), expanded_scales.data(), lhs_with_scales.size());
+
   bool ok = expect(
     std::memcmp(lhs_scalar.data(), lhs_test.data(), lhs_scalar.size() * sizeof(Q8_0Block)) == 0,
     "quantized matrix differs from deterministic scalar Q8_0") &&
     expect(
       std::memcmp(rhs_scalar.data(), rhs_test.data(), rhs_scalar.size() * sizeof(Q8_0Block)) == 0,
-      "quantized vector differs from deterministic scalar Q8_0");
+      "quantized vector differs from deterministic scalar Q8_0") &&
+    expect(
+      std::memcmp(lhs_test.data(), lhs_with_scales.data(), lhs_test.size() * sizeof(Q8_0Block)) == 0,
+      "quantize-with-scales changed Q8_0 output") &&
+    expect(
+      std::memcmp(fused_scales.data(), expanded_scales.data(), fused_scales.size() * sizeof(float)) == 0,
+      "fused scale sidecar differs from expanded binary16 scales");
 
   std::vector<float> dequant_scalar(rhs_values.size());
   std::vector<float> dequant_test(rhs_values.size());
