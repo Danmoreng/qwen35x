@@ -1,8 +1,11 @@
 build/
+/build-*/
 out/
 models/
 benchmarks/
 .venv-hf-parity/
+
+/qwen35x-source-review-*.zip
 
 .vscode/
 .idea/
