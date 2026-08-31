@@ -478,7 +478,7 @@ better codes while the runtime still consumes a simple Q4_0-like layout.
 
 ### D0 — llama.cpp format and quality preselection
 
-Status: in progress
+Status: initial laptop screen completed; production quality expansion pending
 
 Benchmark these Qwen3.5 0.8B GGUF variants on the same i7-8750H and current
 llama.cpp revision:
@@ -629,6 +629,15 @@ D0 decision gate:
   while reducing prompt-processing speed;
 - select no custom runtime format until these llama.cpp measurements exist.
 
+Laptop result (2026-08-31): the three-round, alternating-order llama.cpp screen
+selected Q4_0 as the first native format. Against Q8_0 it measured +45.1%
+decode at context 1, +44.6% at context 256, +38.2% at context 2,048, and +23.7%
+pp2048. IQ4_NL was effectively tied in throughput but showed a less desirable
+long-rewrite failure. The eight-case suite found baseline model failures even in
+Q8_0, so production quality approval remains open. See
+`docs/llama-cpp-quantization-screen.md` for hashes, raw-artifact locations,
+methodology, full results, and limitations.
+
 ### D1 — Native Q4_0 × Q8 backend
 
 Status: pending D0
@@ -767,7 +776,7 @@ Update this table in the same commit that lands or rejects each experiment.
 | A10 | Pending | — | FP32 producer buffers still precede Q8 quantization |
 | B | Pending | — | Prefix state cache not implemented |
 | C1-C6 | Future hardware | — | Requires suitable ISA hosts for validation |
-| D0 | In progress | — | Benchmark the seven llama.cpp GGUF formats and run the eight-case deterministic transcript rewrite suite on this laptop |
+| D0 | Initial screen completed | — | Seven formats, three alternating-order performance rounds, and 56 deterministic rewrite outputs select Q4_0 for the first native backend; production quality expansion remains open |
 | D1-D4 | Pending D0 | — | Native Q4_0/IQ4_NL, mixed precision, and calibrated offline rounding depend on the D0 speed/quality decision |
 | D5 | Research target | — | Custom Hadamard-regularized `Q4_H128` is the preferred custom-format direction after simple Q4 baselines |
 | D6-D7 | Deferred/future hardware | — | State quantization is quality-sensitive; dense sub-four-bit research benefits materially from newer SIMD ISAs |

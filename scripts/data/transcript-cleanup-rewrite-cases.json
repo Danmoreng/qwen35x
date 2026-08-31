@@ -1,0 +1,53 @@
+{
+  "system_prompt": "Clean up the following raw speech transcript. Remove fillers and false starts, fix punctuation and casing, and improve readability. Preserve every fact, name, identifier, number, date, time, correction, and negation. Do not summarize, answer, explain, diagnose, or add information. Return only the cleaned transcript in its original language.",
+  "cases": [
+    {
+      "id": "de_fillers_meeting",
+      "input": "hallo äh ich wollte nur sagen das treffen ist morgen um zehn uhr und bitte bring noch die unterlagen mit",
+      "required_regex": ["(?i)morgen", "(?i)(10([:.]00)?|zehn)\\s*(uhr)?", "(?i)unterlagen"],
+      "forbidden_regex": []
+    },
+    {
+      "id": "de_self_correction",
+      "input": "wir liefern am donnerstag also nein entschuldigung am freitag den vierzehnten und zwar zwölf kartons an frau schneider",
+      "required_regex": ["(?i)freitag", "(?i)(14\\.?|vierzehnt)", "(?i)(12|zwölf)\\s+kartons", "(?i)frau\\s+schneider"],
+      "forbidden_regex": ["(?i)donnerstag"]
+    },
+    {
+      "id": "de_identifier_amount",
+      "input": "notier bitte für herrn özdemir projekt alpha sieben ticket a c vier neun zwei budget sind dreizehntausendfünfhundert euro",
+      "required_regex": ["(?i)(herrn?\\s+)?özdemir", "(?i)alpha\\s*(7|sieben)", "(?i)(AC[- ]?492|a c vier neun zwei)", "(?i)(13[. ,]?500|dreizehntausendfünfhundert)\\s*(€|euro)"],
+      "forbidden_regex": []
+    },
+    {
+      "id": "de_medical_no_invention",
+      "input": "patient berichtet seit drei tagen über kopfschmerzen kein fieber keine übelkeit termin zur kontrolle am zweiten september um acht uhr dreißig",
+      "required_regex": ["(?i)(3|drei)\\s+tage", "(?i)kopfschmerzen", "(?i)kein\\s+fieber", "(?i)keine\\s+übelkeit", "(?i)(2\\.?|zweiten)\\s+september", "(?i)(08[:.]30|8[:.]30|acht\\s+uhr\\s+dreißig)"],
+      "forbidden_regex": ["(?i)diagnos", "(?i)therap", "(?i)medikament", "(?i)nehmen sie"]
+    },
+    {
+      "id": "en_action_items",
+      "input": "okay so um send the revised contract to Maya Chen before five p m and copy Daniel on the email but do not attach the old pricing sheet",
+      "required_regex": ["(?i)maya\\s+chen", "(?i)(5[:.]?00|five)\\s*p\\.?\\s*m\\.?", "(?i)copy\\s+daniel", "(?i)(do\\s+not|don't)\\s+attach.*old\\s+pricing"],
+      "forbidden_regex": []
+    },
+    {
+      "id": "en_amount_correction",
+      "input": "the invoice total is four thousand six hundred and eighteen dollars no wait four thousand six hundred and eighty dollars and payment is due june twenty first",
+      "required_regex": ["(?i)(4[,]?680|four thousand six hundred and eighty)\\s+dollars", "(?i)june\\s+(21(st)?|twenty.first)"],
+      "forbidden_regex": ["(?i)(4[,]?618|four thousand six hundred and eighteen)\\s+dollars"]
+    },
+    {
+      "id": "de_technical_mixed",
+      "input": "bitte update den inference server auf version zwei punkt vier punkt eins aber lass den cuda driver unverändert und starte danach nur den qwen worker neu",
+      "required_regex": ["(?i)(2\\.4\\.1|zwei punkt vier punkt eins)", "(?i)cuda.{0,20}unverändert", "(?i)nur.{0,20}qwen.{0,20}worker.{0,20}neu"],
+      "forbidden_regex": []
+    },
+    {
+      "id": "de_long_negation",
+      "input": "also für das protokoll wir haben heute entschieden dass der test nicht am montag startet sondern am mittwoch zuerst nur mit fünf nutzern und falls fehler auftreten wird nicht automatisch ausgerollt sondern wir prüfen das am donnerstag nochmal gemeinsam",
+      "required_regex": ["(?i)mittwoch", "(?i)(5|fünf)\\s+nutzern", "(?i)nicht\\s+automatisch", "(?i)donnerstag"],
+      "forbidden_regex": ["(?i)(startet|beginnt)\\s+(am\\s+)?montag"]
+    }
+  ]
+}
