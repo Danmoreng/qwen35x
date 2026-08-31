@@ -198,4 +198,48 @@ bool q4_h128_prepare_activation(
   return true;
 }
 
+bool q4_h128_prepare_activations_4(
+  const float * input,
+  Q8_0BlockX4 * output,
+  const std::size_t vector_count,
+  const std::size_t column_count,
+  const std::uint64_t sign_seed,
+  const Q8_0Backend backend) noexcept {
+  if (input == nullptr || output == nullptr || vector_count == 0 ||
+      vector_count % q8_0_packed_vectors != 0 || column_count == 0 ||
+      column_count % q4_h128_transform_size != 0) {
+    return false;
+  }
+  const std::size_t blocks_per_vector = column_count / q8_0_values_per_block;
+  const std::size_t transform_blocks = column_count / q4_h128_transform_size;
+  alignas(32) float transformed[
+    q8_0_packed_vectors * q4_h128_transform_size];
+  for (std::size_t vector_tile = 0;
+       vector_tile < vector_count / q8_0_packed_vectors;
+       ++vector_tile) {
+    for (std::size_t transform_block = 0;
+         transform_block < transform_blocks;
+         ++transform_block) {
+      for (std::size_t token = 0; token < q8_0_packed_vectors; ++token) {
+        const std::size_t vector = vector_tile * q8_0_packed_vectors + token;
+        q4_h128_transform_block(
+          input + vector * column_count +
+            transform_block * q4_h128_transform_size,
+          transformed + token * q4_h128_transform_size,
+          transform_block,
+          sign_seed,
+          backend);
+      }
+      q8_0_quantize_vectors_4(
+        transformed,
+        output + vector_tile * blocks_per_vector +
+          transform_block * q4_h128_q4_blocks_per_transform,
+        q8_0_packed_vectors,
+        q4_h128_q4_blocks_per_transform,
+        backend);
+    }
+  }
+  return true;
+}
+
 } // namespace qwen35x::cpu

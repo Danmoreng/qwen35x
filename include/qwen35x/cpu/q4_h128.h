@@ -65,4 +65,16 @@ void q4_h128_quantize_transformed(
   std::uint64_t sign_seed = q4_h128_default_sign_seed,
   Q8_0Backend backend = Q8_0Backend::auto_select) noexcept;
 
+// Transforms groups of four token-major activation rows and immediately
+// quantizes them into the packed Q8_0 prefill layout. Keeping each transformed
+// H128 block in a small local buffer avoids a batch-sized FP32 scratch pass.
+// vector_count must be divisible by four and column_count by 128.
+[[nodiscard]] bool q4_h128_prepare_activations_4(
+  const float * input,
+  Q8_0BlockX4 * output,
+  std::size_t vector_count,
+  std::size_t column_count,
+  std::uint64_t sign_seed = q4_h128_default_sign_seed,
+  Q8_0Backend backend = Q8_0Backend::auto_select) noexcept;
+
 } // namespace qwen35x::cpu

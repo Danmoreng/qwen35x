@@ -149,6 +149,40 @@ bool test_quantized_projection() {
   return ok;
 }
 
+bool test_fused_packed_activation() {
+  constexpr std::size_t vectors = 8;
+  constexpr std::size_t columns = 256;
+  constexpr std::size_t blocks_per_vector =
+    columns / qwen35x::cpu::q8_0_values_per_block;
+  const std::vector<float> input = make_values(vectors * columns, 0.77F);
+  std::vector<float> transformed(input.size());
+  std::vector<qwen35x::cpu::Q8_0BlockX4> reference(
+    (vectors / qwen35x::cpu::q8_0_packed_vectors) * blocks_per_vector);
+  std::vector<qwen35x::cpu::Q8_0BlockX4> fused(reference.size());
+  bool ok = expect(qwen35x::cpu::q4_h128_transform_rows(
+                     input.data(), transformed.data(), vectors, columns,
+                     qwen35x::cpu::q4_h128_default_sign_seed,
+                     qwen35x::cpu::Q8_0Backend::avx2),
+                   "packed comparison transform failed");
+  qwen35x::cpu::q8_0_quantize_vectors_4(
+    transformed.data(), reference.data(), vectors, blocks_per_vector,
+    qwen35x::cpu::Q8_0Backend::avx2);
+  ok = expect(qwen35x::cpu::q4_h128_prepare_activations_4(
+                input.data(), fused.data(), vectors, columns,
+                qwen35x::cpu::q4_h128_default_sign_seed,
+                qwen35x::cpu::Q8_0Backend::avx2),
+              "fused packed activation preparation failed") && ok;
+  ok = expect(std::equal(
+                reinterpret_cast<const unsigned char *>(reference.data()),
+                reinterpret_cast<const unsigned char *>(reference.data() + reference.size()),
+                reinterpret_cast<const unsigned char *>(fused.data())),
+              "fused packed activation differs from two-pass preparation") && ok;
+  ok = expect(!qwen35x::cpu::q4_h128_prepare_activations_4(
+                input.data(), fused.data(), 6, columns),
+              "invalid packed vector count was accepted") && ok;
+  return ok;
+}
+
 } // namespace
 
 int main() {
@@ -157,6 +191,7 @@ int main() {
   ok = test_rows_and_rejection() && ok;
   ok = test_avx2_parity() && ok;
   ok = test_quantized_projection() && ok;
+  ok = test_fused_packed_activation() && ok;
   if (ok) {
     std::cout << "Q4_H128 tests passed\n";
     return 0;

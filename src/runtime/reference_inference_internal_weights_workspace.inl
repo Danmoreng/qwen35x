@@ -84,6 +84,15 @@ struct Q4H128TransformJob {
   cpu::Q8_0Backend backend = cpu::Q8_0Backend::auto_select;
 };
 
+struct Q4H128PreparePackedJob {
+  const float * input = nullptr;
+  cpu::Q8_0BlockX4 * output = nullptr;
+  std::size_t columns = 0;
+  std::size_t blocks_per_vector = 0;
+  std::uint64_t sign_seed = 0;
+  cpu::Q8_0Backend backend = cpu::Q8_0Backend::auto_select;
+};
+
 void run_q4_h128_transform_rows(
   void * opaque_context,
   const std::size_t row_begin,
@@ -93,6 +102,20 @@ void run_q4_h128_transform_rows(
     job.input + row_begin * job.columns,
     job.output + row_begin * job.columns,
     row_end - row_begin,
+    job.columns,
+    job.sign_seed,
+    job.backend));
+}
+
+void run_q4_h128_prepare_packed_tiles(
+  void * opaque_context,
+  const std::size_t tile_begin,
+  const std::size_t tile_end) noexcept {
+  auto & job = *static_cast<Q4H128PreparePackedJob *>(opaque_context);
+  static_cast<void>(cpu::q4_h128_prepare_activations_4(
+    job.input + tile_begin * cpu::q8_0_packed_vectors * job.columns,
+    job.output + tile_begin * job.blocks_per_vector,
+    (tile_end - tile_begin) * cpu::q8_0_packed_vectors,
     job.columns,
     job.sign_seed,
     job.backend));
@@ -1296,8 +1319,12 @@ bool matmul_2d_quantized_batch(
   if (batch_size == 0 || rows == 0) {
     return true;
   }
+  const bool fuse_h128_packed_q4 =
+    w.uses_q4_h128_transform && w.is_q4_0() &&
+    (rows % cpu::q4_0_packed_rows) == 0 &&
+    !w.packed_q4_0_blocks.empty();
   const float * quantization_inputs = inputs.data();
-  if (w.uses_q4_h128_transform) {
+  if (w.uses_q4_h128_transform && !fuse_h128_packed_q4) {
     std::vector<float> & transformed = w.q8_0_runtime->q4_h128_transform_scratch;
     transformed.resize(batch_size * cols);
     if (w.q8_0_runtime->executor != nullptr && batch_size > 1) {
@@ -1337,9 +1364,34 @@ bool matmul_2d_quantized_batch(
         w.q8_0_runtime->packed_q8_0_batch;
       packed.resize(
         (packed_vector_count / cpu::q8_0_packed_vectors) * blocks_per_row);
-      cpu::q8_0_quantize_vectors_4(
-        quantization_inputs, packed.data(), packed_vector_count, blocks_per_row,
-        w.q8_0_backend);
+      if (fuse_h128_packed_q4) {
+        const std::size_t vector_tiles =
+          packed_vector_count / cpu::q8_0_packed_vectors;
+        if (w.q8_0_runtime->executor != nullptr && vector_tiles > 1) {
+          Q4H128PreparePackedJob prepare_job{
+            inputs.data(), packed.data(), cols, blocks_per_row,
+            w.q4_h128_sign_seed, w.q8_0_backend,
+          };
+          const cpu::CpuExecutorStatus status =
+            w.q8_0_runtime->executor->parallel_for_rows(
+              vector_tiles, run_q4_h128_prepare_packed_tiles, &prepare_job);
+          if (status != cpu::CpuExecutorStatus::ok) {
+            error_message =
+              std::string("Q4_H128 packed activation executor failed: ") +
+              cpu::cpu_executor_status_name(status) + ".";
+            return false;
+          }
+        } else if (!cpu::q4_h128_prepare_activations_4(
+                     inputs.data(), packed.data(), packed_vector_count, cols,
+                     w.q4_h128_sign_seed, w.q8_0_backend)) {
+          error_message = "Q4_H128 packed activation preparation failed.";
+          return false;
+        }
+      } else {
+        cpu::q8_0_quantize_vectors_4(
+          quantization_inputs, packed.data(), packed_vector_count, blocks_per_row,
+          w.q8_0_backend);
+      }
       if (w.q8_0_runtime->executor != nullptr) {
         PackedQ4PrefillJob job{
           w.packed_q4_0_blocks.data(), packed.data(), out.data(),
@@ -1362,12 +1414,27 @@ bool matmul_2d_quantized_batch(
 
     const std::size_t tail_vector_count = batch_size - packed_vector_count;
     if (tail_vector_count != 0) {
+      const float * tail_quantization_inputs =
+        quantization_inputs + packed_vector_count * cols;
+      if (fuse_h128_packed_q4) {
+        std::vector<float> & transformed =
+          w.q8_0_runtime->q4_h128_transform_scratch;
+        transformed.resize(tail_vector_count * cols);
+        if (!cpu::q4_h128_transform_rows(
+              inputs.data() + packed_vector_count * cols,
+              transformed.data(), tail_vector_count, cols,
+              w.q4_h128_sign_seed, w.q8_0_backend)) {
+          error_message = "Q4_H128 batched tail transform failed.";
+          return false;
+        }
+        tail_quantization_inputs = transformed.data();
+      }
       std::vector<cpu::Q8_0BlockX4> & prepared =
         w.q8_0_runtime->prepared_q4_input;
       prepared.resize(tail_vector_count * blocks_per_row);
       for (std::size_t token = 0; token < tail_vector_count; ++token) {
         cpu::q8_0_quantize_vector_1(
-          quantization_inputs + (packed_vector_count + token) * cols,
+          tail_quantization_inputs + token * cols,
           prepared.data() + token * blocks_per_row,
           blocks_per_row,
           w.q8_0_backend);

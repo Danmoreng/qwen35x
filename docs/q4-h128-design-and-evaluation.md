@@ -232,3 +232,23 @@ against BF16 measured mean/max KL 0.416220/2.009178 and 80% top-1 agreement for
 Q4_0. Q4_H128 measured mean/max KL 0.024985/0.101301 and 100% top-1 agreement.
 This case therefore demonstrates a material H128 quality improvement, although
 the broader held-out transcript suite remains the production acceptance gate.
+
+## Fused H128 prefill preparation
+
+On the Ryzen 9 9955HX3D, the initial merged H128 path exposed a larger prefill
+gap than the i7-8750H AVX2 result because Q4_0 uses the wider AVX-512 VNNI
+prefill kernel while H128 still materialized a batch-sized transformed FP32
+buffer. With 12 threads and the standard three runs after one warmup, Q4_0
+measured 1,440.29 prefill tokens/s and H128 measured 1,234.23 tokens/s.
+
+The fused preparation path transforms four token rows a block at a time,
+immediately quantizes each transformed H128 block into the packed Q8 activation
+layout, and partitions those four-row tiles over the persistent executor. This
+removes the batch-sized FP32 write/read pass and parallelizes activation
+quantization together with the transform. The same standard run measured
+1,519.40 prefill tokens/s: +23.1% over the two-pass H128 path and +5.5% over
+same-build Q4_0. Decode remains a separate one-row path; its standard result was
+82.48 tokens/s versus 84.07 tokens/s for Q4_0. The fused and two-pass packed
+activations are byte-identical in the unit test, and the exact 23-token
+arithmetic regression still selects token 19 (`4`) with an approximately
++3.263 post-penalty margin over token 17 (`2`).
