@@ -552,9 +552,7 @@ bool run_forward_cpu_q8_batch(
     }
 
     const auto mlp_start = std::chrono::steady_clock::now();
-    for (std::size_t index = 0; index < residual.size(); ++index) {
-      residual[index] = x[index] + attention[index];
-    }
+    cpu::add_f32(x.data(), attention.data(), residual.data(), residual.size());
     rms_norm_qwen3next_batch(
       residual, batch_size, hidden, layer.post_attention_layernorm, dims.rms_eps, post_norm);
     if (!layer.mlp_gate_up_cpu.is_q8_0() ||
@@ -578,9 +576,8 @@ bool run_forward_cpu_q8_batch(
           layer.mlp_down, mlp_hidden, batch_size, mlp_output, error_message)) {
       return false;
     }
-    for (std::size_t index = 0; index < x.size(); ++index) {
-      x[index] = residual[index] + mlp_output[index];
-    }
+    cpu::add_f32(
+      residual.data(), mlp_output.data(), x.data(), x.size());
     if (profiling != nullptr) {
       profiling->mlp_ms += elapsed_ms(mlp_start);
     }

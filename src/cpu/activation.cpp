@@ -12,6 +12,12 @@ namespace qwen35x::cpu {
 namespace detail {
 
 #if QWEN35X_Q8_0_HAS_AVX2_TU
+void add_f32_avx2(
+  const float * lhs,
+  const float * rhs,
+  float * output,
+  std::size_t count) noexcept;
+
 void rms_norm_f32_avx2(
   const float * input,
   const float * weight,
@@ -34,6 +40,25 @@ void silu_mul_f32_avx2(
 #endif
 
 } // namespace detail
+
+void add_f32(
+  const float * lhs,
+  const float * rhs,
+  float * output,
+  const std::size_t count,
+  const Q8_0Backend backend) noexcept {
+#if QWEN35X_Q8_0_HAS_AVX2_TU
+  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+    detail::add_f32_avx2(lhs, rhs, output, count);
+    return;
+  }
+#else
+  static_cast<void>(backend);
+#endif
+  for (std::size_t index = 0; index < count; ++index) {
+    output[index] = lhs[index] + rhs[index];
+  }
+}
 
 void rms_norm_f32(
   const float * input,

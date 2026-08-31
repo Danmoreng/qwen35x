@@ -140,6 +140,23 @@ bool test_rms_norm(const Q8_0Backend backend) {
   return ok;
 }
 
+bool test_add(const Q8_0Backend backend) {
+  constexpr std::size_t count = 39;
+  std::array<float, count> lhs{};
+  std::array<float, count> rhs{};
+  std::array<float, count> output{};
+  for (std::size_t index = 0; index < count; ++index) {
+    lhs[index] = static_cast<float>(index) * 0.25F;
+    rhs[index] = std::sin(static_cast<float>(index));
+  }
+  qwen35x::cpu::add_f32(lhs.data(), rhs.data(), output.data(), count, backend);
+  bool ok = true;
+  for (std::size_t index = 0; index < count; ++index) {
+    ok = expect(output[index] == lhs[index] + rhs[index], "vector add mismatch") && ok;
+  }
+  return ok;
+}
+
 bool test_backend(const Q8_0Backend backend) {
   constexpr std::size_t blocks = 5;
   constexpr std::size_t rows = 4;
@@ -249,6 +266,7 @@ int main() {
   bool ok = test_known_layout() && test_zero_block() && test_empty_ranges();
   ok = test_silu_mul(Q8_0Backend::auto_select) && ok;
   ok = test_rms_norm(Q8_0Backend::auto_select) && ok;
+  ok = test_add(Q8_0Backend::auto_select) && ok;
   ok = test_backend(Q8_0Backend::scalar) && ok;
   ok = test_backend(Q8_0Backend::auto_select) && ok;
 

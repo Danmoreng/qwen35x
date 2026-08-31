@@ -43,6 +43,31 @@ namespace {
 
 } // namespace
 
+void add_f32_avx2(
+  const float * lhs,
+  const float * rhs,
+  float * output,
+  const std::size_t count) noexcept {
+  std::size_t index = 0;
+  for (; index + 32 <= count; index += 32) {
+    _mm256_storeu_ps(output + index, _mm256_add_ps(
+      _mm256_loadu_ps(lhs + index), _mm256_loadu_ps(rhs + index)));
+    _mm256_storeu_ps(output + index + 8, _mm256_add_ps(
+      _mm256_loadu_ps(lhs + index + 8), _mm256_loadu_ps(rhs + index + 8)));
+    _mm256_storeu_ps(output + index + 16, _mm256_add_ps(
+      _mm256_loadu_ps(lhs + index + 16), _mm256_loadu_ps(rhs + index + 16)));
+    _mm256_storeu_ps(output + index + 24, _mm256_add_ps(
+      _mm256_loadu_ps(lhs + index + 24), _mm256_loadu_ps(rhs + index + 24)));
+  }
+  for (; index + 8 <= count; index += 8) {
+    _mm256_storeu_ps(output + index, _mm256_add_ps(
+      _mm256_loadu_ps(lhs + index), _mm256_loadu_ps(rhs + index)));
+  }
+  for (; index < count; ++index) {
+    output[index] = lhs[index] + rhs[index];
+  }
+}
+
 void rms_norm_f32_avx2(
   const float * input,
   const float * weight,
