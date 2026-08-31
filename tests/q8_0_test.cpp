@@ -1,4 +1,5 @@
 #include "qwen35x/cpu/activation.h"
+#include "qwen35x/cpu/full_attention.h"
 #include "qwen35x/cpu/q8_0.h"
 
 #include <algorithm>
@@ -26,6 +27,11 @@ bool expect(const bool condition, const std::string_view message) {
 
 bool near(const float lhs, const float rhs) {
   const float tolerance = 1.0e-4F + 2.0e-5F * std::max(std::fabs(lhs), std::fabs(rhs));
+  return std::fabs(lhs - rhs) <= tolerance;
+}
+
+bool near_attention(const float lhs, const float rhs) {
+  const float tolerance = 5.0e-4F + 2.0e-4F * std::max(std::fabs(lhs), std::fabs(rhs));
   return std::fabs(lhs - rhs) <= tolerance;
 }
 
@@ -231,6 +237,54 @@ bool test_causal_conv1d_silu(const Q8_0Backend backend) {
   return ok;
 }
 
+bool test_full_attention(const Q8_0Backend backend) {
+  constexpr int heads = 2;
+  constexpr int kv_heads = 1;
+  constexpr int head_dim = 17;
+  constexpr std::array<int, 11> contexts{
+    1, 7, 8, 9, 63, 64, 65, 255, 256, 257, 2048,
+  };
+  bool ok = true;
+  for (const int context : contexts) {
+    const std::size_t query_width = static_cast<std::size_t>(heads * head_dim);
+    const std::size_t kv_width = static_cast<std::size_t>(kv_heads * head_dim);
+    std::vector<float> query(query_width);
+    std::vector<float> gate(query_width);
+    std::vector<float> key_cache(static_cast<std::size_t>(context) * kv_width);
+    std::vector<float> value_cache(static_cast<std::size_t>(context) * kv_width);
+    for (std::size_t index = 0; index < query.size(); ++index) {
+      query[index] = std::sin(static_cast<float>(index) * 0.17F);
+      gate[index] = std::cos(static_cast<float>(index) * 0.23F) * 3.0F;
+    }
+    for (std::size_t index = 0; index < key_cache.size(); ++index) {
+      key_cache[index] = std::cos(static_cast<float>(index) * 0.013F);
+      value_cache[index] = std::sin(static_cast<float>(index) * 0.019F);
+    }
+    std::vector<float> scalar_scores(static_cast<std::size_t>(heads * context));
+    std::vector<float> test_scores(static_cast<std::size_t>(heads * context));
+    std::vector<float> expected(query_width);
+    std::vector<float> actual(query_width);
+    qwen35x::cpu::causal_attention_batch_rows(
+      query.data(), gate.data(), key_cache.data(), value_cache.data(), nullptr,
+      nullptr, scalar_scores.data(), expected.data(), static_cast<std::size_t>(context),
+      query_width, kv_width, context - 1, heads, kv_heads, head_dim,
+      1.0F / std::sqrt(static_cast<float>(head_dim)), 0,
+      static_cast<std::size_t>(heads), Q8_0Backend::scalar);
+    qwen35x::cpu::causal_attention_batch_rows(
+      query.data(), gate.data(), key_cache.data(), value_cache.data(), nullptr,
+      nullptr, test_scores.data(), actual.data(), static_cast<std::size_t>(context),
+      query_width, kv_width, context - 1, heads, kv_heads, head_dim,
+      1.0F / std::sqrt(static_cast<float>(head_dim)), 0,
+      static_cast<std::size_t>(heads), backend);
+    for (std::size_t index = 0; index < actual.size(); ++index) {
+      ok = expect(
+        near_attention(expected[index], actual[index]),
+        "full-attention output mismatch") && ok;
+    }
+  }
+  return ok;
+}
+
 bool test_l2_normalize(const Q8_0Backend backend) {
   constexpr std::size_t rows = 3;
   constexpr std::size_t width = 37;
@@ -380,6 +434,7 @@ int main() {
   ok = test_add(Q8_0Backend::auto_select) && ok;
   ok = test_rope(Q8_0Backend::auto_select) && ok;
   ok = test_causal_conv1d_silu(Q8_0Backend::auto_select) && ok;
+  ok = test_full_attention(Q8_0Backend::auto_select) && ok;
   ok = test_l2_normalize(Q8_0Backend::auto_select) && ok;
   ok = test_backend(Q8_0Backend::scalar) && ok;
   ok = test_backend(Q8_0Backend::auto_select) && ok;
@@ -391,6 +446,7 @@ int main() {
     ok = test_backend(Q8_0Backend::avx2) && ok;
     ok = test_rope(Q8_0Backend::avx2) && ok;
     ok = test_causal_conv1d_silu(Q8_0Backend::avx2) && ok;
+    ok = test_full_attention(Q8_0Backend::avx2) && ok;
   } else {
     ok = expect(
       qwen35x::cpu::q8_0_resolve_backend(Q8_0Backend::avx2) == Q8_0Backend::scalar,

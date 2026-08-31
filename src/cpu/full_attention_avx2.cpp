@@ -108,8 +108,7 @@ void weighted_sum_f32_avx2(
   const std::size_t kv_width,
   const std::size_t head_offset,
   const int sequence_length,
-  const int head_dim,
-  const float inverse_denominator) noexcept {
+  const int head_dim) noexcept {
   int column_base = 0;
   for (; column_base + 64 <= head_dim; column_base += 64) {
     __m256 accum0 = _mm256_setzero_ps();
@@ -122,7 +121,7 @@ void weighted_sum_f32_avx2(
     __m256 accum7 = _mm256_setzero_ps();
     for (int context = 0; context < sequence_length; ++context) {
       const __m256 probability = _mm256_set1_ps(
-        probabilities[static_cast<std::size_t>(context)] * inverse_denominator);
+        probabilities[static_cast<std::size_t>(context)]);
       const std::size_t offset = static_cast<std::size_t>(context) * kv_width +
         head_offset + static_cast<std::size_t>(column_base);
       if (v_cache_f16 != nullptr) {
@@ -161,7 +160,7 @@ void weighted_sum_f32_avx2(
     __m256 accumulator = _mm256_setzero_ps();
     for (int context = 0; context < sequence_length; ++context) {
       const __m256 probability = _mm256_set1_ps(
-        probabilities[static_cast<std::size_t>(context)] * inverse_denominator);
+        probabilities[static_cast<std::size_t>(context)]);
       const std::size_t offset = static_cast<std::size_t>(context) * kv_width +
         head_offset + static_cast<std::size_t>(column_base);
       const __m256 value = v_cache_f16 != nullptr
@@ -179,8 +178,7 @@ void weighted_sum_f32_avx2(
       const float value = v_cache_f16 != nullptr
         ? _cvtsh_ss(v_cache_f16[offset + static_cast<std::size_t>(column_base)])
         : v_cache[offset + static_cast<std::size_t>(column_base)];
-      accumulator += probabilities[static_cast<std::size_t>(context)] *
-        inverse_denominator * value;
+      accumulator += probabilities[static_cast<std::size_t>(context)] * value;
     }
     output[column_base] = accumulator;
   }
@@ -270,10 +268,21 @@ void causal_attention_batch_rows_avx2(
       denominator += probability;
     }
     const float inverse_denominator = 1.0F / (denominator > 0.0F ? denominator : 1.0F);
+    const __m256 inverse_denominator_vector = _mm256_set1_ps(inverse_denominator);
+    context = 0;
+    for (; context + 8 <= sequence_length; context += 8) {
+      _mm256_storeu_ps(
+        score_row + context,
+        _mm256_mul_ps(
+          _mm256_loadu_ps(score_row + context), inverse_denominator_vector));
+    }
+    for (; context < sequence_length; ++context) {
+      score_row[static_cast<std::size_t>(context)] *= inverse_denominator;
+    }
     float * output_head = output + token * query_width + head_offset;
     weighted_sum_f32_avx2(
       v_cache, v_cache_f16, score_row, output_head, kv_width, kv_head_offset,
-      sequence_length, head_dim, inverse_denominator);
+      sequence_length, head_dim);
     int gate_column = 0;
     const __m256 zero = _mm256_setzero_ps();
     const __m256 one = _mm256_set1_ps(1.0F);
@@ -284,7 +293,7 @@ void causal_attention_batch_rows_avx2(
       const __m256 exponential = exp_f32_avx2(_mm256_sub_ps(zero, absolute));
       const __m256 denominator = _mm256_add_ps(one, exponential);
       const __m256 positive = _mm256_div_ps(one, denominator);
-      const __m256 negative = _mm256_div_ps(exponential, denominator);
+      const __m256 negative = _mm256_mul_ps(exponential, positive);
       const __m256 sigmoid = _mm256_blendv_ps(
         negative, positive, _mm256_cmp_ps(gate_value, zero, _CMP_GE_OQ));
       _mm256_storeu_ps(

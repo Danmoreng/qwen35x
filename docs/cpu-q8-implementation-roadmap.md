@@ -278,7 +278,8 @@ stage time, total decode, and peak RSS.
 
 ### A7 — Full-attention low-risk fixes and test expansion
 
-Status: pending
+Status: completed; retained with a small measured gain and substantially better
+test coverage
 
 Implementation:
 
@@ -489,7 +490,7 @@ Update this table in the same commit that lands or rejects each experiment.
 | A4 | Completed, retained | pending commit | Three-slot ring state removes decode window copies; kernel-major weights, four-tap AVX2, and fused SiLU are covered by scalar/SIMD state and output tests. Ordered/reverse pp256 pairs averaged 210.48 versus 198.33 tok/s (+6.1%); decode averaged 37.14 versus 36.72 tok/s (+1.2%). pp2048 was 175.48 versus 165.58 tok/s (+6.0%) even though the optimized run was second. A 2,048-token integration run crossed 32 prefill chunk boundaries successfully. |
 | A5 | Pending | — | Global `min_parallel_rows=1` and long spin phase remain |
 | A6 | Pending | — | Greedy path avoids a copy but still materializes and scans all logits |
-| A7 | Pending | — | Attention test and low-risk normalization/division fixes remain |
+| A7 | Completed, retained | pending commit | Added scalar/AVX2 differential coverage for contexts 1, 7, 8, 9, 63, 64, 65, 255, 256, 257, and 2,048. Softmax probabilities are normalized once and sigmoid uses one vector division. pp256 was 211.31 versus 209.37 tok/s (+0.9%). Ordered/reverse decode pairs averaged 37.44 versus 37.17 tok/s (+0.7%). |
 | A8 | Pending | — | Algebra/row tiling unimplemented |
 | A9 | Pending | — | GQA heads still largely independent |
 | A10 | Pending | — | FP32 producer buffers still precede Q8 quantization |
