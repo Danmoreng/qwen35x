@@ -233,6 +233,46 @@ bool test_q8_matvec(CpuExecutor & executor) {
   return true;
 }
 
+bool test_q8_matmul(CpuExecutor & executor) {
+  constexpr std::size_t rows = 13;
+  constexpr std::size_t vectors = 7;
+  constexpr std::size_t blocks_per_row = 3;
+  constexpr std::size_t row_values = blocks_per_row * q8_0_values_per_block;
+  std::vector<float> matrix_values(rows * row_values);
+  std::vector<float> vector_values(vectors * row_values);
+  for (std::size_t index = 0; index < matrix_values.size(); ++index) {
+    matrix_values[index] = 1.7F * std::sin(static_cast<float>(index) * 0.037F);
+  }
+  for (std::size_t index = 0; index < vector_values.size(); ++index) {
+    vector_values[index] = 1.3F * std::cos(static_cast<float>(index) * 0.091F);
+  }
+  std::vector<Q8_0Block> matrix(rows * blocks_per_row);
+  std::vector<Q8_0Block> vectors_q8(vectors * blocks_per_row);
+  qwen35x::cpu::q8_0_quantize(
+    matrix_values.data(), matrix.data(), matrix.size(), Q8_0Backend::scalar);
+  qwen35x::cpu::q8_0_quantize(
+    vector_values.data(), vectors_q8.data(), vectors_q8.size(), Q8_0Backend::scalar);
+  std::vector<float> expected(rows * vectors);
+  std::vector<float> actual(rows * vectors, -123.0F);
+  std::vector<float> vector_scales(vectors_q8.size());
+  std::vector<float> matrix_scales(matrix.size());
+  qwen35x::cpu::q8_0_scales_to_f32(
+    vectors_q8.data(), vector_scales.data(), vectors_q8.size());
+  qwen35x::cpu::q8_0_scales_to_f32(
+    matrix.data(), matrix_scales.data(), matrix.size());
+  qwen35x::cpu::q8_0_matmul(
+    matrix.data(), vectors_q8.data(), expected.data(), rows, vectors, blocks_per_row, rows,
+    Q8_0Backend::scalar);
+  const CpuExecutorStatus status = executor.q8_0_matmul(
+    matrix.data(), vectors_q8.data(), actual.data(), rows, vectors, blocks_per_row,
+    Q8_0Backend::scalar, vector_scales.data(), matrix_scales.data());
+  bool ok = expect(status == CpuExecutorStatus::ok, "parallel Q8 matmul failed");
+  for (std::size_t index = 0; index < expected.size(); ++index) {
+    ok = expect(near(actual[index], expected[index]), "parallel Q8 matmul output mismatch") && ok;
+  }
+  return ok;
+}
+
 } // namespace
 
 int main() {
@@ -258,6 +298,7 @@ int main() {
   ok = test_busy_result(*executor) && ok;
   ok = test_concurrent_busy_result(*executor) && ok;
   ok = test_q8_matvec(*executor) && ok;
+  ok = test_q8_matmul(*executor) && ok;
   ok = expect(
     executor->parallel_for_rows(1, nullptr, nullptr) == CpuExecutorStatus::invalid_argument,
     "null task did not return invalid_argument") && ok;

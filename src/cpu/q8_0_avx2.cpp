@@ -33,6 +33,25 @@ namespace {
   return _mm256_madd_epi16(pair_products, _mm256_set1_epi16(1));
 }
 
+[[nodiscard]] __m256i dot_block_i8x8_loaded_lhs(
+  const __m256i lhs_bytes,
+  const __m256i lhs_absolute,
+  const __m256i rhs_bytes) noexcept {
+  const __m256i rhs_with_lhs_sign = _mm256_sign_epi8(rhs_bytes, lhs_bytes);
+  const __m256i pair_products = _mm256_maddubs_epi16(lhs_absolute, rhs_with_lhs_sign);
+  return _mm256_madd_epi16(pair_products, _mm256_set1_epi16(1));
+}
+
+[[nodiscard]] __m256i dot_block_i8x8_loaded_lhs(
+  const __m256i lhs_bytes,
+  const __m256i lhs_absolute,
+  const std::int8_t * rhs) noexcept {
+  return dot_block_i8x8_loaded_lhs(
+    lhs_bytes,
+    lhs_absolute,
+    _mm256_loadu_si256(reinterpret_cast<const __m256i *>(rhs)));
+}
+
 [[nodiscard]] __m256 quantize_eight(
   const float * values,
   const __m256 inverse_scale) noexcept {
@@ -58,6 +77,33 @@ namespace {
       integer_dot,
       _mm256_set1_ps(lhs_scale * rhs_scale),
       accumulator);
+  }
+  return horizontal_sum_f32(accumulator);
+}
+
+[[nodiscard]] float dot_row_major_avx2_impl(
+  const Q8_0Block * matrix_row,
+  const Q8_0Block * vectors,
+  const float * vector_scales,
+  const float * matrix_scales,
+  const std::size_t matrix_row_index,
+  const std::size_t vector_index,
+  const std::size_t vector_count,
+  const std::size_t blocks_per_row) noexcept {
+  __m256 accumulator = _mm256_setzero_ps();
+  for (std::size_t block = 0; block < blocks_per_row; ++block) {
+    const std::size_t vector_offset = vector_index * blocks_per_row + block;
+    const Q8_0Block & vector_block = vectors[vector_offset];
+    const __m256 integer_dot = _mm256_cvtepi32_ps(
+      dot_block_i8x8(matrix_row[block].qs, vector_block.qs));
+    const float matrix_scale = matrix_scales != nullptr
+      ? matrix_scales[matrix_row_index * blocks_per_row + block]
+      : _cvtsh_ss(matrix_row[block].d);
+    const float vector_scale = vector_scales != nullptr
+      ? vector_scales[vector_offset]
+      : _cvtsh_ss(vector_block.d);
+    accumulator = _mm256_fmadd_ps(
+      integer_dot, _mm256_set1_ps(matrix_scale * vector_scale), accumulator);
   }
   return horizontal_sum_f32(accumulator);
 }
@@ -152,6 +198,148 @@ void q8_0_matvec_avx2(
       matrix + row * blocks_per_row,
       vector,
       blocks_per_row);
+  }
+}
+
+void q8_0_matmul_avx2(
+  const Q8_0Block * matrix,
+  const Q8_0Block * vectors,
+  float * output,
+  const std::size_t row_count,
+  const std::size_t vector_count,
+  const std::size_t blocks_per_row,
+  const std::size_t output_row_stride,
+  const float * vector_scales,
+  const float * matrix_scales) noexcept {
+  // Eight activation rows fit alongside the shared weight block and scratch
+  // registers on AVX2. This halves weight traffic compared with the original
+  // four-row tile, which matters because prefill repeatedly streams the much
+  // larger model matrix through cache.
+  constexpr std::size_t vector_tile = 8;
+  std::size_t row = 0;
+  // A 2x3 tile keeps all six accumulators, three activation blocks, and the
+  // current weight block in AVX2's 16 registers. Reusing each activation for
+  // two output rows cuts activation loads in half without register spills.
+  for (; row + 2 <= row_count; row += 2) {
+    const Q8_0Block * matrix_row0 = matrix + row * blocks_per_row;
+    const Q8_0Block * matrix_row1 = matrix_row0 + blocks_per_row;
+    std::size_t vector_index = 0;
+    for (; vector_index + 3 <= vector_count; vector_index += 3) {
+      __m256 accum00 = _mm256_setzero_ps();
+      __m256 accum01 = _mm256_setzero_ps();
+      __m256 accum02 = _mm256_setzero_ps();
+      __m256 accum10 = _mm256_setzero_ps();
+      __m256 accum11 = _mm256_setzero_ps();
+      __m256 accum12 = _mm256_setzero_ps();
+      for (std::size_t block = 0; block < blocks_per_row; ++block) {
+        const Q8_0Block & vector0 = vectors[(vector_index + 0) * blocks_per_row + block];
+        const Q8_0Block & vector1 = vectors[(vector_index + 1) * blocks_per_row + block];
+        const Q8_0Block & vector2 = vectors[(vector_index + 2) * blocks_per_row + block];
+        const __m256i bytes0 = _mm256_loadu_si256(
+          reinterpret_cast<const __m256i *>(vector0.qs));
+        const __m256i bytes1 = _mm256_loadu_si256(
+          reinterpret_cast<const __m256i *>(vector1.qs));
+        const __m256i bytes2 = _mm256_loadu_si256(
+          reinterpret_cast<const __m256i *>(vector2.qs));
+        const float vector_scale0 = vector_scales != nullptr
+          ? vector_scales[(vector_index + 0) * blocks_per_row + block]
+          : _cvtsh_ss(vector0.d);
+        const float vector_scale1 = vector_scales != nullptr
+          ? vector_scales[(vector_index + 1) * blocks_per_row + block]
+          : _cvtsh_ss(vector1.d);
+        const float vector_scale2 = vector_scales != nullptr
+          ? vector_scales[(vector_index + 2) * blocks_per_row + block]
+          : _cvtsh_ss(vector2.d);
+
+        const __m256i weight0 = _mm256_loadu_si256(
+          reinterpret_cast<const __m256i *>(matrix_row0[block].qs));
+        const __m256i absolute0 = _mm256_abs_epi8(weight0);
+        const float scale0 = matrix_scales != nullptr
+          ? matrix_scales[row * blocks_per_row + block]
+          : _cvtsh_ss(matrix_row0[block].d);
+        accum00 = _mm256_fmadd_ps(
+          _mm256_cvtepi32_ps(dot_block_i8x8_loaded_lhs(weight0, absolute0, bytes0)),
+          _mm256_set1_ps(scale0 * vector_scale0), accum00);
+        accum01 = _mm256_fmadd_ps(
+          _mm256_cvtepi32_ps(dot_block_i8x8_loaded_lhs(weight0, absolute0, bytes1)),
+          _mm256_set1_ps(scale0 * vector_scale1), accum01);
+        accum02 = _mm256_fmadd_ps(
+          _mm256_cvtepi32_ps(dot_block_i8x8_loaded_lhs(weight0, absolute0, bytes2)),
+          _mm256_set1_ps(scale0 * vector_scale2), accum02);
+
+        const __m256i weight1 = _mm256_loadu_si256(
+          reinterpret_cast<const __m256i *>(matrix_row1[block].qs));
+        const __m256i absolute1 = _mm256_abs_epi8(weight1);
+        const float scale1 = matrix_scales != nullptr
+          ? matrix_scales[(row + 1) * blocks_per_row + block]
+          : _cvtsh_ss(matrix_row1[block].d);
+        accum10 = _mm256_fmadd_ps(
+          _mm256_cvtepi32_ps(dot_block_i8x8_loaded_lhs(weight1, absolute1, bytes0)),
+          _mm256_set1_ps(scale1 * vector_scale0), accum10);
+        accum11 = _mm256_fmadd_ps(
+          _mm256_cvtepi32_ps(dot_block_i8x8_loaded_lhs(weight1, absolute1, bytes1)),
+          _mm256_set1_ps(scale1 * vector_scale1), accum11);
+        accum12 = _mm256_fmadd_ps(
+          _mm256_cvtepi32_ps(dot_block_i8x8_loaded_lhs(weight1, absolute1, bytes2)),
+          _mm256_set1_ps(scale1 * vector_scale2), accum12);
+      }
+      output[(vector_index + 0) * output_row_stride + row] = horizontal_sum_f32(accum00);
+      output[(vector_index + 1) * output_row_stride + row] = horizontal_sum_f32(accum01);
+      output[(vector_index + 2) * output_row_stride + row] = horizontal_sum_f32(accum02);
+      output[(vector_index + 0) * output_row_stride + row + 1] = horizontal_sum_f32(accum10);
+      output[(vector_index + 1) * output_row_stride + row + 1] = horizontal_sum_f32(accum11);
+      output[(vector_index + 2) * output_row_stride + row + 1] = horizontal_sum_f32(accum12);
+    }
+    for (; vector_index < vector_count; ++vector_index) {
+      output[vector_index * output_row_stride + row] = dot_row_major_avx2_impl(
+        matrix_row0, vectors, vector_scales, matrix_scales, row,
+        vector_index, vector_count, blocks_per_row);
+      output[vector_index * output_row_stride + row + 1] = dot_row_major_avx2_impl(
+        matrix_row1, vectors, vector_scales, matrix_scales, row + 1,
+        vector_index, vector_count, blocks_per_row);
+    }
+  }
+  for (; row < row_count; ++row) {
+    const Q8_0Block * matrix_row = matrix + row * blocks_per_row;
+    std::size_t vector_index = 0;
+    for (; vector_index + vector_tile <= vector_count; vector_index += vector_tile) {
+      __m256 accumulators[vector_tile];
+      for (std::size_t lane = 0; lane < vector_tile; ++lane) {
+        accumulators[lane] = _mm256_setzero_ps();
+      }
+      for (std::size_t block = 0; block < blocks_per_row; ++block) {
+        const __m256i weight_bytes = _mm256_loadu_si256(
+          reinterpret_cast<const __m256i *>(matrix_row[block].qs));
+        const __m256i weight_absolute = _mm256_abs_epi8(weight_bytes);
+        const float weight_scale = matrix_scales != nullptr
+          ? matrix_scales[row * blocks_per_row + block]
+          : _cvtsh_ss(matrix_row[block].d);
+        for (std::size_t lane = 0; lane < vector_tile; ++lane) {
+          const std::size_t vector_offset =
+            (vector_index + lane) * blocks_per_row + block;
+          const Q8_0Block & vector_block = vectors[vector_offset];
+          const __m256 integer_dot = _mm256_cvtepi32_ps(
+            dot_block_i8x8_loaded_lhs(weight_bytes, weight_absolute, vector_block.qs));
+          accumulators[lane] = _mm256_fmadd_ps(
+            integer_dot,
+            _mm256_set1_ps(
+              weight_scale *
+              (vector_scales != nullptr
+                 ? vector_scales[vector_offset]
+                 : _cvtsh_ss(vector_block.d))),
+            accumulators[lane]);
+        }
+      }
+      for (std::size_t lane = 0; lane < vector_tile; ++lane) {
+        output[(vector_index + lane) * output_row_stride + row] =
+          horizontal_sum_f32(accumulators[lane]);
+      }
+    }
+    for (; vector_index < vector_count; ++vector_index) {
+      output[vector_index * output_row_stride + row] = dot_row_major_avx2_impl(
+        matrix_row, vectors, vector_scales, matrix_scales, row,
+        vector_index, vector_count, blocks_per_row);
+    }
   }
 }
 

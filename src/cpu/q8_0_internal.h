@@ -36,6 +36,17 @@ void q8_0_matvec_scalar(
   std::size_t row_count,
   std::size_t blocks_per_row) noexcept;
 
+void q8_0_matmul_scalar(
+  const Q8_0Block * matrix,
+  const Q8_0Block * vectors,
+  float * output,
+  std::size_t row_count,
+  std::size_t vector_count,
+  std::size_t blocks_per_row,
+  std::size_t output_row_stride,
+  const float * vector_scales,
+  const float * matrix_scales) noexcept;
+
 #if QWEN35X_Q8_0_HAS_AVX2_TU
 void q8_0_quantize_avx2(
   const float * input,
@@ -58,6 +69,17 @@ void q8_0_matvec_avx2(
   float * output,
   std::size_t row_count,
   std::size_t blocks_per_row) noexcept;
+
+void q8_0_matmul_avx2(
+  const Q8_0Block * matrix,
+  const Q8_0Block * vectors,
+  float * output,
+  std::size_t row_count,
+  std::size_t vector_count,
+  std::size_t blocks_per_row,
+  std::size_t output_row_stride,
+  const float * vector_scales,
+  const float * matrix_scales) noexcept;
 #endif
 
 } // namespace qwen35x::cpu::detail

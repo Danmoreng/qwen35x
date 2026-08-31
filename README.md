@@ -18,6 +18,7 @@ The goal is not a generic multi-model runtime. The goal is a small, hardware-awa
 - `--infer-gpu` defaults to the in-tree Qwen35x CUDA backend and auto-selects the compiled 0.8B or 4B CUDA layout from the loaded model profile
 - Legacy CUDA runtime decode backend remains available with `--gpu-decode-backend default`
 - Batched Qwen35x prefill is the default prompt-processing path and warms the prefill backend during initialization
+- Direct-GGUF CPU Q8_0 prefill includes portable scalar and runtime-dispatched AVX2 kernels; see `docs/cpu-q8-prefill-2026-08-31.md`
 - Device-resident decode path for per-layer hidden/residual/norm/attention/MLP math in `--infer-gpu`
 - GPU logits + GPU sampling path in the legacy runtime decode backend
 - Device-token decode loop path in the legacy runtime decode backend (sampled token stays on GPU for next-step embedding gather)

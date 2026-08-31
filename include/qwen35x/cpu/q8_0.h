@@ -47,6 +47,13 @@ void q8_0_dequantize(
   std::size_t block_count,
   Q8_0Backend backend = Q8_0Backend::auto_select) noexcept;
 
+// Expands only the binary16 scale of each block. This is useful for batched
+// kernels where activation scales are reused across thousands of weight rows.
+void q8_0_scales_to_f32(
+  const Q8_0Block * input,
+  float * output,
+  std::size_t block_count) noexcept;
+
 [[nodiscard]] float q8_0_dot(
   const Q8_0Block * lhs,
   const Q8_0Block * rhs,
@@ -62,5 +69,21 @@ void q8_0_matvec(
   std::size_t row_count,
   std::size_t blocks_per_row,
   Q8_0Backend backend = Q8_0Backend::auto_select) noexcept;
+
+// Batched variant for vector_count independently quantized input rows.
+// vectors and optional vector_scales use token-major layout
+// [vector_count, blocks_per_row]. Output is token-major:
+// output[vector * row_count + row].
+void q8_0_matmul(
+  const Q8_0Block * matrix,
+  const Q8_0Block * vectors,
+  float * output,
+  std::size_t row_count,
+  std::size_t vector_count,
+  std::size_t blocks_per_row,
+  std::size_t output_row_stride,
+  Q8_0Backend backend = Q8_0Backend::auto_select,
+  const float * vector_scales = nullptr,
+  const float * matrix_scales = nullptr) noexcept;
 
 } // namespace qwen35x::cpu

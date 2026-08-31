@@ -3,6 +3,7 @@
 #include "qwen35x/cpu/q8_0.h"
 #include "qwen35x/cpu/executor.h"
 #include "qwen35x/cpu/delta_net.h"
+#include "qwen35x/cpu/full_attention.h"
 #include "qwen35x/runtime/cuda_inference.h"
 #include "qwen35x/runtime/qwen35x_cuda_backend.h"
 #include "qwen35x/weights/gguf.h"
@@ -23,6 +24,7 @@ namespace qwen35x {
 #include "reference_inference_internal_weights_workspace.inl"
 #include "reference_inference_internal_layers.inl"
 #include "reference_inference_internal_forward.inl"
+#include "reference_inference_internal_cpu_prefill.inl"
 #include "reference_decode_backend_api.inl"
 #include "reference_inference_api.inl"
 

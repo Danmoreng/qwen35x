@@ -74,6 +74,18 @@ public:
     std::size_t blocks_per_row,
     Q8_0Backend backend = Q8_0Backend::auto_select) noexcept;
 
+  // Parallel row wrapper around q8_0_matmul(). Output remains token-major.
+  [[nodiscard]] CpuExecutorStatus q8_0_matmul(
+    const Q8_0Block * matrix,
+    const Q8_0Block * vectors,
+    float * output,
+    std::size_t row_count,
+    std::size_t vector_count,
+    std::size_t blocks_per_row,
+    Q8_0Backend backend = Q8_0Backend::auto_select,
+    const float * vector_scales = nullptr,
+    const float * matrix_scales = nullptr) noexcept;
+
 private:
   class Impl;
 

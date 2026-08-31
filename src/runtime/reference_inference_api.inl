@@ -286,6 +286,10 @@ bool run_reference_qwen35_inference(
     fs.v_cache.resize(
       static_cast<std::size_t>(options.max_context) * static_cast<std::size_t>(dims.n_kv_heads) *
       static_cast<std::size_t>(dims.head_dim));
+    if (!options.use_cuda && weights.cpu_q8_runtime != nullptr) {
+      fs.k_cache_f16.resize(fs.k_cache.size());
+      fs.v_cache_f16.resize(fs.v_cache.size());
+    }
     if (options.use_cuda) {
       if (!cuda::allocate_buffer_f32(fs.k_cache.size(), fs.k_cache_device, error_message) ||
           !cuda::allocate_buffer_f32(fs.v_cache.size(), fs.v_cache_device, error_message)) {
@@ -444,28 +448,58 @@ bool run_reference_qwen35_inference(
   int position = 0;
   std::vector<float> predicted_logits;
   const auto prefill_start = std::chrono::steady_clock::now();
-  for (std::size_t prompt_index = 0; prompt_index < options.prompt_tokens.size(); ++prompt_index) {
-    const std::int32_t prompt_token = options.prompt_tokens[prompt_index];
-    const bool compute_next_logits = !options.prefill_only && (prompt_index + 1 == options.prompt_tokens.size());
-    if (!decode_step_with_runtime_backend(
-          decode_backend,
-          weights,
-          dims,
-          state,
-          prompt_token,
-          position,
-          options.use_cuda,
-          options.profile_cuda_sync,
-          predicted_logits,
-          use_cuda_gpu_sampling,
-          compute_next_logits,
-          cuda_workspace_ptr,
-          &profiling,
-          error_message)) {
-      release_cuda_resources();
-      return false;
+  const bool use_cpu_q8_batch_prefill =
+    !options.use_cuda && weights.cpu_q8_runtime != nullptr &&
+    options.qwen35x_prefill_mode == Qwen35xPrefillMode::batched;
+  if (use_cpu_q8_batch_prefill) {
+    constexpr std::size_t cpu_prefill_chunk_size = 64;
+    for (std::size_t chunk_begin = 0; chunk_begin < options.prompt_tokens.size();
+         chunk_begin += cpu_prefill_chunk_size) {
+      const std::size_t chunk_size = std::min(
+        cpu_prefill_chunk_size, options.prompt_tokens.size() - chunk_begin);
+      const bool compute_next_logits =
+        !options.prefill_only && (chunk_begin + chunk_size == options.prompt_tokens.size());
+      if (!run_forward_cpu_q8_batch(
+            weights,
+            dims,
+            state,
+            options.prompt_tokens.data() + chunk_begin,
+            chunk_size,
+            position,
+            compute_next_logits,
+            predicted_logits,
+            &profiling,
+            error_message)) {
+        release_cuda_resources();
+        return false;
+      }
+      position += static_cast<int>(chunk_size);
     }
-    ++position;
+  } else {
+    for (std::size_t prompt_index = 0; prompt_index < options.prompt_tokens.size(); ++prompt_index) {
+      const std::int32_t prompt_token = options.prompt_tokens[prompt_index];
+      const bool compute_next_logits =
+        !options.prefill_only && (prompt_index + 1 == options.prompt_tokens.size());
+      if (!decode_step_with_runtime_backend(
+            decode_backend,
+            weights,
+            dims,
+            state,
+            prompt_token,
+            position,
+            options.use_cuda,
+            options.profile_cuda_sync,
+            predicted_logits,
+            use_cuda_gpu_sampling,
+            compute_next_logits,
+            cuda_workspace_ptr,
+            &profiling,
+            error_message)) {
+        release_cuda_resources();
+        return false;
+      }
+      ++position;
+    }
   }
   const auto prefill_end = std::chrono::steady_clock::now();
   result.prefill_time_ms = std::chrono::duration<double, std::milli>(prefill_end - prefill_start).count();

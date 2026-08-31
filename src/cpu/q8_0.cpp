@@ -153,6 +153,41 @@ void q8_0_matvec_scalar(
   }
 }
 
+void q8_0_matmul_scalar(
+  const Q8_0Block * matrix,
+  const Q8_0Block * vectors,
+  float * output,
+  const std::size_t row_count,
+  const std::size_t vector_count,
+  const std::size_t blocks_per_row,
+  const std::size_t output_row_stride,
+  const float * vector_scales,
+  const float * matrix_scales) noexcept {
+  for (std::size_t row = 0; row < row_count; ++row) {
+    const Q8_0Block * matrix_row = matrix + row * blocks_per_row;
+    for (std::size_t vector_index = 0; vector_index < vector_count; ++vector_index) {
+      float result = 0.0F;
+      for (std::size_t block = 0; block < blocks_per_row; ++block) {
+        const std::size_t vector_offset = vector_index * blocks_per_row + block;
+        const Q8_0Block & vector_block = vectors[vector_offset];
+        std::int32_t integer_dot = 0;
+        for (std::size_t index = 0; index < q8_0_values_per_block; ++index) {
+          integer_dot += static_cast<std::int32_t>(matrix_row[block].qs[index]) *
+            static_cast<std::int32_t>(vector_block.qs[index]);
+        }
+        const float matrix_scale = matrix_scales != nullptr
+          ? matrix_scales[row * blocks_per_row + block]
+          : half_to_float(matrix_row[block].d);
+        const float vector_scale = vector_scales != nullptr
+          ? vector_scales[vector_offset]
+          : half_to_float(vector_block.d);
+        result += matrix_scale * vector_scale * static_cast<float>(integer_dot);
+      }
+      output[vector_index * output_row_stride + row] = result;
+    }
+  }
+}
+
 } // namespace detail
 
 namespace {
@@ -254,6 +289,15 @@ void q8_0_dequantize(
   detail::q8_0_dequantize_scalar(input, output, block_count);
 }
 
+void q8_0_scales_to_f32(
+  const Q8_0Block * input,
+  float * output,
+  const std::size_t block_count) noexcept {
+  for (std::size_t block = 0; block < block_count; ++block) {
+    output[block] = detail::half_to_float(input[block].d);
+  }
+}
+
 float q8_0_dot(
   const Q8_0Block * lhs,
   const Q8_0Block * rhs,
@@ -285,6 +329,46 @@ void q8_0_matvec(
   static_cast<void>(backend);
 #endif
   detail::q8_0_matvec_scalar(matrix, vector, output, row_count, blocks_per_row);
+}
+
+void q8_0_matmul(
+  const Q8_0Block * matrix,
+  const Q8_0Block * vectors,
+  float * output,
+  const std::size_t row_count,
+  const std::size_t vector_count,
+  const std::size_t blocks_per_row,
+  const std::size_t output_row_stride,
+  const Q8_0Backend backend,
+  const float * vector_scales,
+  const float * matrix_scales) noexcept {
+#if QWEN35X_Q8_0_HAS_AVX2_TU
+  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+    detail::q8_0_matmul_avx2(
+      matrix,
+      vectors,
+      output,
+      row_count,
+      vector_count,
+      blocks_per_row,
+      output_row_stride,
+      vector_scales,
+      matrix_scales);
+    return;
+  }
+#else
+  static_cast<void>(backend);
+#endif
+  detail::q8_0_matmul_scalar(
+    matrix,
+    vectors,
+    output,
+    row_count,
+    vector_count,
+    blocks_per_row,
+    output_row_stride,
+    vector_scales,
+    matrix_scales);
 }
 
 } // namespace qwen35x::cpu

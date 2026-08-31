@@ -11,12 +11,15 @@ WARMUP_RUNS=1
 MAX_NEW_TOKENS=128
 MAX_CONTEXT=256
 PROMPT_TOKENS="198" # Default to single token prompt
+PROMPT_REPEAT_TOKEN=""
+PROMPT_TOKEN_COUNT=0
 REPEAT_PENALTY=1.05
 PREFILL_ONLY=false
 MODE="gpu-f32"
 CPU_GGUF="models/gguf/Qwen3.5-0.8B-Q8_0.gguf"
 CPU_THREADS=0
 CPU_ISA="auto"
+PREFILL_MODE="batched"
 CSV_OUT="benchmarks/qwen35x-inference-seq.csv"
 RUN_LABEL=""
 
@@ -55,6 +58,10 @@ while [[ $# -gt 0 ]]; do
       CPU_ISA="$2"
       shift 2
       ;;
+    --prefill-mode)
+      PREFILL_MODE="$2"
+      shift 2
+      ;;
     --csv-out)
       CSV_OUT="$2"
       shift 2
@@ -87,12 +94,31 @@ while [[ $# -gt 0 ]]; do
       PROMPT_TOKENS="$(tr -d '[:space:]' < "$2")"
       shift 2
       ;;
+    --prompt-repeat-token)
+      PROMPT_REPEAT_TOKEN="$2"
+      shift 2
+      ;;
+    --prompt-token-count)
+      PROMPT_TOKEN_COUNT="$2"
+      shift 2
+      ;;
     *)
       echo "Unknown argument: $1"
       exit 1
       ;;
   esac
 done
+
+if [ "$PROMPT_TOKEN_COUNT" -gt 0 ]; then
+  if [ -z "$PROMPT_REPEAT_TOKEN" ]; then
+    echo "--prompt-token-count requires --prompt-repeat-token"
+    exit 1
+  fi
+  PROMPT_TOKENS="$PROMPT_REPEAT_TOKEN"
+  for ((i=1; i<PROMPT_TOKEN_COUNT; i++)); do
+    PROMPT_TOKENS+=",$PROMPT_REPEAT_TOKEN"
+  done
+fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESOLVED_EXE="$EXECUTABLE"
@@ -125,6 +151,7 @@ run_once() {
     "--seed" "123"
     "--profile-json" "$profile_json"
     "--prompt-tokens" "$PROMPT_TOKENS"
+    "--qwen35x-prefill-mode" "$PREFILL_MODE"
   )
   
   if [ "$MODE" == "gpu-f32" ]; then
@@ -200,6 +227,7 @@ for run_index, p_path in enumerate(profiles, start=1):
             'mode': '$MODE',
             'cpu_threads': $CPU_THREADS,
             'cpu_isa': '$CPU_ISA',
+            'prefill_mode': '$PREFILL_MODE',
             'prompt_tokens': data.get('prompt_tokens', 0),
             'generated_tokens': data.get('generated_tokens', 0),
             'load_time_ms': data.get('load_time_ms', 0),

@@ -88,6 +88,7 @@ bool test_empty_ranges() {
 bool test_backend(const Q8_0Backend backend) {
   constexpr std::size_t blocks = 5;
   constexpr std::size_t rows = 4;
+  constexpr std::size_t vectors = 13;
   const std::vector<float> lhs_values = make_values(blocks * rows, 0.25F);
   const std::vector<float> rhs_values = make_values(blocks, 1.75F);
   std::vector<Q8_0Block> lhs_scalar(blocks * rows);
@@ -135,6 +136,54 @@ bool test_backend(const Q8_0Backend backend) {
     lhs_test.data(), rhs_test.data(), test_output.data(), rows, blocks, backend);
   for (std::size_t row = 0; row < rows; ++row) {
     ok = expect(near(scalar_output[row], test_output[row]), "matvec row mismatch") && ok;
+  }
+
+  const std::vector<float> batch_values = make_values(blocks * vectors, 3.25F);
+  std::vector<Q8_0Block> batch_scalar(blocks * vectors);
+  std::vector<Q8_0Block> batch_test(blocks * vectors);
+  qwen35x::cpu::q8_0_quantize(
+    batch_values.data(), batch_scalar.data(), batch_scalar.size(), Q8_0Backend::scalar);
+  qwen35x::cpu::q8_0_quantize(
+    batch_values.data(), batch_test.data(), batch_test.size(), backend);
+  constexpr std::size_t output_stride = rows + 3;
+  std::vector<float> scalar_batch(vectors * output_stride, -91.0F);
+  std::vector<float> test_batch(vectors * output_stride, -91.0F);
+  std::vector<float> batch_scales(batch_test.size());
+  std::vector<float> matrix_scales(lhs_test.size());
+  qwen35x::cpu::q8_0_scales_to_f32(
+    batch_test.data(), batch_scales.data(), batch_test.size());
+  qwen35x::cpu::q8_0_scales_to_f32(
+    lhs_test.data(), matrix_scales.data(), lhs_test.size());
+  qwen35x::cpu::q8_0_matmul(
+    lhs_scalar.data(),
+    batch_scalar.data(),
+    scalar_batch.data(),
+    rows,
+    vectors,
+    blocks,
+    output_stride,
+    Q8_0Backend::scalar);
+  qwen35x::cpu::q8_0_matmul(
+    lhs_test.data(),
+    batch_test.data(),
+    test_batch.data(),
+    rows,
+    vectors,
+    blocks,
+    output_stride,
+    backend,
+    batch_scales.data(),
+    matrix_scales.data());
+  for (std::size_t vector_index = 0; vector_index < vectors; ++vector_index) {
+    for (std::size_t row = 0; row < rows; ++row) {
+      const std::size_t index = vector_index * output_stride + row;
+      ok = expect(near(scalar_batch[index], test_batch[index]), "matmul output mismatch") && ok;
+    }
+    for (std::size_t padding = rows; padding < output_stride; ++padding) {
+      ok = expect(
+        test_batch[vector_index * output_stride + padding] == -91.0F,
+        "matmul overwrote output stride padding") && ok;
+    }
   }
   return ok;
 }

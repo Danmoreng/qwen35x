@@ -26,4 +26,24 @@ void gated_delta_net_update_rows(
   std::size_t row_end,
   Q8_0Backend backend = Q8_0Backend::auto_select) noexcept;
 
+// Batched causal scan over multiple tokens. q/k/v/alpha/beta are head-major,
+// then token-major within each head; output remains token-major. Each flattened
+// state head is owned by exactly one caller range, so head ranges can run
+// concurrently while preserving token order and reusing q/k across value rows.
+void gated_delta_net_update_batch_rows(
+  float * state,
+  const float * q,
+  const float * k,
+  const float * v,
+  const float * alpha,
+  const float * beta,
+  float * output,
+  std::size_t batch_size,
+  std::size_t head_count,
+  std::size_t key_dim,
+  std::size_t value_dim,
+  std::size_t head_begin,
+  std::size_t head_end,
+  Q8_0Backend backend = Q8_0Backend::auto_select) noexcept;
+
 } // namespace qwen35x::cpu

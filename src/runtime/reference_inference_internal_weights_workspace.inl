@@ -3,12 +3,15 @@ namespace {
 struct CpuQ8Runtime {
   std::unique_ptr<cpu::CpuExecutor> executor;
   std::vector<cpu::Q8_0Block> quantized_input;
+  std::vector<cpu::Q8_0Block> quantized_batch;
+  std::vector<float> quantized_batch_scales;
 };
 
 struct TensorData {
   std::vector<std::int64_t> shape;
   std::vector<float> data;
   std::vector<cpu::Q8_0Block> q8_0_blocks;
+  std::vector<float> q8_0_scales;
   cpu::Q8_0Backend q8_0_backend = cpu::Q8_0Backend::auto_select;
   CpuQ8Runtime * q8_0_runtime = nullptr;
   cuda::CudaDeviceMatrixF32 device_matrix;
@@ -108,6 +111,8 @@ struct RuntimeDims {
 struct FullAttentionState {
   std::vector<float> k_cache;
   std::vector<float> v_cache;
+  std::vector<std::uint16_t> k_cache_f16;
+  std::vector<std::uint16_t> v_cache_f16;
   cuda::CudaDeviceBufferF32 k_cache_device;
   cuda::CudaDeviceBufferF32 v_cache_device;
   bool has_device_state = false;
@@ -254,6 +259,7 @@ bool load_tensor_f32(
   out.shape = std::move(tensor.shape);
   out.data = std::move(tensor.data);
   out.q8_0_blocks.clear();
+  out.q8_0_scales.clear();
   return true;
 }
 
@@ -364,6 +370,9 @@ bool load_gguf_q8_0_checked(
   out.shape = {rows, cols};
   out.data.clear();
   out.q8_0_blocks = std::move(tensor.blocks);
+  out.q8_0_scales.resize(out.q8_0_blocks.size());
+  cpu::q8_0_scales_to_f32(
+    out.q8_0_blocks.data(), out.q8_0_scales.data(), out.q8_0_blocks.size());
   out.q8_0_backend = backend;
   out.q8_0_runtime = runtime;
   return true;
@@ -401,6 +410,7 @@ bool load_gguf_f32_checked(
   }
   out.data = std::move(tensor.data);
   out.q8_0_blocks.clear();
+  out.q8_0_scales.clear();
   if (subtract_qwen_norm_offset) {
     for (float & value : out.data) {
       value -= 1.0f;
@@ -425,7 +435,8 @@ bool pack_q8_0_row_concat(
   bool first = true;
   std::size_t total_blocks = 0;
   for (const TensorData * part : parts) {
-    if (part == nullptr || part->shape.size() != 2 || !part->is_q8_0()) {
+    if (part == nullptr || part->shape.size() != 2 || !part->is_q8_0() ||
+        part->q8_0_scales.size() != part->q8_0_blocks.size()) {
       error_message = "Q8_0 packed tensor expects non-empty 2D Q8_0 source tensors.";
       return false;
     }
@@ -463,17 +474,22 @@ bool pack_q8_0_row_concat(
   out.data.clear();
   out.q8_0_blocks.clear();
   out.q8_0_blocks.reserve(total_blocks);
+  out.q8_0_scales.clear();
+  out.q8_0_scales.reserve(total_blocks);
   out.q8_0_backend = backend;
   out.q8_0_runtime = runtime;
   for (const TensorData * part : parts) {
     out.q8_0_blocks.insert(
       out.q8_0_blocks.end(), part->q8_0_blocks.begin(), part->q8_0_blocks.end());
+    out.q8_0_scales.insert(
+      out.q8_0_scales.end(), part->q8_0_scales.begin(), part->q8_0_scales.end());
   }
 
   // The CPU GGUF path uses the packed tensors exclusively. Release the source
   // storage so packing does not increase the resident model size.
   for (TensorData * part : parts) {
     std::vector<cpu::Q8_0Block>().swap(part->q8_0_blocks);
+    std::vector<float>().swap(part->q8_0_scales);
   }
   return true;
 }
@@ -557,6 +573,85 @@ bool matvec_2d(
       sum += row_ptr[c] * x[static_cast<std::size_t>(c)];
     }
     out[static_cast<std::size_t>(r)] = sum;
+  }
+  return true;
+}
+
+bool matmul_2d_q8_batch(
+  const TensorData & w,
+  const std::vector<float> & inputs,
+  const std::size_t batch_size,
+  std::vector<float> & out,
+  std::string & error_message) {
+  if (!w.is_q8_0() || w.shape.size() != 2 || w.q8_0_runtime == nullptr) {
+    error_message = "CPU batched matmul requires a 2D Q8_0 tensor with a runtime.";
+    return false;
+  }
+  const std::size_t rows = static_cast<std::size_t>(w.shape[0]);
+  const std::size_t cols = static_cast<std::size_t>(w.shape[1]);
+  if (cols == 0 || (cols % cpu::q8_0_values_per_block) != 0 ||
+      batch_size > std::numeric_limits<std::size_t>::max() / cols ||
+      inputs.size() != batch_size * cols) {
+    error_message = "CPU batched matmul input shape mismatch.";
+    return false;
+  }
+  const std::size_t blocks_per_row = cols / cpu::q8_0_values_per_block;
+  if (rows > std::numeric_limits<std::size_t>::max() / blocks_per_row ||
+      w.q8_0_blocks.size() != rows * blocks_per_row ||
+      w.q8_0_scales.size() != w.q8_0_blocks.size() ||
+      batch_size > std::numeric_limits<std::size_t>::max() / blocks_per_row ||
+      batch_size > std::numeric_limits<std::size_t>::max() / rows) {
+    error_message = "CPU batched matmul storage size overflow or mismatch.";
+    return false;
+  }
+
+  std::vector<cpu::Q8_0Block> & quantized = w.q8_0_runtime->quantized_batch;
+  quantized.resize(batch_size * blocks_per_row);
+  for (std::size_t token = 0; token < batch_size; ++token) {
+    cpu::q8_0_quantize(
+      inputs.data() + token * cols,
+      quantized.data() + token * blocks_per_row,
+      blocks_per_row,
+      w.q8_0_backend);
+  }
+  std::vector<float> & quantized_scales = w.q8_0_runtime->quantized_batch_scales;
+  quantized_scales.resize(quantized.size());
+  cpu::q8_0_scales_to_f32(
+    quantized.data(),
+    quantized_scales.data(),
+    quantized.size());
+  out.resize(batch_size * rows);
+  if (batch_size == 0 || rows == 0) {
+    return true;
+  }
+  if (w.q8_0_runtime->executor != nullptr) {
+    const cpu::CpuExecutorStatus status = w.q8_0_runtime->executor->q8_0_matmul(
+      w.q8_0_blocks.data(),
+      quantized.data(),
+      out.data(),
+      rows,
+      batch_size,
+      blocks_per_row,
+      w.q8_0_backend,
+      quantized_scales.data(),
+      w.q8_0_scales.data());
+    if (status != cpu::CpuExecutorStatus::ok) {
+      error_message = std::string("Q8_0 CPU batch executor failed: ") +
+        cpu::cpu_executor_status_name(status) + ".";
+      return false;
+    }
+  } else {
+    cpu::q8_0_matmul(
+      w.q8_0_blocks.data(),
+      quantized.data(),
+      out.data(),
+      rows,
+      batch_size,
+      blocks_per_row,
+      rows,
+      w.q8_0_backend,
+      quantized_scales.data(),
+      w.q8_0_scales.data());
   }
   return true;
 }
@@ -801,7 +896,7 @@ bool load_model_weights_from_q8_0_gguf(
 
   cpu::CpuExecutorConfig executor_config;
   executor_config.thread_count = static_cast<std::size_t>(cpu_threads);
-  executor_config.min_parallel_rows = 256;
+  executor_config.min_parallel_rows = 1;
   std::error_code executor_error;
   weights.cpu_q8_runtime = std::make_unique<CpuQ8Runtime>();
   weights.cpu_q8_runtime->executor = cpu::CpuExecutor::create(executor_config, executor_error);
