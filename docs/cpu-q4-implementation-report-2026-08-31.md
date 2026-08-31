@@ -13,8 +13,8 @@ llama.cpp Q4_0 comparison in short prefill and decode, and is approximately
 
 | Workload | Native qwen35x | llama.cpp Q4_0 | Native difference |
 | --- | ---: | ---: | ---: |
-| pp256 | 306.26 tok/s mean | 227.90 tok/s | +34.4% |
-| pp2048 | 255.91 tok/s mean | 202.53 tok/s median | +26.4% |
+| pp256 | 319.01 tok/s mean | 227.90 tok/s | +40.0% |
+| pp2048 | 264.82 tok/s mean | 202.53 tok/s median | +30.8% |
 | prompt-1 / tg128 | 62.75 tok/s mean | 45.50 tok/s | +37.9% |
 
 The qwen35x decode timer includes greedy sampling, while `llama-bench` excludes
@@ -37,6 +37,9 @@ sampling. Timer boundaries therefore favor llama.cpp slightly in that row.
   once per projection rather than once per eight output rows.
 - Greedy-only tied LM-head reduction to one deterministic maximum per executor
   partition, including repetition penalty and lower-token tie-breaking.
+- Four-value-row AVX2 tiling for the batched DeltaNet scan; Q/K vectors are
+  reused and the intermediate decayed-state store/reload is eliminated while
+  preserving the original output reduction order.
 - Unsigned Q4 AVX2 dot products with exact `-8 * activation_sum` correction.
 - Retained eight-token x eight-output-row AVX2 prefill kernel.
 - Eight-row-tile executor scheduling, including tail-token packed matvec.
@@ -62,6 +65,7 @@ three measured runs, six threads, and the same pure Q4_0 GGUF.
 | Prepared FP32 activation scales | 281.52 | 60.57 | Retained foundation |
 | Token-major Q8 plus prepared decode | 306.26 | 61.41 | Retained foundation |
 | Fused greedy LM-head/argmax | unchanged | 62.75 | Current implementation |
+| Batched-only DeltaNet 4-row tile | 319.01 | neutral | Current implementation |
 
 The current step also measured 255.91 tok/s at pp2048 versus 237.58 before it
 (+7.7%). Its pp256 gain is +8.8%. The five-run decode confirmation is +1.4%
@@ -76,6 +80,16 @@ partition. A 16-token end-to-end comparison against a separately built
 `12f9ecf` binary produced identical token IDs with repetition penalty enabled.
 The probabilistic temperature path remains on the materialized-logit path and
 also passes a full-model smoke test.
+
+The safe batched DeltaNet tile improves pp256 from 306.26 to 319.01 tok/s
+(+4.2%) and pp2048 from 255.91 to 264.82 tok/s (+3.5%). Ordered/reverse decode
+A/B pairs were inconsistent: the reverse pair measured 62.52 versus 62.50
+tok/s (new versus baseline), so no decode gain or regression is claimed. The
+single-token kernel remains unchanged. An algebraic output shortcut using
+`old_state dot q + delta * (k dot q)` reached 320.65 pp256 and 265.33 pp2048,
+but changed long generation and materially worsened one identifier/budget
+rewrite; it was rejected. The retained version matches the old 128-token
+sequence and all three previously divergent rewrite outputs exactly.
 
 The pre-vector-scale pp256 thread sweep measured 197.94, 218.53, 234.73, and
 188.30 tok/s at 4, 5, 6, and 8 threads. Six physical-core threads remain the

@@ -301,7 +301,7 @@ overall runtime.
 
 ### A8 — DeltaNet algebra and value-row tiling
 
-Status: pending
+Status: completed for batched prefill; algebraic output shortcut rejected
 
 Implementation:
 
@@ -320,6 +320,16 @@ quality validation mandatory even when the algebra is equivalent.
 Measurement gate: prompt-1/tg128, pp256, pp2048, 2048/128, and DeltaNet stage
 time. FP16 recurrent state is explicitly deferred as a separate quality-risk
 experiment.
+
+Laptop result: four value rows are processed together only in the batched
+causal scan. Q/K loads are shared and the intermediate decayed-state
+store/reload is removed, but the final output dot retains the established FP32
+reduction order. pp256 improves from 306.26 to 319.01 tok/s (+4.2%) and pp2048
+from 255.91 to 264.82 tok/s (+3.5%). Ordered/reverse decode A/B was neutral in
+the reverse pair (62.52 versus 62.50 tok/s), so the old single-token kernel is
+retained. The more aggressive `old dot q + delta * (k dot q)` formulation was
+rejected after it changed a 128-token sequence and worsened the identifier
+rewrite despite slightly higher prompt throughput.
 
 ### A9 — Grouped-query attention and online softmax
 
@@ -657,8 +667,8 @@ Current laptop result (six threads, three measured runs after one warmup):
 
 | Workload | qwen35x native Q4_0 | llama.cpp Q4_0 | Difference |
 | --- | ---: | ---: | ---: |
-| pp256 | 306.26 tok/s | 227.90 tok/s | +34.4% |
-| pp2048 | 255.91 tok/s | 202.53 tok/s | +26.4% |
+| pp256 | 319.01 tok/s | 227.90 tok/s | +40.0% |
+| pp2048 | 264.82 tok/s | 202.53 tok/s | +30.8% |
 | prompt-1 / tg128 | 62.75 tok/s | 45.50 tok/s | +37.9% |
 
 The original canonical native-Q4 implementation measured 171.82 tok/s at
@@ -838,6 +848,8 @@ Do not repeat these unchanged:
 - block-major activations with a larger working set;
 - blanket 2x4 or 1x8 prefill tiles without a new packing hypothesis;
 - 16-token x 8-row prefill on AVX2, which adds spills for sub-1% measured change;
+- algebraic DeltaNet output via `old dot q + delta * (k dot q)`, which changed
+  long generation and worsened an identifier/budget transcript rewrite;
 - CPU prefill chunk size 256 on this host;
 - eight inference threads on the six-core laptop;
 - generic helper dispatch for tiny decode residual loops;
@@ -858,13 +870,13 @@ Update this table in the same commit that lands or rejects each experiment.
 | A5 | Pending | — | Global `min_parallel_rows=1` and long spin phase remain |
 | A6 | Completed for Q4_0 | this commit | The scale sidecar removal saves 30.31 MiB. Greedy Q4 LM-head workers apply repetition penalty and return deterministic local maxima rather than vocabulary logits. Five-run decode rises from 61.41 to 62.75 tok/s (+2.2%); a 16-token full-runtime differential against `12f9ecf` is exact. Temperature sampling retains full logits. |
 | A7 | Completed, retained | `d49aec4` | Added scalar/AVX2 differential coverage for contexts 1, 7, 8, 9, 63, 64, 65, 255, 256, 257, and 2,048. Softmax probabilities are normalized once and sigmoid uses one vector division. pp256 was 211.31 versus 209.37 tok/s (+0.9%). Ordered/reverse decode pairs averaged 37.44 versus 37.17 tok/s (+0.7%). |
-| A8 | Pending | — | Algebra/row tiling unimplemented |
+| A8 | Batched prefill completed | this commit | Four-row AVX2 tiling reuses Q/K and removes the intermediate state store/reload without changing output reduction order. pp256 is +4.2% and pp2048 +3.5%; reverse-order decode A/B is neutral. The faster algebraic-output variant was rejected on transcript quality. |
 | A9 | Pending | — | GQA heads still largely independent |
 | A10 | Pending | — | FP32 producer buffers still precede Q8 quantization |
 | B | Pending | — | Prefix state cache not implemented |
 | C1-C6 | Future hardware | — | Requires suitable ISA hosts for validation |
 | D0 | Initial screen completed | `4ca364c` | Seven formats, three alternating-order performance rounds, 56 deterministic rewrite outputs, and a three-run 2k/2k Q8-versus-Q4_0 comparison select Q4_0 for the first native backend; production quality expansion remains open |
-| D1 | Active; laptop throughput target achieved | `12f9ecf` + this commit | Native Q4_0 scalar/AVX2, packed-only model weights, token-major prepared activations with FP32 scales and sums, unsigned Q4 correction, tile scheduling, fused greedy LM-head, embedding coverage, and 8x8 prefill are implemented. Against llama.cpp Q4_0, pp256 is +34.4%, pp2048 is +26.4%, and decode is +37.9%. Expanded correctness, quality, memory, and long-context gates remain. |
+| D1 | Active; laptop throughput target achieved | `12f9ecf`, `8e3614c` + this commit | Native Q4_0 scalar/AVX2, packed-only model weights, token-major prepared activations, fused greedy LM-head, 8x8 projection prefill, and batched DeltaNet row tiling are implemented. Against llama.cpp Q4_0, pp256 is +40.0%, pp2048 is +30.8%, and decode is +37.9%. Expanded correctness, quality, memory, and long-context gates remain. |
 | D2-D4 | Pending D1 validation | — | IQ4_NL, mixed precision, and calibrated offline rounding follow the validated Q4_0 baseline |
 | D5 | Research target | — | Custom Hadamard-regularized `Q4_H128` is the preferred custom-format direction after simple Q4 baselines |
 | D6-D7 | Deferred/future hardware | — | State quantization is quality-sensitive; dense sub-four-bit research benefits materially from newer SIMD ISAs |
