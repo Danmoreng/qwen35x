@@ -722,13 +722,32 @@ bool sample_token_from_logits(
     return false;
   }
 
-  std::vector<float> logits = raw_logits;
-  apply_repetition_penalty_inplace(logits, token_counts, sampling.repetition_penalty);
-
   if (sampling.temperature <= 1.0e-6f) {
-    out_token = argmax_index(logits);
+    if (sampling.repetition_penalty <= 1.0f) {
+      out_token = argmax_index(raw_logits);
+      return true;
+    }
+    int best_idx = 0;
+    float best_value = -std::numeric_limits<float>::infinity();
+    const std::size_t count = std::min(raw_logits.size(), token_counts.size());
+    for (std::size_t index = 0; index < raw_logits.size(); ++index) {
+      float value = raw_logits[index];
+      if (index < count && token_counts[index] > 0) {
+        value = value > 0.0f
+          ? value / sampling.repetition_penalty
+          : value * sampling.repetition_penalty;
+      }
+      if (value > best_value) {
+        best_value = value;
+        best_idx = static_cast<int>(index);
+      }
+    }
+    out_token = best_idx;
     return true;
   }
+
+  std::vector<float> logits = raw_logits;
+  apply_repetition_penalty_inplace(logits, token_counts, sampling.repetition_penalty);
 
   const float inv_temp = 1.0f / sampling.temperature;
   for (float & v : logits) {
