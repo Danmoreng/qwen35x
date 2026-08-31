@@ -1,0 +1,18 @@
+#pragma once
+
+#include "qwen35x/cpu/q8_0.h"
+
+#include <cstddef>
+
+namespace qwen35x::cpu {
+
+// Computes output[i] = silu(gate[i]) * up[i]. The AVX2 implementation uses
+// the same bounded exp approximation as the optimized attention kernels.
+void silu_mul_f32(
+  const float * gate,
+  const float * up,
+  float * output,
+  std::size_t count,
+  Q8_0Backend backend = Q8_0Backend::auto_select) noexcept;
+
+} // namespace qwen35x::cpu

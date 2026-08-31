@@ -44,6 +44,7 @@ if (QWEN35X_ENABLE_CUDA)
 endif ()
 
 add_library(qwen35x_core
+  src/cpu/activation.cpp
   src/cpu/delta_net.cpp
   src/cpu/executor.cpp
   src/cpu/full_attention.cpp
@@ -71,12 +72,12 @@ if (QWEN35X_SYSTEM_PROCESSOR_LOWER MATCHES "^(x86_64|amd64|i[3-6]86)$" OR
   if (MSVC)
     set(QWEN35X_Q8_0_HAS_AVX2_TU ON)
     set_source_files_properties(
-      src/cpu/q8_0_avx2.cpp src/cpu/delta_net_avx2.cpp src/cpu/full_attention_avx2.cpp
+      src/cpu/activation_avx2.cpp src/cpu/q8_0_avx2.cpp src/cpu/delta_net_avx2.cpp src/cpu/full_attention_avx2.cpp
       PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
   elseif (CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
     set(QWEN35X_Q8_0_HAS_AVX2_TU ON)
     set_source_files_properties(
-      src/cpu/q8_0_avx2.cpp src/cpu/delta_net_avx2.cpp src/cpu/full_attention_avx2.cpp
+      src/cpu/activation_avx2.cpp src/cpu/q8_0_avx2.cpp src/cpu/delta_net_avx2.cpp src/cpu/full_attention_avx2.cpp
       PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-mtune=skylake")
   endif ()
 endif ()
@@ -84,7 +85,7 @@ endif ()
 if (QWEN35X_Q8_0_HAS_AVX2_TU)
   target_sources(
     qwen35x_core PRIVATE
-    src/cpu/q8_0_avx2.cpp src/cpu/delta_net_avx2.cpp src/cpu/full_attention_avx2.cpp)
+    src/cpu/activation_avx2.cpp src/cpu/q8_0_avx2.cpp src/cpu/delta_net_avx2.cpp src/cpu/full_attention_avx2.cpp)
   target_compile_definitions(qwen35x_core PRIVATE QWEN35X_Q8_0_HAS_AVX2_TU=1)
 else ()
   target_compile_definitions(qwen35x_core PRIVATE QWEN35X_Q8_0_HAS_AVX2_TU=0)

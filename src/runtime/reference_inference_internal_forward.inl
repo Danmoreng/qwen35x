@@ -468,9 +468,11 @@ bool run_forward_single_token(
         }
       }
       mlp_hidden.resize(mlp_gate.size());
-      for (std::size_t i = 0; i < mlp_gate.size(); ++i) {
-        mlp_hidden[i] = siluf(mlp_gate[i]) * mlp_up[i];
-      }
+      cpu::silu_mul_f32(
+        mlp_gate.data(), mlp_up.data(), mlp_hidden.data(), mlp_hidden.size(),
+        layer.mlp_down.is_q8_0()
+          ? layer.mlp_down.q8_0_backend
+          : cpu::Q8_0Backend::auto_select);
       if (!matvec_2d(layer.mlp_down, mlp_hidden, mlp_out, use_cuda, error_message)) {
         return false;
       }

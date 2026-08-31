@@ -571,11 +571,12 @@ bool run_forward_cpu_q8_batch(
     }
     for (std::size_t token = 0; token < batch_size; ++token) {
       const float * gate = gate_up.data() + token * 2 * intermediate;
-      const float * up = gate + intermediate;
-      float * hidden_token = mlp_hidden.data() + token * intermediate;
-      for (std::size_t column = 0; column < intermediate; ++column) {
-        hidden_token[column] = siluf(gate[column]) * up[column];
-      }
+      cpu::silu_mul_f32(
+        gate,
+        gate + intermediate,
+        mlp_hidden.data() + token * intermediate,
+        intermediate,
+        layer.mlp_down.q8_0_backend);
     }
     if (!matmul_2d_q8_batch(
           layer.mlp_down, mlp_hidden, batch_size, mlp_output, error_message)) {

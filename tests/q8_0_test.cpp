@@ -1,3 +1,4 @@
+#include "qwen35x/cpu/activation.h"
 #include "qwen35x/cpu/q8_0.h"
 
 #include <algorithm>
@@ -83,6 +84,27 @@ bool test_empty_ranges() {
   float output = 1.0F;
   qwen35x::cpu::q8_0_matvec(nullptr, nullptr, &output, 1, 0, Q8_0Backend::auto_select);
   return expect(output == 0.0F, "zero-width matvec must produce zero") && ok;
+}
+
+bool test_silu_mul(const Q8_0Backend backend) {
+  constexpr std::size_t count = 19;
+  std::array<float, count> gate{};
+  std::array<float, count> up{};
+  for (std::size_t index = 0; index < count; ++index) {
+    gate[index] = (static_cast<float>(index) - 9.0F) * 1.375F;
+    up[index] = std::sin(static_cast<float>(index) * 0.7F);
+  }
+  std::array<float, count> expected{};
+  std::array<float, count> actual{};
+  qwen35x::cpu::silu_mul_f32(
+    gate.data(), up.data(), expected.data(), count, Q8_0Backend::scalar);
+  qwen35x::cpu::silu_mul_f32(
+    gate.data(), up.data(), actual.data(), count, backend);
+  bool ok = true;
+  for (std::size_t index = 0; index < count; ++index) {
+    ok = expect(near(expected[index], actual[index]), "SiLU multiply mismatch") && ok;
+  }
+  return ok;
 }
 
 bool test_backend(const Q8_0Backend backend) {
@@ -192,6 +214,7 @@ bool test_backend(const Q8_0Backend backend) {
 
 int main() {
   bool ok = test_known_layout() && test_zero_block() && test_empty_ranges();
+  ok = test_silu_mul(Q8_0Backend::auto_select) && ok;
   ok = test_backend(Q8_0Backend::scalar) && ok;
   ok = test_backend(Q8_0Backend::auto_select) && ok;
 

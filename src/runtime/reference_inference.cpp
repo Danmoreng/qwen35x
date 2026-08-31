@@ -1,5 +1,7 @@
 #include "qwen35x/runtime/reference_inference.h"
 
+#include "qwen35x/cpu/activation.h"
+
 #include "qwen35x/cpu/q8_0.h"
 #include "qwen35x/cpu/executor.h"
 #include "qwen35x/cpu/delta_net.h"
