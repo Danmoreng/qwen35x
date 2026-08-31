@@ -657,9 +657,9 @@ Current laptop result (six threads, three measured runs after one warmup):
 
 | Workload | qwen35x native Q4_0 | llama.cpp Q4_0 | Difference |
 | --- | ---: | ---: | ---: |
-| pp256 | 268.86 tok/s | 227.90 tok/s | +18.0% |
-| pp2048 | 227.71 tok/s | 202.53 tok/s | +12.4% |
-| prompt-1 / tg128 | 60.68 tok/s | 45.50 tok/s | +33.4% |
+| pp256 | 281.52 tok/s | 227.90 tok/s | +23.5% |
+| pp2048 | 237.58 tok/s | 202.53 tok/s | +17.3% |
+| prompt-1 / tg128 | 60.57 tok/s | 45.50 tok/s | +33.1% |
 
 The original canonical native-Q4 implementation measured 171.82 tok/s at
 pp256 and 55.30 tok/s at prompt-1/tg128. A row-major 1x8 prefill tile reached
@@ -676,6 +676,11 @@ and an exact `-8 * activation_sum` correction. Prepared Q8 blocks now carry one
 int16 sum per token, produced during quantization. It improved pp256 from
 249.94 to 268.86 tok/s (+7.6%) and pp2048 from 214.36 to 227.71 tok/s (+6.2%),
 while prompt-1/tg128 remained effectively neutral at 60.68 versus 60.78 tok/s.
+Prepared Q8 then changed activation-scale storage from FP16 to the exact
+FP16-rounded value expanded once to FP32 during quantization. This removes
+repeated F16C conversions in every output tile and improves pp256 from 268.86
+to 281.52 tok/s (+4.7%) and pp2048 from 227.71 to 237.58 tok/s (+4.3%);
+decode remains effectively neutral at 60.57 tok/s.
 
 The Q4-specific external-review plan is incorporated as this ordered checklist:
 
@@ -687,9 +692,9 @@ The Q4-specific external-review plan is incorporated as this ordered checklist:
    scales and 128 quant bytes occupy exactly 144 bytes, equal to eight canonical
    blocks. Concatenated projections are joined before final packing. Canonical
    model weights are released.
-3. **Prepared Q8 activations — sums slice complete.** Four-token groups are
+3. **Prepared Q8 activations — scale/sum slice complete.** Four-token groups are
    quantized directly into interleaved scratch and exact int16 activation sums
-   are emitted in the same pass. A future A/B should test a
+   plus FP16-rounded FP32 scales are emitted in the same pass. A future A/B should test a
    fully separated 32-byte-aligned quant/scales/sums SoA only when the unsigned
    zero-point kernel is ready; do not add another unconditional repacking copy.
 4. **Decode alternatives — unsigned kernel retained.** The canonical eight-lane
@@ -842,7 +847,7 @@ Update this table in the same commit that lands or rejects each experiment.
 | B | Pending | — | Prefix state cache not implemented |
 | C1-C6 | Future hardware | — | Requires suitable ISA hosts for validation |
 | D0 | Initial screen completed | `4ca364c` | Seven formats, three alternating-order performance rounds, 56 deterministic rewrite outputs, and a three-run 2k/2k Q8-versus-Q4_0 comparison select Q4_0 for the first native backend; production quality expansion remains open |
-| D1 | Active; laptop throughput target achieved | pending | Native Q4_0 scalar/AVX2, packed-only model weights, direct packed activations with sums, unsigned Q4 correction, tile scheduling, embedding/LM-head coverage, and 8x8 prefill are implemented. Against llama.cpp Q4_0, pp256 is +18.0%, pp2048 is +12.4%, and decode is +33.4%. Expanded correctness, quality, memory, and long-context gates remain. |
+| D1 | Active; laptop throughput target achieved | pending | Native Q4_0 scalar/AVX2, packed-only model weights, direct prepared activations with FP32 scales and sums, unsigned Q4 correction, tile scheduling, embedding/LM-head coverage, and 8x8 prefill are implemented. Against llama.cpp Q4_0, pp256 is +23.5%, pp2048 is +17.3%, and decode is +33.1%. Expanded correctness, quality, memory, and long-context gates remain. |
 | D2-D4 | Pending D1 validation | — | IQ4_NL, mixed precision, and calibrated offline rounding follow the validated Q4_0 baseline |
 | D5 | Research target | — | Custom Hadamard-regularized `Q4_H128` is the preferred custom-format direction after simple Q4 baselines |
 | D6-D7 | Deferred/future hardware | — | State quantization is quality-sensitive; dense sub-four-bit research benefits materially from newer SIMD ISAs |

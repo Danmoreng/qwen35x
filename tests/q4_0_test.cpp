@@ -85,7 +85,7 @@ bool test_packed_backend(const Q8_0Backend backend) {
   for (std::size_t block = 0; block < packed_activations.size(); ++block) {
     for (std::size_t token = 0; token < 4; ++token) {
       ok = expect(
-        directly_quantized[block].d[token] == packed_activations[block].d[token],
+        directly_quantized[block].scales[token] == packed_activations[block].scales[token],
         "direct packed quantize scale mismatch") && ok;
       ok = expect(
         directly_quantized[block].sums[token] == packed_activations[block].sums[token],

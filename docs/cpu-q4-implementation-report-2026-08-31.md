@@ -13,9 +13,9 @@ tied at 2,048-token prefill.
 
 | Workload | Native qwen35x | llama.cpp Q4_0 | Native difference |
 | --- | ---: | ---: | ---: |
-| pp256 | 268.86 tok/s mean | 227.90 tok/s | +18.0% |
-| pp2048 | 227.71 tok/s mean | 202.53 tok/s median | +12.4% |
-| prompt-1 / tg128 | 60.68 tok/s mean | 45.50 tok/s | +33.4% |
+| pp256 | 281.52 tok/s mean | 227.90 tok/s | +23.5% |
+| pp2048 | 237.58 tok/s mean | 202.53 tok/s median | +17.3% |
+| prompt-1 / tg128 | 60.57 tok/s mean | 45.50 tok/s | +33.1% |
 
 The qwen35x decode timer includes greedy sampling, while `llama-bench` excludes
 sampling. Timer boundaries therefore favor llama.cpp slightly in that row.
@@ -30,6 +30,7 @@ sampling. Timer boundaries therefore favor llama.cpp slightly in that row.
   quant bytes, with nibble sign bits flipped once at load time.
 - Direct four-token F32-to-packed-Q8 quantization for prefill.
 - Exact int16 activation sums emitted during packed-Q8 quantization.
+- FP16-rounded activation scales expanded to FP32 once during quantization.
 - Unsigned Q4 AVX2 dot products with exact `-8 * activation_sum` correction.
 - Retained eight-token x eight-output-row AVX2 prefill kernel.
 - Eight-row-tile executor scheduling, including tail-token packed matvec.
@@ -51,7 +52,8 @@ three measured runs, six threads, and the same pure Q4_0 GGUF.
 | Direct packed-Q8 8x8 | 235.19 | 56.10 | Retained prefill winner |
 | Packed-only weights and decode | 234.73 | 59.01 | Retained |
 | Vector F16C load for eight weight scales | 249.94 | 60.78 | Retained foundation |
-| Unsigned Q4 plus prepared activation sums | 268.86 | 60.68 | Current implementation |
+| Unsigned Q4 plus prepared activation sums | 268.86 | 60.68 | Retained foundation |
+| Prepared FP32 activation scales | 281.52 | 60.57 | Current implementation |
 
 The pre-vector-scale pp256 thread sweep measured 197.94, 218.53, 234.73, and
 188.30 tok/s at 4, 5, 6, and 8 threads. Six physical-core threads remain the

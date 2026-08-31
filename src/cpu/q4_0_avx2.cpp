@@ -55,8 +55,9 @@ void quantize_q8_block_packed(
   const float max_scalar = _mm_cvtss_f32(max4);
   const float scale = max_scalar / 127.0F;
   const float inverse = scale == 0.0F ? 0.0F : 1.0F / scale;
-  output.d[token] = static_cast<std::uint16_t>(_cvtss_sh(
+  const std::uint16_t half_scale = static_cast<std::uint16_t>(_cvtss_sh(
     scale, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+  output.scales[token] = _cvtsh_ss(half_scale);
 
   const __m256 inverse_scale = _mm256_set1_ps(inverse);
   const __m256i minimum = _mm256_set1_epi32(-127);
@@ -238,7 +239,7 @@ void accumulate_packed_block_x8(
         8 * static_cast<std::int32_t>(activation_block.sums[activation_lane])));
     const __m256 scale = _mm256_mul_ps(
       weight_scales,
-      _mm256_set1_ps(_cvtsh_ss(activation_block.d[activation_lane])));
+      _mm256_set1_ps(activation_block.scales[activation_lane]));
     accumulators[token] = _mm256_fmadd_ps(
       _mm256_cvtepi32_ps(integer_dot), scale, accumulators[token]);
   }
@@ -551,7 +552,7 @@ void q4_0_packed_matvec_q8_0_avx2(
     const Q4_0BlockX8 * row_tile_data = matrix + row_tile * blocks_per_row;
     for (std::size_t block = 0; block < blocks_per_row; ++block) {
       Q8_0BlockX4 packed_activation{};
-      packed_activation.d[0] = vector[block].d;
+      packed_activation.scales[0] = _cvtsh_ss(vector[block].d);
       std::int32_t activation_sum = 0;
       for (std::size_t chunk = 0; chunk < 4; ++chunk) {
         _mm_storel_epi64(

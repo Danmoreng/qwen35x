@@ -116,7 +116,7 @@ void q4_0_packed_matmul_q8_0_scalar(
         const Q4_0BlockX8 & weights = matrix[row_tile * blocks_per_row + block];
         const Q8_0BlockX4 & activations = vectors[vector_tile * blocks_per_row + block];
         for (std::size_t token = 0; token < q8_0_packed_vectors; ++token) {
-          const float activation_scale = half_to_float(activations.d[token]);
+          const float activation_scale = activations.scales[token];
           for (std::size_t row = 0; row < q4_0_packed_rows; ++row) {
             std::int32_t integer_dot = 0;
             for (std::size_t index = 0; index < 16; ++index) {
@@ -163,7 +163,7 @@ void q8_0_quantize_vectors_4_scalar(
         }
         const float scale = absolute_max / 127.0F;
         const float inverse_scale = scale == 0.0F ? 0.0F : 1.0F / scale;
-        destination.d[token] = float_to_half(scale);
+        destination.scales[token] = half_to_float(float_to_half(scale));
         std::int32_t sum = 0;
         for (std::size_t index = 0; index < 32; ++index) {
           const float rounded = std::round(source[index] * inverse_scale);
@@ -246,7 +246,7 @@ void q8_0_pack_vectors_4(
       for (std::size_t token = 0; token < q8_0_packed_vectors; ++token) {
         const Q8_0Block & source =
           canonical[(vector_tile * q8_0_packed_vectors + token) * blocks_per_vector + block];
-        destination.d[token] = source.d;
+        destination.scales[token] = detail::half_to_float(source.d);
         std::int32_t sum = 0;
         for (std::size_t chunk = 0; chunk < 4; ++chunk) {
           std::copy_n(
