@@ -117,6 +117,15 @@ The main `qwen35x.exe` includes the supported 0.8B and 4B CUDA variants and sele
 ./build/qwen35x --infer-reference --hf-model-dir models/qwen3.5-0.8b --chat-user "Tell me a short joke." --max-new-tokens 64 --max-context 256 --stop-on-im-end
 ```
 
+Embedding applications can reuse an in-memory CPU system-prompt snapshot by
+keeping a `ReferenceCpuPrefixCache` alive, setting
+`ReferenceInferenceOptions::cpu_prefix_cache`, and specifying the exact
+`cpu_prefix_token_count` shared by subsequent prompts. For CLI validation,
+`--cpu-prefix-cache-tokens N --cpu-prefix-cache-replays 2` builds the snapshot
+on the first replay and restores it on the second. The cache currently covers
+CPU recurrent and K/V state; model weights are still loaded per API call. A
+cache handle must not be accessed concurrently by multiple inference calls.
+
 4. Run chat inference (CUDA / Qwen35x CUDA default)
 
 ```bash

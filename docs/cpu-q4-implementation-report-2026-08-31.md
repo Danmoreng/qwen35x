@@ -118,6 +118,14 @@ measured 62.98 versus 62.96 tok/s. All produced the same 128-token sequence,
 but packed-Q4 weight traffic dominates enough that removing these FP32 stores
 does not change end-to-end decode on this host. All prototypes were reverted.
 
+The first in-memory system-prefix cache is now available through the public
+CPU inference options. A 128-token snapshot in a 256-token prompt reduces mean
+prefill wall time from 803.49 to 413.86 ms (-48.5%) over three sequential runs.
+Restore averages 2.22 ms and the compact snapshot occupies 21.77 MB. AVX2 and
+forced-scalar cached runs remain token-identical to uncached runs. Model loading
+is not yet persistent, and disk serialization/content hashing remain future
+work.
+
 The pre-vector-scale pp256 thread sweep measured 197.94, 218.53, 234.73, and
 188.30 tok/s at 4, 5, 6, and 8 threads. Six physical-core threads remain the
 default for this host.

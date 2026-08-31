@@ -215,6 +215,19 @@ bool run_reference_qwen35_inference(
     error_message = "cpu_threads must be >= 0 (zero selects the automatic default).";
     return false;
   }
+  if (options.cpu_prefix_token_count > 0 && options.cpu_prefix_cache == nullptr) {
+    error_message = "cpu_prefix_token_count requires a CPU prefix-cache handle.";
+    return false;
+  }
+  if (options.cpu_prefix_token_count >= options.prompt_tokens.size() &&
+      options.cpu_prefix_token_count > 0) {
+    error_message = "CPU prefix cache must leave at least one uncached prompt token.";
+    return false;
+  }
+  if (options.use_cuda && options.cpu_prefix_token_count > 0) {
+    error_message = "The in-memory prefix cache currently supports CPU inference only.";
+    return false;
+  }
   if (options.use_cuda && !options.cpu_gguf_path.empty()) {
     error_message = "--cpu-gguf is a CPU-only weight path and cannot be combined with GPU inference.";
     return false;
@@ -476,15 +489,73 @@ bool run_reference_qwen35_inference(
   int position = 0;
   std::vector<float> predicted_logits;
   const auto prefill_start = std::chrono::steady_clock::now();
+  const std::size_t prefix_token_count = options.cpu_prefix_token_count;
+  const std::size_t kv_width =
+    static_cast<std::size_t>(dims.n_kv_heads) * static_cast<std::size_t>(dims.head_dim);
+  const std::string prefix_model_signature = prefix_token_count > 0
+    ? cpu_prefix_model_signature(options, profile, dims) : std::string{};
+  bool prefix_cache_hit = false;
+  if (prefix_token_count > 0 && options.cpu_prefix_cache != nullptr &&
+      options.cpu_prefix_cache->implementation_ != nullptr) {
+    const auto restore_start = std::chrono::steady_clock::now();
+    const auto snapshot = std::static_pointer_cast<CpuPrefixCacheSnapshot>(
+      options.cpu_prefix_cache->implementation_);
+    const bool tokens_match = snapshot->prefix_tokens.size() == prefix_token_count &&
+      std::equal(
+        snapshot->prefix_tokens.begin(), snapshot->prefix_tokens.end(),
+        options.prompt_tokens.begin());
+    if (snapshot->state_abi_version == kCpuPrefixCacheStateAbiVersion &&
+        snapshot->model_signature == prefix_model_signature && tokens_match &&
+        snapshot->backend == cpu::q8_0_resolve_backend(options.cpu_q8_backend) &&
+        snapshot->prefill_mode == options.qwen35x_prefill_mode &&
+        snapshot->hidden == dims.hidden && snapshot->head_dim == dims.head_dim &&
+        snapshot->kv_heads == dims.n_kv_heads &&
+        restore_cpu_prefix_state(
+          *snapshot, state, prefix_token_count, kv_width)) {
+      position = static_cast<int>(prefix_token_count);
+      prefix_cache_hit = true;
+      result.cached_prefix_tokens = position;
+      result.prefix_cache_restore_time_ms = elapsed_ms(restore_start);
+      result.prefix_cache_bytes = cpu_prefix_cache_size_bytes(*snapshot);
+    } else {
+      options.cpu_prefix_cache->clear();
+    }
+  }
+  auto capture_prefix_if_ready = [&]() {
+    if (prefix_token_count == 0 || prefix_cache_hit ||
+        position != static_cast<int>(prefix_token_count) ||
+        options.cpu_prefix_cache == nullptr) {
+      return;
+    }
+    auto snapshot = std::make_shared<CpuPrefixCacheSnapshot>();
+    snapshot->model_signature = prefix_model_signature;
+    snapshot->prefix_tokens.assign(
+      options.prompt_tokens.begin(),
+      options.prompt_tokens.begin() + static_cast<std::ptrdiff_t>(prefix_token_count));
+    snapshot->backend = cpu::q8_0_resolve_backend(options.cpu_q8_backend);
+    snapshot->prefill_mode = options.qwen35x_prefill_mode;
+    snapshot->hidden = dims.hidden;
+    snapshot->head_dim = dims.head_dim;
+    snapshot->kv_heads = dims.n_kv_heads;
+    capture_cpu_prefix_state(
+      state, prefix_token_count, kv_width,
+      snapshot->backend == cpu::Q8_0Backend::avx2, *snapshot);
+    result.prefix_cache_bytes = cpu_prefix_cache_size_bytes(*snapshot);
+    options.cpu_prefix_cache->implementation_ = std::move(snapshot);
+  };
   const bool use_cpu_q8_batch_prefill =
     !options.use_cuda && weights.cpu_q8_runtime != nullptr &&
     options.qwen35x_prefill_mode == Qwen35xPrefillMode::batched;
   if (use_cpu_q8_batch_prefill) {
     constexpr std::size_t cpu_prefill_chunk_size = 64;
-    for (std::size_t chunk_begin = 0; chunk_begin < options.prompt_tokens.size();
-         chunk_begin += cpu_prefill_chunk_size) {
-      const std::size_t chunk_size = std::min(
+    for (std::size_t chunk_begin = static_cast<std::size_t>(position);
+         chunk_begin < options.prompt_tokens.size();) {
+      std::size_t chunk_size = std::min(
         cpu_prefill_chunk_size, options.prompt_tokens.size() - chunk_begin);
+      if (!prefix_cache_hit && chunk_begin < prefix_token_count &&
+          chunk_begin + chunk_size > prefix_token_count) {
+        chunk_size = prefix_token_count - chunk_begin;
+      }
       const bool compute_next_logits =
         !options.prefill_only && (chunk_begin + chunk_size == options.prompt_tokens.size());
       if (!run_forward_cpu_q8_batch(
@@ -503,9 +574,12 @@ bool run_reference_qwen35_inference(
         return false;
       }
       position += static_cast<int>(chunk_size);
+      chunk_begin += chunk_size;
+      capture_prefix_if_ready();
     }
   } else {
-    for (std::size_t prompt_index = 0; prompt_index < options.prompt_tokens.size(); ++prompt_index) {
+    for (std::size_t prompt_index = static_cast<std::size_t>(position);
+         prompt_index < options.prompt_tokens.size(); ++prompt_index) {
       const std::int32_t prompt_token = options.prompt_tokens[prompt_index];
       const bool compute_next_logits =
         !options.prefill_only && (prompt_index + 1 == options.prompt_tokens.size());
@@ -529,13 +603,16 @@ bool run_reference_qwen35_inference(
         return false;
       }
       ++position;
+      capture_prefix_if_ready();
     }
   }
   const auto prefill_end = std::chrono::steady_clock::now();
   result.prefill_time_ms = std::chrono::duration<double, std::milli>(prefill_end - prefill_start).count();
   result.prefill_tokens_per_second =
     (result.prefill_time_ms > 0.0)
-      ? (static_cast<double>(options.prompt_tokens.size()) * 1000.0 / result.prefill_time_ms)
+      ? (static_cast<double>(options.prompt_tokens.size() -
+          static_cast<std::size_t>(result.cached_prefix_tokens)) * 1000.0 /
+          result.prefill_time_ms)
       : 0.0;
 
   result.generated_tokens.clear();
