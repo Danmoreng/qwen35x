@@ -152,4 +152,39 @@ q4_0_packed_matvec_prepared_q8_0_argmax_avx2(
   std::size_t blocks_per_row) noexcept;
 #endif
 
+#if QWEN35X_Q8_0_HAS_AVX_VNNI_TU
+void q4_0_packed_matmul_q8_0_avx_vnni(
+  const Q4_0BlockX8 * matrix,
+  const Q8_0BlockX4 * vectors,
+  float * output,
+  std::size_t row_count,
+  std::size_t vector_count,
+  std::size_t blocks_per_row,
+  std::size_t output_row_stride) noexcept;
+
+void q4_0_packed_matvec_q8_0_avx_vnni(
+  const Q4_0BlockX8 * matrix,
+  const Q8_0Block * vector,
+  float * output,
+  std::size_t row_count,
+  std::size_t blocks_per_row) noexcept;
+
+void q4_0_packed_matvec_prepared_q8_0_avx_vnni(
+  const Q4_0BlockX8 * matrix,
+  const Q8_0BlockX4 * vector,
+  float * output,
+  std::size_t row_count,
+  std::size_t blocks_per_row) noexcept;
+
+[[nodiscard]] Q4_0ArgmaxResult
+q4_0_packed_matvec_prepared_q8_0_argmax_avx_vnni(
+  const Q4_0BlockX8 * matrix,
+  const Q8_0BlockX4 * vector,
+  const int * token_counts,
+  float repetition_penalty,
+  std::size_t row_offset,
+  std::size_t row_count,
+  std::size_t blocks_per_row) noexcept;
+#endif
+
 } // namespace qwen35x::cpu::detail

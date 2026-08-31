@@ -84,7 +84,7 @@ if (QWEN35X_SYSTEM_PROCESSOR_LOWER MATCHES "^(x86_64|amd64|i[3-6]86)$" OR
       set(QWEN35X_Q8_0_HAS_AVX_VNNI_TU ON)
       set(QWEN35X_Q8_0_HAS_AVX512_TU ON)
       set_source_files_properties(
-        src/cpu/q8_0_vnni.cpp
+        src/cpu/q4_0_vnni.cpp src/cpu/q8_0_vnni.cpp
         PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
       set_source_files_properties(
         src/cpu/activation_avx512.cpp
@@ -99,7 +99,7 @@ if (QWEN35X_SYSTEM_PROCESSOR_LOWER MATCHES "^(x86_64|amd64|i[3-6]86)$" OR
     if (QWEN35X_COMPILER_HAS_MAVXVNNI)
       set(QWEN35X_Q8_0_HAS_AVX_VNNI_TU ON)
       set_source_files_properties(
-        src/cpu/q8_0_vnni.cpp
+        src/cpu/q4_0_vnni.cpp src/cpu/q8_0_vnni.cpp
         PROPERTIES COMPILE_OPTIONS "-mavx2;-mavxvnni;-mfma;-mf16c")
       check_cxx_compiler_flag("-mavx512f" QWEN35X_COMPILER_HAS_MAVX512F)
       if (QWEN35X_COMPILER_HAS_MAVX512F)
@@ -122,7 +122,7 @@ else ()
 endif ()
 
 if (QWEN35X_Q8_0_HAS_AVX_VNNI_TU)
-  target_sources(qwen35x_core PRIVATE src/cpu/q8_0_vnni.cpp)
+  target_sources(qwen35x_core PRIVATE src/cpu/q4_0_vnni.cpp src/cpu/q8_0_vnni.cpp)
   target_compile_definitions(qwen35x_core PRIVATE QWEN35X_Q8_0_HAS_AVX_VNNI_TU=1)
 else ()
   target_compile_definitions(qwen35x_core PRIVATE QWEN35X_Q8_0_HAS_AVX_VNNI_TU=0)
