@@ -16,6 +16,15 @@ namespace {
   return _mm_cvtss_f32(sum);
 }
 
+[[nodiscard]] std::int32_t horizontal_sum_i32(const __m256i value) noexcept {
+  const __m128i low = _mm256_castsi256_si128(value);
+  const __m128i high = _mm256_extracti128_si256(value, 1);
+  __m128i sum = _mm_add_epi32(low, high);
+  sum = _mm_hadd_epi32(sum, sum);
+  sum = _mm_hadd_epi32(sum, sum);
+  return _mm_cvtsi128_si32(sum);
+}
+
 [[nodiscard]] __m256 quantize_q8_eight(
   const __m256 values,
   const __m256 inverse_scale) noexcept {
@@ -60,6 +69,8 @@ void quantize_q8_block_packed(
   i1 = _mm256_min_epi32(_mm256_max_epi32(i1, minimum), maximum);
   i2 = _mm256_min_epi32(_mm256_max_epi32(i2, minimum), maximum);
   i3 = _mm256_min_epi32(_mm256_max_epi32(i3, minimum), maximum);
+  output.sums[token] = static_cast<std::int16_t>(horizontal_sum_i32(
+    _mm256_add_epi32(_mm256_add_epi32(i0, i1), _mm256_add_epi32(i2, i3))));
   i0 = _mm256_packs_epi32(i0, i1);
   i2 = _mm256_packs_epi32(i2, i3);
   const __m256i packed = _mm256_permutevar8x32_epi32(
@@ -112,6 +123,19 @@ void quantize_q8_block_packed(
     _mm256_madd_epi16(pair_products, _mm256_set1_epi16(1)));
 }
 
+[[nodiscard]] __m256i mul_sum_u8_s8_pairs_acc(
+  const __m256i accumulator,
+  const __m256i unsigned_weights,
+  const __m256i signed_activations) noexcept {
+  // Q4 is at most 15, so each adjacent pair is bounded by
+  // 2 * 15 * 127 = 3810 and VPMADDUBSW cannot saturate.
+  const __m256i pair_products = _mm256_maddubs_epi16(
+    unsigned_weights, signed_activations);
+  return _mm256_add_epi32(
+    accumulator,
+    _mm256_madd_epi16(pair_products, _mm256_set1_epi16(1)));
+}
+
 [[nodiscard]] __m256i load_q8_token_half(
   const Q8_0BlockX4 & block,
   const std::size_t token,
@@ -131,9 +155,7 @@ void accumulate_packed_block_x8(
   __m256 (&accumulators)[TokenCount]) noexcept {
   static_assert(TokenCount == 1 || TokenCount == 4 || TokenCount == 8);
   const __m256i nibble_mask = _mm256_set1_epi8(0x0f);
-  const __m256i sign_lut = _mm256_setr_epi8(
-    0, 1, 2, 3, 4, 5, 6, 7, -8, -7, -6, -5, -4, -3, -2, -1,
-    0, 1, 2, 3, 4, 5, 6, 7, -8, -7, -6, -5, -4, -3, -2, -1);
+  const __m256i packed_sign_flip = _mm256_set1_epi8(static_cast<char>(0x88));
 
   const __m256i raw_0123_0 = _mm256_loadu_si256(
     reinterpret_cast<const __m256i *>(weights.qs));
@@ -144,22 +166,22 @@ void accumulate_packed_block_x8(
   const __m256i raw_4567_1 = _mm256_loadu_si256(
     reinterpret_cast<const __m256i *>(weights.qs + 96));
 
-  const __m256i weight_0123_0 = _mm256_shuffle_epi8(
-    sign_lut, _mm256_and_si256(raw_0123_0, nibble_mask));
-  const __m256i weight_4567_0 = _mm256_shuffle_epi8(
-    sign_lut, _mm256_and_si256(raw_4567_0, nibble_mask));
-  const __m256i weight_0123_1 = _mm256_shuffle_epi8(
-    sign_lut, _mm256_and_si256(raw_0123_1, nibble_mask));
-  const __m256i weight_4567_1 = _mm256_shuffle_epi8(
-    sign_lut, _mm256_and_si256(raw_4567_1, nibble_mask));
-  const __m256i weight_0123_2 = _mm256_shuffle_epi8(
-    sign_lut, _mm256_and_si256(_mm256_srli_epi16(raw_0123_0, 4), nibble_mask));
-  const __m256i weight_4567_2 = _mm256_shuffle_epi8(
-    sign_lut, _mm256_and_si256(_mm256_srli_epi16(raw_4567_0, 4), nibble_mask));
-  const __m256i weight_0123_3 = _mm256_shuffle_epi8(
-    sign_lut, _mm256_and_si256(_mm256_srli_epi16(raw_0123_1, 4), nibble_mask));
-  const __m256i weight_4567_3 = _mm256_shuffle_epi8(
-    sign_lut, _mm256_and_si256(_mm256_srli_epi16(raw_4567_1, 4), nibble_mask));
+  const __m256i unsigned_0123_0 = _mm256_xor_si256(raw_0123_0, packed_sign_flip);
+  const __m256i unsigned_4567_0 = _mm256_xor_si256(raw_4567_0, packed_sign_flip);
+  const __m256i unsigned_0123_1 = _mm256_xor_si256(raw_0123_1, packed_sign_flip);
+  const __m256i unsigned_4567_1 = _mm256_xor_si256(raw_4567_1, packed_sign_flip);
+  const __m256i weight_0123_0 = _mm256_and_si256(unsigned_0123_0, nibble_mask);
+  const __m256i weight_4567_0 = _mm256_and_si256(unsigned_4567_0, nibble_mask);
+  const __m256i weight_0123_1 = _mm256_and_si256(unsigned_0123_1, nibble_mask);
+  const __m256i weight_4567_1 = _mm256_and_si256(unsigned_4567_1, nibble_mask);
+  const __m256i weight_0123_2 = _mm256_and_si256(
+    _mm256_srli_epi16(unsigned_0123_0, 4), nibble_mask);
+  const __m256i weight_4567_2 = _mm256_and_si256(
+    _mm256_srli_epi16(unsigned_4567_0, 4), nibble_mask);
+  const __m256i weight_0123_3 = _mm256_and_si256(
+    _mm256_srli_epi16(unsigned_0123_1, 4), nibble_mask);
+  const __m256i weight_4567_3 = _mm256_and_si256(
+    _mm256_srli_epi16(unsigned_4567_1, 4), nibble_mask);
 
   // The lane order below is 0,4,1,5,2,6,3,7 until the final permutation.
   const __m256 natural_weight_scales = _mm256_cvtph_ps(_mm_loadu_si128(
@@ -177,39 +199,43 @@ void accumulate_packed_block_x8(
     const __m256i activation_1 =
       load_q8_token_half(activation_block, activation_lane, 1);
     __m256i integer_dot = _mm256_setzero_si256();
-    integer_dot = mul_sum_i8_pairs_acc(
+    integer_dot = mul_sum_u8_s8_pairs_acc(
       integer_dot,
       _mm256_blend_epi32(weight_0123_0, _mm256_shuffle_epi32(weight_4567_0, 177), 170),
       _mm256_shuffle_epi32(activation_0, 0));
-    integer_dot = mul_sum_i8_pairs_acc(
+    integer_dot = mul_sum_u8_s8_pairs_acc(
       integer_dot,
       _mm256_blend_epi32(_mm256_shuffle_epi32(weight_0123_0, 177), weight_4567_0, 170),
       _mm256_shuffle_epi32(activation_0, 85));
-    integer_dot = mul_sum_i8_pairs_acc(
+    integer_dot = mul_sum_u8_s8_pairs_acc(
       integer_dot,
       _mm256_blend_epi32(weight_0123_1, _mm256_shuffle_epi32(weight_4567_1, 177), 170),
       _mm256_shuffle_epi32(activation_0, 170));
-    integer_dot = mul_sum_i8_pairs_acc(
+    integer_dot = mul_sum_u8_s8_pairs_acc(
       integer_dot,
       _mm256_blend_epi32(_mm256_shuffle_epi32(weight_0123_1, 177), weight_4567_1, 170),
       _mm256_shuffle_epi32(activation_0, 255));
-    integer_dot = mul_sum_i8_pairs_acc(
+    integer_dot = mul_sum_u8_s8_pairs_acc(
       integer_dot,
       _mm256_blend_epi32(weight_0123_2, _mm256_shuffle_epi32(weight_4567_2, 177), 170),
       _mm256_shuffle_epi32(activation_1, 0));
-    integer_dot = mul_sum_i8_pairs_acc(
+    integer_dot = mul_sum_u8_s8_pairs_acc(
       integer_dot,
       _mm256_blend_epi32(_mm256_shuffle_epi32(weight_0123_2, 177), weight_4567_2, 170),
       _mm256_shuffle_epi32(activation_1, 85));
-    integer_dot = mul_sum_i8_pairs_acc(
+    integer_dot = mul_sum_u8_s8_pairs_acc(
       integer_dot,
       _mm256_blend_epi32(weight_0123_3, _mm256_shuffle_epi32(weight_4567_3, 177), 170),
       _mm256_shuffle_epi32(activation_1, 170));
-    integer_dot = mul_sum_i8_pairs_acc(
+    integer_dot = mul_sum_u8_s8_pairs_acc(
       integer_dot,
       _mm256_blend_epi32(_mm256_shuffle_epi32(weight_0123_3, 177), weight_4567_3, 170),
       _mm256_shuffle_epi32(activation_1, 255));
 
+    integer_dot = _mm256_sub_epi32(
+      integer_dot,
+      _mm256_set1_epi32(
+        8 * static_cast<std::int32_t>(activation_block.sums[activation_lane])));
     const __m256 scale = _mm256_mul_ps(
       weight_scales,
       _mm256_set1_ps(_cvtsh_ss(activation_block.d[activation_lane])));
@@ -526,12 +552,17 @@ void q4_0_packed_matvec_q8_0_avx2(
     for (std::size_t block = 0; block < blocks_per_row; ++block) {
       Q8_0BlockX4 packed_activation{};
       packed_activation.d[0] = vector[block].d;
+      std::int32_t activation_sum = 0;
       for (std::size_t chunk = 0; chunk < 4; ++chunk) {
         _mm_storel_epi64(
           reinterpret_cast<__m128i *>(packed_activation.qs + chunk * 32),
           _mm_loadl_epi64(reinterpret_cast<const __m128i *>(
             vector[block].qs + chunk * 8)));
+        for (std::size_t index = 0; index < 8; ++index) {
+          activation_sum += vector[block].qs[chunk * 8 + index];
+        }
       }
+      packed_activation.sums[0] = static_cast<std::int16_t>(activation_sum);
       accumulate_packed_block_x8<1>(
         row_tile_data[block], packed_activation, nullptr, accumulator);
     }

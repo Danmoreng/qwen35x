@@ -42,13 +42,15 @@ static_assert(sizeof(Q4_0BlockX8) == 8 * sizeof(Q4_0Block));
 // eight-byte chunks. This is transient prefill scratch, not a GGUF format.
 struct Q8_0BlockX4 {
   std::uint16_t d[4];
+  std::int16_t sums[4];
   std::int8_t qs[4 * q8_0_values_per_block];
 };
 
 static_assert(std::is_standard_layout_v<Q8_0BlockX4>);
 static_assert(offsetof(Q8_0BlockX4, d) == 0);
-static_assert(offsetof(Q8_0BlockX4, qs) == 8);
-static_assert(sizeof(Q8_0BlockX4) == 4 * sizeof(Q8_0Block));
+static_assert(offsetof(Q8_0BlockX4, sums) == 8);
+static_assert(offsetof(Q8_0BlockX4, qs) == 16);
+static_assert(sizeof(Q8_0BlockX4) == 144);
 
 inline constexpr std::size_t q4_0_packed_rows = 8;
 inline constexpr std::size_t q8_0_packed_vectors = 4;

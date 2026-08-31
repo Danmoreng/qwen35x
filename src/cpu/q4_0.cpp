@@ -164,11 +164,15 @@ void q8_0_quantize_vectors_4_scalar(
         const float scale = absolute_max / 127.0F;
         const float inverse_scale = scale == 0.0F ? 0.0F : 1.0F / scale;
         destination.d[token] = float_to_half(scale);
+        std::int32_t sum = 0;
         for (std::size_t index = 0; index < 32; ++index) {
           const float rounded = std::round(source[index] * inverse_scale);
-          destination.qs[(index / 8) * 32 + token * 8 + index % 8] =
-            static_cast<std::int8_t>(std::clamp(rounded, -127.0F, 127.0F));
+          const auto quantized = static_cast<std::int8_t>(
+            std::clamp(rounded, -127.0F, 127.0F));
+          destination.qs[(index / 8) * 32 + token * 8 + index % 8] = quantized;
+          sum += quantized;
         }
+        destination.sums[token] = static_cast<std::int16_t>(sum);
       }
     }
   }
@@ -243,12 +247,17 @@ void q8_0_pack_vectors_4(
         const Q8_0Block & source =
           canonical[(vector_tile * q8_0_packed_vectors + token) * blocks_per_vector + block];
         destination.d[token] = source.d;
+        std::int32_t sum = 0;
         for (std::size_t chunk = 0; chunk < 4; ++chunk) {
           std::copy_n(
             source.qs + chunk * 8,
             8,
             destination.qs + chunk * 32 + token * 8);
+          for (std::size_t index = 0; index < 8; ++index) {
+            sum += source.qs[chunk * 8 + index];
+          }
         }
+        destination.sums[token] = static_cast<std::int16_t>(sum);
       }
     }
   }

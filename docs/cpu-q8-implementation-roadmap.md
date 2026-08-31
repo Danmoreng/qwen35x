@@ -657,9 +657,9 @@ Current laptop result (six threads, three measured runs after one warmup):
 
 | Workload | qwen35x native Q4_0 | llama.cpp Q4_0 | Difference |
 | --- | ---: | ---: | ---: |
-| pp256 | 249.94 tok/s | 227.90 tok/s | +9.7% |
-| pp2048 | 214.36 tok/s mean; 216.48 median | 202.53 tok/s median | +5.8% mean; +6.9% median |
-| prompt-1 / tg128 | 60.78 tok/s | 45.50 tok/s | +33.6% |
+| pp256 | 268.86 tok/s | 227.90 tok/s | +18.0% |
+| pp2048 | 227.71 tok/s | 202.53 tok/s | +12.4% |
+| prompt-1 / tg128 | 60.68 tok/s | 45.50 tok/s | +33.4% |
 
 The original canonical native-Q4 implementation measured 171.82 tok/s at
 pp256 and 55.30 tok/s at prompt-1/tg128. A row-major 1x8 prefill tile reached
@@ -671,6 +671,12 @@ single F16C conversion of all eight packed weight scales, followed by one lane
 permutation, produced the current 249.94 pp256, 214.36 pp2048, and 60.78 decode
 results.
 
+The next retained A/B replaced signed nibble expansion with unsigned Q4 values
+and an exact `-8 * activation_sum` correction. Prepared Q8 blocks now carry one
+int16 sum per token, produced during quantization. It improved pp256 from
+249.94 to 268.86 tok/s (+7.6%) and pp2048 from 214.36 to 227.71 tok/s (+6.2%),
+while prompt-1/tg128 remained effectively neutral at 60.68 versus 60.78 tok/s.
+
 The Q4-specific external-review plan is incorporated as this ordered checklist:
 
 1. **Q4 semantics and correctness — substantially complete.** Preserve signed
@@ -681,14 +687,15 @@ The Q4-specific external-review plan is incorporated as this ordered checklist:
    scales and 128 quant bytes occupy exactly 144 bytes, equal to eight canonical
    blocks. Concatenated projections are joined before final packing. Canonical
    model weights are released.
-3. **Prepared Q8 activations — first slice complete.** Four-token groups are
-   quantized directly into interleaved scratch. A future A/B should test a
+3. **Prepared Q8 activations — sums slice complete.** Four-token groups are
+   quantized directly into interleaved scratch and exact int16 activation sums
+   are emitted in the same pass. A future A/B should test a
    fully separated 32-byte-aligned quant/scales/sums SoA only when the unsigned
    zero-point kernel is ready; do not add another unconditional repacking copy.
-4. **Decode alternatives — first winner retained.** The canonical eight-lane
-   kernel established 55.30 tok/s. The packed output-vector kernel reaches
-   60.78 tok/s. A formal signed-versus-unsigned-nibble A/B remains useful before
-   VNNI.
+4. **Decode alternatives — unsigned kernel retained.** The canonical eight-lane
+   kernel established 55.30 tok/s. The packed output-vector kernel reached
+   60.78 tok/s, and unsigned Q4 plus activation-sum correction is neutral at
+   60.68 tok/s while materially improving prefill. This is the AVX-VNNI bridge.
 5. **Prefill tile search — active.** Retain 8-token x 8-row on this laptop.
    Record 2x3 canonical, 1x8 canonical, 4x8 packed, direct-4x8, and 8x8 results.
    Test 2x4/4x4 or 16x8 only when evidence justifies another experiment.
@@ -835,7 +842,7 @@ Update this table in the same commit that lands or rejects each experiment.
 | B | Pending | — | Prefix state cache not implemented |
 | C1-C6 | Future hardware | — | Requires suitable ISA hosts for validation |
 | D0 | Initial screen completed | `4ca364c` | Seven formats, three alternating-order performance rounds, 56 deterministic rewrite outputs, and a three-run 2k/2k Q8-versus-Q4_0 comparison select Q4_0 for the first native backend; production quality expansion remains open |
-| D1 | Active; laptop throughput target achieved | pending | Native Q4_0 scalar/AVX2, packed-only model weights, direct packed activations, tile scheduling, embedding/LM-head coverage, and 8x8 prefill are implemented. Against llama.cpp Q4_0, pp256 is +9.7%, pp2048 is +5.8% by mean, and decode is +33.6%. Expanded correctness, quality, memory, and long-context gates remain. |
+| D1 | Active; laptop throughput target achieved | pending | Native Q4_0 scalar/AVX2, packed-only model weights, direct packed activations with sums, unsigned Q4 correction, tile scheduling, embedding/LM-head coverage, and 8x8 prefill are implemented. Against llama.cpp Q4_0, pp256 is +18.0%, pp2048 is +12.4%, and decode is +33.4%. Expanded correctness, quality, memory, and long-context gates remain. |
 | D2-D4 | Pending D1 validation | — | IQ4_NL, mixed precision, and calibrated offline rounding follow the validated Q4_0 baseline |
 | D5 | Research target | — | Custom Hadamard-regularized `Q4_H128` is the preferred custom-format direction after simple Q4 baselines |
 | D6-D7 | Deferred/future hardware | — | State quantization is quality-sensitive; dense sub-four-bit research benefits materially from newer SIMD ISAs |

@@ -13,9 +13,9 @@ tied at 2,048-token prefill.
 
 | Workload | Native qwen35x | llama.cpp Q4_0 | Native difference |
 | --- | ---: | ---: | ---: |
-| pp256 | 249.94 tok/s mean | 227.90 tok/s | +9.7% |
-| pp2048 | 214.36 tok/s mean, 216.48 median | 202.53 tok/s median | +5.8% mean, +6.9% median |
-| prompt-1 / tg128 | 60.78 tok/s mean | 45.50 tok/s | +33.6% |
+| pp256 | 268.86 tok/s mean | 227.90 tok/s | +18.0% |
+| pp2048 | 227.71 tok/s mean | 202.53 tok/s median | +12.4% |
+| prompt-1 / tg128 | 60.68 tok/s mean | 45.50 tok/s | +33.4% |
 
 The qwen35x decode timer includes greedy sampling, while `llama-bench` excludes
 sampling. Timer boundaries therefore favor llama.cpp slightly in that row.
@@ -29,6 +29,8 @@ sampling. Timer boundaries therefore favor llama.cpp slightly in that row.
 - A size-neutral 144-byte `Q4_0BlockX8`: eight FP16 scales plus 128 interleaved
   quant bytes, with nibble sign bits flipped once at load time.
 - Direct four-token F32-to-packed-Q8 quantization for prefill.
+- Exact int16 activation sums emitted during packed-Q8 quantization.
+- Unsigned Q4 AVX2 dot products with exact `-8 * activation_sum` correction.
 - Retained eight-token x eight-output-row AVX2 prefill kernel.
 - Eight-row-tile executor scheduling, including tail-token packed matvec.
 - Packed embedding row gather and packed tied LM-head matvec.
@@ -48,7 +50,8 @@ three measured runs, six threads, and the same pure Q4_0 GGUF.
 | Direct packed-Q8 4x8 | 205.40 | not repeated | Retained architecture; small isolated gain |
 | Direct packed-Q8 8x8 | 235.19 | 56.10 | Retained prefill winner |
 | Packed-only weights and decode | 234.73 | 59.01 | Retained |
-| Vector F16C load for eight weight scales | 249.94 | 60.78 | Current implementation |
+| Vector F16C load for eight weight scales | 249.94 | 60.78 | Retained foundation |
+| Unsigned Q4 plus prepared activation sums | 268.86 | 60.68 | Current implementation |
 
 The pre-vector-scale pp256 thread sweep measured 197.94, 218.53, 234.73, and
 188.30 tok/s at 4, 5, 6, and 8 threads. Six physical-core threads remain the
