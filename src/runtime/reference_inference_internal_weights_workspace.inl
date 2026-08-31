@@ -400,7 +400,8 @@ bool load_gguf_q8_0_checked(
   const cpu::Q8_0Backend backend,
   CpuQ8Runtime * runtime,
   TensorData & out,
-  std::string & error_message) {
+  std::string & error_message,
+  const bool retain_scales = true) {
   const GgufTensorInfo * info = reader.find_tensor(tensor_name);
   if (info == nullptr) {
     error_message = "Required GGUF tensor '" + tensor_name + "' is missing.";
@@ -422,9 +423,13 @@ bool load_gguf_q8_0_checked(
   out.shape = {rows, cols};
   out.data.clear();
   out.q8_0_blocks = std::move(tensor.blocks);
-  out.q8_0_scales.resize(out.q8_0_blocks.size());
-  cpu::q8_0_scales_to_f32(
-    out.q8_0_blocks.data(), out.q8_0_scales.data(), out.q8_0_blocks.size());
+  if (retain_scales) {
+    out.q8_0_scales.resize(out.q8_0_blocks.size());
+    cpu::q8_0_scales_to_f32(
+      out.q8_0_blocks.data(), out.q8_0_scales.data(), out.q8_0_blocks.size());
+  } else {
+    out.q8_0_scales.clear();
+  }
   out.q8_0_backend = backend;
   out.q8_0_runtime = runtime;
   return true;
@@ -909,7 +914,8 @@ bool load_model_weights_from_q8_0_gguf(
         backend,
         runtime,
         weights.embed_tokens,
-        error_message) ||
+        error_message,
+        false) ||
       !load_gguf_f32_checked(
         reader,
         "output_norm.weight",

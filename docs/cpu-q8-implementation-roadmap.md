@@ -254,7 +254,8 @@ preserving turbo rather than by reducing a directly timed stage.
 
 ### A6 — Greedy LM-head matvec plus argmax fusion
 
-Status: pending
+Status: partially completed; unused embedding/LM-head scale sidecar removed,
+greedy matvec/argmax fusion still pending
 
 Implementation:
 
@@ -489,7 +490,7 @@ Update this table in the same commit that lands or rejects each experiment.
 | A3 | Pending | — | Local vectors and model-global quantization scratch remain |
 | A4 | Completed, retained | pending commit | Three-slot ring state removes decode window copies; kernel-major weights, four-tap AVX2, and fused SiLU are covered by scalar/SIMD state and output tests. Ordered/reverse pp256 pairs averaged 210.48 versus 198.33 tok/s (+6.1%); decode averaged 37.14 versus 36.72 tok/s (+1.2%). pp2048 was 175.48 versus 165.58 tok/s (+6.0%) even though the optimized run was second. A 2,048-token integration run crossed 32 prefill chunk boundaries successfully. |
 | A5 | Pending | — | Global `min_parallel_rows=1` and long spin phase remain |
-| A6 | Pending | — | Greedy path avoids a copy but still materializes and scans all logits |
+| A6 | Partial | pending commit | The embedding/LM-head tensor no longer allocates an unused FP32 scale sidecar, saving 7,946,240 floats (30.31 MiB) for this model. Greedy matvec/argmax fusion remains pending. |
 | A7 | Completed, retained | pending commit | Added scalar/AVX2 differential coverage for contexts 1, 7, 8, 9, 63, 64, 65, 255, 256, 257, and 2,048. Softmax probabilities are normalized once and sigmoid uses one vector division. pp256 was 211.31 versus 209.37 tok/s (+0.9%). Ordered/reverse decode pairs averaged 37.44 versus 37.17 tok/s (+0.7%). |
 | A8 | Pending | — | Algebra/row tiling unimplemented |
 | A9 | Pending | — | GQA heads still largely independent |
