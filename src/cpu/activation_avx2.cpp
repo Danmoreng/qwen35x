@@ -105,14 +105,14 @@ void causal_conv1d_silu_f32_avx2(
   float * state,
   std::size_t ring_index,
   const float * input,
-  const std::size_t input_stride,
+  std::size_t input_stride,
   const float * kernel_major_weights,
   float * output,
-  const std::size_t batch_size,
-  const std::size_t channel_count,
-  const std::size_t kernel_size,
-  const std::size_t channel_begin,
-  const std::size_t channel_end) noexcept {
+  std::size_t batch_size,
+  std::size_t channel_count,
+  std::size_t kernel_size,
+  std::size_t channel_begin,
+  std::size_t channel_end) noexcept {
   const std::size_t history = kernel_size - 1;
   const __m256 one = _mm256_set1_ps(1.0F);
   const __m256 zero = _mm256_setzero_ps();

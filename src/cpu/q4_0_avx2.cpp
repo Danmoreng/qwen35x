@@ -1,5 +1,7 @@
 #include "q4_0_internal.h"
 
+#include "f16c_compat.h"
+
 #include <immintrin.h>
 
 #include <cstddef>
@@ -56,9 +58,8 @@ void quantize_q8_block_packed(
   const float max_scalar = _mm_cvtss_f32(max4);
   const float scale = max_scalar / 127.0F;
   const float inverse = scale == 0.0F ? 0.0F : 1.0F / scale;
-  const std::uint16_t half_scale = static_cast<std::uint16_t>(_cvtss_sh(
-    scale, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-  output.scales[token] = _cvtsh_ss(half_scale);
+  const std::uint16_t half_scale = f16c_float_to_half(scale);
+  output.scales[token] = f16c_half_to_float(half_scale);
 
   const __m256 inverse_scale = _mm256_set1_ps(inverse);
   const __m256i minimum = _mm256_set1_epi32(-127);
@@ -259,22 +260,22 @@ void accumulate_packed_block_x8(
   for (; block + 4 <= block_count; block += 4) {
     accumulator0 = _mm256_fmadd_ps(
       _mm256_cvtepi32_ps(dot_q4_q8(weights[block], activations[block])),
-      _mm256_set1_ps(_cvtsh_ss(weights[block].d) * _cvtsh_ss(activations[block].d)),
+      _mm256_set1_ps(f16c_half_to_float(weights[block].d) * f16c_half_to_float(activations[block].d)),
       accumulator0);
     accumulator1 = _mm256_fmadd_ps(
       _mm256_cvtepi32_ps(dot_q4_q8(weights[block + 1], activations[block + 1])),
       _mm256_set1_ps(
-        _cvtsh_ss(weights[block + 1].d) * _cvtsh_ss(activations[block + 1].d)),
+        f16c_half_to_float(weights[block + 1].d) * f16c_half_to_float(activations[block + 1].d)),
       accumulator1);
     accumulator2 = _mm256_fmadd_ps(
       _mm256_cvtepi32_ps(dot_q4_q8(weights[block + 2], activations[block + 2])),
       _mm256_set1_ps(
-        _cvtsh_ss(weights[block + 2].d) * _cvtsh_ss(activations[block + 2].d)),
+        f16c_half_to_float(weights[block + 2].d) * f16c_half_to_float(activations[block + 2].d)),
       accumulator2);
     accumulator3 = _mm256_fmadd_ps(
       _mm256_cvtepi32_ps(dot_q4_q8(weights[block + 3], activations[block + 3])),
       _mm256_set1_ps(
-        _cvtsh_ss(weights[block + 3].d) * _cvtsh_ss(activations[block + 3].d)),
+        f16c_half_to_float(weights[block + 3].d) * f16c_half_to_float(activations[block + 3].d)),
       accumulator3);
   }
   accumulator0 = _mm256_add_ps(accumulator0, accumulator1);
@@ -282,7 +283,7 @@ void accumulate_packed_block_x8(
   for (; block < block_count; ++block) {
     accumulator0 = _mm256_fmadd_ps(
       _mm256_cvtepi32_ps(dot_q4_q8(weights[block], activations[block])),
-      _mm256_set1_ps(_cvtsh_ss(weights[block].d) * _cvtsh_ss(activations[block].d)),
+      _mm256_set1_ps(f16c_half_to_float(weights[block].d) * f16c_half_to_float(activations[block].d)),
       accumulator0);
   }
   return horizontal_sum_f32(_mm256_add_ps(accumulator0, accumulator2));
@@ -303,7 +304,7 @@ void dot_eight_rows(
     const __m256i activation_bytes = _mm256_loadu_si256(
       reinterpret_cast<const __m256i *>(vector[block].qs));
     const __m256i activation_absolute = _mm256_abs_epi8(activation_bytes);
-    const float activation_scale = _cvtsh_ss(vector[block].d);
+    const float activation_scale = f16c_half_to_float(vector[block].d);
 #if defined(__clang__)
 #pragma clang loop unroll(full)
 #elif defined(__GNUC__)
@@ -314,7 +315,7 @@ void dot_eight_rows(
       accumulators[lane] = _mm256_fmadd_ps(
         _mm256_cvtepi32_ps(dot_q4_q8_loaded(
           unpack_q4_0(weight), activation_bytes, activation_absolute)),
-        _mm256_set1_ps(_cvtsh_ss(weight.d) * activation_scale),
+        _mm256_set1_ps(f16c_half_to_float(weight.d) * activation_scale),
         accumulators[lane]);
     }
   }
@@ -336,10 +337,10 @@ void dot_eight_rows(
     const std::size_t vector_offset = vector_index * blocks_per_row + block;
     const float weight_scale = matrix_scales != nullptr
       ? matrix_scales[row * blocks_per_row + block]
-      : _cvtsh_ss(matrix_row[block].d);
+      : f16c_half_to_float(matrix_row[block].d);
     const float activation_scale = vector_scales != nullptr
       ? vector_scales[vector_offset]
-      : _cvtsh_ss(vectors[vector_offset].d);
+      : f16c_half_to_float(vectors[vector_offset].d);
     accumulator = _mm256_fmadd_ps(
       _mm256_cvtepi32_ps(dot_q4_q8(matrix_row[block], vectors[vector_offset])),
       _mm256_set1_ps(weight_scale * activation_scale), accumulator);
@@ -355,7 +356,7 @@ void q4_0_dequantize_avx2(
   const std::size_t block_count) noexcept {
   for (std::size_t block = 0; block < block_count; ++block) {
     const __m256i values = unpack_q4_0(input[block]);
-    const __m256 scale = _mm256_set1_ps(_cvtsh_ss(input[block].d));
+    const __m256 scale = _mm256_set1_ps(f16c_half_to_float(input[block].d));
     float * destination = output + block * q4_0_values_per_block;
     const __m128i low = _mm256_castsi256_si128(values);
     const __m128i high = _mm256_extracti128_si256(values, 1);
@@ -424,7 +425,7 @@ void q4_0_matmul_q8_0_avx2(
         const __m256i weights = unpack_q4_0(matrix_row[block]);
         const float weight_scale = matrix_scales != nullptr
           ? matrix_scales[row * blocks_per_row + block]
-          : _cvtsh_ss(matrix_row[block].d);
+          : f16c_half_to_float(matrix_row[block].d);
 #if defined(__clang__)
 #pragma clang loop unroll(full)
 #elif defined(__GNUC__)
@@ -439,7 +440,7 @@ void q4_0_matmul_q8_0_avx2(
             weights, activation, _mm256_abs_epi8(activation)));
           const float activation_scale = vector_scales != nullptr
             ? vector_scales[vector_offset]
-            : _cvtsh_ss(vectors[vector_offset].d);
+            : f16c_half_to_float(vectors[vector_offset].d);
           accumulators[lane] = _mm256_fmadd_ps(
             integer_dot,
             _mm256_set1_ps(weight_scale * activation_scale),
@@ -554,7 +555,7 @@ void q4_0_packed_matvec_q8_0_avx2(
     const Q4_0BlockX8 * row_tile_data = matrix + row_tile * blocks_per_row;
     for (std::size_t block = 0; block < blocks_per_row; ++block) {
       Q8_0BlockX4 packed_activation{};
-      packed_activation.scales[0] = _cvtsh_ss(vector[block].d);
+      packed_activation.scales[0] = f16c_half_to_float(vector[block].d);
       std::int32_t activation_sum = 0;
       for (std::size_t chunk = 0; chunk < 4; ++chunk) {
         _mm_storel_epi64(

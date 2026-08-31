@@ -1,5 +1,7 @@
 #include "q8_0_internal.h"
 
+#include "f16c_compat.h"
+
 #include <immintrin.h>
 
 #include <cstddef>
@@ -93,19 +95,19 @@ namespace {
       dot_block_i8x8(lhs[block + 3].qs, rhs[block + 3].qs));
     accumulator0 = _mm256_fmadd_ps(
       integer_dot0,
-      _mm256_set1_ps(_cvtsh_ss(lhs[block].d) * _cvtsh_ss(rhs[block].d)),
+      _mm256_set1_ps(f16c_half_to_float(lhs[block].d) * f16c_half_to_float(rhs[block].d)),
       accumulator0);
     accumulator1 = _mm256_fmadd_ps(
       integer_dot1,
-      _mm256_set1_ps(_cvtsh_ss(lhs[block + 1].d) * _cvtsh_ss(rhs[block + 1].d)),
+      _mm256_set1_ps(f16c_half_to_float(lhs[block + 1].d) * f16c_half_to_float(rhs[block + 1].d)),
       accumulator1);
     accumulator2 = _mm256_fmadd_ps(
       integer_dot2,
-      _mm256_set1_ps(_cvtsh_ss(lhs[block + 2].d) * _cvtsh_ss(rhs[block + 2].d)),
+      _mm256_set1_ps(f16c_half_to_float(lhs[block + 2].d) * f16c_half_to_float(rhs[block + 2].d)),
       accumulator2);
     accumulator3 = _mm256_fmadd_ps(
       integer_dot3,
-      _mm256_set1_ps(_cvtsh_ss(lhs[block + 3].d) * _cvtsh_ss(rhs[block + 3].d)),
+      _mm256_set1_ps(f16c_half_to_float(lhs[block + 3].d) * f16c_half_to_float(rhs[block + 3].d)),
       accumulator3);
   }
   accumulator0 = _mm256_add_ps(accumulator0, accumulator1);
@@ -115,7 +117,7 @@ namespace {
       dot_block_i8x8(lhs[block].qs, rhs[block].qs));
     accumulator0 = _mm256_fmadd_ps(
       integer_dot,
-      _mm256_set1_ps(_cvtsh_ss(lhs[block].d) * _cvtsh_ss(rhs[block].d)),
+      _mm256_set1_ps(f16c_half_to_float(lhs[block].d) * f16c_half_to_float(rhs[block].d)),
       accumulator0);
   }
   return horizontal_sum_f32(_mm256_add_ps(accumulator0, accumulator2));
@@ -138,10 +140,10 @@ namespace {
       dot_block_i8x8(matrix_row[block].qs, vector_block.qs));
     const float matrix_scale = matrix_scales != nullptr
       ? matrix_scales[matrix_row_index * blocks_per_row + block]
-      : _cvtsh_ss(matrix_row[block].d);
+      : f16c_half_to_float(matrix_row[block].d);
     const float vector_scale = vector_scales != nullptr
       ? vector_scales[vector_offset]
-      : _cvtsh_ss(vector_block.d);
+      : f16c_half_to_float(vector_block.d);
     accumulator = _mm256_fmadd_ps(
       integer_dot, _mm256_set1_ps(matrix_scale * vector_scale), accumulator);
   }
@@ -164,7 +166,7 @@ void dot_four_rows_avx2_impl(
     const __m256i vector_bytes = _mm256_loadu_si256(
       reinterpret_cast<const __m256i *>(vector[block].qs));
     const __m256i vector_absolute = _mm256_abs_epi8(vector_bytes);
-    const float vector_scale = _cvtsh_ss(vector[block].d);
+    const float vector_scale = f16c_half_to_float(vector[block].d);
 
     const __m256i weight0 = _mm256_loadu_si256(
       reinterpret_cast<const __m256i *>(row0[block].qs));
@@ -177,22 +179,22 @@ void dot_four_rows_avx2_impl(
     accumulator0 = _mm256_fmadd_ps(
       _mm256_cvtepi32_ps(dot_block_i8x8_loaded_rhs(
         weight0, vector_bytes, vector_absolute)),
-      _mm256_set1_ps(_cvtsh_ss(row0[block].d) * vector_scale),
+      _mm256_set1_ps(f16c_half_to_float(row0[block].d) * vector_scale),
       accumulator0);
     accumulator1 = _mm256_fmadd_ps(
       _mm256_cvtepi32_ps(dot_block_i8x8_loaded_rhs(
         weight1, vector_bytes, vector_absolute)),
-      _mm256_set1_ps(_cvtsh_ss(row1[block].d) * vector_scale),
+      _mm256_set1_ps(f16c_half_to_float(row1[block].d) * vector_scale),
       accumulator1);
     accumulator2 = _mm256_fmadd_ps(
       _mm256_cvtepi32_ps(dot_block_i8x8_loaded_rhs(
         weight2, vector_bytes, vector_absolute)),
-      _mm256_set1_ps(_cvtsh_ss(row2[block].d) * vector_scale),
+      _mm256_set1_ps(f16c_half_to_float(row2[block].d) * vector_scale),
       accumulator2);
     accumulator3 = _mm256_fmadd_ps(
       _mm256_cvtepi32_ps(dot_block_i8x8_loaded_rhs(
         weight3, vector_bytes, vector_absolute)),
-      _mm256_set1_ps(_cvtsh_ss(row3[block].d) * vector_scale),
+      _mm256_set1_ps(f16c_half_to_float(row3[block].d) * vector_scale),
       accumulator3);
   }
   output[0] = horizontal_sum_f32(accumulator0);
@@ -216,7 +218,7 @@ void dot_eight_rows_avx2_impl(
     const __m256i vector_bytes = _mm256_loadu_si256(
       reinterpret_cast<const __m256i *>(vector[block].qs));
     const __m256i vector_absolute = _mm256_abs_epi8(vector_bytes);
-    const float vector_scale = _cvtsh_ss(vector[block].d);
+    const float vector_scale = f16c_half_to_float(vector[block].d);
 #if defined(__clang__)
 #pragma clang loop unroll(full)
 #elif defined(__GNUC__)
@@ -229,7 +231,7 @@ void dot_eight_rows_avx2_impl(
       accumulators[lane] = _mm256_fmadd_ps(
         _mm256_cvtepi32_ps(dot_block_i8x8_loaded_rhs(
           weight_bytes, vector_bytes, vector_absolute)),
-        _mm256_set1_ps(_cvtsh_ss(weight.d) * vector_scale),
+        _mm256_set1_ps(f16c_half_to_float(weight.d) * vector_scale),
         accumulators[lane]);
     }
   }
@@ -272,11 +274,10 @@ void q8_0_quantize_avx2(
     const float max_scalar = _mm_cvtss_f32(max4);
     const float scale = max_scalar / 127.0F;
     const float inverse_scale_scalar = scale == 0.0F ? 0.0F : 1.0F / scale;
-    const std::uint16_t half_scale = static_cast<std::uint16_t>(_cvtss_sh(
-      scale, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+    const std::uint16_t half_scale = f16c_float_to_half(scale);
     output[block].d = half_scale;
     if (scales != nullptr) {
-      scales[block] = _cvtsh_ss(half_scale);
+      scales[block] = f16c_half_to_float(half_scale);
     }
     const __m256 inverse_scale = _mm256_set1_ps(inverse_scale_scalar);
 
@@ -303,7 +304,7 @@ void q8_0_dequantize_avx2(
   float * output,
   const std::size_t block_count) noexcept {
   for (std::size_t block = 0; block < block_count; ++block) {
-    const __m256 scale = _mm256_set1_ps(_cvtsh_ss(input[block].d));
+    const __m256 scale = _mm256_set1_ps(f16c_half_to_float(input[block].d));
     float * y = output + block * q8_0_values_per_block;
     for (std::size_t group = 0; group < 4; ++group) {
       const __m128i bytes = _mm_loadl_epi64(
@@ -403,20 +404,20 @@ void q8_0_matmul_avx2(
           reinterpret_cast<const __m256i *>(vector2.qs));
         const float vector_scale0 = vector_scales != nullptr
           ? vector_scales[(vector_index + 0) * blocks_per_row + block]
-          : _cvtsh_ss(vector0.d);
+          : f16c_half_to_float(vector0.d);
         const float vector_scale1 = vector_scales != nullptr
           ? vector_scales[(vector_index + 1) * blocks_per_row + block]
-          : _cvtsh_ss(vector1.d);
+          : f16c_half_to_float(vector1.d);
         const float vector_scale2 = vector_scales != nullptr
           ? vector_scales[(vector_index + 2) * blocks_per_row + block]
-          : _cvtsh_ss(vector2.d);
+          : f16c_half_to_float(vector2.d);
 
         const __m256i weight0 = _mm256_loadu_si256(
           reinterpret_cast<const __m256i *>(matrix_row0[block].qs));
         const __m256i absolute0 = _mm256_abs_epi8(weight0);
         const float scale0 = matrix_scales != nullptr
           ? matrix_scales[row * blocks_per_row + block]
-          : _cvtsh_ss(matrix_row0[block].d);
+          : f16c_half_to_float(matrix_row0[block].d);
         accum00 = _mm256_fmadd_ps(
           _mm256_cvtepi32_ps(dot_block_i8x8_loaded_lhs(weight0, absolute0, bytes0)),
           _mm256_set1_ps(scale0 * vector_scale0), accum00);
@@ -432,7 +433,7 @@ void q8_0_matmul_avx2(
         const __m256i absolute1 = _mm256_abs_epi8(weight1);
         const float scale1 = matrix_scales != nullptr
           ? matrix_scales[(row + 1) * blocks_per_row + block]
-          : _cvtsh_ss(matrix_row1[block].d);
+          : f16c_half_to_float(matrix_row1[block].d);
         accum10 = _mm256_fmadd_ps(
           _mm256_cvtepi32_ps(dot_block_i8x8_loaded_lhs(weight1, absolute1, bytes0)),
           _mm256_set1_ps(scale1 * vector_scale0), accum10);
@@ -473,7 +474,7 @@ void q8_0_matmul_avx2(
         const __m256i weight_absolute = _mm256_abs_epi8(weight_bytes);
         const float weight_scale = matrix_scales != nullptr
           ? matrix_scales[row * blocks_per_row + block]
-          : _cvtsh_ss(matrix_row[block].d);
+          : f16c_half_to_float(matrix_row[block].d);
         for (std::size_t lane = 0; lane < vector_tile; ++lane) {
           const std::size_t vector_offset =
             (vector_index + lane) * blocks_per_row + block;
@@ -486,7 +487,7 @@ void q8_0_matmul_avx2(
               weight_scale *
               (vector_scales != nullptr
                  ? vector_scales[vector_offset]
-                 : _cvtsh_ss(vector_block.d))),
+                 : f16c_half_to_float(vector_block.d))),
             accumulators[lane]);
         }
       }

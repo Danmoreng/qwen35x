@@ -1,5 +1,7 @@
 #include "qwen35x/cpu/full_attention.h"
 
+#include "f16c_compat.h"
+
 #include <immintrin.h>
 
 #include <algorithm>
@@ -95,7 +97,7 @@ namespace {
   }
   float result = horizontal_sum_f32(_mm256_add_ps(accum0, accum1));
   for (; index < count; ++index) {
-    result += lhs[index] * _cvtsh_ss(rhs[index]);
+    result += lhs[index] * f16c_half_to_float(rhs[index]);
   }
   return result;
 }
@@ -153,7 +155,7 @@ void dot_pair_f16_avx2(
   result0 = horizontal_sum_f32(_mm256_add_ps(accum00, accum01));
   result1 = horizontal_sum_f32(_mm256_add_ps(accum10, accum11));
   for (; index < count; ++index) {
-    const float value = _cvtsh_ss(rhs[index]);
+    const float value = f16c_half_to_float(rhs[index]);
     result0 += lhs0[index] * value;
     result1 += lhs1[index] * value;
   }
@@ -250,7 +252,7 @@ void weighted_sum_pair_avx2(
       const std::size_t offset = static_cast<std::size_t>(context) * kv_width +
         head_offset + static_cast<std::size_t>(column);
       const float value = v_cache_f16 != nullptr
-        ? _cvtsh_ss(v_cache_f16[offset]) : v_cache[offset];
+        ? f16c_half_to_float(v_cache_f16[offset]) : v_cache[offset];
       accum0 += probabilities0[context] * value;
       accum1 += probabilities1[context] * value;
     }
@@ -359,7 +361,7 @@ void weighted_sum_f32_avx2(
     for (int context = 0; context < sequence_length; ++context) {
       const std::size_t offset = static_cast<std::size_t>(context) * kv_width + head_offset;
       const float value = v_cache_f16 != nullptr
-        ? _cvtsh_ss(v_cache_f16[offset + static_cast<std::size_t>(column_base)])
+        ? f16c_half_to_float(v_cache_f16[offset + static_cast<std::size_t>(column_base)])
         : v_cache[offset + static_cast<std::size_t>(column_base)];
       accumulator += probabilities[static_cast<std::size_t>(context)] * value;
     }
@@ -388,7 +390,7 @@ void attention_cache_store_f16_avx2(
       _mm256_cvtps_ph(_mm256_loadu_ps(input + index), _MM_FROUND_TO_NEAREST_INT));
   }
   for (; index < count; ++index) {
-    output[index] = static_cast<std::uint16_t>(_cvtss_sh(input[index], _MM_FROUND_TO_NEAREST_INT));
+    output[index] = f16c_float_to_half(input[index]);
   }
 }
 
