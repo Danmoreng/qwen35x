@@ -425,6 +425,10 @@ bool run_forward_single_token(
             state.full_states[static_cast<std::size_t>(full_idx)],
             normed,
             position,
+            state.rope_cosine.data() +
+              static_cast<std::size_t>(position) * static_cast<std::size_t>(dims.rope_dim / 2),
+            state.rope_sine.data() +
+              static_cast<std::size_t>(position) * static_cast<std::size_t>(dims.rope_dim / 2),
             attn_out,
             use_cuda,
             cuda_workspace,

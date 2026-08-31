@@ -468,6 +468,8 @@ bool run_full_attention_step(
   FullAttentionState & state,
   const std::vector<float> & x,
   const int position,
+  const float * rope_cosine,
+  const float * rope_sine,
   std::vector<float> & out,
   const bool use_cuda,
   CudaForwardWorkspace * cuda_workspace,
@@ -529,8 +531,14 @@ bool run_full_attention_step(
   rms_norm_per_head_qwen3next(q, dims.n_heads, dims.head_dim, layer.full.q_norm, dims.rms_eps, q_normed);
   rms_norm_per_head_qwen3next(k_flat, dims.n_kv_heads, dims.head_dim, layer.full.k_norm, dims.rms_eps, k_normed);
 
-  apply_rope_inplace(q_normed, dims.n_heads, dims.head_dim, dims.rope_dim, position, dims.rope_theta);
-  apply_rope_inplace(k_normed, dims.n_kv_heads, dims.head_dim, dims.rope_dim, position, dims.rope_theta);
+  cpu::rope_f32(
+    q_normed.data(), static_cast<std::size_t>(dims.n_heads),
+    static_cast<std::size_t>(dims.head_dim), static_cast<std::size_t>(dims.rope_dim),
+    rope_cosine, rope_sine, layer.full.o_proj.q8_0_backend);
+  cpu::rope_f32(
+    k_normed.data(), static_cast<std::size_t>(dims.n_kv_heads),
+    static_cast<std::size_t>(dims.head_dim), static_cast<std::size_t>(dims.rope_dim),
+    rope_cosine, rope_sine, layer.full.o_proj.q8_0_backend);
 
   const std::size_t token_stride = static_cast<std::size_t>(dims.n_kv_heads * dims.head_dim);
   std::memcpy(

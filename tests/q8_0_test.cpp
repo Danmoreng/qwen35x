@@ -159,6 +159,36 @@ bool test_add(const Q8_0Backend backend) {
   return ok;
 }
 
+bool test_rope(const Q8_0Backend backend) {
+  constexpr std::size_t heads = 3;
+  constexpr std::size_t head_dim = 23;
+  constexpr std::size_t rope_dim = 18;
+  constexpr std::size_t half = rope_dim / 2;
+  std::array<float, heads * head_dim> expected{};
+  for (std::size_t index = 0; index < expected.size(); ++index) {
+    expected[index] = std::sin(static_cast<float>(index) * 0.19F) * 2.0F;
+  }
+  auto actual = expected;
+  std::array<float, half> cosine{};
+  std::array<float, half> sine{};
+  for (std::size_t index = 0; index < half; ++index) {
+    const float angle = static_cast<float>(index + 1) * 0.13F;
+    cosine[index] = std::cos(angle);
+    sine[index] = std::sin(angle);
+  }
+  qwen35x::cpu::rope_f32(
+    expected.data(), heads, head_dim, rope_dim,
+    cosine.data(), sine.data(), Q8_0Backend::scalar);
+  qwen35x::cpu::rope_f32(
+    actual.data(), heads, head_dim, rope_dim,
+    cosine.data(), sine.data(), backend);
+  bool ok = true;
+  for (std::size_t index = 0; index < actual.size(); ++index) {
+    ok = expect(near(expected[index], actual[index]), "RoPE mismatch") && ok;
+  }
+  return ok;
+}
+
 bool test_l2_normalize(const Q8_0Backend backend) {
   constexpr std::size_t rows = 3;
   constexpr std::size_t width = 37;
@@ -306,6 +336,7 @@ int main() {
   ok = test_silu_mul(Q8_0Backend::auto_select) && ok;
   ok = test_rms_norm(Q8_0Backend::auto_select) && ok;
   ok = test_add(Q8_0Backend::auto_select) && ok;
+  ok = test_rope(Q8_0Backend::auto_select) && ok;
   ok = test_l2_normalize(Q8_0Backend::auto_select) && ok;
   ok = test_backend(Q8_0Backend::scalar) && ok;
   ok = test_backend(Q8_0Backend::auto_select) && ok;
@@ -315,6 +346,7 @@ int main() {
       qwen35x::cpu::q8_0_resolve_backend(Q8_0Backend::avx2) == Q8_0Backend::avx2,
       "available AVX2 backend did not resolve to AVX2") && ok;
     ok = test_backend(Q8_0Backend::avx2) && ok;
+    ok = test_rope(Q8_0Backend::avx2) && ok;
   } else {
     ok = expect(
       qwen35x::cpu::q8_0_resolve_backend(Q8_0Backend::avx2) == Q8_0Backend::scalar,

@@ -268,6 +268,24 @@ bool run_reference_qwen35_inference(
   }
 
   ModelState state;
+  const std::size_t rope_half = static_cast<std::size_t>(dims.rope_dim / 2);
+  state.rope_inverse_frequency.resize(rope_half);
+  for (std::size_t index = 0; index < rope_half; ++index) {
+    state.rope_inverse_frequency[index] = std::pow(
+      dims.rope_theta,
+      -static_cast<float>(2 * index) / static_cast<float>(dims.rope_dim));
+  }
+  state.rope_cosine.resize(static_cast<std::size_t>(required_context) * rope_half);
+  state.rope_sine.resize(static_cast<std::size_t>(required_context) * rope_half);
+  for (int position = 0; position < required_context; ++position) {
+    const std::size_t position_offset = static_cast<std::size_t>(position) * rope_half;
+    for (std::size_t index = 0; index < rope_half; ++index) {
+      const float angle =
+        static_cast<float>(position) * state.rope_inverse_frequency[index];
+      state.rope_cosine[position_offset + index] = std::cos(angle);
+      state.rope_sine[position_offset + index] = std::sin(angle);
+    }
+  }
   int full_layers = 0;
   int linear_layers = 0;
   for (const auto block : profile.fingerprint.attention_schedule) {

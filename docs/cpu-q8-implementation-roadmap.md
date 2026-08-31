@@ -148,7 +148,7 @@ separate if only one is measurably beneficial.
 
 ### A2 — Request-level RoPE cache and AVX2 rotation
 
-Status: pending
+Status: completed; retained as a neutral architectural cleanup
 
 Implementation:
 
@@ -484,7 +484,7 @@ Update this table in the same commit that lands or rejects each experiment.
 | --- | --- | --- | --- |
 | A0 | Pending | — | Stable reference figures exist; expanded controlled baseline still required |
 | A1 | Completed, neutral | pending commit | F16C conversion and loaded-YMM reuse verified in disassembly; fused scale sidecar removes the second pass. All tests pass. Ordered/reverse A/B pairs were dominated by laptop drift: combined pp256 was 198.59 versus 199.63 tok/s, decode 36.61 versus 36.74 tok/s, and pp2048 168.22 versus 169.56 tok/s (A1 versus baseline). No speedup is claimed. |
-| A2 | Pending | — | Decode and each full-attention prefill layer currently recompute trigonometry |
+| A2 | Completed, neutral | pending commit | Request tables are sized to the required context, shared by all full-attention layers, and consumed by tested AVX2 rotation. pp256 was 198.32 versus 198.12 tok/s. Ordered/reverse decode pairs averaged 36.88 versus 36.90 tok/s (A2 versus immediate baseline), so no laptop throughput gain is claimed. The cache removes redundant transcendental work and prepares prefix-state caching. |
 | A3 | Pending | — | Local vectors and model-global quantization scratch remain |
 | A4 | Pending | — | Current decode creates/copies a convolution window; clean redesign required |
 | A5 | Pending | — | Global `min_parallel_rows=1` and long spin phase remain |

@@ -13,28 +13,6 @@ void rms_norm_qwen3next_batch(
     eps, 1.0F);
 }
 
-void apply_rope_from_tables_inplace(
-  std::vector<float> & values,
-  const int head_count,
-  const int head_dim,
-  const int rope_dim,
-  const float * cosine,
-  const float * sine) {
-  const int half = rope_dim / 2;
-  for (int head = 0; head < head_count; ++head) {
-    const std::size_t base =
-      static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim);
-    for (int index = 0; index < half; ++index) {
-      const std::size_t first = base + static_cast<std::size_t>(index);
-      const std::size_t second = first + static_cast<std::size_t>(half);
-      const float x0 = values[first];
-      const float x1 = values[second];
-      values[first] = x0 * cosine[index] - x1 * sine[index];
-      values[second] = x1 * cosine[index] + x0 * sine[index];
-    }
-  }
-}
-
 struct GatedDeltaNetBatchCpuJob {
   float * state = nullptr;
   const float * q = nullptr;
@@ -296,6 +274,8 @@ bool run_full_attention_batch_cpu_q8(
   const std::vector<float> & input,
   const std::size_t batch_size,
   const int position_start,
+  const float * rope_cosine,
+  const float * rope_sine,
   std::vector<float> & output,
   std::string & error_message) {
   if (!layer.full.qkv_proj_cpu.is_q8_0() || !layer.full.o_proj.is_q8_0()) {
@@ -327,25 +307,6 @@ bool run_full_attention_batch_cpu_q8(
   const int q_span = 2 * dims.head_dim;
   const float attention_scale = 1.0F / std::sqrt(static_cast<float>(dims.head_dim));
   const int rope_half = dims.rope_dim / 2;
-  std::vector<float> rope_inverse_frequency(static_cast<std::size_t>(rope_half));
-  for (int index = 0; index < rope_half; ++index) {
-    rope_inverse_frequency[static_cast<std::size_t>(index)] = std::pow(
-      dims.rope_theta,
-      -static_cast<float>(2 * index) / static_cast<float>(dims.rope_dim));
-  }
-  std::vector<float> rope_cosine(batch_size * static_cast<std::size_t>(rope_half));
-  std::vector<float> rope_sine(batch_size * static_cast<std::size_t>(rope_half));
-  for (std::size_t token = 0; token < batch_size; ++token) {
-    const float position = static_cast<float>(position_start + static_cast<int>(token));
-    for (int index = 0; index < rope_half; ++index) {
-      const float angle =
-        position * rope_inverse_frequency[static_cast<std::size_t>(index)];
-      rope_cosine[token * static_cast<std::size_t>(rope_half) +
-        static_cast<std::size_t>(index)] = std::cos(angle);
-      rope_sine[token * static_cast<std::size_t>(rope_half) +
-        static_cast<std::size_t>(index)] = std::sin(angle);
-    }
-  }
 
   for (std::size_t token = 0; token < batch_size; ++token) {
     const int position = position_start + static_cast<int>(token);
@@ -371,13 +332,17 @@ bool run_full_attention_batch_cpu_q8(
     rms_norm_per_head_qwen3next(
       k_flat, dims.n_kv_heads, dims.head_dim, layer.full.k_norm, dims.rms_eps, k_normed);
     const float * token_cosine =
-      rope_cosine.data() + token * static_cast<std::size_t>(rope_half);
+      rope_cosine + token * static_cast<std::size_t>(rope_half);
     const float * token_sine =
-      rope_sine.data() + token * static_cast<std::size_t>(rope_half);
-    apply_rope_from_tables_inplace(
-      q_normed, dims.n_heads, dims.head_dim, dims.rope_dim, token_cosine, token_sine);
-    apply_rope_from_tables_inplace(
-      k_normed, dims.n_kv_heads, dims.head_dim, dims.rope_dim, token_cosine, token_sine);
+      rope_sine + token * static_cast<std::size_t>(rope_half);
+    cpu::rope_f32(
+      q_normed.data(), static_cast<std::size_t>(dims.n_heads),
+      static_cast<std::size_t>(dims.head_dim), static_cast<std::size_t>(dims.rope_dim),
+      token_cosine, token_sine, layer.full.o_proj.q8_0_backend);
+    cpu::rope_f32(
+      k_normed.data(), static_cast<std::size_t>(dims.n_kv_heads),
+      static_cast<std::size_t>(dims.head_dim), static_cast<std::size_t>(dims.rope_dim),
+      token_cosine, token_sine, layer.full.o_proj.q8_0_backend);
 
     std::memcpy(
       query_batch.data() + token * query_width,
@@ -529,6 +494,10 @@ bool run_forward_cpu_q8_batch(
         normed,
         batch_size,
         position_start,
+        state.rope_cosine.data() +
+          static_cast<std::size_t>(position_start) * static_cast<std::size_t>(dims.rope_dim / 2),
+        state.rope_sine.data() +
+          static_cast<std::size_t>(position_start) * static_cast<std::size_t>(dims.rope_dim / 2),
         attention,
         error_message);
     }

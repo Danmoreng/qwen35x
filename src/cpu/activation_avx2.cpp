@@ -68,6 +68,39 @@ void add_f32_avx2(
   }
 }
 
+void rope_f32_avx2(
+  float * values,
+  const std::size_t head_count,
+  const std::size_t head_dim,
+  const std::size_t rope_dim,
+  const float * cosine,
+  const float * sine) noexcept {
+  const std::size_t half = rope_dim / 2;
+  for (std::size_t head = 0; head < head_count; ++head) {
+    float * first = values + head * head_dim;
+    float * second = first + half;
+    std::size_t index = 0;
+    for (; index + 8 <= half; index += 8) {
+      const __m256 x0 = _mm256_loadu_ps(first + index);
+      const __m256 x1 = _mm256_loadu_ps(second + index);
+      const __m256 c = _mm256_loadu_ps(cosine + index);
+      const __m256 s = _mm256_loadu_ps(sine + index);
+      _mm256_storeu_ps(
+        first + index,
+        _mm256_fmsub_ps(x0, c, _mm256_mul_ps(x1, s)));
+      _mm256_storeu_ps(
+        second + index,
+        _mm256_fmadd_ps(x1, c, _mm256_mul_ps(x0, s)));
+    }
+    for (; index < half; ++index) {
+      const float x0 = first[index];
+      const float x1 = second[index];
+      first[index] = x0 * cosine[index] - x1 * sine[index];
+      second[index] = x1 * cosine[index] + x0 * sine[index];
+    }
+  }
+}
+
 void rms_norm_f32_avx2(
   const float * input,
   const float * weight,

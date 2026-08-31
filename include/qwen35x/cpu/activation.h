@@ -13,6 +13,17 @@ void add_f32(
   std::size_t count,
   Q8_0Backend backend = Q8_0Backend::auto_select) noexcept;
 
+// Applies split-half rotary position embedding to head_count rows. cosine and
+// sine each contain rope_dim / 2 values for the requested absolute position.
+void rope_f32(
+  float * values,
+  std::size_t head_count,
+  std::size_t head_dim,
+  std::size_t rope_dim,
+  const float * cosine,
+  const float * sine,
+  Q8_0Backend backend = Q8_0Backend::auto_select) noexcept;
+
 // Applies RMS normalization to row_count rows. The width-element weight is
 // shared by all rows and weight_offset supports Qwen's (1 + weight) form.
 void rms_norm_f32(

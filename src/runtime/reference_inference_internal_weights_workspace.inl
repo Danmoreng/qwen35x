@@ -129,6 +129,9 @@ struct LinearAttentionState {
 struct ModelState {
   std::vector<FullAttentionState> full_states;
   std::vector<LinearAttentionState> linear_states;
+  std::vector<float> rope_inverse_frequency;
+  std::vector<float> rope_cosine;
+  std::vector<float> rope_sine;
 };
 
 struct FullAttentionBatchCpuJob {
@@ -718,36 +721,6 @@ void l2_norm_per_head(
   cpu::l2_normalize_f32(
     x.data(), static_cast<std::size_t>(num_heads),
     static_cast<std::size_t>(head_dim), eps, output_scale);
-}
-
-void apply_rope_inplace(
-  std::vector<float> & x,
-  const int num_heads,
-  const int head_dim,
-  const int rope_dim,
-  const int position,
-  const float rope_theta) {
-  if (rope_dim <= 0 || rope_dim > head_dim || (rope_dim % 2) != 0) {
-    return;
-  }
-  const int half = rope_dim / 2;
-  for (int h = 0; h < num_heads; ++h) {
-    const std::size_t base = static_cast<std::size_t>(h) * static_cast<std::size_t>(head_dim);
-    for (int i = 0; i < half; ++i) {
-      const float inv_freq = std::pow(rope_theta, -static_cast<float>(2 * i) / static_cast<float>(rope_dim));
-      const float angle = static_cast<float>(position) * inv_freq;
-      const float c = std::cos(angle);
-      const float s = std::sin(angle);
-
-      const std::size_t i0 = base + static_cast<std::size_t>(i);
-      const std::size_t i1 = base + static_cast<std::size_t>(i + half);
-
-      const float x0 = x[i0];
-      const float x1 = x[i1];
-      x[i0] = x0 * c - x1 * s;
-      x[i1] = x1 * c + x0 * s;
-    }
-  }
 }
 
 bool build_runtime_dims(const ModelProfile & profile, RuntimeDims & dims, std::string & error_message) {

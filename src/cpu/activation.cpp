@@ -18,6 +18,14 @@ void add_f32_avx2(
   float * output,
   std::size_t count) noexcept;
 
+void rope_f32_avx2(
+  float * values,
+  std::size_t head_count,
+  std::size_t head_dim,
+  std::size_t rope_dim,
+  const float * cosine,
+  const float * sine) noexcept;
+
 void rms_norm_f32_avx2(
   const float * input,
   const float * weight,
@@ -64,6 +72,39 @@ void add_f32(
 #endif
   for (std::size_t index = 0; index < count; ++index) {
     output[index] = lhs[index] + rhs[index];
+  }
+}
+
+void rope_f32(
+  float * values,
+  const std::size_t head_count,
+  const std::size_t head_dim,
+  const std::size_t rope_dim,
+  const float * cosine,
+  const float * sine,
+  const Q8_0Backend backend) noexcept {
+  if (rope_dim == 0 || rope_dim > head_dim || (rope_dim & 1U) != 0U) {
+    return;
+  }
+#if QWEN35X_Q8_0_HAS_AVX2_TU
+  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+    detail::rope_f32_avx2(
+      values, head_count, head_dim, rope_dim, cosine, sine);
+    return;
+  }
+#else
+  static_cast<void>(backend);
+#endif
+  const std::size_t half = rope_dim / 2;
+  for (std::size_t head = 0; head < head_count; ++head) {
+    float * first = values + head * head_dim;
+    float * second = first + half;
+    for (std::size_t index = 0; index < half; ++index) {
+      const float x0 = first[index];
+      const float x1 = second[index];
+      first[index] = x0 * cosine[index] - x1 * sine[index];
+      second[index] = x1 * cosine[index] + x0 * sine[index];
+    }
   }
 }
 
