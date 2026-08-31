@@ -17,6 +17,8 @@ namespace {
 
 constexpr std::uint32_t gguf_version = 3;
 constexpr std::uint32_t default_alignment = 32;
+constexpr std::uint64_t q4_0_elements_per_block = 32;
+constexpr std::uint64_t q4_0_bytes_per_block = 18;
 constexpr std::uint64_t q8_0_elements_per_block = 32;
 constexpr std::uint64_t q8_0_bytes_per_block = 34;
 constexpr std::uint64_t max_serialized_string_bytes = 64ULL * 1024ULL * 1024ULL;
@@ -24,6 +26,7 @@ constexpr std::uint64_t max_metadata_entries = 1'000'000;
 constexpr std::uint64_t max_tensor_entries = 1'000'000;
 
 static_assert(std::is_trivially_copyable_v<cpu::Q8_0Block>);
+static_assert(std::is_trivially_copyable_v<cpu::Q4_0Block>);
 
 enum class GgufValueType : std::uint32_t {
   uint8 = 0,
@@ -357,8 +360,27 @@ bool compute_tensor_layout(GgufTensorInfo & info, std::string & error_message) {
     return true;
   }
 
+  if (info.is_q4_0()) {
+    if (info.ggml_shape.empty()) {
+      error_message = "Q4_0 tensor '" + info.name + "' has no contiguous dimension.";
+      return false;
+    }
+    if (info.ggml_shape.front() % q4_0_elements_per_block != 0) {
+      error_message = "Q4_0 tensor '" + info.name +
+        "' has a contiguous dimension that is not divisible by 32.";
+      return false;
+    }
+    const std::uint64_t block_count = elements / q4_0_elements_per_block;
+    if (!checked_mul_u64(block_count, q4_0_bytes_per_block, info.data_size)) {
+      error_message = "Q4_0 tensor '" + info.name + "' byte size overflows uint64.";
+      return false;
+    }
+    return true;
+  }
+
   error_message = "Tensor '" + info.name + "' uses unsupported GGML payload type " +
-                  std::to_string(info.ggml_type) + " (only F32=0 and Q8_0=8 are supported).";
+                  std::to_string(info.ggml_type) +
+                  " (only F32=0, Q4_0=2 and Q8_0=8 are supported).";
   return false;
 }
 
@@ -778,6 +800,57 @@ bool GgufReader::read_q8_0_tensor(
 
   if constexpr (std::endian::native == std::endian::big) {
     for (cpu::Q8_0Block & block : out_tensor.blocks) {
+      block.d = static_cast<std::uint16_t>((block.d >> 8U) | (block.d << 8U));
+    }
+  }
+  return true;
+}
+
+bool GgufReader::read_q4_0_tensor(
+  const std::string_view tensor_name,
+  GgufTensorQ4_0 & out_tensor,
+  std::string & error_message) const {
+  out_tensor = {};
+  error_message.clear();
+  if (!is_open_) {
+    error_message = "No GGUF file is open.";
+    return false;
+  }
+  const GgufTensorInfo * info = find_tensor(tensor_name);
+  if (info == nullptr) {
+    error_message = tensor_not_found_message(tensor_name);
+    return false;
+  }
+  if (!info->is_q4_0()) {
+    error_message = "Tensor '" + info->name + "' is not Q4_0 (GGML type " +
+      std::to_string(info->ggml_type) + ").";
+    return false;
+  }
+  const std::uint64_t block_count = info->data_size / sizeof(cpu::Q4_0Block);
+  if (block_count > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+    error_message = "Q4_0 tensor '" + info->name + "' is too large for an owned vector.";
+    return false;
+  }
+  try {
+    out_tensor.name = info->name;
+    out_tensor.shape = info->shape;
+    out_tensor.blocks.resize(static_cast<std::size_t>(block_count));
+  } catch (const std::bad_alloc &) {
+    out_tensor = {};
+    error_message = "Out of memory while allocating Q4_0 tensor '" + info->name + "'.";
+    return false;
+  } catch (const std::length_error &) {
+    out_tensor = {};
+    error_message = "Q4_0 tensor '" + info->name + "' is too large for an owned vector.";
+    return false;
+  }
+  if (!read_file_range(
+        path_, info->data_offset, out_tensor.blocks.data(), info->data_size, error_message)) {
+    out_tensor = {};
+    return false;
+  }
+  if constexpr (std::endian::native == std::endian::big) {
+    for (cpu::Q4_0Block & block : out_tensor.blocks) {
       block.d = static_cast<std::uint16_t>((block.d >> 8U) | (block.d << 8U));
     }
   }

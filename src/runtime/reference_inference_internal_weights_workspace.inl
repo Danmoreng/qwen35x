@@ -5,11 +5,15 @@ struct CpuQ8Runtime {
   std::vector<cpu::Q8_0Block> quantized_input;
   std::vector<cpu::Q8_0Block> quantized_batch;
   std::vector<float> quantized_batch_scales;
+  std::vector<cpu::Q8_0BlockX4> packed_q8_0_batch;
 };
 
 struct TensorData {
   std::vector<std::int64_t> shape;
   std::vector<float> data;
+  std::vector<cpu::Q4_0Block> q4_0_blocks;
+  std::vector<cpu::Q4_0BlockX8> packed_q4_0_blocks;
+  std::vector<float> q4_0_scales;
   std::vector<cpu::Q8_0Block> q8_0_blocks;
   std::vector<float> q8_0_scales;
   cpu::Q8_0Backend q8_0_backend = cpu::Q8_0Backend::auto_select;
@@ -20,7 +24,63 @@ struct TensorData {
   bool is_q8_0() const noexcept {
     return !q8_0_blocks.empty();
   }
+
+  bool is_q4_0() const noexcept {
+    return !q4_0_blocks.empty() || !packed_q4_0_blocks.empty();
+  }
+
+  bool is_cpu_quantized() const noexcept {
+    return is_q4_0() || is_q8_0();
+  }
 };
+
+struct PackedQ4PrefillJob {
+  const cpu::Q4_0BlockX8 * matrix = nullptr;
+  const cpu::Q8_0BlockX4 * vectors = nullptr;
+  float * output = nullptr;
+  std::size_t vector_count = 0;
+  std::size_t blocks_per_row = 0;
+  std::size_t output_row_stride = 0;
+  cpu::Q8_0Backend backend = cpu::Q8_0Backend::auto_select;
+};
+
+struct PackedQ4MatvecJob {
+  const cpu::Q4_0BlockX8 * matrix = nullptr;
+  const cpu::Q8_0Block * vector = nullptr;
+  float * output = nullptr;
+  std::size_t blocks_per_row = 0;
+  cpu::Q8_0Backend backend = cpu::Q8_0Backend::auto_select;
+};
+
+void run_packed_q4_prefill_tiles(
+  void * opaque_context,
+  const std::size_t tile_begin,
+  const std::size_t tile_end) noexcept {
+  auto & job = *static_cast<PackedQ4PrefillJob *>(opaque_context);
+  cpu::q4_0_packed_matmul_q8_0(
+    job.matrix + tile_begin * job.blocks_per_row,
+    job.vectors,
+    job.output + tile_begin * cpu::q4_0_packed_rows,
+    (tile_end - tile_begin) * cpu::q4_0_packed_rows,
+    job.vector_count,
+    job.blocks_per_row,
+    job.output_row_stride,
+    job.backend);
+}
+
+void run_packed_q4_matvec_tiles(
+  void * opaque_context,
+  const std::size_t tile_begin,
+  const std::size_t tile_end) noexcept {
+  auto & job = *static_cast<PackedQ4MatvecJob *>(opaque_context);
+  cpu::q4_0_packed_matvec_q8_0(
+    job.matrix + tile_begin * job.blocks_per_row,
+    job.vector,
+    job.output + tile_begin * cpu::q4_0_packed_rows,
+    (tile_end - tile_begin) * cpu::q4_0_packed_rows,
+    job.blocks_per_row,
+    job.backend);
+}
 
 struct FullAttentionWeights {
   TensorData q_proj;
@@ -392,7 +452,7 @@ bool gguf_shape_matches(
   return true;
 }
 
-bool load_gguf_q8_0_checked(
+bool load_gguf_quantized_checked(
   const GgufReader & reader,
   const std::string & tensor_name,
   const std::int64_t rows,
@@ -407,8 +467,8 @@ bool load_gguf_q8_0_checked(
     error_message = "Required GGUF tensor '" + tensor_name + "' is missing.";
     return false;
   }
-  if (!info->is_q8_0()) {
-    error_message = "GGUF tensor '" + tensor_name + "' is not Q8_0.";
+  if (!info->is_q4_0() && !info->is_q8_0()) {
+    error_message = "GGUF tensor '" + tensor_name + "' is neither Q4_0 nor Q8_0.";
     return false;
   }
   if (!gguf_shape_matches(info->shape, {rows, cols})) {
@@ -416,19 +476,45 @@ bool load_gguf_q8_0_checked(
     return false;
   }
 
-  GgufTensorQ8_0 tensor;
-  if (!reader.read_q8_0_tensor(tensor_name, tensor, error_message)) {
-    return false;
-  }
   out.shape = {rows, cols};
   out.data.clear();
-  out.q8_0_blocks = std::move(tensor.blocks);
-  if (retain_scales) {
-    out.q8_0_scales.resize(out.q8_0_blocks.size());
-    cpu::q8_0_scales_to_f32(
-      out.q8_0_blocks.data(), out.q8_0_scales.data(), out.q8_0_blocks.size());
+  out.q4_0_blocks.clear();
+  out.packed_q4_0_blocks.clear();
+  out.q4_0_scales.clear();
+  out.q8_0_blocks.clear();
+  out.q8_0_scales.clear();
+  if (info->is_q4_0()) {
+    GgufTensorQ4_0 tensor;
+    if (!reader.read_q4_0_tensor(tensor_name, tensor, error_message)) {
+      return false;
+    }
+    out.q4_0_blocks = std::move(tensor.blocks);
+    const std::size_t row_count = static_cast<std::size_t>(rows);
+    const std::size_t blocks_per_row =
+      static_cast<std::size_t>(cols) / cpu::q4_0_values_per_block;
+    if ((row_count % cpu::q4_0_packed_rows) == 0) {
+      out.packed_q4_0_blocks.resize(
+        (row_count / cpu::q4_0_packed_rows) * blocks_per_row);
+      cpu::q4_0_pack_rows_8(
+        out.q4_0_blocks.data(), out.packed_q4_0_blocks.data(),
+        row_count, blocks_per_row);
+    }
+    if (retain_scales) {
+      out.q4_0_scales.resize(out.q4_0_blocks.size());
+      cpu::q4_0_scales_to_f32(
+        out.q4_0_blocks.data(), out.q4_0_scales.data(), out.q4_0_blocks.size());
+    }
   } else {
-    out.q8_0_scales.clear();
+    GgufTensorQ8_0 tensor;
+    if (!reader.read_q8_0_tensor(tensor_name, tensor, error_message)) {
+      return false;
+    }
+    out.q8_0_blocks = std::move(tensor.blocks);
+    if (retain_scales) {
+      out.q8_0_scales.resize(out.q8_0_blocks.size());
+      cpu::q8_0_scales_to_f32(
+        out.q8_0_blocks.data(), out.q8_0_scales.data(), out.q8_0_blocks.size());
+    }
   }
   out.q8_0_backend = backend;
   out.q8_0_runtime = runtime;
@@ -466,6 +552,9 @@ bool load_gguf_f32_checked(
     out.shape.push_back(static_cast<std::int64_t>(dimension));
   }
   out.data = std::move(tensor.data);
+  out.q4_0_blocks.clear();
+  out.packed_q4_0_blocks.clear();
+  out.q4_0_scales.clear();
   out.q8_0_blocks.clear();
   out.q8_0_scales.clear();
   if (subtract_qwen_norm_offset) {
@@ -476,12 +565,12 @@ bool load_gguf_f32_checked(
   return true;
 }
 
-bool pack_q8_0_row_concat(
+bool pack_quantized_row_concat(
   const std::initializer_list<TensorData *> parts,
   TensorData & out,
   std::string & error_message) {
   if (parts.size() == 0) {
-    error_message = "Q8_0 packed tensor has no source tensors.";
+    error_message = "Quantized packed tensor has no source tensors.";
     return false;
   }
 
@@ -490,61 +579,100 @@ bool pack_q8_0_row_concat(
   cpu::Q8_0Backend backend = cpu::Q8_0Backend::auto_select;
   CpuQ8Runtime * runtime = nullptr;
   bool first = true;
+  bool use_q4_0 = false;
   std::size_t total_blocks = 0;
   for (const TensorData * part : parts) {
-    if (part == nullptr || part->shape.size() != 2 || !part->is_q8_0() ||
-        part->q8_0_scales.size() != part->q8_0_blocks.size()) {
-      error_message = "Q8_0 packed tensor expects non-empty 2D Q8_0 source tensors.";
+    if (part == nullptr || part->shape.size() != 2 || !part->is_cpu_quantized()) {
+      error_message = "Quantized packed tensor expects non-empty 2D source tensors.";
+      return false;
+    }
+    const bool part_q4_0 = part->is_q4_0();
+    const std::size_t part_blocks = part_q4_0
+      ? part->q4_0_blocks.size() : part->q8_0_blocks.size();
+    const std::size_t part_scales = part_q4_0
+      ? part->q4_0_scales.size() : part->q8_0_scales.size();
+    if (part_scales != part_blocks) {
+      error_message = "Quantized packed tensor source scale storage mismatch.";
       return false;
     }
     if (first) {
       cols = part->shape[1];
       backend = part->q8_0_backend;
       runtime = part->q8_0_runtime;
+      use_q4_0 = part_q4_0;
       first = false;
     } else if (part->shape[1] != cols || part->q8_0_backend != backend ||
-               part->q8_0_runtime != runtime) {
-      error_message = "Q8_0 packed tensor source tensors have incompatible layouts or runtimes.";
+               part->q8_0_runtime != runtime || part_q4_0 != use_q4_0) {
+      error_message = "Quantized packed tensor source tensors have incompatible formats or runtimes.";
       return false;
     }
     if (part->shape[0] <= 0 || total_rows > std::numeric_limits<std::int64_t>::max() - part->shape[0] ||
-        total_blocks > std::numeric_limits<std::size_t>::max() - part->q8_0_blocks.size()) {
-      error_message = "Q8_0 packed tensor dimensions overflow.";
+        total_blocks > std::numeric_limits<std::size_t>::max() - part_blocks) {
+      error_message = "Quantized packed tensor dimensions overflow.";
       return false;
     }
     total_rows += part->shape[0];
-    total_blocks += part->q8_0_blocks.size();
+    total_blocks += part_blocks;
   }
   if (cols <= 0 || (cols % static_cast<std::int64_t>(cpu::q8_0_values_per_block)) != 0) {
-    error_message = "Q8_0 packed tensor has an invalid column count.";
+    error_message = "Quantized packed tensor has an invalid column count.";
     return false;
   }
   const std::size_t expected_blocks =
     static_cast<std::size_t>(total_rows) *
     (static_cast<std::size_t>(cols) / cpu::q8_0_values_per_block);
   if (total_blocks != expected_blocks) {
-    error_message = "Q8_0 packed tensor source storage size mismatch.";
+    error_message = "Quantized packed tensor source storage size mismatch.";
     return false;
   }
 
   out.shape = {total_rows, cols};
   out.data.clear();
+  out.q4_0_blocks.clear();
+  out.packed_q4_0_blocks.clear();
+  out.q4_0_scales.clear();
   out.q8_0_blocks.clear();
-  out.q8_0_blocks.reserve(total_blocks);
   out.q8_0_scales.clear();
-  out.q8_0_scales.reserve(total_blocks);
+  if (use_q4_0) {
+    out.q4_0_blocks.reserve(total_blocks);
+    out.q4_0_scales.reserve(total_blocks);
+  } else {
+    out.q8_0_blocks.reserve(total_blocks);
+    out.q8_0_scales.reserve(total_blocks);
+  }
   out.q8_0_backend = backend;
   out.q8_0_runtime = runtime;
   for (const TensorData * part : parts) {
-    out.q8_0_blocks.insert(
-      out.q8_0_blocks.end(), part->q8_0_blocks.begin(), part->q8_0_blocks.end());
-    out.q8_0_scales.insert(
-      out.q8_0_scales.end(), part->q8_0_scales.begin(), part->q8_0_scales.end());
+    if (use_q4_0) {
+      out.q4_0_blocks.insert(
+        out.q4_0_blocks.end(), part->q4_0_blocks.begin(), part->q4_0_blocks.end());
+      out.q4_0_scales.insert(
+        out.q4_0_scales.end(), part->q4_0_scales.begin(), part->q4_0_scales.end());
+    } else {
+      out.q8_0_blocks.insert(
+        out.q8_0_blocks.end(), part->q8_0_blocks.begin(), part->q8_0_blocks.end());
+      out.q8_0_scales.insert(
+        out.q8_0_scales.end(), part->q8_0_scales.begin(), part->q8_0_scales.end());
+    }
   }
 
-  // The CPU GGUF path uses the packed tensors exclusively. Release the source
-  // storage so packing does not increase the resident model size.
+  if (use_q4_0 &&
+      (static_cast<std::size_t>(total_rows) % cpu::q4_0_packed_rows) == 0) {
+    const std::size_t blocks_per_row =
+      static_cast<std::size_t>(cols) / cpu::q4_0_values_per_block;
+    out.packed_q4_0_blocks.resize(
+      (static_cast<std::size_t>(total_rows) / cpu::q4_0_packed_rows) *
+      blocks_per_row);
+    cpu::q4_0_pack_rows_8(
+      out.q4_0_blocks.data(), out.packed_q4_0_blocks.data(),
+      static_cast<std::size_t>(total_rows), blocks_per_row);
+  }
+
+  // The concatenated tensors replace these source projections at runtime.
   for (TensorData * part : parts) {
+    std::vector<cpu::Q4_0Block>().swap(part->q4_0_blocks);
+    std::vector<cpu::Q4_0BlockX8>().swap(part->packed_q4_0_blocks);
+    std::vector<float>().swap(part->q4_0_scales);
     std::vector<cpu::Q8_0Block>().swap(part->q8_0_blocks);
     std::vector<float>().swap(part->q8_0_scales);
   }
@@ -570,6 +698,50 @@ bool matvec_2d(
       return false;
     }
     return cuda::run_matvec_f32(w.device_matrix, x, out, error_message);
+  }
+
+  if (w.is_q4_0()) {
+    if ((cols % static_cast<int>(cpu::q4_0_values_per_block)) != 0) {
+      error_message = "Q4_0 matvec column count is not divisible by 32.";
+      return false;
+    }
+    const std::size_t blocks_per_row =
+      static_cast<std::size_t>(cols) / cpu::q4_0_values_per_block;
+    if ((static_cast<std::size_t>(rows) % cpu::q4_0_packed_rows) != 0 ||
+        w.packed_q4_0_blocks.size() !=
+          (static_cast<std::size_t>(rows) / cpu::q4_0_packed_rows) * blocks_per_row) {
+      error_message = "Packed Q4_0 matvec weight storage size mismatch.";
+      return false;
+    }
+    std::vector<cpu::Q8_0Block> local_quantized_input;
+    std::vector<cpu::Q8_0Block> * quantized_input = &local_quantized_input;
+    if (w.q8_0_runtime != nullptr) {
+      quantized_input = &w.q8_0_runtime->quantized_input;
+    }
+    quantized_input->resize(blocks_per_row);
+    cpu::q8_0_quantize(x.data(), quantized_input->data(), blocks_per_row, w.q8_0_backend);
+    out.resize(static_cast<std::size_t>(rows));
+    if (w.q8_0_runtime != nullptr && w.q8_0_runtime->executor != nullptr) {
+      PackedQ4MatvecJob job{
+        w.packed_q4_0_blocks.data(), quantized_input->data(), out.data(),
+        blocks_per_row, w.q8_0_backend,
+      };
+      const cpu::CpuExecutorStatus status =
+        w.q8_0_runtime->executor->parallel_for_rows(
+          static_cast<std::size_t>(rows) / cpu::q4_0_packed_rows,
+          run_packed_q4_matvec_tiles,
+          &job);
+      if (status != cpu::CpuExecutorStatus::ok) {
+        error_message = std::string("Q4_0 CPU executor failed: ") +
+          cpu::cpu_executor_status_name(status) + ".";
+        return false;
+      }
+    } else {
+      cpu::q4_0_packed_matvec_q8_0(
+        w.packed_q4_0_blocks.data(), quantized_input->data(), out.data(),
+        static_cast<std::size_t>(rows), blocks_per_row, w.q8_0_backend);
+    }
+    return true;
   }
 
   if (w.is_q8_0()) {
@@ -634,14 +806,14 @@ bool matvec_2d(
   return true;
 }
 
-bool matmul_2d_q8_batch(
+bool matmul_2d_quantized_batch(
   const TensorData & w,
   const std::vector<float> & inputs,
   const std::size_t batch_size,
   std::vector<float> & out,
   std::string & error_message) {
-  if (!w.is_q8_0() || w.shape.size() != 2 || w.q8_0_runtime == nullptr) {
-    error_message = "CPU batched matmul requires a 2D Q8_0 tensor with a runtime.";
+  if (!w.is_cpu_quantized() || w.shape.size() != 2 || w.q8_0_runtime == nullptr) {
+    error_message = "CPU batched matmul requires a 2D Q4_0/Q8_0 tensor with a runtime.";
     return false;
   }
   const std::size_t rows = static_cast<std::size_t>(w.shape[0]);
@@ -654,12 +826,109 @@ bool matmul_2d_q8_batch(
   }
   const std::size_t blocks_per_row = cols / cpu::q8_0_values_per_block;
   if (rows > std::numeric_limits<std::size_t>::max() / blocks_per_row ||
-      w.q8_0_blocks.size() != rows * blocks_per_row ||
-      w.q8_0_scales.size() != w.q8_0_blocks.size() ||
       batch_size > std::numeric_limits<std::size_t>::max() / blocks_per_row ||
       batch_size > std::numeric_limits<std::size_t>::max() / rows) {
     error_message = "CPU batched matmul storage size overflow or mismatch.";
     return false;
+  }
+  const std::size_t expected_weight_blocks = rows * blocks_per_row;
+  if ((w.is_q4_0() &&
+       ((rows % cpu::q4_0_packed_rows) != 0 ||
+        w.packed_q4_0_blocks.size() !=
+          (rows / cpu::q4_0_packed_rows) * blocks_per_row)) ||
+      (w.is_q8_0() &&
+       (w.q8_0_blocks.size() != expected_weight_blocks ||
+        w.q8_0_scales.size() != expected_weight_blocks))) {
+    error_message = "CPU batched matmul weight storage size mismatch.";
+    return false;
+  }
+
+  out.resize(batch_size * rows);
+  if (batch_size == 0 || rows == 0) {
+    return true;
+  }
+  if (w.is_q4_0() &&
+      (rows % cpu::q4_0_packed_rows) == 0 &&
+      !w.packed_q4_0_blocks.empty()) {
+    const std::size_t packed_vector_count =
+      batch_size - (batch_size % cpu::q8_0_packed_vectors);
+    const std::size_t expected_packed_blocks =
+      (rows / cpu::q4_0_packed_rows) * blocks_per_row;
+    if (w.packed_q4_0_blocks.size() != expected_packed_blocks) {
+      error_message = "Packed Q4_0 prefill weight storage size mismatch.";
+      return false;
+    }
+    if (packed_vector_count != 0) {
+      std::vector<cpu::Q8_0BlockX4> & packed =
+        w.q8_0_runtime->packed_q8_0_batch;
+      packed.resize(
+        (packed_vector_count / cpu::q8_0_packed_vectors) * blocks_per_row);
+      cpu::q8_0_quantize_vectors_4(
+        inputs.data(), packed.data(), packed_vector_count, blocks_per_row,
+        w.q8_0_backend);
+      if (w.q8_0_runtime->executor != nullptr) {
+        PackedQ4PrefillJob job{
+          w.packed_q4_0_blocks.data(), packed.data(), out.data(),
+          packed_vector_count, blocks_per_row, rows, w.q8_0_backend,
+        };
+        const cpu::CpuExecutorStatus status =
+          w.q8_0_runtime->executor->parallel_for_rows(
+            rows / cpu::q4_0_packed_rows, run_packed_q4_prefill_tiles, &job);
+        if (status != cpu::CpuExecutorStatus::ok) {
+          error_message = std::string("Packed Q4_0 CPU batch executor failed: ") +
+            cpu::cpu_executor_status_name(status) + ".";
+          return false;
+        }
+      } else {
+        cpu::q4_0_packed_matmul_q8_0(
+          w.packed_q4_0_blocks.data(), packed.data(), out.data(), rows,
+          packed_vector_count, blocks_per_row, rows, w.q8_0_backend);
+      }
+    }
+
+    const std::size_t tail_vector_count = batch_size - packed_vector_count;
+    if (tail_vector_count != 0) {
+      std::vector<cpu::Q8_0Block> & quantized = w.q8_0_runtime->quantized_batch;
+      std::vector<float> & quantized_scales =
+        w.q8_0_runtime->quantized_batch_scales;
+      quantized.resize(tail_vector_count * blocks_per_row);
+      quantized_scales.resize(quantized.size());
+      for (std::size_t token = 0; token < tail_vector_count; ++token) {
+        cpu::q8_0_quantize_with_scales(
+          inputs.data() + (packed_vector_count + token) * cols,
+          quantized.data() + token * blocks_per_row,
+          quantized_scales.data() + token * blocks_per_row,
+          blocks_per_row,
+          w.q8_0_backend);
+      }
+      float * tail_output = out.data() + packed_vector_count * rows;
+      for (std::size_t token = 0; token < tail_vector_count; ++token) {
+        const cpu::Q8_0Block * tail_vector =
+          quantized.data() + token * blocks_per_row;
+        float * token_output = tail_output + token * rows;
+        if (w.q8_0_runtime->executor != nullptr) {
+          PackedQ4MatvecJob job{
+            w.packed_q4_0_blocks.data(), tail_vector, token_output,
+            blocks_per_row, w.q8_0_backend,
+          };
+          const cpu::CpuExecutorStatus status =
+            w.q8_0_runtime->executor->parallel_for_rows(
+              rows / cpu::q4_0_packed_rows,
+              run_packed_q4_matvec_tiles,
+              &job);
+          if (status != cpu::CpuExecutorStatus::ok) {
+            error_message = std::string("Packed Q4_0 CPU batch tail executor failed: ") +
+              cpu::cpu_executor_status_name(status) + ".";
+            return false;
+          }
+        } else {
+          cpu::q4_0_packed_matvec_q8_0(
+            w.packed_q4_0_blocks.data(), tail_vector, token_output, rows,
+            blocks_per_row, w.q8_0_backend);
+        }
+      }
+    }
+    return true;
   }
 
   std::vector<cpu::Q8_0Block> & quantized = w.q8_0_runtime->quantized_batch;
@@ -674,38 +943,20 @@ bool matmul_2d_q8_batch(
       blocks_per_row,
       w.q8_0_backend);
   }
-  out.resize(batch_size * rows);
-  if (batch_size == 0 || rows == 0) {
-    return true;
-  }
   if (w.q8_0_runtime->executor != nullptr) {
     const cpu::CpuExecutorStatus status = w.q8_0_runtime->executor->q8_0_matmul(
-      w.q8_0_blocks.data(),
-      quantized.data(),
-      out.data(),
-      rows,
-      batch_size,
-      blocks_per_row,
-      w.q8_0_backend,
-      quantized_scales.data(),
-      w.q8_0_scales.data());
+          w.q8_0_blocks.data(), quantized.data(), out.data(), rows, batch_size,
+          blocks_per_row, w.q8_0_backend, quantized_scales.data(), w.q8_0_scales.data());
     if (status != cpu::CpuExecutorStatus::ok) {
-      error_message = std::string("Q8_0 CPU batch executor failed: ") +
+      error_message = std::string("Quantized CPU batch executor failed: ") +
         cpu::cpu_executor_status_name(status) + ".";
       return false;
     }
   } else {
     cpu::q8_0_matmul(
-      w.q8_0_blocks.data(),
-      quantized.data(),
-      out.data(),
-      rows,
-      batch_size,
-      blocks_per_row,
-      rows,
-      w.q8_0_backend,
-      quantized_scales.data(),
-      w.q8_0_scales.data());
+      w.q8_0_blocks.data(), quantized.data(), out.data(), rows, batch_size,
+      blocks_per_row, rows, w.q8_0_backend,
+      quantized_scales.data(), w.q8_0_scales.data());
   }
   return true;
 }
@@ -872,10 +1123,31 @@ bool load_model_weights_from_safetensors(
     }
   }
 
+  // Q4 decode, prefill, embedding gather, and the tied LM head all consume the
+  // size-neutral eight-row layout. Keep exactly one permanent weight copy.
+  const auto release_canonical_q4 = [](TensorData & tensor) {
+    if (!tensor.packed_q4_0_blocks.empty()) {
+      std::vector<cpu::Q4_0Block>().swap(tensor.q4_0_blocks);
+      std::vector<float>().swap(tensor.q4_0_scales);
+    }
+  };
+  release_canonical_q4(weights.embed_tokens);
+  for (LayerWeights & layer : weights.layers) {
+    release_canonical_q4(layer.mlp_gate_up_cpu);
+    release_canonical_q4(layer.mlp_down);
+    if (layer.is_linear) {
+      release_canonical_q4(layer.linear.in_proj_all_cpu);
+      release_canonical_q4(layer.linear.out_proj);
+    } else {
+      release_canonical_q4(layer.full.qkv_proj_cpu);
+      release_canonical_q4(layer.full.o_proj);
+    }
+  }
+
   return true;
 }
 
-bool load_model_weights_from_q8_0_gguf(
+bool load_model_weights_from_quantized_gguf(
   const std::string & gguf_path,
   const RuntimeDims & dims,
   const ModelProfile & profile,
@@ -906,7 +1178,7 @@ bool load_model_weights_from_q8_0_gguf(
     return false;
   }
   CpuQ8Runtime * const runtime = weights.cpu_q8_runtime.get();
-  if (!load_gguf_q8_0_checked(
+  if (!load_gguf_quantized_checked(
         reader,
         "token_embd.weight",
         dims.vocab_size,
@@ -945,17 +1217,17 @@ bool load_model_weights_from_q8_0_gguf(
           true,
           layer.post_attention_layernorm,
           error_message) ||
-        !load_gguf_q8_0_checked(
+        !load_gguf_quantized_checked(
           reader, base + "ffn_gate.weight", dims.intermediate, dims.hidden, backend, runtime, layer.mlp_gate, error_message) ||
-        !load_gguf_q8_0_checked(
+        !load_gguf_quantized_checked(
           reader, base + "ffn_up.weight", dims.intermediate, dims.hidden, backend, runtime, layer.mlp_up, error_message) ||
-        !load_gguf_q8_0_checked(
+        !load_gguf_quantized_checked(
           reader, base + "ffn_down.weight", dims.hidden, dims.intermediate, backend, runtime, layer.mlp_down, error_message)) {
       return false;
     }
 
     if (layer.is_linear) {
-      if (!load_gguf_q8_0_checked(
+      if (!load_gguf_quantized_checked(
             reader,
             base + "attn_qkv.weight",
             dims.linear_conv_channels,
@@ -964,7 +1236,7 @@ bool load_model_weights_from_q8_0_gguf(
             runtime,
             layer.linear.in_proj_qkv,
             error_message) ||
-          !load_gguf_q8_0_checked(
+          !load_gguf_quantized_checked(
             reader,
             base + "attn_gate.weight",
             dims.linear_v_dim,
@@ -973,7 +1245,7 @@ bool load_model_weights_from_q8_0_gguf(
             runtime,
             layer.linear.in_proj_z,
             error_message) ||
-          !load_gguf_q8_0_checked(
+          !load_gguf_quantized_checked(
             reader,
             base + "ssm_beta.weight",
             dims.linear_num_v_heads,
@@ -982,7 +1254,7 @@ bool load_model_weights_from_q8_0_gguf(
             runtime,
             layer.linear.in_proj_b,
             error_message) ||
-          !load_gguf_q8_0_checked(
+          !load_gguf_quantized_checked(
             reader,
             base + "ssm_alpha.weight",
             dims.linear_num_v_heads,
@@ -998,7 +1270,7 @@ bool load_model_weights_from_q8_0_gguf(
             false,
             layer.linear.conv1d,
             error_message) ||
-          !load_gguf_q8_0_checked(
+          !load_gguf_quantized_checked(
             reader,
             base + "ssm_out.weight",
             dims.hidden,
@@ -1034,13 +1306,13 @@ bool load_model_weights_from_q8_0_gguf(
       layer.linear.ssm_a = layer.linear.a_log.data;
       pack_conv1d_kernel_major(layer.linear, dims);
     } else {
-      if (!load_gguf_q8_0_checked(
+      if (!load_gguf_quantized_checked(
             reader, base + "attn_q.weight", full_q_out, dims.hidden, backend, runtime, layer.full.q_proj, error_message) ||
-          !load_gguf_q8_0_checked(
+          !load_gguf_quantized_checked(
             reader, base + "attn_k.weight", full_kv_out, dims.hidden, backend, runtime, layer.full.k_proj, error_message) ||
-          !load_gguf_q8_0_checked(
+          !load_gguf_quantized_checked(
             reader, base + "attn_v.weight", full_kv_out, dims.hidden, backend, runtime, layer.full.v_proj, error_message) ||
-          !load_gguf_q8_0_checked(
+          !load_gguf_quantized_checked(
             reader, base + "attn_output.weight", dims.hidden, full_o_in, backend, runtime, layer.full.o_proj, error_message) ||
           !load_gguf_f32_checked(
             reader, base + "attn_q_norm.weight", {dims.head_dim}, true, layer.full.q_norm, error_message) ||
@@ -1050,12 +1322,12 @@ bool load_model_weights_from_q8_0_gguf(
       }
     }
 
-    if (!pack_q8_0_row_concat(
+    if (!pack_quantized_row_concat(
           {&layer.mlp_gate, &layer.mlp_up}, layer.mlp_gate_up_cpu, error_message)) {
       return false;
     }
     if (layer.is_linear) {
-      if (!pack_q8_0_row_concat(
+      if (!pack_quantized_row_concat(
             {
               &layer.linear.in_proj_qkv,
               &layer.linear.in_proj_z,
@@ -1066,7 +1338,7 @@ bool load_model_weights_from_q8_0_gguf(
             error_message)) {
         return false;
       }
-    } else if (!pack_q8_0_row_concat(
+    } else if (!pack_quantized_row_concat(
                  {&layer.full.q_proj, &layer.full.k_proj, &layer.full.v_proj},
                  layer.full.qkv_proj_cpu,
                  error_message)) {
@@ -1087,7 +1359,7 @@ bool load_model_weights(
   ModelWeights & weights,
   std::string & error_message) {
   if (!cpu_gguf_path.empty()) {
-    return load_model_weights_from_q8_0_gguf(
+    return load_model_weights_from_quantized_gguf(
       cpu_gguf_path, dims, profile, backend, cpu_threads, weights, error_message);
   }
   return load_model_weights_from_safetensors(model_dir, dims, profile, weights, error_message);

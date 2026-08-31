@@ -84,7 +84,7 @@ bool write_synthetic_gguf(
 
   stream.write("GGUF", 4);
   write_le(stream, std::uint32_t{3});
-  write_le(stream, std::uint64_t{2});
+  write_le(stream, std::uint64_t{3});
   write_le(stream, std::uint64_t{15});
 
   write_kv_prefix(stream, "general.alignment", gguf_type_uint32);
@@ -144,6 +144,13 @@ bool write_synthetic_gguf(
   write_le(stream, std::uint32_t{8});
   write_le(stream, std::uint64_t{32});
 
+  write_string(stream, "matrix_q4");
+  write_le(stream, std::uint32_t{2});
+  write_le(stream, std::uint64_t{32});
+  write_le(stream, std::uint64_t{2});
+  write_le(stream, std::uint32_t{2});
+  write_le(stream, std::uint64_t{128});
+
   pad_to(stream, 32);
   constexpr std::array<float, 4> f32_values{1.0F, -2.5F, 0.0F, 4.25F};
   for (const float value : f32_values) {
@@ -158,6 +165,15 @@ bool write_synthetic_gguf(
     for (std::int32_t i = 0; i < 32; ++i) {
       const std::int8_t quant = static_cast<std::int8_t>(block == 0 ? i - 16 : 31 - i);
       stream.put(static_cast<char>(quant));
+    }
+  }
+  for (std::uint32_t i = 0; i < 28; ++i) {
+    stream.put('\0');
+  }
+  for (std::uint32_t block = 0; block < 2; ++block) {
+    write_le(stream, std::uint16_t{0x3c00});
+    for (std::uint32_t i = 0; i < 16; ++i) {
+      stream.put(static_cast<char>((block * 16U + i) & 0xffU));
     }
   }
   stream.close();
@@ -201,7 +217,7 @@ bool test_valid_file(TempFiles & files) {
     expect(reader.version() == 3, "version mismatch") &&
     expect(reader.alignment() == 32, "alignment mismatch") &&
     expect(reader.metadata_count() == 15, "metadata count mismatch") &&
-    expect(reader.tensors().size() == 2, "tensor count mismatch");
+    expect(reader.tensors().size() == 3, "tensor count mismatch");
 
   const qwen35x::GgufTensorInfo * matrix = reader.find_tensor("matrix");
   ok = expect(matrix != nullptr, "matrix missing from index") && ok;
@@ -228,6 +244,22 @@ bool test_valid_file(TempFiles & files) {
       expect(q8.blocks[0].qs[31] == 15, "last first-block Q8_0 quant mismatch") &&
       expect(q8.blocks[1].qs[0] == 31, "first second-block Q8_0 quant mismatch") &&
       expect(q8.blocks[1].qs[31] == 0, "last Q8_0 quant mismatch") && ok;
+  }
+
+  const qwen35x::GgufTensorInfo * matrix_q4 = reader.find_tensor("matrix_q4");
+  ok = expect(matrix_q4 != nullptr, "Q4_0 matrix missing from index") && ok;
+  if (matrix_q4 != nullptr) {
+    ok = expect(matrix_q4->is_q4_0(), "Q4_0 matrix type mismatch") &&
+      expect(matrix_q4->shape == std::vector<std::uint64_t>({2, 32}), "Q4_0 shape mismatch") &&
+      expect(matrix_q4->data_size == 36, "Q4_0 byte size mismatch") && ok;
+  }
+  qwen35x::GgufTensorQ4_0 q4;
+  ok = expect(reader.read_q4_0_tensor("matrix_q4", q4, error), error) &&
+    expect(q4.blocks.size() == 2, "Q4_0 block count mismatch") && ok;
+  if (q4.blocks.size() == 2) {
+    ok = expect(q4.blocks[0].d == 0x3c00, "Q4_0 scale mismatch") &&
+      expect(q4.blocks[0].qs[0] == 0, "first Q4_0 byte mismatch") &&
+      expect(q4.blocks[1].qs[15] == 31, "last Q4_0 byte mismatch") && ok;
   }
 
   std::vector<std::uint8_t> raw;

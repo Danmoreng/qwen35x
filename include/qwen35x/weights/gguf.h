@@ -1,5 +1,6 @@
 #pragma once
 
+#include "qwen35x/cpu/q4_0.h"
 #include "qwen35x/cpu/q8_0.h"
 
 #include <cstddef>
@@ -13,6 +14,7 @@ namespace qwen35x {
 
 enum class GgmlTensorType : std::uint32_t {
   f32 = 0,
+  q4_0 = 2,
   q8_0 = 8,
 };
 
@@ -38,6 +40,10 @@ struct GgufTensorInfo {
   bool is_q8_0() const noexcept {
     return ggml_type == static_cast<std::uint32_t>(GgmlTensorType::q8_0);
   }
+
+  bool is_q4_0() const noexcept {
+    return ggml_type == static_cast<std::uint32_t>(GgmlTensorType::q4_0);
+  }
 };
 
 struct GgufTensorF32 {
@@ -52,11 +58,17 @@ struct GgufTensorQ8_0 {
   std::vector<cpu::Q8_0Block> blocks;
 };
 
+struct GgufTensorQ4_0 {
+  std::string name;
+  std::vector<std::uint64_t> shape;
+  std::vector<cpu::Q4_0Block> blocks;
+};
+
 // Minimal GGUF-v3 reader for the Qwen3.5 Q8 CPU path. It indexes the file
 // without retaining tensor payloads in memory. Payload reads are owned and
 // independent, so callers can choose which tensors to keep resident.
 //
-// Tensor payload types other than F32 and Q8_0 are intentionally rejected at
+// Tensor payload types other than F32, Q4_0 and Q8_0 are intentionally rejected at
 // open time. Every GGUF metadata scalar/array/string type defined by v3 is
 // nevertheless validated and safely skipped.
 class GgufReader {
@@ -111,6 +123,11 @@ public:
   bool read_q8_0_tensor(
     std::string_view tensor_name,
     GgufTensorQ8_0 & out_tensor,
+    std::string & error_message) const;
+
+  bool read_q4_0_tensor(
+    std::string_view tensor_name,
+    GgufTensorQ4_0 & out_tensor,
     std::string & error_message) const;
 
 private:

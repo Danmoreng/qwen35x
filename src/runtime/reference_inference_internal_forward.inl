@@ -358,23 +358,27 @@ bool run_forward_single_token(
 
   const auto embedding_start = std::chrono::steady_clock::now();
   std::vector<float> x(static_cast<std::size_t>(dims.hidden), 0.0f);
-  if (weights.embed_tokens.is_q8_0()) {
+  if (weights.embed_tokens.is_cpu_quantized()) {
     if ((dims.hidden % static_cast<int>(cpu::q8_0_values_per_block)) != 0) {
-      error_message = "Q8_0 embedding width is not divisible by 32.";
+      error_message = "Quantized embedding width is not divisible by 32.";
       return false;
     }
     const std::size_t blocks_per_row =
       static_cast<std::size_t>(dims.hidden) / cpu::q8_0_values_per_block;
     const std::size_t row_offset = static_cast<std::size_t>(token_id) * blocks_per_row;
-    if (row_offset + blocks_per_row > weights.embed_tokens.q8_0_blocks.size()) {
-      error_message = "Q8_0 embedding row is outside the loaded tensor.";
+    if (token_id < 0 || token_id >= dims.vocab_size) {
+      error_message = "Quantized embedding row is outside the loaded tensor.";
       return false;
     }
-    cpu::q8_0_dequantize(
-      weights.embed_tokens.q8_0_blocks.data() + row_offset,
-      x.data(),
-      blocks_per_row,
-      weights.embed_tokens.q8_0_backend);
+    if (weights.embed_tokens.is_q4_0()) {
+      cpu::q4_0_packed_dequantize_row(
+        weights.embed_tokens.packed_q4_0_blocks.data(),
+        static_cast<std::size_t>(token_id), x.data(), blocks_per_row);
+    } else {
+      cpu::q8_0_dequantize(
+        weights.embed_tokens.q8_0_blocks.data() + row_offset,
+        x.data(), blocks_per_row, weights.embed_tokens.q8_0_backend);
+    }
   } else {
     const std::size_t row_offset =
       static_cast<std::size_t>(token_id) * static_cast<std::size_t>(dims.hidden);
@@ -453,7 +457,7 @@ bool run_forward_single_token(
         return false;
       }
     } else {
-      if (layer.mlp_gate_up_cpu.is_q8_0()) {
+      if (layer.mlp_gate_up_cpu.is_cpu_quantized()) {
         std::vector<float> packed;
         if (!matvec_2d(layer.mlp_gate_up_cpu, post_norm, packed, false, error_message)) {
           return false;
@@ -474,7 +478,7 @@ bool run_forward_single_token(
       mlp_hidden.resize(mlp_gate.size());
       cpu::silu_mul_f32(
         mlp_gate.data(), mlp_up.data(), mlp_hidden.data(), mlp_hidden.size(),
-        layer.mlp_down.is_q8_0()
+        layer.mlp_down.is_cpu_quantized()
           ? layer.mlp_down.q8_0_backend
           : cpu::Q8_0Backend::auto_select);
       if (!matvec_2d(layer.mlp_down, mlp_hidden, mlp_out, use_cuda, error_message)) {

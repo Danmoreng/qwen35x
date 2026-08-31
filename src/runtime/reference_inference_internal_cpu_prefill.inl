@@ -82,7 +82,7 @@ bool run_linear_attention_batch_cpu_q8(
   const std::size_t batch_size,
   std::vector<float> & output,
   std::string & error_message) {
-  if (!layer.linear.in_proj_all_cpu.is_q8_0() || !layer.linear.out_proj.is_q8_0()) {
+  if (!layer.linear.in_proj_all_cpu.is_cpu_quantized() || !layer.linear.out_proj.is_cpu_quantized()) {
     error_message = "Batched CPU linear attention requires packed Q8_0 projections.";
     return false;
   }
@@ -106,7 +106,7 @@ bool run_linear_attention_batch_cpu_q8(
   }
 
   std::vector<float> projected;
-  if (!matmul_2d_q8_batch(
+  if (!matmul_2d_quantized_batch(
         layer.linear.in_proj_all_cpu, input, batch_size, projected, error_message)) {
     return false;
   }
@@ -253,7 +253,7 @@ bool run_linear_attention_batch_cpu_q8(
       layer.linear.out_proj.q8_0_backend);
   }
 
-  return matmul_2d_q8_batch(
+  return matmul_2d_quantized_batch(
     layer.linear.out_proj, gated, batch_size, output, error_message);
 }
 
@@ -268,7 +268,7 @@ bool run_full_attention_batch_cpu_q8(
   const float * rope_sine,
   std::vector<float> & output,
   std::string & error_message) {
-  if (!layer.full.qkv_proj_cpu.is_q8_0() || !layer.full.o_proj.is_q8_0()) {
+  if (!layer.full.qkv_proj_cpu.is_cpu_quantized() || !layer.full.o_proj.is_cpu_quantized()) {
     error_message = "Batched CPU full attention requires packed Q8_0 projections.";
     return false;
   }
@@ -277,7 +277,7 @@ bool run_full_attention_batch_cpu_q8(
   const std::size_t kv_width = static_cast<std::size_t>(dims.n_kv_heads * dims.head_dim);
   const std::size_t projection_width = q_full_width + 2 * kv_width;
   std::vector<float> projected;
-  if (!matmul_2d_q8_batch(
+  if (!matmul_2d_quantized_batch(
         layer.full.qkv_proj_cpu, input, batch_size, projected, error_message)) {
     return false;
   }
@@ -402,7 +402,7 @@ bool run_full_attention_batch_cpu_q8(
     run_full_attention_batch_cpu_rows(&job, 0, attention_rows);
   }
 
-  return matmul_2d_q8_batch(
+  return matmul_2d_quantized_batch(
     layer.full.o_proj, attention, batch_size, output, error_message);
 }
 
@@ -424,8 +424,8 @@ bool run_forward_cpu_q8_batch(
   const std::size_t hidden = static_cast<std::size_t>(dims.hidden);
   const std::size_t intermediate = static_cast<std::size_t>(dims.intermediate);
   const std::size_t embedding_blocks = hidden / cpu::q8_0_values_per_block;
-  if (!weights.embed_tokens.is_q8_0() || (hidden % cpu::q8_0_values_per_block) != 0) {
-    error_message = "Batched CPU Q8_0 forward requires Q8_0 embeddings aligned to 32 values.";
+  if (!weights.embed_tokens.is_cpu_quantized() || (hidden % cpu::q8_0_values_per_block) != 0) {
+    error_message = "Batched CPU quantized forward requires Q4_0/Q8_0 embeddings aligned to 32 values.";
     return false;
   }
   if (profiling != nullptr) {
@@ -440,12 +440,19 @@ bool run_forward_cpu_q8_batch(
       error_message = "Batched CPU prefill token id is outside the vocabulary.";
       return false;
     }
-    cpu::q8_0_dequantize(
-      weights.embed_tokens.q8_0_blocks.data() +
-        static_cast<std::size_t>(token_id) * embedding_blocks,
-      x.data() + token * hidden,
-      embedding_blocks,
-      weights.embed_tokens.q8_0_backend);
+    if (weights.embed_tokens.is_q4_0()) {
+      cpu::q4_0_packed_dequantize_row(
+        weights.embed_tokens.packed_q4_0_blocks.data(),
+        static_cast<std::size_t>(token_id),
+        x.data() + token * hidden, embedding_blocks);
+    } else {
+      const std::size_t block_offset =
+        static_cast<std::size_t>(token_id) * embedding_blocks;
+      cpu::q8_0_dequantize(
+        weights.embed_tokens.q8_0_blocks.data() + block_offset,
+        x.data() + token * hidden, embedding_blocks,
+        weights.embed_tokens.q8_0_backend);
+    }
   }
   if (profiling != nullptr) {
     profiling->embedding_ms += elapsed_ms(embedding_start);
@@ -502,11 +509,11 @@ bool run_forward_cpu_q8_batch(
     cpu::add_f32(x.data(), attention.data(), residual.data(), residual.size());
     rms_norm_qwen3next_batch(
       residual, batch_size, hidden, layer.post_attention_layernorm, dims.rms_eps, post_norm);
-    if (!layer.mlp_gate_up_cpu.is_q8_0() ||
-        !matmul_2d_q8_batch(
+    if (!layer.mlp_gate_up_cpu.is_cpu_quantized() ||
+        !matmul_2d_quantized_batch(
           layer.mlp_gate_up_cpu, post_norm, batch_size, gate_up, error_message)) {
       if (error_message.empty()) {
-        error_message = "Batched CPU MLP requires packed Q8_0 gate/up weights.";
+        error_message = "Batched CPU MLP requires packed Q4_0/Q8_0 gate/up weights.";
       }
       return false;
     }
@@ -519,7 +526,7 @@ bool run_forward_cpu_q8_batch(
         intermediate,
         layer.mlp_down.q8_0_backend);
     }
-    if (!matmul_2d_q8_batch(
+    if (!matmul_2d_quantized_batch(
           layer.mlp_down, mlp_hidden, batch_size, mlp_output, error_message)) {
       return false;
     }

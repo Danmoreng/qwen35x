@@ -87,6 +87,26 @@ struct Q8MatmulJob {
   const float * matrix_scales = nullptr;
 };
 
+struct Q4MatvecJob {
+  const Q4_0Block * matrix = nullptr;
+  const Q8_0Block * vector = nullptr;
+  float * output = nullptr;
+  std::size_t blocks_per_row = 0;
+  Q8_0Backend backend = Q8_0Backend::auto_select;
+};
+
+struct Q4MatmulJob {
+  const Q4_0Block * matrix = nullptr;
+  const Q8_0Block * vectors = nullptr;
+  float * output = nullptr;
+  std::size_t total_row_count = 0;
+  std::size_t vector_count = 0;
+  std::size_t blocks_per_row = 0;
+  Q8_0Backend backend = Q8_0Backend::auto_select;
+  const float * vector_scales = nullptr;
+  const float * matrix_scales = nullptr;
+};
+
 void run_q8_matvec_rows(
   void * opaque_context,
   const std::size_t row_begin,
@@ -116,6 +136,40 @@ void run_q8_matmul_rows(
     job.vectors,
     job.output + row_begin,
     local_rows,
+    job.vector_count,
+    job.blocks_per_row,
+    job.total_row_count,
+    job.backend,
+    job.vector_scales,
+    job.matrix_scales != nullptr
+      ? job.matrix_scales + row_begin * job.blocks_per_row
+      : nullptr);
+}
+
+void run_q4_matvec_rows(
+  void * opaque_context,
+  const std::size_t row_begin,
+  const std::size_t row_end) noexcept {
+  auto & job = *static_cast<Q4MatvecJob *>(opaque_context);
+  const Q4_0Block * row_matrix = job.matrix;
+  if (job.blocks_per_row != 0) {
+    row_matrix += row_begin * job.blocks_per_row;
+  }
+  qwen35x::cpu::q4_0_matvec_q8_0(
+    row_matrix, job.vector, job.output + row_begin,
+    row_end - row_begin, job.blocks_per_row, job.backend);
+}
+
+void run_q4_matmul_rows(
+  void * opaque_context,
+  const std::size_t row_begin,
+  const std::size_t row_end) noexcept {
+  auto & job = *static_cast<Q4MatmulJob *>(opaque_context);
+  qwen35x::cpu::q4_0_matmul_q8_0(
+    job.matrix + row_begin * job.blocks_per_row,
+    job.vectors,
+    job.output + row_begin,
+    row_end - row_begin,
     job.vector_count,
     job.blocks_per_row,
     job.total_row_count,
@@ -430,6 +484,61 @@ CpuExecutorStatus CpuExecutor::q8_0_matmul(
     matrix_scales,
   };
   return parallel_for_rows(row_count, run_q8_matmul_rows, &job);
+}
+
+CpuExecutorStatus CpuExecutor::q4_0_matvec_q8_0(
+  const Q4_0Block * matrix,
+  const Q8_0Block * vector,
+  float * output,
+  const std::size_t row_count,
+  const std::size_t blocks_per_row,
+  const Q8_0Backend backend) noexcept {
+  if (row_count == 0) {
+    return CpuExecutorStatus::ok;
+  }
+  if ((backend != Q8_0Backend::auto_select &&
+       backend != Q8_0Backend::scalar &&
+       backend != Q8_0Backend::avx2) ||
+      output == nullptr ||
+      (blocks_per_row != 0 && (matrix == nullptr || vector == nullptr)) ||
+      (blocks_per_row != 0 &&
+       row_count > std::numeric_limits<std::size_t>::max() / blocks_per_row)) {
+    return CpuExecutorStatus::invalid_argument;
+  }
+  Q4MatvecJob job{
+    matrix, vector, output, blocks_per_row, q8_0_resolve_backend(backend),
+  };
+  return parallel_for_rows(row_count, run_q4_matvec_rows, &job);
+}
+
+CpuExecutorStatus CpuExecutor::q4_0_matmul_q8_0(
+  const Q4_0Block * matrix,
+  const Q8_0Block * vectors,
+  float * output,
+  const std::size_t row_count,
+  const std::size_t vector_count,
+  const std::size_t blocks_per_row,
+  const Q8_0Backend backend,
+  const float * vector_scales,
+  const float * matrix_scales) noexcept {
+  if (row_count == 0 || vector_count == 0) {
+    return CpuExecutorStatus::ok;
+  }
+  if ((backend != Q8_0Backend::auto_select &&
+       backend != Q8_0Backend::scalar &&
+       backend != Q8_0Backend::avx2) ||
+      matrix == nullptr || vectors == nullptr || output == nullptr ||
+      blocks_per_row == 0 ||
+      row_count > std::numeric_limits<std::size_t>::max() / blocks_per_row ||
+      vector_count > std::numeric_limits<std::size_t>::max() / blocks_per_row ||
+      vector_count > std::numeric_limits<std::size_t>::max() / row_count) {
+    return CpuExecutorStatus::invalid_argument;
+  }
+  Q4MatmulJob job{
+    matrix, vectors, output, row_count, vector_count, blocks_per_row,
+    q8_0_resolve_backend(backend), vector_scales, matrix_scales,
+  };
+  return parallel_for_rows(row_count, run_q4_matmul_rows, &job);
 }
 
 } // namespace qwen35x::cpu

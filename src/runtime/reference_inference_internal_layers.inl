@@ -319,7 +319,7 @@ bool run_linear_attention_step(
       return false;
     }
   } else {
-    if (layer.linear.in_proj_all_cpu.is_q8_0()) {
+    if (layer.linear.in_proj_all_cpu.is_cpu_quantized()) {
       std::vector<float> packed;
       if (!matvec_2d(layer.linear.in_proj_all_cpu, x, packed, false, error_message)) {
         return false;
@@ -384,7 +384,7 @@ bool run_linear_attention_step(
   l2_norm_per_head(k, dims.linear_num_k_heads, dims.linear_head_k_dim);
 
   std::vector<float> core_out(static_cast<std::size_t>(dims.linear_v_dim), 0.0f);
-  const cpu::Q8_0Backend cpu_backend = layer.linear.out_proj.is_q8_0()
+  const cpu::Q8_0Backend cpu_backend = layer.linear.out_proj.is_cpu_quantized()
     ? layer.linear.out_proj.q8_0_backend
     : cpu::Q8_0Backend::auto_select;
   CpuQ8Runtime * const cpu_runtime = layer.linear.out_proj.q8_0_runtime;
@@ -471,7 +471,7 @@ bool run_full_attention_step(
       return false;
     }
   } else {
-    if (layer.full.qkv_proj_cpu.is_q8_0()) {
+    if (layer.full.qkv_proj_cpu.is_cpu_quantized()) {
       std::vector<float> packed;
       if (!matvec_2d(layer.full.qkv_proj_cpu, x, packed, false, error_message)) {
         return false;
