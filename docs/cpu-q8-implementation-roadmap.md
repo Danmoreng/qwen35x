@@ -333,7 +333,8 @@ rewrite despite slightly higher prompt throughput.
 
 ### A9 — Grouped-query attention and online softmax
 
-Status: pending
+Status: decode pair grouping retained; four-head grouping and online softmax
+pending
 
 Implementation order:
 
@@ -349,6 +350,16 @@ causal boundaries, and grouped/un-grouped parity.
 
 Measurement gate: context-256/tg128, context-2048/tg128, pp2048, memory usage,
 and attention stage time. Expect little benefit at context one.
+
+Laptop result: the first retained decode slice groups two adjacent query heads
+that share a KV head. It preserves four executor tasks, reuses every K load for
+two dot products, and reuses every V load for two weighted sums. Context-one
+decode is neutral at 62.81 versus 62.75 tok/s. Context-256/tg128 improves from
+61.66 to 62.03 tok/s (+0.6%). Context-2048/tg128 improves from 52.20 to 54.98
+tok/s (+5.3%), and a second optimized run after the baseline measured 55.12
+tok/s. Differential coverage uses FP16 caches, contexts 1, 7, 8, 9, 63, 64,
+65, 255, 256, 257, and 2,048, plus head dimensions 17 and 256. A 128-token
+full-model generation is token-identical to the pre-A9 binary.
 
 ### A10 — Producer-to-Q8 fusion
 
@@ -865,18 +876,18 @@ Update this table in the same commit that lands or rejects each experiment.
 | A0 | Pending | — | Stable reference figures exist; expanded controlled baseline still required |
 | A1 | Completed, neutral | `511d9a5` | F16C conversion and loaded-YMM reuse verified in disassembly; fused scale sidecar removes the second pass. All tests pass. Ordered/reverse A/B pairs were dominated by laptop drift: combined pp256 was 198.59 versus 199.63 tok/s, decode 36.61 versus 36.74 tok/s, and pp2048 168.22 versus 169.56 tok/s (A1 versus baseline). No speedup is claimed. |
 | A2 | Completed, neutral | `961478d` | Request tables are sized to the required context, shared by all full-attention layers, and consumed by tested AVX2 rotation. pp256 was 198.32 versus 198.12 tok/s. Ordered/reverse decode pairs averaged 36.88 versus 36.90 tok/s (A2 versus immediate baseline), so no laptop throughput gain is claimed. The cache removes redundant transcendental work and prepares prefix-state caching. |
-| A3 | Pending | — | Local vectors and model-global quantization scratch remain |
+| A3 | Completed, neutral on laptop | — | Reusing outer request vectors measured 62.57 tok/s; extending reuse through linear/full-attention temporaries measured 62.80 versus the 62.75 baseline. The experiment was reverted because allocation removal was inside measurement noise. |
 | A4 | Completed, retained | `4c74dd8` | Three-slot ring state removes decode window copies; kernel-major weights, four-tap AVX2, and fused SiLU are covered by scalar/SIMD state and output tests. Ordered/reverse pp256 pairs averaged 210.48 versus 198.33 tok/s (+6.1%); decode averaged 37.14 versus 36.72 tok/s (+1.2%). pp2048 was 175.48 versus 165.58 tok/s (+6.0%) even though the optimized run was second. A 2,048-token integration run crossed 32 prefill chunk boundaries successfully. |
-| A5 | Pending | — | Global `min_parallel_rows=1` and long spin phase remain |
+| A5 | Completed, neutral on laptop | — | Decode-specific inline thresholds of 16 and 32 rows measured 62.64 and 62.66 tok/s. Both were reverted; the existing executor policy remains. |
 | A6 | Completed for Q4_0 | this commit | The scale sidecar removal saves 30.31 MiB. Greedy Q4 LM-head workers apply repetition penalty and return deterministic local maxima rather than vocabulary logits. Five-run decode rises from 61.41 to 62.75 tok/s (+2.2%); a 16-token full-runtime differential against `12f9ecf` is exact. Temperature sampling retains full logits. |
 | A7 | Completed, retained | `d49aec4` | Added scalar/AVX2 differential coverage for contexts 1, 7, 8, 9, 63, 64, 65, 255, 256, 257, and 2,048. Softmax probabilities are normalized once and sigmoid uses one vector division. pp256 was 211.31 versus 209.37 tok/s (+0.9%). Ordered/reverse decode pairs averaged 37.44 versus 37.17 tok/s (+0.7%). |
 | A8 | Batched prefill completed | this commit | Four-row AVX2 tiling reuses Q/K and removes the intermediate state store/reload without changing output reduction order. pp256 is +4.2% and pp2048 +3.5%; reverse-order decode A/B is neutral. The faster algebraic-output variant was rejected on transcript quality. |
-| A9 | Pending | — | GQA heads still largely independent |
+| A9 | Decode pair grouping retained | this commit | Two query heads reuse shared K/V loads while preserving four executor tasks. Context-2048/tg128 rises from 52.20 to 54.98 tok/s (+5.3%), confirmed at 55.12 after the baseline run; context-one is neutral and a 128-token generation is exact. Four-head grouping and online softmax remain to evaluate. |
 | A10 | Pending | — | FP32 producer buffers still precede Q8 quantization |
 | B | Pending | — | Prefix state cache not implemented |
 | C1-C6 | Future hardware | — | Requires suitable ISA hosts for validation |
 | D0 | Initial screen completed | `4ca364c` | Seven formats, three alternating-order performance rounds, 56 deterministic rewrite outputs, and a three-run 2k/2k Q8-versus-Q4_0 comparison select Q4_0 for the first native backend; production quality expansion remains open |
-| D1 | Active; laptop throughput target achieved | `12f9ecf`, `8e3614c` + this commit | Native Q4_0 scalar/AVX2, packed-only model weights, token-major prepared activations, fused greedy LM-head, 8x8 projection prefill, and batched DeltaNet row tiling are implemented. Against llama.cpp Q4_0, pp256 is +40.0%, pp2048 is +30.8%, and decode is +37.9%. Expanded correctness, quality, memory, and long-context gates remain. |
+| D1 | Active; laptop throughput target achieved | `12f9ecf`, `8e3614c` + this commit | Native Q4_0 scalar/AVX2, packed-only model weights, token-major prepared activations, fused greedy LM-head, 8x8 projection prefill, batched DeltaNet row tiling, and paired GQA decode are implemented. Against llama.cpp Q4_0, pp256 is +40.0%, pp2048 is +30.8%, and short decode is +37.9%; paired GQA adds +5.3% at context 2,048 over the prior native path. Expanded correctness, quality, memory, and long-context gates remain. |
 | D2-D4 | Pending D1 validation | — | IQ4_NL, mixed precision, and calibrated offline rounding follow the validated Q4_0 baseline |
 | D5 | Research target | — | Custom Hadamard-regularized `Q4_H128` is the preferred custom-format direction after simple Q4 baselines |
 | D6-D7 | Deferred/future hardware | — | State quantization is quality-sensitive; dense sub-four-bit research benefits materially from newer SIMD ISAs |

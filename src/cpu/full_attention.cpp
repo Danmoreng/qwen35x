@@ -144,6 +144,26 @@ void causal_attention_batch_rows_avx2(
   float attention_scale,
   std::size_t row_begin,
   std::size_t row_end) noexcept;
+
+void causal_attention_decode_gqa_pairs_avx2(
+  const float * queries,
+  const float * gates,
+  const float * k_cache,
+  const float * v_cache,
+  const std::uint16_t * k_cache_f16,
+  const std::uint16_t * v_cache_f16,
+  float * scores,
+  float * output,
+  std::size_t context_stride,
+  std::size_t query_width,
+  std::size_t kv_width,
+  int sequence_length,
+  int head_count,
+  int kv_head_count,
+  int head_dim,
+  float attention_scale,
+  std::size_t pair_begin,
+  std::size_t pair_end) noexcept;
 #endif
 
 } // namespace detail
@@ -208,6 +228,56 @@ void causal_attention_batch_rows(
     queries, gates, k_cache, v_cache, k_cache_f16, v_cache_f16, scores, output, context_stride,
     query_width, kv_width, position_start, head_count, kv_head_count,
     head_dim, attention_scale, row_begin, row_end);
+}
+
+void causal_attention_decode_gqa_pairs(
+  const float * queries,
+  const float * gates,
+  const float * k_cache,
+  const float * v_cache,
+  const std::uint16_t * k_cache_f16,
+  const std::uint16_t * v_cache_f16,
+  float * scores,
+  float * output,
+  const std::size_t context_stride,
+  const std::size_t query_width,
+  const std::size_t kv_width,
+  const int sequence_length,
+  const int head_count,
+  const int kv_head_count,
+  const int head_dim,
+  const float attention_scale,
+  const std::size_t pair_begin,
+  const std::size_t pair_end,
+  const Q8_0Backend backend) noexcept {
+  const std::size_t pair_count = static_cast<std::size_t>(head_count) / 2U;
+  if (queries == nullptr || gates == nullptr || k_cache == nullptr ||
+      v_cache == nullptr || scores == nullptr || output == nullptr ||
+      context_stride < static_cast<std::size_t>(sequence_length) ||
+      query_width == 0 || kv_width == 0 || sequence_length <= 0 ||
+      head_count <= 0 || kv_head_count <= 0 || head_dim <= 0 ||
+      (head_count % kv_head_count) != 0 ||
+      ((head_count / kv_head_count) % 2) != 0 || pair_begin >= pair_end ||
+      pair_end > pair_count) {
+    return;
+  }
+#if QWEN35X_Q8_0_HAS_AVX2_TU
+  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+    detail::causal_attention_decode_gqa_pairs_avx2(
+      queries, gates, k_cache, v_cache, k_cache_f16, v_cache_f16,
+      scores, output, context_stride, query_width, kv_width,
+      sequence_length, head_count, kv_head_count, head_dim, attention_scale,
+      pair_begin, pair_end);
+    return;
+  }
+#else
+  static_cast<void>(backend);
+#endif
+  detail::causal_attention_batch_rows_scalar(
+    queries, gates, k_cache, v_cache, k_cache_f16, v_cache_f16,
+    scores, output, context_stride, query_width, kv_width,
+    sequence_length - 1, head_count, kv_head_count, head_dim, attention_scale,
+    pair_begin * 2U, pair_end * 2U);
 }
 
 } // namespace qwen35x::cpu

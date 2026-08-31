@@ -292,6 +292,19 @@ void run_full_attention_batch_cpu_rows(
     row_begin, row_end, job.backend);
 }
 
+void run_full_attention_decode_cpu_pairs(
+  void * opaque_context,
+  const std::size_t pair_begin,
+  const std::size_t pair_end) noexcept {
+  auto & job = *static_cast<FullAttentionBatchCpuJob *>(opaque_context);
+  cpu::causal_attention_decode_gqa_pairs(
+    job.queries, job.gates, job.k_cache, job.v_cache,
+    job.k_cache_f16, job.v_cache_f16, job.scores, job.output,
+    job.context_stride, job.query_width, job.kv_width, job.position_start + 1,
+    job.head_count, job.kv_head_count, job.head_dim, job.attention_scale,
+    pair_begin, pair_end, job.backend);
+}
+
 struct CudaForwardWorkspace {
   cuda::CudaDeviceBufferF32 hidden_in;
   cuda::CudaDeviceBufferF32 intermediate_a;

@@ -580,6 +580,7 @@ bool run_full_attention_step(
   const std::size_t query_width =
     static_cast<std::size_t>(dims.n_heads * dims.head_dim);
   const std::size_t attention_rows = static_cast<std::size_t>(dims.n_heads);
+  const std::size_t attention_pairs = attention_rows / 2U;
   const std::size_t context_stride = static_cast<std::size_t>(seq_len);
   std::vector<float> attn_cat(query_width, 0.0f);
   std::vector<float> scores(attention_rows * context_stride, 0.0f);
@@ -605,14 +606,14 @@ bool run_full_attention_step(
   CpuQ8Runtime * const runtime = layer.full.o_proj.q8_0_runtime;
   if (runtime != nullptr && runtime->executor != nullptr) {
     const cpu::CpuExecutorStatus status = runtime->executor->parallel_for_rows(
-      attention_rows, run_full_attention_batch_cpu_rows, &job);
+      attention_pairs, run_full_attention_decode_cpu_pairs, &job);
     if (status != cpu::CpuExecutorStatus::ok) {
       error_message = std::string("Full-attention CPU executor failed: ") +
         cpu::cpu_executor_status_name(status) + ".";
       return false;
     }
   } else {
-    run_full_attention_batch_cpu_rows(&job, 0, attention_rows);
+    run_full_attention_decode_cpu_pairs(&job, 0, attention_pairs);
   }
 
   if (!matvec_2d(layer.full.o_proj, attn_cat, out, use_cuda, error_message)) {

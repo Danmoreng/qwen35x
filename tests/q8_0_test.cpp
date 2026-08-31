@@ -285,6 +285,63 @@ bool test_full_attention(const Q8_0Backend backend) {
   return ok;
 }
 
+bool test_full_attention_decode_pairs(const Q8_0Backend backend) {
+  constexpr int heads = 8;
+  constexpr int kv_heads = 2;
+  constexpr std::array<int, 2> head_dims{17, 256};
+  constexpr std::array<int, 11> contexts{
+    1, 7, 8, 9, 63, 64, 65, 255, 256, 257, 2048,
+  };
+  bool ok = true;
+  for (const int head_dim : head_dims) {
+    for (const int context : contexts) {
+      const std::size_t query_width = static_cast<std::size_t>(heads * head_dim);
+      const std::size_t kv_width = static_cast<std::size_t>(kv_heads * head_dim);
+      std::vector<float> query(query_width);
+      std::vector<float> gate(query_width);
+      std::vector<float> key_cache(static_cast<std::size_t>(context) * kv_width);
+      std::vector<float> value_cache(static_cast<std::size_t>(context) * kv_width);
+      for (std::size_t index = 0; index < query.size(); ++index) {
+        query[index] = std::sin(static_cast<float>(index) * 0.017F);
+        gate[index] = std::cos(static_cast<float>(index) * 0.023F) * 3.0F;
+      }
+      for (std::size_t index = 0; index < key_cache.size(); ++index) {
+        key_cache[index] = std::cos(static_cast<float>(index) * 0.0013F);
+        value_cache[index] = std::sin(static_cast<float>(index) * 0.0019F);
+      }
+      std::vector<std::uint16_t> key_cache_f16(key_cache.size());
+      std::vector<std::uint16_t> value_cache_f16(value_cache.size());
+      qwen35x::cpu::attention_cache_store_f16(
+        key_cache.data(), key_cache_f16.data(), key_cache.size(), backend);
+      qwen35x::cpu::attention_cache_store_f16(
+        value_cache.data(), value_cache_f16.data(), value_cache.size(), backend);
+      std::vector<float> reference_scores(static_cast<std::size_t>(heads * context));
+      std::vector<float> paired_scores(static_cast<std::size_t>(heads * context));
+      std::vector<float> reference(query_width);
+      std::vector<float> paired(query_width);
+      const float scale = 1.0F / std::sqrt(static_cast<float>(head_dim));
+      qwen35x::cpu::causal_attention_batch_rows(
+        query.data(), gate.data(), key_cache.data(), value_cache.data(),
+        key_cache_f16.data(), value_cache_f16.data(), reference_scores.data(),
+        reference.data(), static_cast<std::size_t>(context), query_width, kv_width,
+        context - 1, heads, kv_heads, head_dim, scale, 0,
+        static_cast<std::size_t>(heads), backend);
+      qwen35x::cpu::causal_attention_decode_gqa_pairs(
+        query.data(), gate.data(), key_cache.data(), value_cache.data(),
+        key_cache_f16.data(), value_cache_f16.data(), paired_scores.data(),
+        paired.data(), static_cast<std::size_t>(context), query_width, kv_width,
+        context, heads, kv_heads, head_dim, scale, 0,
+        static_cast<std::size_t>(heads / 2), backend);
+      for (std::size_t index = 0; index < paired.size(); ++index) {
+        ok = expect(
+          near_attention(reference[index], paired[index]),
+          "paired GQA decode output differs from row kernel") && ok;
+      }
+    }
+  }
+  return ok;
+}
+
 bool test_l2_normalize(const Q8_0Backend backend) {
   constexpr std::size_t rows = 3;
   constexpr std::size_t width = 37;
@@ -435,6 +492,7 @@ int main() {
   ok = test_rope(Q8_0Backend::auto_select) && ok;
   ok = test_causal_conv1d_silu(Q8_0Backend::auto_select) && ok;
   ok = test_full_attention(Q8_0Backend::auto_select) && ok;
+  ok = test_full_attention_decode_pairs(Q8_0Backend::auto_select) && ok;
   ok = test_l2_normalize(Q8_0Backend::auto_select) && ok;
   ok = test_backend(Q8_0Backend::scalar) && ok;
   ok = test_backend(Q8_0Backend::auto_select) && ok;
@@ -447,6 +505,7 @@ int main() {
     ok = test_rope(Q8_0Backend::avx2) && ok;
     ok = test_causal_conv1d_silu(Q8_0Backend::avx2) && ok;
     ok = test_full_attention(Q8_0Backend::avx2) && ok;
+    ok = test_full_attention_decode_pairs(Q8_0Backend::avx2) && ok;
   } else {
     ok = expect(
       qwen35x::cpu::q8_0_resolve_backend(Q8_0Backend::avx2) == Q8_0Backend::scalar,

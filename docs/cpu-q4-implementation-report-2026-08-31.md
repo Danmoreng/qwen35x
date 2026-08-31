@@ -40,6 +40,9 @@ sampling. Timer boundaries therefore favor llama.cpp slightly in that row.
 - Four-value-row AVX2 tiling for the batched DeltaNet scan; Q/K vectors are
   reused and the intermediate decayed-state store/reload is eliminated while
   preserving the original output reduction order.
+- Decode-only two-query-head GQA tiling. Each pair shares one KV head, so K/V
+  cache vectors are loaded once for two score and value streams while four
+  executor tasks remain available on the six-core host.
 - Unsigned Q4 AVX2 dot products with exact `-8 * activation_sum` correction.
 - Retained eight-token x eight-output-row AVX2 prefill kernel.
 - Eight-row-tile executor scheduling, including tail-token packed matvec.
@@ -66,6 +69,7 @@ three measured runs, six threads, and the same pure Q4_0 GGUF.
 | Token-major Q8 plus prepared decode | 306.26 | 61.41 | Retained foundation |
 | Fused greedy LM-head/argmax | unchanged | 62.75 | Current implementation |
 | Batched-only DeltaNet 4-row tile | 319.01 | neutral | Current implementation |
+| Two-head GQA decode tile | unchanged | 62.81 | Retained; larger at long context |
 
 The current step also measured 255.91 tok/s at pp2048 versus 237.58 before it
 (+7.7%). Its pp256 gain is +8.8%. The five-run decode confirmation is +1.4%
@@ -91,6 +95,14 @@ but changed long generation and materially worsened one identifier/budget
 rewrite; it was rejected. The retained version matches the old 128-token
 sequence and all three previously divergent rewrite outputs exactly.
 
+The decode-only GQA pair kernel is neutral at context one (62.81 versus 62.75
+tok/s), improves context-256/tg128 from 61.66 to 62.03 tok/s (+0.6%), and
+improves context-2048/tg128 from 52.20 to 54.98 tok/s (+5.3%). A second
+post-baseline context-2048 run measured 55.12 tok/s, confirming the gain. The
+new differential test covers contexts 1 through 2,048 with both odd and native
+head dimensions, F16 caches, and scalar/AVX2 dispatch. A 128-token end-to-end
+generation remains token-identical to the pre-A9 binary.
+
 The pre-vector-scale pp256 thread sweep measured 197.94, 218.53, 234.73, and
 188.30 tok/s at 4, 5, 6, and 8 threads. Six physical-core threads remain the
 default for this host.
@@ -101,8 +113,10 @@ The test suite covers canonical and packed layouts, nibble ordering, negative
 Q4 scales, direct packed-Q8 equality, scalar/AVX2 dots, matvec, matmul, output
 strides, embedding-row gather, GGUF parsing, and the existing executor and
 DeltaNet tests. The complete five-test CPU suite passes in both the Release and
-ASan/UBSan builds. A forced-scalar full-model smoke run also completes using the
-same packed model representation.
+ASan/UBSan builds. Decode-GQA additionally compares the paired path against the
+established row kernel at eleven context boundaries, head dimensions 17 and
+256, and FP16 cache storage. A forced-scalar full-model smoke run also completes
+using the same packed model representation.
 
 GCC keeps the hot AVX2 arithmetic free of function calls, but the 8x8 kernel
 does spill YMM values because AVX2 exposes only sixteen vector registers. The

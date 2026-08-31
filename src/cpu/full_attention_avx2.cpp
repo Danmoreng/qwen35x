@@ -100,6 +100,189 @@ namespace {
   return result;
 }
 
+void dot_pair_f32_avx2(
+  const float * lhs0,
+  const float * lhs1,
+  const float * rhs,
+  const int count,
+  float & result0,
+  float & result1) noexcept {
+  __m256 accum00 = _mm256_setzero_ps();
+  __m256 accum01 = _mm256_setzero_ps();
+  __m256 accum10 = _mm256_setzero_ps();
+  __m256 accum11 = _mm256_setzero_ps();
+  int index = 0;
+  for (; index + 16 <= count; index += 16) {
+    const __m256 rhs0 = _mm256_loadu_ps(rhs + index);
+    const __m256 rhs1 = _mm256_loadu_ps(rhs + index + 8);
+    accum00 = _mm256_fmadd_ps(_mm256_loadu_ps(lhs0 + index), rhs0, accum00);
+    accum01 = _mm256_fmadd_ps(_mm256_loadu_ps(lhs0 + index + 8), rhs1, accum01);
+    accum10 = _mm256_fmadd_ps(_mm256_loadu_ps(lhs1 + index), rhs0, accum10);
+    accum11 = _mm256_fmadd_ps(_mm256_loadu_ps(lhs1 + index + 8), rhs1, accum11);
+  }
+  result0 = horizontal_sum_f32(_mm256_add_ps(accum00, accum01));
+  result1 = horizontal_sum_f32(_mm256_add_ps(accum10, accum11));
+  for (; index < count; ++index) {
+    result0 += lhs0[index] * rhs[index];
+    result1 += lhs1[index] * rhs[index];
+  }
+}
+
+void dot_pair_f16_avx2(
+  const float * lhs0,
+  const float * lhs1,
+  const std::uint16_t * rhs,
+  const int count,
+  float & result0,
+  float & result1) noexcept {
+  __m256 accum00 = _mm256_setzero_ps();
+  __m256 accum01 = _mm256_setzero_ps();
+  __m256 accum10 = _mm256_setzero_ps();
+  __m256 accum11 = _mm256_setzero_ps();
+  int index = 0;
+  for (; index + 16 <= count; index += 16) {
+    const __m256 rhs0 = _mm256_cvtph_ps(
+      _mm_loadu_si128(reinterpret_cast<const __m128i *>(rhs + index)));
+    const __m256 rhs1 = _mm256_cvtph_ps(
+      _mm_loadu_si128(reinterpret_cast<const __m128i *>(rhs + index + 8)));
+    accum00 = _mm256_fmadd_ps(_mm256_loadu_ps(lhs0 + index), rhs0, accum00);
+    accum01 = _mm256_fmadd_ps(_mm256_loadu_ps(lhs0 + index + 8), rhs1, accum01);
+    accum10 = _mm256_fmadd_ps(_mm256_loadu_ps(lhs1 + index), rhs0, accum10);
+    accum11 = _mm256_fmadd_ps(_mm256_loadu_ps(lhs1 + index + 8), rhs1, accum11);
+  }
+  result0 = horizontal_sum_f32(_mm256_add_ps(accum00, accum01));
+  result1 = horizontal_sum_f32(_mm256_add_ps(accum10, accum11));
+  for (; index < count; ++index) {
+    const float value = _cvtsh_ss(rhs[index]);
+    result0 += lhs0[index] * value;
+    result1 += lhs1[index] * value;
+  }
+}
+
+void normalize_softmax_avx2(float * scores, const int count, const float maximum) noexcept {
+  __m256 denominator_vector = _mm256_setzero_ps();
+  const __m256 maximum_vector = _mm256_set1_ps(maximum);
+  int index = 0;
+  for (; index + 8 <= count; index += 8) {
+    const __m256 probability = exp_f32_avx2(
+      _mm256_sub_ps(_mm256_loadu_ps(scores + index), maximum_vector));
+    _mm256_storeu_ps(scores + index, probability);
+    denominator_vector = _mm256_add_ps(denominator_vector, probability);
+  }
+  float denominator = horizontal_sum_f32(denominator_vector);
+  for (; index < count; ++index) {
+    const float probability = std::exp(scores[index] - maximum);
+    scores[index] = probability;
+    denominator += probability;
+  }
+  const float inverse = 1.0F / (denominator > 0.0F ? denominator : 1.0F);
+  const __m256 inverse_vector = _mm256_set1_ps(inverse);
+  index = 0;
+  for (; index + 8 <= count; index += 8) {
+    _mm256_storeu_ps(
+      scores + index, _mm256_mul_ps(_mm256_loadu_ps(scores + index), inverse_vector));
+  }
+  for (; index < count; ++index) {
+    scores[index] *= inverse;
+  }
+}
+
+void weighted_sum_pair_avx2(
+  const float * v_cache,
+  const std::uint16_t * v_cache_f16,
+  const float * probabilities0,
+  const float * probabilities1,
+  float * output0,
+  float * output1,
+  const std::size_t kv_width,
+  const std::size_t head_offset,
+  const int sequence_length,
+  const int head_dim) noexcept {
+  int column = 0;
+  for (; column + 32 <= head_dim; column += 32) {
+    __m256 accum00 = _mm256_setzero_ps();
+    __m256 accum01 = _mm256_setzero_ps();
+    __m256 accum02 = _mm256_setzero_ps();
+    __m256 accum03 = _mm256_setzero_ps();
+    __m256 accum10 = _mm256_setzero_ps();
+    __m256 accum11 = _mm256_setzero_ps();
+    __m256 accum12 = _mm256_setzero_ps();
+    __m256 accum13 = _mm256_setzero_ps();
+    for (int context = 0; context < sequence_length; ++context) {
+      const std::size_t offset = static_cast<std::size_t>(context) * kv_width +
+        head_offset + static_cast<std::size_t>(column);
+      const __m256 value0 = v_cache_f16 != nullptr
+        ? _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(v_cache_f16 + offset)))
+        : _mm256_loadu_ps(v_cache + offset);
+      const __m256 value1 = v_cache_f16 != nullptr
+        ? _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(v_cache_f16 + offset + 8)))
+        : _mm256_loadu_ps(v_cache + offset + 8);
+      const __m256 value2 = v_cache_f16 != nullptr
+        ? _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(v_cache_f16 + offset + 16)))
+        : _mm256_loadu_ps(v_cache + offset + 16);
+      const __m256 value3 = v_cache_f16 != nullptr
+        ? _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(v_cache_f16 + offset + 24)))
+        : _mm256_loadu_ps(v_cache + offset + 24);
+      const __m256 probability0 = _mm256_set1_ps(probabilities0[context]);
+      const __m256 probability1 = _mm256_set1_ps(probabilities1[context]);
+      accum00 = _mm256_fmadd_ps(probability0, value0, accum00);
+      accum01 = _mm256_fmadd_ps(probability0, value1, accum01);
+      accum02 = _mm256_fmadd_ps(probability0, value2, accum02);
+      accum03 = _mm256_fmadd_ps(probability0, value3, accum03);
+      accum10 = _mm256_fmadd_ps(probability1, value0, accum10);
+      accum11 = _mm256_fmadd_ps(probability1, value1, accum11);
+      accum12 = _mm256_fmadd_ps(probability1, value2, accum12);
+      accum13 = _mm256_fmadd_ps(probability1, value3, accum13);
+    }
+    _mm256_storeu_ps(output0 + column, accum00);
+    _mm256_storeu_ps(output0 + column + 8, accum01);
+    _mm256_storeu_ps(output0 + column + 16, accum02);
+    _mm256_storeu_ps(output0 + column + 24, accum03);
+    _mm256_storeu_ps(output1 + column, accum10);
+    _mm256_storeu_ps(output1 + column + 8, accum11);
+    _mm256_storeu_ps(output1 + column + 16, accum12);
+    _mm256_storeu_ps(output1 + column + 24, accum13);
+  }
+  for (; column < head_dim; ++column) {
+    float accum0 = 0.0F;
+    float accum1 = 0.0F;
+    for (int context = 0; context < sequence_length; ++context) {
+      const std::size_t offset = static_cast<std::size_t>(context) * kv_width +
+        head_offset + static_cast<std::size_t>(column);
+      const float value = v_cache_f16 != nullptr
+        ? _cvtsh_ss(v_cache_f16[offset]) : v_cache[offset];
+      accum0 += probabilities0[context] * value;
+      accum1 += probabilities1[context] * value;
+    }
+    output0[column] = accum0;
+    output1[column] = accum1;
+  }
+}
+
+[[nodiscard]] float stable_sigmoid(float value) noexcept;
+
+void apply_gate_avx2(float * output, const float * gate, const int count) noexcept {
+  const __m256 zero = _mm256_setzero_ps();
+  const __m256 one = _mm256_set1_ps(1.0F);
+  const __m256 sign_mask = _mm256_set1_ps(-0.0F);
+  int column = 0;
+  for (; column + 8 <= count; column += 8) {
+    const __m256 gate_value = _mm256_loadu_ps(gate + column);
+    const __m256 absolute = _mm256_andnot_ps(sign_mask, gate_value);
+    const __m256 exponential = exp_f32_avx2(_mm256_sub_ps(zero, absolute));
+    const __m256 denominator = _mm256_add_ps(one, exponential);
+    const __m256 positive = _mm256_div_ps(one, denominator);
+    const __m256 negative = _mm256_mul_ps(exponential, positive);
+    const __m256 sigmoid = _mm256_blendv_ps(
+      negative, positive, _mm256_cmp_ps(gate_value, zero, _CMP_GE_OQ));
+    _mm256_storeu_ps(
+      output + column, _mm256_mul_ps(_mm256_loadu_ps(output + column), sigmoid));
+  }
+  for (; column < count; ++column) {
+    output[column] *= stable_sigmoid(gate[column]);
+  }
+}
+
 void weighted_sum_f32_avx2(
   const float * v_cache,
   const std::uint16_t * v_cache_f16,
@@ -304,6 +487,70 @@ void causal_attention_batch_rows_avx2(
       output_head[static_cast<std::size_t>(gate_column)] *= stable_sigmoid(gate[gate_column]);
     }
   }
+}
+
+void causal_attention_decode_gqa_pairs_avx2(
+  const float * queries,
+  const float * gates,
+  const float * k_cache,
+  const float * v_cache,
+  const std::uint16_t * k_cache_f16,
+  const std::uint16_t * v_cache_f16,
+  float * scores,
+  float * output,
+  const std::size_t context_stride,
+  const std::size_t query_width,
+  const std::size_t kv_width,
+  const int sequence_length,
+  const int head_count,
+  const int kv_head_count,
+  const int head_dim,
+  const float attention_scale,
+  const std::size_t pair_begin,
+  const std::size_t pair_end) noexcept {
+  const int heads_per_kv = head_count / kv_head_count;
+  for (std::size_t pair = pair_begin; pair < pair_end; ++pair) {
+    const int head0 = static_cast<int>(pair * 2U);
+    const int head1 = head0 + 1;
+    const int kv_head = head0 / heads_per_kv;
+    const std::size_t head_offset0 =
+      static_cast<std::size_t>(head0) * static_cast<std::size_t>(head_dim);
+    const std::size_t head_offset1 = head_offset0 + static_cast<std::size_t>(head_dim);
+    const std::size_t kv_head_offset =
+      static_cast<std::size_t>(kv_head) * static_cast<std::size_t>(head_dim);
+    const float * query0 = queries + head_offset0;
+    const float * query1 = queries + head_offset1;
+    float * score0 = scores + static_cast<std::size_t>(head0) * context_stride;
+    float * score1 = scores + static_cast<std::size_t>(head1) * context_stride;
+    float maximum0 = -std::numeric_limits<float>::infinity();
+    float maximum1 = -std::numeric_limits<float>::infinity();
+    for (int context = 0; context < sequence_length; ++context) {
+      const std::size_t offset = static_cast<std::size_t>(context) * kv_width + kv_head_offset;
+      float dot0 = 0.0F;
+      float dot1 = 0.0F;
+      if (k_cache_f16 != nullptr) {
+        dot_pair_f16_avx2(query0, query1, k_cache_f16 + offset, head_dim, dot0, dot1);
+      } else {
+        dot_pair_f32_avx2(query0, query1, k_cache + offset, head_dim, dot0, dot1);
+      }
+      const float scaled0 = dot0 * attention_scale;
+      const float scaled1 = dot1 * attention_scale;
+      score0[context] = scaled0;
+      score1[context] = scaled1;
+      maximum0 = std::max(maximum0, scaled0);
+      maximum1 = std::max(maximum1, scaled1);
+    }
+    normalize_softmax_avx2(score0, sequence_length, maximum0);
+    normalize_softmax_avx2(score1, sequence_length, maximum1);
+    float * output0 = output + head_offset0;
+    float * output1 = output + head_offset1;
+    weighted_sum_pair_avx2(
+      v_cache, v_cache_f16, score0, score1, output0, output1,
+      kv_width, kv_head_offset, sequence_length, head_dim);
+    apply_gate_avx2(output0, gates + head_offset0, head_dim);
+    apply_gate_avx2(output1, gates + head_offset1, head_dim);
+  }
+  static_cast<void>(query_width);
 }
 
 } // namespace qwen35x::cpu::detail
