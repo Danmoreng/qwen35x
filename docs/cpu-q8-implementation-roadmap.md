@@ -464,6 +464,276 @@ If broad pre-AVX2 performance is a product requirement, add an SSSE3/SSE4.1 Q8
 dot backend using `pabsb`, `psignb`, `pmaddubsw`, and `pmaddwd`. Keep the fully
 scalar path as the final correctness fallback.
 
+## Workstream D: lower-bit weights and transcript-quality evaluation
+
+This workstream is active on the AVX2 laptop. It was added after the second
+external review and takes priority over speculative sub-four-bit kernels. The
+central hypothesis is that decode is sufficiently weight-bandwidth-bound for a
+good W4A8 implementation to provide a larger gain than further tuning of the
+existing Q8 matvec.
+
+Quantization algorithm and runtime storage format are separate decisions. RTN,
+an importance matrix, GPTQ/AWQ-style optimization, or AutoRound may choose
+better codes while the runtime still consumes a simple Q4_0-like layout.
+
+### D0 — llama.cpp format and quality preselection
+
+Status: in progress
+
+Benchmark these Qwen3.5 0.8B GGUF variants on the same i7-8750H and current
+llama.cpp revision:
+
+| Format | Role in the comparison |
+| --- | --- |
+| Q8_0 | Current quality and performance reference |
+| Q6_K | High-quality lower-bandwidth reference |
+| Q5_K_M | Conservative mixed five-bit candidate |
+| Q4_K_M | Common quality-oriented four-bit candidate |
+| Q4_0 | Simplest prospective custom AVX2 kernel format |
+| IQ4_NL | Same nominal block size with nonlinear codebook |
+| IQ4_XS | Smaller four-bit reference with more scale decoding |
+
+Prefer files quantized directly from BF16/FP16/FP32 and generated with a
+documented importance matrix where available. Do not requantize the existing
+Q8_0 file to Q4. Record repository, revision/file name, exact byte size, SHA-256,
+GGUF metadata, and quantization provenance.
+
+Performance matrix:
+
+| Workload | Required measurement |
+| --- | --- |
+| pp256 | Prompt processing and comparison continuity |
+| pp2048 | Realistic long transcript prefill |
+| prompt-1 / tg128 | Base bandwidth-bound decode |
+| context-256 / tg128 | Medium-context attention contribution |
+| context-2048 / tg128 | Long-context GQA/KV contribution |
+| realistic cleanup | End-to-end prefill, decode, and wall clock |
+
+Use six physical-core threads, CPU-only execution, identical llama.cpp build,
+batch/ubatch/cache settings, one warmup and at least three measured runs. Run
+formats sequentially, rotate their order for small differences, and record
+median/spread as well as averages. Model loading and file size must be reported
+separately from timed inference.
+
+### D0 quality mini-suite
+
+Run greedy decoding with the exact same system instruction, chat template,
+maximum output length, and deterministic settings for all formats. Start with
+the following eight rewrite inputs; preserve the raw input and generated output
+for review rather than recording only a subjective score.
+
+1. **German fillers and punctuation**
+
+   ```text
+   hallo äh ich wollte nur sagen das treffen ist morgen um zehn uhr und bitte
+   bring noch die unterlagen mit
+   ```
+
+   Required facts: meeting is tomorrow at 10:00; bring the documents.
+
+2. **German self-correction**
+
+   ```text
+   wir liefern am donnerstag also nein entschuldigung am freitag den
+   vierzehnten und zwar zwölf kartons an frau schneider
+   ```
+
+   Required facts: Friday the 14th, 12 boxes, recipient Frau Schneider; the
+   superseded Thursday date must not remain as the final commitment.
+
+3. **German names, identifier, and amount**
+
+   ```text
+   notier bitte für herrn özdemir projekt alpha sieben ticket a c vier neun
+   zwei budget sind dreizehntausendfünfhundert euro
+   ```
+
+   Required facts: Herr Özdemir, Projekt Alpha 7, ticket AC-492, EUR 13,500.
+
+4. **German medical-style dictation without invention**
+
+   ```text
+   patient berichtet seit drei tagen über kopfschmerzen kein fieber keine
+   übelkeit termin zur kontrolle am zweiten september um acht uhr dreißig
+   ```
+
+   Required facts: three days, headache, no fever, no nausea, September 2 at
+   08:30. The model must only clean the wording and must not add diagnoses or
+   treatment advice.
+
+5. **English fillers and action items**
+
+   ```text
+   okay so um send the revised contract to Maya Chen before five p m and copy
+   Daniel on the email but do not attach the old pricing sheet
+   ```
+
+   Required facts: Maya Chen, before 5 p.m., copy Daniel, exclude old pricing.
+
+6. **English numbers and correction**
+
+   ```text
+   the invoice total is four thousand six hundred and eighteen dollars no wait
+   four thousand six hundred and eighty dollars and payment is due june twenty
+   first
+   ```
+
+   Required facts: corrected total USD 4,680 and due date June 21; USD 4,618
+   must not be presented as final.
+
+7. **Mixed-language technical transcript**
+
+   ```text
+   bitte update den inference server auf version zwei punkt vier punkt eins
+   aber lass den cuda driver unverändert und starte danach nur den qwen worker
+   neu
+   ```
+
+   Required facts: inference server 2.4.1, do not change CUDA driver, restart
+   only the Qwen worker.
+
+8. **Longer disfluent paragraph with negation**
+
+   ```text
+   also für das protokoll wir haben heute entschieden dass der test nicht am
+   montag startet sondern am mittwoch zuerst nur mit fünf nutzern und falls
+   fehler auftreten wird nicht automatisch ausgerollt sondern wir prüfen das
+   am donnerstag nochmal gemeinsam
+   ```
+
+   Required facts: starts Wednesday, not Monday; five users; no automatic
+   rollout on errors; joint review Thursday.
+
+For every output score or flag:
+
+- preservation of names, identifiers, numbers, dates, times, negations, and
+  corrected statements;
+- omissions and unsupported additions;
+- punctuation, casing, readability, and removal of disfluencies;
+- repetition, truncation, malformed text, and instruction leakage;
+- output token count and wall-clock latency;
+- exact match of critical-fact assertions;
+- optional teacher comparison: token-level KLD/top-k agreement against BF16 or
+  at least Q8_0 when a compatible logits harness exists.
+
+The first pass may use a small manual rubric: `critical facts` (pass/fail),
+`unsupported additions` (count), and `rewrite quality` (1–5). Keep all raw
+outputs so later human review can override automated judgments. A format is not
+approved merely because its prose sounds fluent.
+
+D0 decision gate:
+
+- eliminate any format with repeated critical-fact corruption or instability;
+- identify the fastest acceptable Q4 and a conservative Q5/Q6 fallback;
+- compare prefill and decode separately because Q4 unpacking can improve decode
+  while reducing prompt-processing speed;
+- select no custom runtime format until these llama.cpp measurements exist.
+
+### D1 — Native Q4_0 × Q8 backend
+
+Status: pending D0
+
+Implement a Q4_0 loader, scalar reference, activation sums, AVX2 Q4×Q8 dot,
+eight-row decode tile, separate batched-prefill tile, and load-time packing that
+replaces the source weight representation. Expand nibbles only in registers.
+Use the unsigned-nibble identity
+`sum(q * a) - 8 * sum(a)` to avoid unnecessary signed conversion.
+
+Initial merge targets on this laptop:
+
+- at least 20–25% faster decode than the retained Q8 path;
+- no more than a small, explicitly measured prefill regression;
+- scalar/AVX2 differential tests at all block/tile tails;
+- no material failure in the D0 transcript suite;
+- total resident model memory must fall rather than contain Q8 and Q4 copies.
+
+### D2 — Native IQ4_NL × Q8 backend
+
+Status: pending D1
+
+Reuse executor and row tiling from D1. Expand nibbles to indices, use a
+lane-safe duplicated 16-entry table with `VPSHUFB`, and feed the resulting
+signed bytes to the established Q8 dot sequence. Compare cycles/weight,
+prefill, decode, RSS, and D0 quality directly against Q4_0.
+
+### D3 — Mixed tensor precision
+
+Status: pending D1/D2
+
+Represent weight format per tensor and dispatch by format, ISA, and
+decode/prefill mode. First candidate:
+
+- large MLP and DeltaNet matrices: Q4_0 or IQ4_NL;
+- full-attention projections: IQ4_NL or Q5;
+- LM head: Q5_0 initially;
+- small norms, convolution weights, and parameter vectors: FP16/FP32/current
+  representation as appropriate.
+
+Measure tensor ablations and prioritize names, numbers, negation, and output
+projection sensitivity. `Q4_K_M` is a mixed model policy, not one homogeneous
+block type, and should not be conflated with a simple Q4 runtime kernel.
+
+### D4 — Calibration and offline rounding
+
+Status: pending a stable runtime format
+
+Generate candidates directly from BF16/FP16 using transcript-specific
+calibration data:
+
+- naive RTN Q4_0;
+- llama.cpp importance-matrix Q4;
+- AutoRound Q4_0 and Q4_K_M;
+- selected AWQ/GPTQ-like rounding exported into the same runtime layout;
+- mixed-precision output/embedding alternatives.
+
+Calibration data must contain German and English raw transcripts, fillers,
+self-corrections, names, identifiers, dates, times, numbers, short/long inputs,
+and the real system prompt/chat template. Runtime-kernel performance and offline
+quantizer quality must remain independently measurable.
+
+### D5 — Custom Hadamard Q4 format
+
+Status: research target after D1–D4
+
+This is the preferred custom-format research direction before dense EXL3:
+
+```text
+Q4_H128 = randomized-sign Hadamard-128 regularization + calibrated simple Q4
+```
+
+Offline transform weight input blocks by the orthogonal signed Hadamard matrix;
+at runtime transform each activation block once, quantize it to Q8, and reuse it
+across all projections sharing that input. Proposed metadata includes transform
+ID/version, block size, sign seed, quantization method, scale granularity, and
+format ABI. Benchmark the transform overhead separately and ensure transformed
+activations are reused across packed QKV, gate/up, and DeltaNet projections.
+
+The goal is to capture much of QTIP/EXL3's outlier-regularization benefit while
+retaining an extremely simple hardware-native Q4 dot kernel.
+
+### D6 — Quantized KV cache and DeltaNet state
+
+Status: deferred quality-risk experiments
+
+Evaluate Q8 KV cache only at long contexts after weight-only Q4. Evaluate FP16
+DeltaNet state with FP32 compute only after long deterministic recurrence and
+transcript tests. Neither is expected to help context-one decode as much as
+lower-bit weights, and recurrent error accumulation makes state quantization
+more sensitive.
+
+### D7 — Dense EXL3/QTIP/Trellis research backend
+
+Status: future research, primarily modern hardware
+
+Treat existing EXL3 CPU code as a reference rather than a drop-in dense engine;
+it targets MoE expert offload. A future dense prototype requires CPU-native
+packing, Hadamard-128 activation transforms, scalar and AVX2 references,
+AVX-512 VNNI/VBMI implementations, and separate dense GEMV and prefill kernels.
+Compare two-, three-, and four-bit quality only after D0–D5 establish a strong
+four-bit baseline. On the i7-8750H, Q4_0/IQ4_NL should be preferred over Trellis
+at four bits because the latter adds decode/transform complexity without VNNI,
+AVX-512, or VBMI.
+
 ## Known rejected approaches
 
 Do not repeat these unchanged:
@@ -497,6 +767,10 @@ Update this table in the same commit that lands or rejects each experiment.
 | A10 | Pending | — | FP32 producer buffers still precede Q8 quantization |
 | B | Pending | — | Prefix state cache not implemented |
 | C1-C6 | Future hardware | — | Requires suitable ISA hosts for validation |
+| D0 | In progress | — | Benchmark the seven llama.cpp GGUF formats and run the eight-case deterministic transcript rewrite suite on this laptop |
+| D1-D4 | Pending D0 | — | Native Q4_0/IQ4_NL, mixed precision, and calibrated offline rounding depend on the D0 speed/quality decision |
+| D5 | Research target | — | Custom Hadamard-regularized `Q4_H128` is the preferred custom-format direction after simple Q4 baselines |
+| D6-D7 | Deferred/future hardware | — | State quantization is quality-sensitive; dense sub-four-bit research benefits materially from newer SIMD ISAs |
 
 ## Completion definition
 
