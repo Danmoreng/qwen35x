@@ -173,7 +173,7 @@ separately if existing stage timers are insufficient.
 
 ### A3 — Persistent request workspace and span-based projections
 
-Status: pending
+Status: evaluated; neutral on the laptop and not retained
 
 Implementation:
 
@@ -230,7 +230,7 @@ the state layout and correctness tests come first.
 
 ### A5 — Per-kernel threading policy and laptop affinity
 
-Status: pending
+Status: evaluated; neutral on the laptop and not retained
 
 Implementation:
 
@@ -474,21 +474,37 @@ Feature detection should distinguish at least:
 
 ### C2 — 256-bit AVX-VNNI Q8 backend
 
-Status: future-hardware pending
+Status: completed and retained on Zen 5
 
 This is the first modern Q8 dot-product backend. A Q8 block's 32 bytes fit one
 YMM register exactly. Initially preserve the established sign/absolute-value
 mapping and replace the AVX2 multiply-add sequence with the appropriate VNNI
 dot-product instruction. Benchmark decode and prefill independently.
 
+Zen 5 result: the isolated AVX-VNNI translation unit preserves the canonical
+34-byte Q8_0 layout and replaces the AVX2 multiply-add pair with 256-bit VNNI.
+Runtime CPUID dispatch keeps one binary safe on older AVX2 and scalar hosts.
+In an alternating-order six-run comparison at 12 threads, pp256 improved from
+790.43 to 857.23 tok/s (+8.45%). Prompt-1/tg128 was neutral at 62.90 versus
+62.67 tok/s (-0.37%, within run-to-run spread). Commit: `476a43d`.
+
 ### C3 — AVX-512 FP32 kernels and 256-bit EVEX/VNNI tiling
 
-Status: future-hardware pending
+Status: first FP32 activation slice completed; attention, DeltaNet, and
+256-bit EVEX/VNNI tiling pending
 
 Use AVX-512 where it naturally benefits normalization, residuals, SiLU, RoPE,
 convolution, attention, and DeltaNet. For Q8, first evaluate 256-bit EVEX/VNNI
 using the larger register file and larger output tiles before assuming ZMM is
 better. Avoid unnecessary frequency reduction from wide instructions.
+
+Zen 5 result: an isolated AVX-512F translation unit now covers FP32 residual
+add, RMSNorm, L2 normalization, SiLU, SiLU-multiply, RoPE, and causal
+convolution. Q8 dots deliberately remain on 256-bit AVX-VNNI. Against the VNNI
+level, pp256 improved by 3.15% for Q8 and 3.07% for Q4; Q8 prompt-1/tg128 was
+neutral at +0.20%, with no observed wide-vector frequency penalty. Full
+attention, DeltaNet, 256-bit EVEX/VNNI larger-register tiling, and native ZMM
+Q8 remain separate experiments. Commit: `6ef1218`.
 
 ### C4 — Replacing Q8 weight layout
 
@@ -923,7 +939,10 @@ Update this table in the same commit that lands or rejects each experiment.
 | A9 | Decode pair grouping retained | `cc83dec` | Two query heads reuse shared K/V loads while preserving four executor tasks. Context-2048/tg128 rises from 52.20 to 54.98 tok/s (+5.3%), confirmed at 55.12 after the baseline run; context-one is neutral and a 128-token generation is exact. Four-head grouping regressed to 53.47 tok/s and normalization fusion regressed to 54.10 versus 54.96 tok/s. |
 | A10 | Completed, neutral on laptop | — | Final RMS-to-Q8 was 62.68 versus 62.65 tok/s; all-layer RMS-to-Q8 was 62.94 versus 62.96; MLP SiLU-multiply-to-Q8 was 62.98 versus 62.96. Exact-output prototypes were reverted because packed-Q4 weight traffic dominates. |
 | B | In-memory CPU slice completed | this commit | A 128-token snapshot cuts 256-token prompt prefill from 803.49 to 413.86 ms (-48.5%); restore is 2.22 ms, storage is 21.77 MB, and AVX2/scalar output sequences are exact. Persistent model ownership, content hashing, and disk serialization remain. |
-| C1-C6 | Future hardware | — | Requires suitable ISA hosts for validation |
+| C1 | Pending | — | Replace the coarse backend enum with one resolved immutable per-operation kernel table |
+| C2 | Completed, retained | `476a43d` | 256-bit AVX-VNNI raises Q8 pp256 by 8.45%; short decode is neutral; CPUID fallback keeps the binary portable |
+| C3 | Partial, retained | `6ef1218` | AVX-512 FP32 activation kernels add 3.15% Q8 and 3.07% Q4 pp256 over VNNI; attention, DeltaNet, and EVEX/VNNI tiling remain |
+| C4-C6 | Pending/deferred | — | Q8 layout replacement and native ZMM Q8 remain modern-host experiments; AMX needs a supported host; pre-AVX2 SIMD is product-scope dependent |
 | D0 | Initial screen completed | `4ca364c` | Seven formats, three alternating-order performance rounds, 56 deterministic rewrite outputs, and a three-run 2k/2k Q8-versus-Q4_0 comparison select Q4_0 for the first native backend; production quality expansion remains open |
 | D1 | Active; laptop throughput target achieved | `12f9ecf`, `8e3614c` + this commit | Native Q4_0 scalar/AVX2, packed-only model weights, token-major prepared activations, fused greedy LM-head, 8x8 projection prefill, batched DeltaNet row tiling, and paired GQA decode are implemented. Against llama.cpp Q4_0, pp256 is +40.0%, pp2048 is +30.8%, and short decode is +37.9%; paired GQA adds +5.3% at context 2,048 over the prior native path. Expanded correctness, quality, memory, and long-context gates remain. |
 | D2-D4 | Pending D1 validation | — | IQ4_NL, mixed precision, and calibrated offline rounding follow the validated Q4_0 baseline |
