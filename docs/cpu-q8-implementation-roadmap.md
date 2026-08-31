@@ -400,8 +400,8 @@ traffic, rather than FP32 activation materialization, dominates this host.
 
 ## Workstream B: system-prompt state cache
 
-Status: first in-memory CPU snapshot/restore slice implemented; persistent
-model sessions and disk serialization pending
+Status: in-memory CPU snapshot/restore and persistent loaded-model session
+implemented; disk serialization pending
 
 This is likely the largest product-level latency gain for repeated transcript
 cleanup requests and can proceed independently of newer ISA work.
@@ -435,18 +435,30 @@ caches retain FP32. The handle validates the exact prefix tokens, resolved CPU
 backend, prefill mode, state ABI, architecture/profile, model dimensions, and
 canonical GGUF path/size/modification time. A handle must not be accessed by
 concurrent inference calls.
+
 For a 128-token cached prefix inside a 256-token prompt, three sequential runs
 reduced mean measured prefill from 803.49 ms to 413.86 ms (48.5%). Restore
 itself averaged 2.22 ms and the snapshot occupied 21,774,848 bytes. A varied
 256-token prompt plus 64 generated tokens is token-identical with and without
 the cache; the forced-scalar restore path is also token-identical.
 
-This first API slice intentionally does not claim a cryptographic content key:
-the in-memory cache uses file identity/metadata and is invalidated on mismatch.
-Disk persistence must add a model-content hash and a portable serialization
-header carrying the state ABI and layout constraints. The next product-level
-step is a persistent loaded-model session so repeated requests also avoid the
-approximately 0.6-second GGUF load seen on this laptop.
+`ReferenceCpuModelSession` now owns packed CPU weights and the executor across
+requests. It validates the same model identity plus resolved ISA backend and
+thread count, transactionally reloads on mismatch, and serializes concurrent
+callers because the executor scratch remains mutable. Applications can prepare
+the session explicitly at worker startup or let the first inference initialize
+it lazily.
+
+In the 64-input/8-output test, prepared-session hits reduce mean request setup
+from 728.80 to 1.13 ms and measured load+prefill+decode time from 1,046.58 to
+312.52 ms (-70.1%). With both session and a 128-token prefix enabled for the
+256-input/16-output test, measured stages fall from 1,777.28 to 655.60 ms
+(-63.1%); session and prefix hits were observed in all three measured runs.
+
+The in-memory identity intentionally is not a cryptographic content key. Disk
+persistence must add a model-content hash and a portable serialization header
+carrying the state ABI and layout constraints. The next product-level step is
+integrating one prepared session per worker into the long-lived HTTP service.
 
 ## Workstream C: future modern x86 backends
 
@@ -950,7 +962,7 @@ Update this table in the same commit that lands or rejects each experiment.
 | A8 | Batched prefill completed | this commit | Four-row AVX2 tiling reuses Q/K and removes the intermediate state store/reload without changing output reduction order. pp256 is +4.2% and pp2048 +3.5%; reverse-order decode A/B is neutral. The faster algebraic-output variant was rejected on transcript quality. |
 | A9 | Decode pair grouping retained | `cc83dec` | Two query heads reuse shared K/V loads while preserving four executor tasks. Context-2048/tg128 rises from 52.20 to 54.98 tok/s (+5.3%), confirmed at 55.12 after the baseline run; context-one is neutral and a 128-token generation is exact. Four-head grouping regressed to 53.47 tok/s and normalization fusion regressed to 54.10 versus 54.96 tok/s. |
 | A10 | Completed, neutral on laptop | — | Final RMS-to-Q8 was 62.68 versus 62.65 tok/s; all-layer RMS-to-Q8 was 62.94 versus 62.96; MLP SiLU-multiply-to-Q8 was 62.98 versus 62.96. Exact-output prototypes were reverted because packed-Q4 weight traffic dominates. |
-| B | In-memory CPU slice completed | this commit | A 128-token snapshot cuts 256-token prompt prefill from 803.49 to 413.86 ms (-48.5%); restore is 2.22 ms, storage is 21.77 MB, and AVX2/scalar output sequences are exact. Persistent model ownership, content hashing, and disk serialization remain. |
+| B | In-memory cache and model session completed | `2377f3c`, `6351f73` | A 128-token snapshot cuts 256-token prompt prefill from 803.49 to 413.86 ms (-48.5%); persistent weights cut 64/8 measured request stages by 70.1%, and the combined session+prefix path cuts 256/16 stages by 63.1%. AVX2/scalar cache outputs and persistent-session outputs are exact. HTTP integration, content hashing, and disk serialization remain. |
 | C1 | Pending | — | Replace the coarse backend enum with one resolved immutable per-operation kernel table |
 | C2 | Completed, retained | `476a43d` | 256-bit AVX-VNNI raises Q8 pp256 by 8.45%; short decode is neutral; CPUID fallback keeps the binary portable |
 | C3 | Partial, retained | `6ef1218`, this commit | AVX-512 FP32 activation kernels add 3.15% Q8 and 3.07% Q4 pp256 over VNNI. Q4 AVX-VNNI adds 11.5% pp256 over AVX2, and its 12x8 EVEX/VNNI tile adds 9.7% pp2048 over the 8x8 VEX tile. Q8 EVEX tiling, attention, and DeltaNet remain. |

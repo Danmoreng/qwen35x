@@ -1,3 +1,85 @@
+namespace {
+
+struct CpuModelSessionState {
+  mutable std::mutex mutex;
+  std::string model_signature;
+  ModelWeights weights;
+  bool loaded = false;
+};
+
+[[nodiscard]] std::string cpu_model_session_signature(
+  const ReferenceInferenceOptions & options,
+  const ModelProfile & profile,
+  const RuntimeDims & dims) {
+  return cpu_prefix_model_signature(options, profile, dims) +
+    "|backend=" + cpu::q8_0_backend_name(
+      cpu::q8_0_resolve_backend(options.cpu_q8_backend)) +
+    "|threads=" + std::to_string(options.cpu_threads);
+}
+
+} // namespace
+
+ReferenceCpuModelSession::ReferenceCpuModelSession()
+  : implementation_(std::make_shared<CpuModelSessionState>()) {}
+
+void ReferenceCpuModelSession::clear() {
+  if (implementation_ == nullptr) {
+    implementation_ = std::make_shared<CpuModelSessionState>();
+    return;
+  }
+  const auto state = std::static_pointer_cast<CpuModelSessionState>(implementation_);
+  const std::lock_guard<std::mutex> lock(state->mutex);
+  state->weights = ModelWeights{};
+  state->model_signature.clear();
+  state->loaded = false;
+}
+
+bool ReferenceCpuModelSession::empty() const {
+  if (implementation_ == nullptr) {
+    return true;
+  }
+  const auto state = std::static_pointer_cast<CpuModelSessionState>(implementation_);
+  const std::lock_guard<std::mutex> lock(state->mutex);
+  return !state->loaded;
+}
+
+namespace {
+
+bool ensure_cpu_model_session_locked(
+  const ModelProfile & profile,
+  const ReferenceInferenceOptions & options,
+  const RuntimeDims & dims,
+  CpuModelSessionState & session,
+  bool & cache_hit,
+  std::string & error_message) {
+  const std::string signature = cpu_model_session_signature(options, profile, dims);
+  if (session.loaded && session.model_signature == signature) {
+    cache_hit = true;
+    return true;
+  }
+
+  ModelWeights candidate;
+  if (!load_model_weights(
+        options.model_dir,
+        options.cpu_gguf_path,
+        dims,
+        profile,
+        options.cpu_q8_backend,
+        options.cpu_threads,
+        candidate,
+        error_message)) {
+    return false;
+  }
+
+  session.weights = std::move(candidate);
+  session.model_signature = signature;
+  session.loaded = true;
+  cache_hit = false;
+  return true;
+}
+
+} // namespace
+
 bool parse_token_list_csv(
   const std::string & csv,
   std::vector<std::int32_t> & out_tokens,
@@ -32,6 +114,42 @@ bool parse_token_list_csv(
   }
 
   return true;
+}
+
+bool prepare_reference_cpu_model_session(
+  const ModelProfile & profile,
+  const ReferenceInferenceOptions & options,
+  ReferenceCpuModelSession & session,
+  std::string & error_message) {
+  if (profile.family != "qwen3.5") {
+    error_message = "Reference CPU model sessions currently support only qwen3.5 family.";
+    return false;
+  }
+  if (options.model_dir.empty()) {
+    error_message = "Reference CPU model session requires --hf-model-dir.";
+    return false;
+  }
+  if (options.use_cuda) {
+    error_message = "Reference CPU model sessions cannot be used with GPU inference.";
+    return false;
+  }
+  if (options.cpu_threads < 0) {
+    error_message = "cpu_threads must be >= 0 (zero selects the automatic default).";
+    return false;
+  }
+
+  RuntimeDims dims;
+  if (!build_runtime_dims(profile, dims, error_message)) {
+    return false;
+  }
+  if (session.implementation_ == nullptr) {
+    session.implementation_ = std::make_shared<CpuModelSessionState>();
+  }
+  const auto state = std::static_pointer_cast<CpuModelSessionState>(session.implementation_);
+  const std::lock_guard<std::mutex> lock(state->mutex);
+  bool cache_hit = false;
+  return ensure_cpu_model_session_locked(
+    profile, options, dims, *state, cache_hit, error_message);
 }
 
 bool run_qwen35x_cuda_inference(
@@ -228,6 +346,10 @@ bool run_reference_qwen35_inference(
     error_message = "The in-memory prefix cache currently supports CPU inference only.";
     return false;
   }
+  if (options.use_cuda && options.cpu_model_session != nullptr) {
+    error_message = "Persistent CPU model sessions cannot be used with GPU inference.";
+    return false;
+  }
   if (options.use_cuda && !options.cpu_gguf_path.empty()) {
     error_message = "--cpu-gguf is a CPU-only weight path and cannot be combined with GPU inference.";
     return false;
@@ -263,18 +385,40 @@ bool run_reference_qwen35_inference(
   const auto load_start = std::chrono::steady_clock::now();
   const bool use_cuda_matvec_bf16 = options.use_cuda && options.use_cuda_matvec_bf16;
 
-  ModelWeights weights;
-  if (!load_model_weights(
-        options.model_dir,
-        options.cpu_gguf_path,
-        dims,
-        profile,
-        options.cpu_q8_backend,
-        options.cpu_threads,
-        weights,
-        error_message)) {
+  ModelWeights request_weights;
+  ModelWeights * weights_ptr = &request_weights;
+  std::shared_ptr<CpuModelSessionState> cpu_model_session_state;
+  std::unique_lock<std::mutex> cpu_model_session_lock;
+  if (options.cpu_model_session != nullptr) {
+    if (options.cpu_model_session->implementation_ == nullptr) {
+      options.cpu_model_session->implementation_ =
+        std::make_shared<CpuModelSessionState>();
+    }
+    cpu_model_session_state = std::static_pointer_cast<CpuModelSessionState>(
+      options.cpu_model_session->implementation_);
+    cpu_model_session_lock = std::unique_lock<std::mutex>(cpu_model_session_state->mutex);
+    if (!ensure_cpu_model_session_locked(
+          profile,
+          options,
+          dims,
+          *cpu_model_session_state,
+          result.cpu_model_session_hit,
+          error_message)) {
+      return false;
+    }
+    weights_ptr = &cpu_model_session_state->weights;
+  } else if (!load_model_weights(
+               options.model_dir,
+               options.cpu_gguf_path,
+               dims,
+               profile,
+               options.cpu_q8_backend,
+               options.cpu_threads,
+               request_weights,
+               error_message)) {
     return false;
   }
+  ModelWeights & weights = *weights_ptr;
   if (options.use_cuda && !upload_model_weights_to_cuda(weights, use_cuda_matvec_bf16, error_message)) {
     release_model_weights_cuda(weights);
     return false;

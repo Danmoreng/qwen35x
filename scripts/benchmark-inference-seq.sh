@@ -19,6 +19,7 @@ MODE="gpu-f32"
 CPU_GGUF="models/gguf/Qwen3.5-0.8B-Q8_0.gguf"
 CPU_THREADS=0
 CPU_ISA="auto"
+CPU_MODEL_SESSION_REPLAYS=0
 CPU_PREFIX_CACHE_TOKENS=0
 CPU_PREFIX_CACHE_REPLAYS=1
 PREFILL_MODE="batched"
@@ -62,6 +63,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --cpu-prefix-cache-tokens)
       CPU_PREFIX_CACHE_TOKENS="$2"
+      shift 2
+      ;;
+    --cpu-model-session-replays)
+      CPU_MODEL_SESSION_REPLAYS="$2"
       shift 2
       ;;
     --cpu-prefix-cache-replays)
@@ -187,6 +192,10 @@ run_once() {
       "--cpu-prefix-cache-replays" "$CPU_PREFIX_CACHE_REPLAYS"
     )
   fi
+
+  if [ "$CPU_MODEL_SESSION_REPLAYS" -gt 0 ]; then
+    args+=("--cpu-model-session-replays" "$CPU_MODEL_SESSION_REPLAYS")
+  fi
   
   if [ "$PREFILL_ONLY" == true ]; then
     args+=("--prefill-only")
@@ -244,6 +253,7 @@ for run_index, p_path in enumerate(profiles, start=1):
             'mode': '$MODE',
             'cpu_threads': $CPU_THREADS,
             'cpu_isa': '$CPU_ISA',
+            'cpu_model_session_hit': data.get('cpu_model_session_hit', False),
             'cached_prefix_tokens': data.get('cached_prefix_tokens', 0),
             'prefix_cache_restore_time_ms': data.get('prefix_cache_restore_time_ms', 0),
             'prefix_cache_bytes': data.get('prefix_cache_bytes', 0),
