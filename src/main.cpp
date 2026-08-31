@@ -9,11 +9,81 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
 
 namespace {
+
+constexpr char kLogitsDumpMagic[8] = {'Q', '3', '5', 'L', 'G', 'T', '1', '\0'};
+constexpr std::uint32_t kLogitsDumpVersion = 1;
+
+struct LogitsDumpWriter {
+  std::string path;
+  std::uint64_t expected_records = 0;
+  std::uint64_t written_records = 0;
+  std::uint32_t vocabulary_size = 0;
+  std::ofstream stream;
+};
+
+template <typename T>
+bool write_binary_value(std::ofstream & stream, const T & value) {
+  stream.write(reinterpret_cast<const char *>(&value), sizeof(T));
+  return static_cast<bool>(stream);
+}
+
+bool write_logits_dump_record(
+  void * opaque_context,
+  const std::size_t output_index,
+  const std::int32_t target_token,
+  const float * logits,
+  const std::size_t logit_count,
+  std::string & error_message) {
+  auto & writer = *static_cast<LogitsDumpWriter *>(opaque_context);
+  if (output_index != writer.written_records ||
+      output_index >= writer.expected_records) {
+    error_message = "Logit dump callback received an unexpected output index.";
+    return false;
+  }
+  if (logits == nullptr || logit_count == 0 ||
+      logit_count > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
+    error_message = "Logit dump callback received an invalid vocabulary buffer.";
+    return false;
+  }
+  if (!writer.stream.is_open()) {
+    writer.stream.open(writer.path, std::ios::binary | std::ios::trunc);
+    if (!writer.stream) {
+      error_message = "Failed to open logits dump path: " + writer.path;
+      return false;
+    }
+    writer.vocabulary_size = static_cast<std::uint32_t>(logit_count);
+    writer.stream.write(kLogitsDumpMagic, sizeof(kLogitsDumpMagic));
+    if (!write_binary_value(writer.stream, kLogitsDumpVersion) ||
+        !write_binary_value(writer.stream, writer.vocabulary_size) ||
+        !write_binary_value(writer.stream, writer.expected_records)) {
+      error_message = "Failed to write logits dump header: " + writer.path;
+      return false;
+    }
+  } else if (writer.vocabulary_size != logit_count) {
+    error_message = "Vocabulary size changed while writing logits dump.";
+    return false;
+  }
+
+  if (!write_binary_value(writer.stream, target_token)) {
+    error_message = "Failed to write logits dump target token.";
+    return false;
+  }
+  writer.stream.write(
+    reinterpret_cast<const char *>(logits),
+    static_cast<std::streamsize>(logit_count * sizeof(float)));
+  if (!writer.stream) {
+    error_message = "Failed to write full-vocabulary logits dump.";
+    return false;
+  }
+  ++writer.written_records;
+  return true;
+}
 
 std::string json_escape(const std::string & input) {
   std::string out;
@@ -324,6 +394,9 @@ int main(int argc, char ** argv) {
   std::string prompt_text;
   std::string prompt_file_path;
   std::string chat_user_text;
+  std::string forced_output_tokens_csv;
+  std::string forced_output_text;
+  std::string logits_output_path;
   std::string stop_tokens_csv;
   std::vector<std::string> stop_texts;
   bool stop_on_im_end = false;
@@ -341,6 +414,7 @@ int main(int argc, char ** argv) {
   bool infer_reference = false;
   bool infer_gpu = false;
   bool gpu_decode_backend_explicit = false;
+  bool max_new_tokens_explicit = false;
   int cpu_model_session_replays = 0;
   int cpu_prefix_cache_replays = 1;
   qwen35x::Bf16TensorBenchOptions bench_options;
@@ -446,8 +520,15 @@ int main(int argc, char ** argv) {
       prompt_file_path = argv[++i];
     } else if (arg == "--chat-user" && i + 1 < argc) {
       chat_user_text = argv[++i];
+    } else if (arg == "--forced-output-tokens" && i + 1 < argc) {
+      forced_output_tokens_csv = argv[++i];
+    } else if (arg == "--forced-output-text" && i + 1 < argc) {
+      forced_output_text = argv[++i];
+    } else if (arg == "--logits-out" && i + 1 < argc) {
+      logits_output_path = argv[++i];
     } else if (arg == "--max-new-tokens" && i + 1 < argc) {
       infer_options.max_new_tokens = std::stoi(argv[++i]);
+      max_new_tokens_explicit = true;
     } else if (arg == "--max-context" && i + 1 < argc) {
       infer_options.max_context = std::stoi(argv[++i]);
     } else if (arg == "--temperature" && i + 1 < argc) {
@@ -541,7 +622,7 @@ int main(int argc, char ** argv) {
       std::cout << "       qwen35x --bench-nvfp4-projection --hf-model-dir <path> [--nvfp4-tensor <base-name>] [--nvfp4-projection-kernel <row|warp|scale-group|blackwell-fp4>] [--bench-warmup <n>] [--bench-iters <n>]\n";
       std::cout << "       qwen35x --bench-nvfp4-prefill-projection --hf-model-dir <path> [--nvfp4-tensor <base-name>] [--nvfp4-prefill-seq-len <n>] [--bench-warmup <n>] [--bench-iters <n>]\n";
       std::cout << "       qwen35x --bench-nvfp4-gate-up --hf-model-dir <path> [--nvfp4-gate-tensor <base-name>] [--nvfp4-up-tensor <base-name>] [--bench-warmup <n>] [--bench-iters <n>]\n";
-      std::cout << "       qwen35x --infer-reference --hf-model-dir <path> [--cpu-gguf <q4_0-or-q8_0.gguf>] [--cpu-threads <n>] [--cpu-isa <auto|scalar|avx2|avx-vnni|avx512|avx512-vnni>] [--cpu-model-session-replays <n>] [--cpu-prefix-cache-tokens <n> --cpu-prefix-cache-replays <n>] (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
+      std::cout << "       qwen35x --infer-reference --hf-model-dir <path> [--cpu-gguf <q4_0-or-q8_0.gguf>] [--cpu-threads <n>] [--cpu-isa <auto|scalar|avx2|avx-vnni|avx512|avx512-vnni>] [--cpu-model-session-replays <n>] [--cpu-prefix-cache-tokens <n> --cpu-prefix-cache-replays <n>] (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--forced-output-tokens <csv> | --forced-output-text <text>] [--logits-out <path>] [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "       qwen35x --infer-gpu --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "               [--temperature <float>] [--top-p <float>] [--top-k <int>] [--repeat-penalty <float>] [--seed <int64>]\n";
       std::cout << "               [--gpu-bf16|--gpu-f32-matvec] [--gpu-decode-backend <default|qwen35x>] [--gpu-decode-blocks <n>] [--qwen35x-prefill-mode <replay|batched>]\n";
@@ -834,7 +915,8 @@ int main(int argc, char ** argv) {
     qwen35x::QwenTokenizer tokenizer;
     bool has_tokenizer = false;
     const bool need_tokenizer =
-      !prompt_text.empty() || !prompt_file_path.empty() || !chat_user_text.empty() || !stop_texts.empty() || stop_on_im_end;
+      !prompt_text.empty() || !prompt_file_path.empty() || !chat_user_text.empty() ||
+      !forced_output_text.empty() || !stop_texts.empty() || stop_on_im_end;
     if (need_tokenizer) {
       if (!qwen35x::QwenTokenizer::load_from_hf_directory(hf_model_dir, tokenizer, error_message)) {
         std::cerr << "tokenizer load failed: " << error_message << "\n";
@@ -919,6 +1001,46 @@ int main(int argc, char ** argv) {
       }
     }
 
+    if (!forced_output_tokens_csv.empty() && !forced_output_text.empty()) {
+      std::cerr << "teacher-forcing parse failed: provide tokens or text, not both\n";
+      return 11;
+    }
+    if (!forced_output_text.empty()) {
+      if (!has_tokenizer) {
+        std::cerr << "teacher-forcing parse failed: tokenizer is not loaded\n";
+        return 11;
+      }
+      if (!tokenizer.encode(
+            forced_output_text,
+            infer_options.forced_output_tokens,
+            error_message)) {
+        std::cerr << "teacher-forcing tokenize failed: " << error_message << "\n";
+        return 11;
+      }
+    } else if (!forced_output_tokens_csv.empty()) {
+      if (!qwen35x::parse_token_list_csv(
+            forced_output_tokens_csv,
+            infer_options.forced_output_tokens,
+            error_message)) {
+        std::cerr << "teacher-forcing parse failed: " << error_message << "\n";
+        return 11;
+      }
+    }
+    if (!infer_options.forced_output_tokens.empty()) {
+      if (max_new_tokens_explicit &&
+          infer_options.max_new_tokens !=
+            static_cast<int>(infer_options.forced_output_tokens.size())) {
+        std::cerr << "teacher-forcing parse failed: --max-new-tokens must match the forced token count\n";
+        return 11;
+      }
+      infer_options.max_new_tokens =
+        static_cast<int>(infer_options.forced_output_tokens.size());
+    }
+    if (!logits_output_path.empty() && infer_options.forced_output_tokens.empty()) {
+      std::cerr << "--logits-out requires teacher-forced output tokens or text\n";
+      return 11;
+    }
+
     const auto profile = qwen35x::ProfileLoader::load_from_hf_directory(hf_model_dir, error_message);
     if (!profile) {
       std::cerr << "profile load failed: " << error_message << "\n";
@@ -941,6 +1063,17 @@ int main(int argc, char ** argv) {
     const int cpu_inference_replays = std::max(
       cpu_prefix_cache_replays,
       cpu_model_session_replays > 0 ? cpu_model_session_replays : 1);
+    LogitsDumpWriter logits_writer;
+    if (!logits_output_path.empty()) {
+      if (cpu_inference_replays != 1) {
+        std::cerr << "--logits-out requires exactly one inference replay\n";
+        return 11;
+      }
+      logits_writer.path = logits_output_path;
+      logits_writer.expected_records = infer_options.forced_output_tokens.size();
+      infer_options.logits_callback = write_logits_dump_record;
+      infer_options.logits_callback_context = &logits_writer;
+    }
     qwen35x::ReferenceCpuModelSession cpu_model_session;
     if (cpu_model_session_replays > 0) {
       infer_options.cpu_model_session = &cpu_model_session;
@@ -959,6 +1092,14 @@ int main(int argc, char ** argv) {
       if (!qwen35x::run_reference_qwen35_inference(
             *profile, infer_options, infer_result, error_message)) {
         std::cerr << "reference inference failed: " << error_message << "\n";
+        return 13;
+      }
+    }
+    if (!logits_output_path.empty()) {
+      logits_writer.stream.flush();
+      if (logits_writer.written_records != logits_writer.expected_records ||
+          !logits_writer.stream) {
+        std::cerr << "logits dump did not complete successfully\n";
         return 13;
       }
     }

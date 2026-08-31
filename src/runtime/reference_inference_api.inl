@@ -350,6 +350,26 @@ bool run_reference_qwen35_inference(
     error_message = "Persistent CPU model sessions cannot be used with GPU inference.";
     return false;
   }
+  if ((options.logits_callback != nullptr || !options.forced_output_tokens.empty()) &&
+      options.use_cuda) {
+    error_message = "Teacher-forced logit observation currently supports CPU inference only.";
+    return false;
+  }
+  if (options.logits_callback != nullptr && options.prefill_only) {
+    error_message = "Logit observation cannot be combined with prefill-only inference.";
+    return false;
+  }
+  if (!options.forced_output_tokens.empty() &&
+      options.forced_output_tokens.size() !=
+        static_cast<std::size_t>(options.max_new_tokens)) {
+    error_message = "forced_output_tokens must contain exactly max_new_tokens entries.";
+    return false;
+  }
+  if (!options.forced_output_tokens.empty() &&
+      (!options.stop_token_ids.empty() || !options.stop_token_sequences.empty())) {
+    error_message = "Teacher-forced inference cannot be combined with stop conditions.";
+    return false;
+  }
   if (options.use_cuda && !options.cpu_gguf_path.empty()) {
     error_message = "--cpu-gguf is a CPU-only weight path and cannot be combined with GPU inference.";
     return false;
@@ -365,6 +385,12 @@ bool run_reference_qwen35_inference(
   RuntimeDims dims;
   if (!build_runtime_dims(profile, dims, error_message)) {
     return false;
+  }
+  for (const std::int32_t token : options.forced_output_tokens) {
+    if (token < 0 || token >= dims.vocab_size) {
+      error_message = "Teacher-forced output token is outside the model vocabulary.";
+      return false;
+    }
   }
 
   if (options.max_context <= 0) {
@@ -571,6 +597,7 @@ bool run_reference_qwen35_inference(
     options.sampling.repetition_penalty,
     -1,
     !options.use_cuda && options.sampling.temperature <= 1.0e-6F &&
+      options.logits_callback == nullptr &&
       weights.embed_tokens.is_q4_0() && weights.cpu_q8_runtime != nullptr &&
       weights.cpu_q8_runtime->executor != nullptr,
   };
@@ -963,7 +990,31 @@ bool run_reference_qwen35_inference(
       }
     }
   } else {
+    auto observe_logits = [&](const int output_index) {
+      if (options.logits_callback == nullptr) {
+        return true;
+      }
+      if (predicted_logits.size() != static_cast<std::size_t>(dims.vocab_size)) {
+        error_message = "Observed CPU logits do not match the model vocabulary size.";
+        return false;
+      }
+      const std::int32_t target_token = options.forced_output_tokens.empty()
+        ? -1
+        : options.forced_output_tokens[static_cast<std::size_t>(output_index)];
+      return options.logits_callback(
+        options.logits_callback_context,
+        static_cast<std::size_t>(output_index),
+        target_token,
+        predicted_logits.data(),
+        predicted_logits.size(),
+        error_message);
+    };
     for (int i = 0; i < options.max_new_tokens; ++i) {
+      if (!observe_logits(i)) {
+        release_cuda_decode_buffers();
+        release_cuda_resources();
+        return false;
+      }
       if (!maybe_sync_cuda_for_stage_timing(options.use_cuda, options.profile_cuda_sync, error_message)) {
         release_cuda_decode_buffers();
         release_cuda_resources();
@@ -971,7 +1022,9 @@ bool run_reference_qwen35_inference(
       }
       const auto sampling_start = std::chrono::steady_clock::now();
       int current = 0;
-      if (cpu_greedy_sampling_ptr != nullptr) {
+      if (!options.forced_output_tokens.empty()) {
+        current = options.forced_output_tokens[static_cast<std::size_t>(i)];
+      } else if (cpu_greedy_sampling_ptr != nullptr) {
         current = cpu_greedy_sampling.next_token;
         cpu_greedy_sampling.next_token = -1;
         if (current < 0 || current >= dims.vocab_size) {

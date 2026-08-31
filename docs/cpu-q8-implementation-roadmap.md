@@ -887,7 +887,7 @@ quantizer quality must remain independently measurable.
 
 ### D5 — Custom Hadamard Q4 format
 
-Status: research target after D1–D4
+Status: active on an engine-native artifact and laptop AVX2 baseline
 
 This is the preferred custom-format research direction before dense EXL3:
 
@@ -904,6 +904,15 @@ activations are reused across packed QKV, gate/up, and DeltaNet projections.
 
 The goal is to capture much of QTIP/EXL3's outlier-regularization benefit while
 retaining an extremely simple hardware-native Q4 dot kernel.
+
+The concrete ABI, conversion stages, teacher-forced full-vocabulary KL/NLL
+methodology, held-out acceptance gates, and scalar/AVX2 delivery sequence are
+defined in `docs/q4-h128-design-and-evaluation.md`. The evaluation harness is
+deliberately independent of free-running generation: it forces the identical
+target history through BF16 and every quantized candidate before comparing raw
+logits. The first converter always reads BF16 safetensors directly, keeps tied
+embedding/LM-head semantics simple, and does not require GGUF or llama.cpp
+compatibility.
 
 ### D6 — Quantized KV cache and DeltaNet state
 
@@ -970,7 +979,7 @@ Update this table in the same commit that lands or rejects each experiment.
 | D0 | Initial screen completed | `4ca364c` | Seven formats, three alternating-order performance rounds, 56 deterministic rewrite outputs, and a three-run 2k/2k Q8-versus-Q4_0 comparison select Q4_0 for the first native backend; production quality expansion remains open |
 | D1 | Active; laptop throughput target achieved | `12f9ecf`, `8e3614c` + this commit | Native Q4_0 scalar/AVX2, packed-only model weights, token-major prepared activations, fused greedy LM-head, 8x8 projection prefill, batched DeltaNet row tiling, paired GQA decode, AVX-VNNI, and a 12x8 AVX-512-VNNI prefill tile are implemented. Against llama.cpp Q4_0, the original laptop result is +40.0% pp256, +30.8% pp2048, and +37.9% short decode. On Zen 5, AVX-VNNI adds 11.5% pp256 over AVX2 and the EVEX tile adds another 9.7% pp2048 over the 8x8 VEX tile. Expanded correctness, quality, memory, and long-context gates remain. |
 | D2-D4 | Pending D1 validation | — | IQ4_NL, mixed precision, and calibrated offline rounding follow the validated Q4_0 baseline |
-| D5 | Research target | — | Custom Hadamard-regularized `Q4_H128` is the preferred custom-format direction after simple Q4 baselines |
+| D5 | Active | this branch | Engine-native `Q4_H128` design and teacher-forced full-logit KL/NLL evaluation are defined; artifact conversion and scalar/AVX2 runtime integration follow |
 | D6-D7 | Deferred/future hardware | — | State quantization is quality-sensitive; dense sub-four-bit research benefits materially from newer SIMD ISAs |
 
 ## Completion definition
