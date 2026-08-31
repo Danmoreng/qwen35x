@@ -11,7 +11,6 @@
 namespace qwen35x::cpu {
 namespace detail {
 
-constexpr float kInverseSqrt128 = 0.08838834764831844055F;
 constexpr std::uint64_t kBlockStride = UINT64_C(0x9e3779b97f4a7c15);
 constexpr std::uint64_t kWordStride = UINT64_C(0xd1b54a32d192ed03);
 
@@ -46,7 +45,7 @@ void apply_signs(
   }
 }
 
-void hadamard_128_inplace(float * values) noexcept {
+void hadamard_128_unscaled_inplace(float * values) noexcept {
   for (std::size_t stride = 1; stride < q4_h128_transform_size; stride *= 2) {
     for (std::size_t base = 0; base < q4_h128_transform_size; base += 2 * stride) {
       for (std::size_t lane = 0; lane < stride; ++lane) {
@@ -57,9 +56,6 @@ void hadamard_128_inplace(float * values) noexcept {
       }
     }
   }
-  for (std::size_t index = 0; index < q4_h128_transform_size; ++index) {
-    values[index] *= kInverseSqrt128;
-  }
 }
 
 void q4_h128_transform_block_scalar(
@@ -69,7 +65,20 @@ void q4_h128_transform_block_scalar(
   const std::uint64_t sign_seed) noexcept {
   std::copy_n(input, q4_h128_transform_size, output);
   apply_signs(output, transform_block_index, sign_seed);
-  hadamard_128_inplace(output);
+  hadamard_128_unscaled_inplace(output);
+  for (std::size_t index = 0; index < q4_h128_transform_size; ++index) {
+    output[index] *= q4_h128_inverse_sqrt_size;
+  }
+}
+
+void q4_h128_transform_block_scalar_unscaled(
+  const float * input,
+  float * output,
+  const std::size_t transform_block_index,
+  const std::uint64_t sign_seed) noexcept {
+  std::copy_n(input, q4_h128_transform_size, output);
+  apply_signs(output, transform_block_index, sign_seed);
+  hadamard_128_unscaled_inplace(output);
 }
 
 } // namespace detail
@@ -121,6 +130,37 @@ bool q4_h128_transform_rows(
       const std::size_t offset = row * column_count + block * q4_h128_transform_size;
       q4_h128_transform_block(
         input + offset, output + offset, block, sign_seed, backend);
+    }
+  }
+  return true;
+}
+
+bool q4_h128_transform_rows_unscaled(
+  const float * input,
+  float * output,
+  const std::size_t row_count,
+  const std::size_t column_count,
+  const std::uint64_t sign_seed,
+  const Q8_0Backend backend) noexcept {
+  if (input == nullptr || output == nullptr || column_count == 0 ||
+      column_count % q4_h128_transform_size != 0) {
+    return false;
+  }
+  const std::size_t transform_blocks = column_count / q4_h128_transform_size;
+  for (std::size_t row = 0; row < row_count; ++row) {
+    for (std::size_t block = 0; block < transform_blocks; ++block) {
+      const std::size_t offset = row * column_count + block * q4_h128_transform_size;
+#if QWEN35X_Q8_0_HAS_AVX2_TU
+      if (q8_0_backend_uses_avx2(backend)) {
+        detail::q4_h128_transform_block_avx2_unscaled(
+          input + offset, output + offset, block, sign_seed);
+        continue;
+      }
+#else
+      static_cast<void>(backend);
+#endif
+      detail::q4_h128_transform_block_scalar_unscaled(
+        input + offset, output + offset, block, sign_seed);
     }
   }
   return true;

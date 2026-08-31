@@ -89,7 +89,7 @@ void run_q4_h128_transform_rows(
   const std::size_t row_begin,
   const std::size_t row_end) noexcept {
   auto & job = *static_cast<Q4H128TransformJob *>(opaque_context);
-  static_cast<void>(cpu::q4_h128_transform_rows(
+  static_cast<void>(cpu::q4_h128_transform_rows_unscaled(
     job.input + row_begin * job.columns,
     job.output + row_begin * job.columns,
     row_end - row_begin,
@@ -1077,7 +1077,7 @@ bool matvec_2d(
         transform_scratch = &w.q8_0_runtime->q4_h128_transform_scratch;
       }
       transform_scratch->resize(static_cast<std::size_t>(cols));
-      if (!cpu::q4_h128_transform_rows(
+      if (!cpu::q4_h128_transform_rows_unscaled(
             x.data(), transform_scratch->data(), 1,
             static_cast<std::size_t>(cols), w.q4_h128_sign_seed,
             w.q8_0_backend)) {
@@ -1094,6 +1094,11 @@ bool matvec_2d(
     prepared_input->resize(blocks_per_row);
     cpu::q8_0_quantize_vector_1(
       quantization_input, prepared_input->data(), blocks_per_row, w.q8_0_backend);
+    if (w.uses_q4_h128_transform) {
+      for (cpu::Q8_0BlockX4 & block : *prepared_input) {
+        block.scales[0] *= cpu::q4_h128_inverse_sqrt_size;
+      }
+    }
     out.resize(static_cast<std::size_t>(rows));
     if (w.q8_0_runtime != nullptr && w.q8_0_runtime->executor != nullptr) {
       PackedQ4MatvecJob job{
@@ -1211,7 +1216,7 @@ bool greedy_q4_token(
   const float * quantization_input = input.data();
   if (weights.uses_q4_h128_transform) {
     runtime.q4_h128_transform_scratch.resize(cols);
-    if (!cpu::q4_h128_transform_rows(
+    if (!cpu::q4_h128_transform_rows_unscaled(
           input.data(), runtime.q4_h128_transform_scratch.data(), 1, cols,
           weights.q4_h128_sign_seed, weights.q8_0_backend)) {
       error_message = "Q4_H128 greedy activation transform failed.";
@@ -1223,6 +1228,11 @@ bool greedy_q4_token(
   cpu::q8_0_quantize_vector_1(
     quantization_input, runtime.prepared_q4_input.data(), blocks_per_row,
     weights.q8_0_backend);
+  if (weights.uses_q4_h128_transform) {
+    for (cpu::Q8_0BlockX4 & block : runtime.prepared_q4_input) {
+      block.scales[0] *= cpu::q4_h128_inverse_sqrt_size;
+    }
+  }
   runtime.greedy_results.assign(
     runtime.executor->thread_count(),
     cpu::Q4_0ArgmaxResult{-std::numeric_limits<float>::infinity(), 0});
@@ -1313,7 +1323,7 @@ bool matmul_2d_quantized_batch(
           cpu::cpu_executor_status_name(status) + ".";
         return false;
       }
-    } else if (!cpu::q4_h128_transform_rows(
+    } else if (!cpu::q4_h128_transform_rows_unscaled(
                  inputs.data(), transformed.data(), batch_size, cols,
                  w.q4_h128_sign_seed, w.q8_0_backend)) {
       error_message = "Q4_H128 batched activation transform failed.";
@@ -1340,6 +1350,13 @@ bool matmul_2d_quantized_batch(
       cpu::q8_0_quantize_vectors_4(
         quantization_inputs, packed.data(), packed_vector_count, blocks_per_row,
         w.q8_0_backend);
+      if (w.uses_q4_h128_transform) {
+        for (cpu::Q8_0BlockX4 & block : packed) {
+          for (float & scale : block.scales) {
+            scale *= cpu::q4_h128_inverse_sqrt_size;
+          }
+        }
+      }
       if (w.q8_0_runtime->executor != nullptr) {
         PackedQ4PrefillJob job{
           w.packed_q4_0_blocks.data(), packed.data(), out.data(),
@@ -1371,6 +1388,11 @@ bool matmul_2d_quantized_batch(
           prepared.data() + token * blocks_per_row,
           blocks_per_row,
           w.q8_0_backend);
+      }
+      if (w.uses_q4_h128_transform) {
+        for (cpu::Q8_0BlockX4 & block : prepared) {
+          block.scales[0] *= cpu::q4_h128_inverse_sqrt_size;
+        }
       }
       float * tail_output = out.data() + packed_vector_count * rows;
       for (std::size_t token = 0; token < tail_vector_count; ++token) {

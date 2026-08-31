@@ -9,7 +9,7 @@
 
 namespace qwen35x::cpu::detail {
 
-void q4_h128_transform_block_avx2(
+void q4_h128_transform_block_avx2_unscaled(
   const float * input,
   float * output,
   const std::size_t transform_block_index,
@@ -62,7 +62,16 @@ void q4_h128_transform_block_avx2(
       }
     }
   }
-  const __m256 scale = _mm256_set1_ps(0.08838834764831844055F);
+}
+
+void q4_h128_transform_block_avx2(
+  const float * input,
+  float * output,
+  const std::size_t transform_block_index,
+  const std::uint64_t sign_seed) noexcept {
+  q4_h128_transform_block_avx2_unscaled(
+    input, output, transform_block_index, sign_seed);
+  const __m256 scale = _mm256_set1_ps(q4_h128_inverse_sqrt_size);
   for (std::size_t index = 0; index < q4_h128_transform_size; index += 8) {
     _mm256_storeu_ps(
       output + index,
