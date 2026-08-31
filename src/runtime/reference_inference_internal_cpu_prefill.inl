@@ -209,11 +209,9 @@ bool run_linear_attention_batch_cpu_q8(
     std::memcpy(q.data(), conv_out, q_width * sizeof(float));
     std::memcpy(k.data(), conv_out + q_width, q_width * sizeof(float));
     std::memcpy(v.data(), conv_out + 2 * q_width, value_width * sizeof(float));
-    l2_norm_per_head(q, dims.linear_num_k_heads, dims.linear_head_k_dim);
+    l2_norm_per_head(
+      q, dims.linear_num_k_heads, dims.linear_head_k_dim, 1.0e-6F, q_scale);
     l2_norm_per_head(k, dims.linear_num_k_heads, dims.linear_head_k_dim);
-    for (float & value : q) {
-      value *= q_scale;
-    }
     for (std::size_t head = 0; head < head_count; ++head) {
       const std::size_t head_token = head * batch_size + token;
       std::memcpy(

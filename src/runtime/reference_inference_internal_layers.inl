@@ -396,13 +396,10 @@ bool run_linear_attention_step(
   std::vector<float> q(conv_out.begin(), conv_out.begin() + dims.linear_q_dim);
   std::vector<float> k(conv_out.begin() + dims.linear_q_dim, conv_out.begin() + 2 * dims.linear_q_dim);
   std::vector<float> v(conv_out.begin() + 2 * dims.linear_q_dim, conv_out.end());
-  l2_norm_per_head(q, dims.linear_num_k_heads, dims.linear_head_k_dim);
-  l2_norm_per_head(k, dims.linear_num_k_heads, dims.linear_head_k_dim);
-
   const float q_scale = 1.0f / std::sqrt(static_cast<float>(dims.linear_head_k_dim));
-  for (float & qv : q) {
-    qv *= q_scale;
-  }
+  l2_norm_per_head(
+    q, dims.linear_num_k_heads, dims.linear_head_k_dim, 1.0e-6F, q_scale);
+  l2_norm_per_head(k, dims.linear_num_k_heads, dims.linear_head_k_dim);
 
   std::vector<float> core_out(static_cast<std::size_t>(dims.linear_v_dim), 0.0f);
   const cpu::Q8_0Backend cpu_backend = layer.linear.out_proj.is_q8_0()

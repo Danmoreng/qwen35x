@@ -716,19 +716,11 @@ void l2_norm_per_head(
   std::vector<float> & x,
   const int num_heads,
   const int head_dim,
-  const float eps = 1.0e-6f) {
-  for (int h = 0; h < num_heads; ++h) {
-    const std::size_t base = static_cast<std::size_t>(h) * static_cast<std::size_t>(head_dim);
-    float sq_sum = 0.0f;
-    for (int d = 0; d < head_dim; ++d) {
-      const float v = x[base + static_cast<std::size_t>(d)];
-      sq_sum += v * v;
-    }
-    const float inv = 1.0f / std::sqrt(sq_sum + eps);
-    for (int d = 0; d < head_dim; ++d) {
-      x[base + static_cast<std::size_t>(d)] *= inv;
-    }
-  }
+  const float eps = 1.0e-6f,
+  const float output_scale = 1.0F) {
+  cpu::l2_normalize_f32(
+    x.data(), static_cast<std::size_t>(num_heads),
+    static_cast<std::size_t>(head_dim), eps, output_scale);
 }
 
 void apply_rope_inplace(

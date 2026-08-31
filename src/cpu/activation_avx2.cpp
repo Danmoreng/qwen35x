@@ -118,6 +118,42 @@ void rms_norm_f32_avx2(
   }
 }
 
+void l2_normalize_f32_avx2(
+  float * values,
+  const std::size_t row_count,
+  const std::size_t width,
+  const float eps,
+  const float output_scale) noexcept {
+  for (std::size_t row = 0; row < row_count; ++row) {
+    float * current = values + row * width;
+    __m256 sum0 = _mm256_setzero_ps();
+    __m256 sum1 = _mm256_setzero_ps();
+    std::size_t column = 0;
+    for (; column + 16 <= width; column += 16) {
+      const __m256 x0 = _mm256_loadu_ps(current + column);
+      const __m256 x1 = _mm256_loadu_ps(current + column + 8);
+      sum0 = _mm256_fmadd_ps(x0, x0, sum0);
+      sum1 = _mm256_fmadd_ps(x1, x1, sum1);
+    }
+    float squared_sum = horizontal_sum_f32(_mm256_add_ps(sum0, sum1));
+    for (; column < width; ++column) {
+      squared_sum += current[column] * current[column];
+    }
+    const __m256 multiplier = _mm256_set1_ps(
+      output_scale / std::sqrt(squared_sum + eps));
+    column = 0;
+    for (; column + 8 <= width; column += 8) {
+      _mm256_storeu_ps(
+        current + column,
+        _mm256_mul_ps(_mm256_loadu_ps(current + column), multiplier));
+    }
+    const float multiplier_scalar = _mm_cvtss_f32(_mm256_castps256_ps128(multiplier));
+    for (; column < width; ++column) {
+      current[column] *= multiplier_scalar;
+    }
+  }
+}
+
 void silu_f32_avx2(
   const float * input,
   float * output,

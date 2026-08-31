@@ -25,6 +25,14 @@ void rms_norm_f32(
   float weight_offset,
   Q8_0Backend backend = Q8_0Backend::auto_select) noexcept;
 
+void l2_normalize_f32(
+  float * values,
+  std::size_t row_count,
+  std::size_t width,
+  float eps,
+  float output_scale = 1.0F,
+  Q8_0Backend backend = Q8_0Backend::auto_select) noexcept;
+
 void silu_f32(
   const float * input,
   float * output,

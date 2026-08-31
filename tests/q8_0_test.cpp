@@ -157,6 +157,25 @@ bool test_add(const Q8_0Backend backend) {
   return ok;
 }
 
+bool test_l2_normalize(const Q8_0Backend backend) {
+  constexpr std::size_t rows = 3;
+  constexpr std::size_t width = 37;
+  std::array<float, rows * width> expected{};
+  for (std::size_t index = 0; index < expected.size(); ++index) {
+    expected[index] = std::cos(static_cast<float>(index) * 0.13F) * 2.0F;
+  }
+  auto actual = expected;
+  qwen35x::cpu::l2_normalize_f32(
+    expected.data(), rows, width, 1.0e-6F, 0.125F, Q8_0Backend::scalar);
+  qwen35x::cpu::l2_normalize_f32(
+    actual.data(), rows, width, 1.0e-6F, 0.125F, backend);
+  bool ok = true;
+  for (std::size_t index = 0; index < actual.size(); ++index) {
+    ok = expect(near(expected[index], actual[index]), "L2 normalization mismatch") && ok;
+  }
+  return ok;
+}
+
 bool test_backend(const Q8_0Backend backend) {
   constexpr std::size_t blocks = 5;
   constexpr std::size_t rows = 4;
@@ -267,6 +286,7 @@ int main() {
   ok = test_silu_mul(Q8_0Backend::auto_select) && ok;
   ok = test_rms_norm(Q8_0Backend::auto_select) && ok;
   ok = test_add(Q8_0Backend::auto_select) && ok;
+  ok = test_l2_normalize(Q8_0Backend::auto_select) && ok;
   ok = test_backend(Q8_0Backend::scalar) && ok;
   ok = test_backend(Q8_0Backend::auto_select) && ok;
 

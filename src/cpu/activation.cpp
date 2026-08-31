@@ -27,6 +27,13 @@ void rms_norm_f32_avx2(
   float eps,
   float weight_offset) noexcept;
 
+void l2_normalize_f32_avx2(
+  float * values,
+  std::size_t row_count,
+  std::size_t width,
+  float eps,
+  float output_scale) noexcept;
+
 void silu_f32_avx2(
   const float * input,
   float * output,
@@ -89,6 +96,35 @@ void rms_norm_f32(
       std::sqrt(squared_sum / static_cast<float>(width) + eps);
     for (std::size_t column = 0; column < width; ++column) {
       y[column] = x[column] * inverse * (weight[column] + weight_offset);
+    }
+  }
+}
+
+void l2_normalize_f32(
+  float * values,
+  const std::size_t row_count,
+  const std::size_t width,
+  const float eps,
+  const float output_scale,
+  const Q8_0Backend backend) noexcept {
+#if QWEN35X_Q8_0_HAS_AVX2_TU
+  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx2) {
+    detail::l2_normalize_f32_avx2(
+      values, row_count, width, eps, output_scale);
+    return;
+  }
+#else
+  static_cast<void>(backend);
+#endif
+  for (std::size_t row = 0; row < row_count; ++row) {
+    float * current = values + row * width;
+    float squared_sum = 0.0F;
+    for (std::size_t column = 0; column < width; ++column) {
+      squared_sum += current[column] * current[column];
+    }
+    const float multiplier = output_scale / std::sqrt(squared_sum + eps);
+    for (std::size_t column = 0; column < width; ++column) {
+      current[column] *= multiplier;
     }
   }
 }
