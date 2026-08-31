@@ -52,6 +52,15 @@ namespace {
     _mm256_loadu_si256(reinterpret_cast<const __m256i *>(rhs)));
 }
 
+[[nodiscard]] __m256i dot_block_i8x8_loaded_rhs(
+  const __m256i lhs_bytes,
+  const __m256i rhs_bytes,
+  const __m256i rhs_absolute) noexcept {
+  const __m256i lhs_with_rhs_sign = _mm256_sign_epi8(lhs_bytes, rhs_bytes);
+  const __m256i pair_products = _mm256_maddubs_epi16(rhs_absolute, lhs_with_rhs_sign);
+  return _mm256_madd_epi16(pair_products, _mm256_set1_epi16(1));
+}
+
 [[nodiscard]] __m256 quantize_eight(
   const float * values,
   const __m256 inverse_scale) noexcept {
@@ -154,6 +163,7 @@ void dot_four_rows_avx2_impl(
   for (std::size_t block = 0; block < blocks_per_row; ++block) {
     const __m256i vector_bytes = _mm256_loadu_si256(
       reinterpret_cast<const __m256i *>(vector[block].qs));
+    const __m256i vector_absolute = _mm256_abs_epi8(vector_bytes);
     const float vector_scale = _cvtsh_ss(vector[block].d);
 
     const __m256i weight0 = _mm256_loadu_si256(
@@ -165,23 +175,23 @@ void dot_four_rows_avx2_impl(
     const __m256i weight3 = _mm256_loadu_si256(
       reinterpret_cast<const __m256i *>(row3[block].qs));
     accumulator0 = _mm256_fmadd_ps(
-      _mm256_cvtepi32_ps(dot_block_i8x8_loaded_lhs(
-        weight0, _mm256_abs_epi8(weight0), vector_bytes)),
+      _mm256_cvtepi32_ps(dot_block_i8x8_loaded_rhs(
+        weight0, vector_bytes, vector_absolute)),
       _mm256_set1_ps(_cvtsh_ss(row0[block].d) * vector_scale),
       accumulator0);
     accumulator1 = _mm256_fmadd_ps(
-      _mm256_cvtepi32_ps(dot_block_i8x8_loaded_lhs(
-        weight1, _mm256_abs_epi8(weight1), vector_bytes)),
+      _mm256_cvtepi32_ps(dot_block_i8x8_loaded_rhs(
+        weight1, vector_bytes, vector_absolute)),
       _mm256_set1_ps(_cvtsh_ss(row1[block].d) * vector_scale),
       accumulator1);
     accumulator2 = _mm256_fmadd_ps(
-      _mm256_cvtepi32_ps(dot_block_i8x8_loaded_lhs(
-        weight2, _mm256_abs_epi8(weight2), vector_bytes)),
+      _mm256_cvtepi32_ps(dot_block_i8x8_loaded_rhs(
+        weight2, vector_bytes, vector_absolute)),
       _mm256_set1_ps(_cvtsh_ss(row2[block].d) * vector_scale),
       accumulator2);
     accumulator3 = _mm256_fmadd_ps(
-      _mm256_cvtepi32_ps(dot_block_i8x8_loaded_lhs(
-        weight3, _mm256_abs_epi8(weight3), vector_bytes)),
+      _mm256_cvtepi32_ps(dot_block_i8x8_loaded_rhs(
+        weight3, vector_bytes, vector_absolute)),
       _mm256_set1_ps(_cvtsh_ss(row3[block].d) * vector_scale),
       accumulator3);
   }
@@ -205,6 +215,7 @@ void dot_eight_rows_avx2_impl(
   for (std::size_t block = 0; block < blocks_per_row; ++block) {
     const __m256i vector_bytes = _mm256_loadu_si256(
       reinterpret_cast<const __m256i *>(vector[block].qs));
+    const __m256i vector_absolute = _mm256_abs_epi8(vector_bytes);
     const float vector_scale = _cvtsh_ss(vector[block].d);
 #if defined(__clang__)
 #pragma clang loop unroll(full)
@@ -216,8 +227,8 @@ void dot_eight_rows_avx2_impl(
       const __m256i weight_bytes = _mm256_loadu_si256(
         reinterpret_cast<const __m256i *>(weight.qs));
       accumulators[lane] = _mm256_fmadd_ps(
-        _mm256_cvtepi32_ps(dot_block_i8x8_loaded_lhs(
-          weight_bytes, _mm256_abs_epi8(weight_bytes), vector_bytes)),
+        _mm256_cvtepi32_ps(dot_block_i8x8_loaded_rhs(
+          weight_bytes, vector_bytes, vector_absolute)),
         _mm256_set1_ps(_cvtsh_ss(weight.d) * vector_scale),
         accumulators[lane]);
     }
