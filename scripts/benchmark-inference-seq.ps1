@@ -4,8 +4,12 @@ param(
     [string]$HFModelDir = "models/qwen3.5-0.8b",
     [string]$CsvOut = "benchmarks/qwen35x-inference-seq.csv",
     [string]$RunLabel = "",
-    [ValidateSet("gpu-bf16", "gpu-f32", "cpu-reference")]
+    [ValidateSet("gpu-bf16", "gpu-f32", "cpu-reference", "cpu-gguf")]
     [string[]]$Modes = @("gpu-bf16", "gpu-f32"),
+    [string]$CpuGguf = "",
+    [int]$CpuThreads = 0,
+    [ValidateSet("auto", "scalar", "avx2")]
+    [string]$CpuIsa = "auto",
     [ValidateSet("chat-user", "prompt-text", "prompt-file", "prompt-tokens")]
     [string]$PromptMode = "chat-user",
     [string]$PromptName = "chat_short_joke",
@@ -122,6 +126,9 @@ function Invoke-BenchmarkRun {
         [Parameter(Mandatory = $true)][string]$ExePath,
         [Parameter(Mandatory = $true)][string]$Mode,
         [Parameter(Mandatory = $true)][string]$ModelDir,
+        [Parameter(Mandatory = $false)][string]$CpuGguf,
+        [Parameter(Mandatory = $true)][int]$CpuThreads,
+        [Parameter(Mandatory = $true)][string]$CpuIsa,
         [Parameter(Mandatory = $true)][string]$PromptMode,
         [Parameter(Mandatory = $true)][string]$PromptText,
         [Parameter(Mandatory = $false)][string]$PromptFile,
@@ -154,6 +161,9 @@ function Invoke-BenchmarkRun {
         "cpu-reference" {
             $args += @("--infer-reference")
         }
+        "cpu-gguf" {
+            $args += @("--infer-reference")
+        }
         default {
             throw "Unsupported mode: $Mode"
         }
@@ -171,6 +181,14 @@ function Invoke-BenchmarkRun {
         "--profile-json", $ProfileJsonPath
     )
 
+    if ($Mode -eq "cpu-gguf") {
+        $args += @(
+            "--cpu-gguf", $CpuGguf,
+            "--cpu-threads", "$CpuThreads",
+            "--cpu-isa", $CpuIsa
+        )
+    }
+
     if ($PromptMode -eq "chat-user") {
         $args += @("--chat-user", $PromptText)
     } elseif ($PromptMode -eq "prompt-text") {
@@ -181,28 +199,29 @@ function Invoke-BenchmarkRun {
         $args += @("--prompt-tokens", $PromptTokensCsv)
     }
 
-    if ($ProfileSyncEnabled -and $Mode -ne "cpu-reference") {
+    $isCpuMode = $Mode -eq "cpu-reference" -or $Mode -eq "cpu-gguf"
+    if ($ProfileSyncEnabled -and -not $isCpuMode) {
         $args += @("--profile-sync")
     }
-    if ($Qwen35xProfileEnabled -and $Mode -ne "cpu-reference") {
+    if ($Qwen35xProfileEnabled -and -not $isCpuMode) {
         $args += @("--qwen35x-profile")
     }
     if ($PrefillOnlyEnabled) {
         $args += @("--prefill-only")
     }
-    if ($Mode -ne "cpu-reference" -and $Qwen35xPrefillMode -ne "default") {
+    if (-not $isCpuMode -and $Qwen35xPrefillMode -ne "default") {
         $args += @("--qwen35x-prefill-mode", $Qwen35xPrefillMode)
     }
-    if ($Mode -ne "cpu-reference" -and $Qwen35xPrefillKernel -ne "default") {
+    if (-not $isCpuMode -and $Qwen35xPrefillKernel -ne "default") {
         $args += @("--qwen35x-prefill-kernel", $Qwen35xPrefillKernel)
     }
-    if ($Mode -ne "cpu-reference" -and $Qwen35xWeightPrecision -ne "bf16") {
+    if (-not $isCpuMode -and $Qwen35xWeightPrecision -ne "bf16") {
         $args += @("--qwen35x-weight-precision", $Qwen35xWeightPrecision)
     }
-    if ($Mode -ne "cpu-reference" -and $Qwen35xCachePrecision -ne "bf16") {
+    if (-not $isCpuMode -and $Qwen35xCachePrecision -ne "bf16") {
         $args += @("--qwen35x-cache-precision", $Qwen35xCachePrecision)
     }
-    if ($Mode -ne "cpu-reference" -and $GpuDecodeBlocks -gt 0) {
+    if (-not $isCpuMode -and $GpuDecodeBlocks -gt 0) {
         $args += @("--gpu-decode-blocks", "$GpuDecodeBlocks")
     }
 
@@ -227,6 +246,9 @@ $repoRoot = Split-Path -Parent $scriptDir
 
 $resolvedExe = Resolve-RepoPath -Path $Executable -RepoRoot $repoRoot
 $resolvedModelDir = Resolve-RepoPath -Path $HFModelDir -RepoRoot $repoRoot
+$resolvedCpuGguf = if ([string]::IsNullOrWhiteSpace($CpuGguf)) { "" } else {
+    Resolve-RepoPath -Path $CpuGguf -RepoRoot $repoRoot
+}
 $resolvedCsvOut = Resolve-RepoPath -Path $CsvOut -RepoRoot $repoRoot
 $profileTmpDir = if ([string]::IsNullOrWhiteSpace($ProfileDir)) {
     Join-Path $repoRoot "build\bench-profiles"
@@ -243,6 +265,14 @@ if (-not (Test-Path $resolvedExe)) {
 }
 if (-not (Test-Path $resolvedModelDir)) {
     throw "Model directory not found: $resolvedModelDir"
+}
+if ($Modes -contains "cpu-gguf") {
+    if ([string]::IsNullOrWhiteSpace($resolvedCpuGguf) -or -not (Test-Path $resolvedCpuGguf)) {
+        throw "CPU GGUF file not found: $resolvedCpuGguf"
+    }
+    if ($CpuThreads -lt 1) {
+        throw "CpuThreads must be >= 1 for cpu-gguf mode."
+    }
 }
 if ($Runs -lt 1) {
     throw "Runs must be >= 1."
@@ -265,8 +295,8 @@ if ($PromptMode -eq "prompt-file" -and -not (Test-Path -LiteralPath $resolvedPro
 if ($PromptMode -eq "prompt-tokens" -and [string]::IsNullOrWhiteSpace($PromptTokensCsv)) {
     throw "PromptTokensCsv must be non-empty when PromptMode is 'prompt-tokens'."
 }
-if ($Qwen35xProfile.IsPresent -and $Modes -contains "cpu-reference") {
-    Write-Warning "Qwen35xProfile is ignored for cpu-reference mode."
+if ($Qwen35xProfile.IsPresent -and ($Modes -contains "cpu-reference" -or $Modes -contains "cpu-gguf")) {
+    Write-Warning "Qwen35xProfile is ignored for CPU modes."
 }
 
 New-Item -ItemType Directory -Path (Split-Path -Parent $resolvedCsvOut) -Force | Out-Null
@@ -286,6 +316,9 @@ foreach ($mode in $Modes) {
                 -ExePath $resolvedExe `
                 -Mode $mode `
                 -ModelDir $resolvedModelDir `
+                -CpuGguf $resolvedCpuGguf `
+                -CpuThreads $CpuThreads `
+                -CpuIsa $CpuIsa `
                 -PromptMode $PromptMode `
                 -PromptText $PromptText `
                 -PromptFile $resolvedPromptFile `
@@ -320,6 +353,9 @@ foreach ($mode in $Modes) {
                 -ExePath $resolvedExe `
                 -Mode $mode `
                 -ModelDir $resolvedModelDir `
+                -CpuGguf $resolvedCpuGguf `
+                -CpuThreads $CpuThreads `
+                -CpuIsa $CpuIsa `
                 -PromptMode $PromptMode `
                 -PromptText $PromptText `
                 -PromptFile $resolvedPromptFile `
@@ -372,6 +408,9 @@ foreach ($mode in $Modes) {
                 timestamp_utc    = [DateTime]::UtcNow.ToString("o")
                 run_label        = $RunLabel
                 mode             = $mode
+                cpu_gguf         = if ($mode -eq "cpu-gguf") { $resolvedCpuGguf } else { "" }
+                cpu_threads      = if ($mode -eq "cpu-gguf") { $CpuThreads } else { "" }
+                cpu_isa          = if ($mode -eq "cpu-gguf") { $CpuIsa } else { "" }
                 qwen35x_prefill_mode = $effectiveQwen35xPrefillMode
                 qwen35x_prefill_kernel = $effectiveQwen35xPrefillKernel
                 qwen35x_weight_precision = $effectiveQwen35xWeightPrecision

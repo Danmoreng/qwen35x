@@ -90,7 +90,12 @@ LLAMA_CPP_DIR="$(git -C "$(dirname "$LLAMA_BENCH")" rev-parse --show-toplevel)"
 {
   date --iso-8601=seconds
   uname -a
-  lscpu
+  if command -v lscpu >/dev/null 2>&1; then
+    lscpu
+  elif command -v powershell.exe >/dev/null 2>&1; then
+    powershell.exe -NoProfile -Command \
+      "Get-CimInstance Win32_Processor | Format-List Name,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed"
+  fi
   printf '\nllama.cpp commit: '
   git -C "$LLAMA_CPP_DIR" rev-parse HEAD
   printf 'llama.cpp description: '
