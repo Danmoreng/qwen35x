@@ -121,53 +121,6 @@ void run_gated_delta_net_batch_cpu_rows(
     job.backend);
 }
 
-struct FullAttentionBatchCpuJob {
-  const float * queries = nullptr;
-  const float * gates = nullptr;
-  const float * k_cache = nullptr;
-  const float * v_cache = nullptr;
-  const std::uint16_t * k_cache_f16 = nullptr;
-  const std::uint16_t * v_cache_f16 = nullptr;
-  float * scores = nullptr;
-  float * output = nullptr;
-  std::size_t context_stride = 0;
-  std::size_t query_width = 0;
-  std::size_t kv_width = 0;
-  int position_start = 0;
-  int head_count = 0;
-  int kv_head_count = 0;
-  int head_dim = 0;
-  float attention_scale = 1.0F;
-  cpu::Q8_0Backend backend = cpu::Q8_0Backend::auto_select;
-};
-
-void run_full_attention_batch_cpu_rows(
-  void * opaque_context,
-  const std::size_t row_begin,
-  const std::size_t row_end) noexcept {
-  auto & job = *static_cast<FullAttentionBatchCpuJob *>(opaque_context);
-  cpu::causal_attention_batch_rows(
-    job.queries,
-    job.gates,
-    job.k_cache,
-    job.v_cache,
-    job.k_cache_f16,
-    job.v_cache_f16,
-    job.scores,
-    job.output,
-    job.context_stride,
-    job.query_width,
-    job.kv_width,
-    job.position_start,
-    job.head_count,
-    job.kv_head_count,
-    job.head_dim,
-    job.attention_scale,
-    row_begin,
-    row_end,
-    job.backend);
-}
-
 bool run_linear_attention_batch_cpu_q8(
   const LayerWeights & layer,
   const RuntimeDims & dims,

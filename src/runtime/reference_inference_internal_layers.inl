@@ -550,6 +550,15 @@ bool run_full_attention_step(
   const bool use_cuda_full_kernel =
     use_cuda && state.has_device_state && cuda_workspace != nullptr && cuda_workspace->has_device_buffers &&
     layer.full.o_proj.has_device_matrix;
+  if (!use_cuda_full_kernel && !state.k_cache_f16.empty() && !state.v_cache_f16.empty()) {
+    const std::size_t offset = static_cast<std::size_t>(position) * token_stride;
+    cpu::attention_cache_store_f16(
+      k_normed.data(), state.k_cache_f16.data() + offset, token_stride,
+      layer.full.o_proj.q8_0_backend);
+    cpu::attention_cache_store_f16(
+      v_flat.data(), state.v_cache_f16.data() + offset, token_stride,
+      layer.full.o_proj.q8_0_backend);
+  }
   if (use_cuda_full_kernel) {
     const std::size_t offset = static_cast<std::size_t>(position) * token_stride;
     const std::size_t full_q_count = static_cast<std::size_t>(dims.n_heads * dims.head_dim);
@@ -581,55 +590,44 @@ bool run_full_attention_step(
     return true;
   }
 
-  const int n_rep = dims.n_heads / dims.n_kv_heads;
   const float scale = 1.0f / std::sqrt(static_cast<float>(dims.head_dim));
   const int seq_len = position + 1;
-  std::vector<float> attn_cat(static_cast<std::size_t>(dims.n_heads * dims.head_dim), 0.0f);
-  std::vector<float> scores(static_cast<std::size_t>(seq_len), 0.0f);
-
-  for (int h = 0; h < dims.n_heads; ++h) {
-    const int kvh = h / n_rep;
-    const std::size_t q_base = static_cast<std::size_t>(h * dims.head_dim);
-
-    float max_score = -std::numeric_limits<float>::infinity();
-    for (int t = 0; t < seq_len; ++t) {
-      const float * k_ptr = state.k_cache.data() +
-                           (static_cast<std::size_t>(t) * static_cast<std::size_t>(dims.n_kv_heads) +
-                            static_cast<std::size_t>(kvh)) *
-                             static_cast<std::size_t>(dims.head_dim);
-      float dot = 0.0f;
-      for (int d = 0; d < dims.head_dim; ++d) {
-        dot += q_normed[q_base + static_cast<std::size_t>(d)] * k_ptr[d];
-      }
-      dot *= scale;
-      scores[static_cast<std::size_t>(t)] = dot;
-      if (dot > max_score) {
-        max_score = dot;
-      }
+  const std::size_t query_width =
+    static_cast<std::size_t>(dims.n_heads * dims.head_dim);
+  const std::size_t attention_rows = static_cast<std::size_t>(dims.n_heads);
+  const std::size_t context_stride = static_cast<std::size_t>(seq_len);
+  std::vector<float> attn_cat(query_width, 0.0f);
+  std::vector<float> scores(attention_rows * context_stride, 0.0f);
+  FullAttentionBatchCpuJob job{
+    q_normed.data(),
+    gate.data(),
+    state.k_cache.data(),
+    state.v_cache.data(),
+    state.k_cache_f16.empty() ? nullptr : state.k_cache_f16.data(),
+    state.v_cache_f16.empty() ? nullptr : state.v_cache_f16.data(),
+    scores.data(),
+    attn_cat.data(),
+    context_stride,
+    query_width,
+    token_stride,
+    position,
+    dims.n_heads,
+    dims.n_kv_heads,
+    dims.head_dim,
+    scale,
+    layer.full.o_proj.q8_0_backend,
+  };
+  CpuQ8Runtime * const runtime = layer.full.o_proj.q8_0_runtime;
+  if (runtime != nullptr && runtime->executor != nullptr) {
+    const cpu::CpuExecutorStatus status = runtime->executor->parallel_for_rows(
+      attention_rows, run_full_attention_batch_cpu_rows, &job);
+    if (status != cpu::CpuExecutorStatus::ok) {
+      error_message = std::string("Full-attention CPU executor failed: ") +
+        cpu::cpu_executor_status_name(status) + ".";
+      return false;
     }
-
-    float denom = 0.0f;
-    for (int t = 0; t < seq_len; ++t) {
-      const float ev = std::exp(scores[static_cast<std::size_t>(t)] - max_score);
-      scores[static_cast<std::size_t>(t)] = ev;
-      denom += ev;
-    }
-    if (denom <= 0.0f) {
-      denom = 1.0f;
-    }
-
-    for (int d = 0; d < dims.head_dim; ++d) {
-      float acc = 0.0f;
-      for (int t = 0; t < seq_len; ++t) {
-        const float p = scores[static_cast<std::size_t>(t)] / denom;
-        const float * v_ptr = state.v_cache.data() +
-                             (static_cast<std::size_t>(t) * static_cast<std::size_t>(dims.n_kv_heads) +
-                              static_cast<std::size_t>(kvh)) *
-                               static_cast<std::size_t>(dims.head_dim);
-        acc += p * v_ptr[d];
-      }
-      attn_cat[q_base + static_cast<std::size_t>(d)] = acc * sigmoidf_stable(gate[q_base + static_cast<std::size_t>(d)]);
-    }
+  } else {
+    run_full_attention_batch_cpu_rows(&job, 0, attention_rows);
   }
 
   if (!matvec_2d(layer.full.o_proj, attn_cat, out, use_cuda, error_message)) {
