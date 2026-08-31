@@ -207,9 +207,28 @@ Q4_H128 measured mean KL 1.96881, compared with 1.96188 for the prior Q4_0
 sample. This is statistically insufficient to accept or reject the format and
 does not replace the held-out transcript suite.
 
-An additional arithmetic smoke prompt, `What is 2 + 2? Answer with only the
-number.`, generated token ID 19 (`4`) after the four-token empty thinking block
-with both the local Q4_0 and Q4_H128 artifacts. That reconstructed prompt has 22
-input tokens, whereas the independently reported failing prompt has 23, so it
-does not yet reproduce or close that exact regression. The exact prompt-token
-sequence must be retained as a permanent gate once it is available.
+The exact 23-token arithmetic regression is stored in
+`scripts/data/q4-h128-quality-cases.json`:
+
+```text
+Was ist 2 + 2? Antworte nur mit der Zahl.
+```
+
+With the same chat tokens, 12 threads, greedy sampling, and repetition penalty
+1.05, BF16, Q4_0, and Q4_H128 generated the same four-token empty thinking
+wrapper. At the fifth step Q4_0 selected token 17 (`2`), while BF16 and Q4_H128
+selected token 19 (`4`). Because token 17 already occurs in the prompt, its
+positive raw logit is divided by 1.05 before greedy selection. The resulting
+decision margins were:
+
+| Weights | post-penalty `logit(4) - logit(2)` | next token |
+| --- | ---: | ---: |
+| BF16 | +4.313247 | 19 (`4`) |
+| Q4_0 | -1.038412 | 17 (`2`) |
+| Q4_H128 | +3.360266 | 19 (`4`) |
+
+Across all five teacher-aligned positions, raw full-vocabulary comparison
+against BF16 measured mean/max KL 0.416220/2.009178 and 80% top-1 agreement for
+Q4_0. Q4_H128 measured mean/max KL 0.024985/0.101301 and 100% top-1 agreement.
+This case therefore demonstrates a material H128 quality improvement, although
+the broader held-out transcript suite remains the production acceptance gate.
