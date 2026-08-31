@@ -7,9 +7,36 @@
 #define QWEN35X_Q8_0_HAS_AVX2_TU 0
 #endif
 
+#ifndef QWEN35X_Q8_0_HAS_AVX512_TU
+#define QWEN35X_Q8_0_HAS_AVX512_TU 0
+#endif
+
 namespace qwen35x::cpu {
 
 namespace detail {
+
+#if QWEN35X_Q8_0_HAS_AVX512_TU
+void add_f32_avx512(
+  const float * lhs, const float * rhs, float * output, std::size_t count) noexcept;
+void rope_f32_avx512(
+  float * values, std::size_t head_count, std::size_t head_dim,
+  std::size_t rope_dim, const float * cosine, const float * sine) noexcept;
+void causal_conv1d_silu_f32_avx512(
+  float * state, std::size_t ring_index, const float * input,
+  std::size_t input_stride, const float * kernel_major_weights, float * output,
+  std::size_t batch_size, std::size_t channel_count, std::size_t kernel_size,
+  std::size_t channel_begin, std::size_t channel_end) noexcept;
+void rms_norm_f32_avx512(
+  const float * input, const float * weight, float * output,
+  std::size_t row_count, std::size_t width, float eps, float weight_offset) noexcept;
+void l2_normalize_f32_avx512(
+  float * values, std::size_t row_count, std::size_t width,
+  float eps, float output_scale) noexcept;
+void silu_f32_avx512(
+  const float * input, float * output, std::size_t count) noexcept;
+void silu_mul_f32_avx512(
+  const float * gate, const float * up, float * output, std::size_t count) noexcept;
+#endif
 
 #if QWEN35X_Q8_0_HAS_AVX2_TU
 void add_f32_avx2(
@@ -75,6 +102,12 @@ void add_f32(
   float * output,
   const std::size_t count,
   const Q8_0Backend backend) noexcept {
+#if QWEN35X_Q8_0_HAS_AVX512_TU
+  if (q8_0_backend_uses_avx512(backend)) {
+    detail::add_f32_avx512(lhs, rhs, output, count);
+    return;
+  }
+#endif
 #if QWEN35X_Q8_0_HAS_AVX2_TU
   if (q8_0_backend_uses_avx2(backend)) {
     detail::add_f32_avx2(lhs, rhs, output, count);
@@ -99,6 +132,13 @@ void rope_f32(
   if (rope_dim == 0 || rope_dim > head_dim || (rope_dim & 1U) != 0U) {
     return;
   }
+#if QWEN35X_Q8_0_HAS_AVX512_TU
+  if (q8_0_backend_uses_avx512(backend)) {
+    detail::rope_f32_avx512(
+      values, head_count, head_dim, rope_dim, cosine, sine);
+    return;
+  }
+#endif
 #if QWEN35X_Q8_0_HAS_AVX2_TU
   if (q8_0_backend_uses_avx2(backend)) {
     detail::rope_f32_avx2(
@@ -137,6 +177,14 @@ void causal_conv1d_silu_f32(
   if (kernel_size == 0 || channel_begin >= channel_end) {
     return;
   }
+#if QWEN35X_Q8_0_HAS_AVX512_TU
+  if (q8_0_backend_uses_avx512(backend)) {
+    detail::causal_conv1d_silu_f32_avx512(
+      state, ring_index, input, input_stride, kernel_major_weights, output,
+      batch_size, channel_count, kernel_size, channel_begin, channel_end);
+    return;
+  }
+#endif
 #if QWEN35X_Q8_0_HAS_AVX2_TU
   if (q8_0_backend_uses_avx2(backend)) {
     detail::causal_conv1d_silu_f32_avx2(
@@ -182,6 +230,13 @@ void rms_norm_f32(
   const float eps,
   const float weight_offset,
   const Q8_0Backend backend) noexcept {
+#if QWEN35X_Q8_0_HAS_AVX512_TU
+  if (q8_0_backend_uses_avx512(backend)) {
+    detail::rms_norm_f32_avx512(
+      input, weight, output, row_count, width, eps, weight_offset);
+    return;
+  }
+#endif
 #if QWEN35X_Q8_0_HAS_AVX2_TU
   if (q8_0_backend_uses_avx2(backend)) {
     detail::rms_norm_f32_avx2(
@@ -213,6 +268,13 @@ void l2_normalize_f32(
   const float eps,
   const float output_scale,
   const Q8_0Backend backend) noexcept {
+#if QWEN35X_Q8_0_HAS_AVX512_TU
+  if (q8_0_backend_uses_avx512(backend)) {
+    detail::l2_normalize_f32_avx512(
+      values, row_count, width, eps, output_scale);
+    return;
+  }
+#endif
 #if QWEN35X_Q8_0_HAS_AVX2_TU
   if (q8_0_backend_uses_avx2(backend)) {
     detail::l2_normalize_f32_avx2(
@@ -240,6 +302,12 @@ void silu_f32(
   float * output,
   const std::size_t count,
   const Q8_0Backend backend) noexcept {
+#if QWEN35X_Q8_0_HAS_AVX512_TU
+  if (q8_0_backend_uses_avx512(backend)) {
+    detail::silu_f32_avx512(input, output, count);
+    return;
+  }
+#endif
 #if QWEN35X_Q8_0_HAS_AVX2_TU
   if (q8_0_backend_uses_avx2(backend)) {
     detail::silu_f32_avx2(input, output, count);
@@ -264,6 +332,12 @@ void silu_mul_f32(
   float * output,
   const std::size_t count,
   const Q8_0Backend backend) noexcept {
+#if QWEN35X_Q8_0_HAS_AVX512_TU
+  if (q8_0_backend_uses_avx512(backend)) {
+    detail::silu_mul_f32_avx512(gate, up, output, count);
+    return;
+  }
+#endif
 #if QWEN35X_Q8_0_HAS_AVX2_TU
   if (q8_0_backend_uses_avx2(backend)) {
     detail::silu_mul_f32_avx2(gate, up, output, count);

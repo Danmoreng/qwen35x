@@ -67,6 +67,7 @@ add_library(qwen35x_core
 
 set(QWEN35X_Q8_0_HAS_AVX2_TU OFF)
 set(QWEN35X_Q8_0_HAS_AVX_VNNI_TU OFF)
+set(QWEN35X_Q8_0_HAS_AVX512_TU OFF)
 string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" QWEN35X_SYSTEM_PROCESSOR_LOWER)
 # Keep qwen35x_core on the portable compiler baseline. Only the isolated
 # translation unit below may contain AVX2/FMA/F16C instructions.
@@ -81,9 +82,13 @@ if (QWEN35X_SYSTEM_PROCESSOR_LOWER MATCHES "^(x86_64|amd64|i[3-6]86)$" OR
     # available in the VS 2022 toolset. Older MSVCs keep the AVX2 backend.
     if (MSVC_VERSION GREATER_EQUAL 1930)
       set(QWEN35X_Q8_0_HAS_AVX_VNNI_TU ON)
+      set(QWEN35X_Q8_0_HAS_AVX512_TU ON)
       set_source_files_properties(
         src/cpu/q8_0_vnni.cpp
         PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+      set_source_files_properties(
+        src/cpu/activation_avx512.cpp
+        PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     endif ()
   elseif (CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
     set(QWEN35X_Q8_0_HAS_AVX2_TU ON)
@@ -96,6 +101,13 @@ if (QWEN35X_SYSTEM_PROCESSOR_LOWER MATCHES "^(x86_64|amd64|i[3-6]86)$" OR
       set_source_files_properties(
         src/cpu/q8_0_vnni.cpp
         PROPERTIES COMPILE_OPTIONS "-mavx2;-mavxvnni;-mfma;-mf16c")
+      check_cxx_compiler_flag("-mavx512f" QWEN35X_COMPILER_HAS_MAVX512F)
+      if (QWEN35X_COMPILER_HAS_MAVX512F)
+        set(QWEN35X_Q8_0_HAS_AVX512_TU ON)
+        set_source_files_properties(
+          src/cpu/activation_avx512.cpp
+          PROPERTIES COMPILE_OPTIONS "-mavx512f;-mfma")
+      endif ()
     endif ()
   endif ()
 endif ()
@@ -114,6 +126,13 @@ if (QWEN35X_Q8_0_HAS_AVX_VNNI_TU)
   target_compile_definitions(qwen35x_core PRIVATE QWEN35X_Q8_0_HAS_AVX_VNNI_TU=1)
 else ()
   target_compile_definitions(qwen35x_core PRIVATE QWEN35X_Q8_0_HAS_AVX_VNNI_TU=0)
+endif ()
+
+if (QWEN35X_Q8_0_HAS_AVX512_TU)
+  target_sources(qwen35x_core PRIVATE src/cpu/activation_avx512.cpp)
+  target_compile_definitions(qwen35x_core PRIVATE QWEN35X_Q8_0_HAS_AVX512_TU=1)
+else ()
+  target_compile_definitions(qwen35x_core PRIVATE QWEN35X_Q8_0_HAS_AVX512_TU=0)
 endif ()
 
 target_include_directories(qwen35x_core

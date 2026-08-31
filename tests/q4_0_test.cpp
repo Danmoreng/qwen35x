@@ -277,6 +277,10 @@ int main() {
     ok = test_backend(Q8_0Backend::avx_vnni) &&
       test_packed_backend(Q8_0Backend::avx_vnni) && ok;
   }
+  if (qwen35x::cpu::q8_0_backend_available(Q8_0Backend::avx512)) {
+    ok = test_backend(Q8_0Backend::avx512) &&
+      test_packed_backend(Q8_0Backend::avx512) && ok;
+  }
   if (ok) {
     std::cout << "q4_0 tests passed\n";
     return 0;

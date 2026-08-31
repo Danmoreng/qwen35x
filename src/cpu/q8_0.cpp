@@ -248,6 +248,29 @@ bool avx_vnni_runtime_available() noexcept {
 #endif
 }
 
+bool avx512_runtime_available() noexcept {
+#if !QWEN35X_Q8_0_HAS_AVX512_TU
+  return false;
+#elif defined(_MSC_VER)
+  if (!avx_vnni_runtime_available()) {
+    return false;
+  }
+  // Opmask plus the upper halves of ZMM0-31 must be enabled by the OS.
+  if ((_xgetbv(0) & 0xe6U) != 0xe6U) {
+    return false;
+  }
+  int registers[4] = {};
+  __cpuidex(registers, 7, 0);
+  constexpr int avx512f_bit = 1 << 16;
+  return (registers[1] & avx512f_bit) != 0;
+#elif defined(__GNUC__) || defined(__clang__)
+  __builtin_cpu_init();
+  return avx_vnni_runtime_available() && __builtin_cpu_supports("avx512f");
+#else
+  return false;
+#endif
+}
+
 } // namespace
 
 bool q8_0_backend_available(const Q8_0Backend backend) noexcept {
@@ -263,6 +286,10 @@ bool q8_0_backend_available(const Q8_0Backend backend) noexcept {
       static const bool available = avx_vnni_runtime_available();
       return available;
     }
+    case Q8_0Backend::avx512: {
+      static const bool available = avx512_runtime_available();
+      return available;
+    }
   }
   return false;
 }
@@ -271,7 +298,12 @@ Q8_0Backend q8_0_resolve_backend(const Q8_0Backend requested) noexcept {
   if (requested == Q8_0Backend::scalar) {
     return Q8_0Backend::scalar;
   }
-  if ((requested == Q8_0Backend::auto_select || requested == Q8_0Backend::avx_vnni) &&
+  if ((requested == Q8_0Backend::auto_select || requested == Q8_0Backend::avx512) &&
+      q8_0_backend_available(Q8_0Backend::avx512)) {
+    return Q8_0Backend::avx512;
+  }
+  if ((requested == Q8_0Backend::auto_select || requested == Q8_0Backend::avx_vnni ||
+       requested == Q8_0Backend::avx512) &&
       q8_0_backend_available(Q8_0Backend::avx_vnni)) {
     return Q8_0Backend::avx_vnni;
   }
@@ -282,7 +314,12 @@ Q8_0Backend q8_0_resolve_backend(const Q8_0Backend requested) noexcept {
 
 bool q8_0_backend_uses_avx2(const Q8_0Backend backend) noexcept {
   const Q8_0Backend resolved = q8_0_resolve_backend(backend);
-  return resolved == Q8_0Backend::avx2 || resolved == Q8_0Backend::avx_vnni;
+  return resolved == Q8_0Backend::avx2 || resolved == Q8_0Backend::avx_vnni ||
+    resolved == Q8_0Backend::avx512;
+}
+
+bool q8_0_backend_uses_avx512(const Q8_0Backend backend) noexcept {
+  return q8_0_resolve_backend(backend) == Q8_0Backend::avx512;
 }
 
 const char * q8_0_backend_name(const Q8_0Backend backend) noexcept {
@@ -295,6 +332,8 @@ const char * q8_0_backend_name(const Q8_0Backend backend) noexcept {
       return "avx2+fma+f16c";
     case Q8_0Backend::avx_vnni:
       return "avx-vnni+avx2+fma+f16c";
+    case Q8_0Backend::avx512:
+      return "avx512-fp32+avx-vnni+avx2";
   }
   return "unknown";
 }
@@ -363,7 +402,8 @@ float q8_0_dot(
   const std::size_t block_count,
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX_VNNI_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx_vnni) {
+  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx_vnni ||
+      q8_0_resolve_backend(backend) == Q8_0Backend::avx512) {
     return detail::q8_0_dot_avx_vnni(lhs, rhs, block_count);
   }
 #endif
@@ -385,7 +425,8 @@ void q8_0_matvec(
   const std::size_t blocks_per_row,
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX_VNNI_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx_vnni) {
+  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx_vnni ||
+      q8_0_resolve_backend(backend) == Q8_0Backend::avx512) {
     detail::q8_0_matvec_avx_vnni(matrix, vector, output, row_count, blocks_per_row);
     return;
   }
@@ -413,7 +454,8 @@ void q8_0_matmul(
   const float * vector_scales,
   const float * matrix_scales) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX_VNNI_TU
-  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx_vnni) {
+  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx_vnni ||
+      q8_0_resolve_backend(backend) == Q8_0Backend::avx512) {
     detail::q8_0_matmul_avx_vnni(
       matrix,
       vectors,
