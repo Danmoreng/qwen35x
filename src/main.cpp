@@ -1,3 +1,4 @@
+#include "qwen35x/cpu/q4_0.h"
 #include "qwen35x/compiler/compiler.h"
 #include "qwen35x/runtime/reference_inference.h"
 #include "qwen35x/runtime/runtime.h"
@@ -299,6 +300,14 @@ bool write_profile_json(
   out << "  \"qwen35x_weight_precision\": \"" << json_escape(qwen35x_weight_precision_name(options.qwen35x_weight_precision)) << "\",\n";
   out << "  \"qwen35x_cache_precision\": \"" << json_escape(qwen35x_cache_precision_name(options.qwen35x_cache_precision)) << "\",\n";
   out << "  \"cpu_kv_cache\": \"" << (options.use_cuda ? "not-applicable" : (result.cpu_kv_cache_f16 ? "fp16" : "fp32")) << "\",\n";
+  if (!options.use_cuda) {
+    out << "  \"cpu_isa_resolved\": \"" << qwen35x::cpu::q8_0_backend_name(
+      qwen35x::cpu::q8_0_resolve_backend(options.cpu_q8_backend)) << "\",\n";
+    out << "  \"cpu_q4_decode_kernel\": \"" << qwen35x::cpu::q4_0_decode_kernel_name(options.cpu_q8_backend) << "\",\n";
+    out << "  \"cpu_q4_prefill_kernel\": \"" << qwen35x::cpu::q4_0_prefill_kernel_name(options.cpu_q8_backend) << "\",\n";
+    out << "  \"cpu_q8_dot_kernel\": \"" << qwen35x::cpu::q8_0_backend_name(
+      qwen35x::cpu::q8_0_dot_backend_for_capabilities(options.cpu_q8_backend, qwen35x::cpu::cpu_capabilities())) << "\",\n";
+  }
   out << "  \"prefill_only\": " << (options.prefill_only ? "true" : "false") << ",\n";
   out << "  \"prompt_tokens\": " << options.prompt_tokens.size() << ",\n";
   out << "  \"prompt_token_ids\": [";
@@ -435,6 +444,7 @@ int main(int argc, char ** argv) {
   bool bench_nvfp4_projection = false;
   bool bench_nvfp4_prefill_projection = false;
   bool bench_nvfp4_gate_up = false;
+  bool cpu_isa_strict = false;
   bool infer_reference = false;
   bool infer_gpu = false;
   bool gpu_decode_backend_explicit = false;
@@ -481,6 +491,8 @@ int main(int argc, char ** argv) {
       cpu_model_session_replays = std::stoi(argv[++i]);
     } else if (arg == "--top-logits" && i + 1 < argc) {
       infer_options.capture_top_logits = std::stoi(argv[++i]);
+    } else if (arg == "--cpu-isa-strict") {
+      cpu_isa_strict = true;
     } else if (arg == "--cpu-isa" && i + 1 < argc) {
       const std::string isa = argv[++i];
       if (isa == "auto") {
@@ -657,7 +669,7 @@ int main(int argc, char ** argv) {
       std::cout << "       qwen35x --bench-nvfp4-projection --hf-model-dir <path> [--nvfp4-tensor <base-name>] [--nvfp4-projection-kernel <row|warp|scale-group|blackwell-fp4>] [--bench-warmup <n>] [--bench-iters <n>]\n";
       std::cout << "       qwen35x --bench-nvfp4-prefill-projection --hf-model-dir <path> [--nvfp4-tensor <base-name>] [--nvfp4-prefill-seq-len <n>] [--bench-warmup <n>] [--bench-iters <n>]\n";
       std::cout << "       qwen35x --bench-nvfp4-gate-up --hf-model-dir <path> [--nvfp4-gate-tensor <base-name>] [--nvfp4-up-tensor <base-name>] [--bench-warmup <n>] [--bench-iters <n>]\n";
-      std::cout << "       qwen35x --infer-reference --hf-model-dir <path> [--cpu-gguf <q4_0-or-q8_0.gguf> | --cpu-q4-h128 <artifact>] [--cpu-threads <n>] [--cpu-kv-cache <fp16|fp32>] [--cpu-isa <auto|scalar|avx2|avx-vnni|avx512|avx512-vnni>] [--cpu-model-session-replays <n>] [--cpu-prefix-cache-tokens <n> --cpu-prefix-cache-replays <n>] [--top-logits <n>] (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--forced-output-tokens <csv> | --forced-output-text <text>] [--logits-out <path>] [--max-new-tokens <n>] [--max-context <n>]\n";
+      std::cout << "       qwen35x --infer-reference --hf-model-dir <path> [--cpu-gguf <q4_0-or-q8_0.gguf> | --cpu-q4-h128 <artifact>] [--cpu-threads <n>] [--cpu-kv-cache <fp16|fp32>] [--cpu-isa <auto|scalar|avx2|avx-vnni|avx512|avx512-vnni>] [--cpu-isa-strict] [--cpu-model-session-replays <n>] [--cpu-prefix-cache-tokens <n> --cpu-prefix-cache-replays <n>] [--top-logits <n>] (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--forced-output-tokens <csv> | --forced-output-text <text>] [--logits-out <path>] [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "       qwen35x --infer-gpu --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "               [--temperature <float>] [--top-p <float>] [--top-k <int>] [--repeat-penalty <float>] [--seed <int64>]\n";
       std::cout << "               [--gpu-bf16|--gpu-f32-matvec] [--gpu-decode-backend <default|qwen35x>] [--gpu-decode-blocks <n>] [--qwen35x-prefill-mode <replay|batched>]\n";
@@ -941,6 +953,11 @@ int main(int argc, char ** argv) {
   }
 
   if (infer_reference) {
+    if (cpu_isa_strict && !qwen35x::cpu::q8_0_backend_available(infer_options.cpu_q8_backend)) {
+      std::cerr << "Requested CPU ISA is unavailable (strict mode): "
+                << qwen35x::cpu::q8_0_backend_name(infer_options.cpu_q8_backend) << "\n";
+      return 2;
+    }
     if (hf_model_dir.empty()) {
       hf_model_dir = "models/qwen3.5-0.8b";
     }
@@ -1176,6 +1193,13 @@ int main(int argc, char ** argv) {
       ? "q4_h128" : (infer_options.cpu_gguf_path.empty() ? "f32" : "gguf")) << "\n";
     std::cout << "  cpu_isa: " << qwen35x::cpu::q8_0_backend_name(
       qwen35x::cpu::q8_0_resolve_backend(infer_options.cpu_q8_backend)) << "\n";
+    if (!infer_options.use_cuda) {
+      std::cout << "  cpu_kernels: q4_decode=" << qwen35x::cpu::q4_0_decode_kernel_name(infer_options.cpu_q8_backend)
+                << " q4_prefill=" << qwen35x::cpu::q4_0_prefill_kernel_name(infer_options.cpu_q8_backend)
+                << " q8_dot=" << qwen35x::cpu::q8_0_backend_name(qwen35x::cpu::q8_0_dot_backend_for_capabilities(
+                     infer_options.cpu_q8_backend, qwen35x::cpu::cpu_capabilities())) << "\n";
+    }
+
     std::cout << "  cpu_threads: " << infer_options.cpu_threads << "\n";
     if (!infer_options.use_cuda) {
       std::cout << "  cpu_kv_cache: " << (infer_result.cpu_kv_cache_f16 ? "fp16" : "fp32") << "\n";

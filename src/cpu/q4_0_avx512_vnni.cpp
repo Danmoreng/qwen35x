@@ -178,7 +178,7 @@ void q4_0_packed_matmul_q8_0_avx512_vnni(
   }
 
   if (vector_tile < vector_tiles) {
-    q4_0_packed_matmul_q8_0_avx_vnni(
+    q4_0_packed_matmul_q8_0_evex_vnni(
       matrix,
       vectors + vector_tile * blocks_per_row,
       output + vector_tile * 4 * output_row_stride,

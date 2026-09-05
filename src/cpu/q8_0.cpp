@@ -252,7 +252,7 @@ bool avx512_runtime_available() noexcept {
 #if !QWEN35X_Q8_0_HAS_AVX512_TU
   return false;
 #elif defined(_MSC_VER)
-  if (!avx_vnni_runtime_available()) {
+  if (!avx2_runtime_available()) {
     return false;
   }
   // Opmask plus the upper halves of ZMM0-31 must be enabled by the OS.
@@ -261,11 +261,12 @@ bool avx512_runtime_available() noexcept {
   }
   int registers[4] = {};
   __cpuidex(registers, 7, 0);
-  constexpr int avx512f_bit = 1 << 16;
-  return (registers[1] & avx512f_bit) != 0;
+  // /arch:AVX512 permits F, DQ, CD, BW and VL throughout this TU.
+  constexpr unsigned arch_mask = (1U << 16) | (1U << 17) | (1U << 28) | (1U << 30) | (1U << 31);
+  return (static_cast<unsigned>(registers[1]) & arch_mask) == arch_mask;
 #elif defined(__GNUC__) || defined(__clang__)
   __builtin_cpu_init();
-  return avx_vnni_runtime_available() && __builtin_cpu_supports("avx512f");
+  return avx2_runtime_available() && __builtin_cpu_supports("avx512f");
 #else
   return false;
 #endif
@@ -281,7 +282,8 @@ bool avx512_vnni_runtime_available() noexcept {
   int registers[4] = {};
   __cpuidex(registers, 7, 0);
   constexpr int avx512_vnni_bit = 1 << 11;
-  return (registers[2] & avx512_vnni_bit) != 0;
+  return (registers[2] & avx512_vnni_bit) != 0 &&
+    (static_cast<unsigned>(registers[1]) & (1U << 31)) != 0;
 #elif defined(__GNUC__) || defined(__clang__)
   __builtin_cpu_init();
   return avx512_runtime_available() &&
@@ -319,28 +321,51 @@ bool q8_0_backend_available(const Q8_0Backend backend) noexcept {
   return false;
 }
 
-Q8_0Backend q8_0_resolve_backend(const Q8_0Backend requested) noexcept {
-  if (requested == Q8_0Backend::scalar) {
+Q8_0Backend q8_0_resolve_backend_for_capabilities(
+  const Q8_0Backend requested, const CpuCapabilities capabilities) noexcept {
+  if (requested == Q8_0Backend::scalar || !capabilities.avx2) {
     return Q8_0Backend::scalar;
   }
   if ((requested == Q8_0Backend::auto_select ||
        requested == Q8_0Backend::avx512_vnni) &&
-      q8_0_backend_available(Q8_0Backend::avx512_vnni)) {
+      capabilities.avx512 && capabilities.avx512_vnni) {
     return Q8_0Backend::avx512_vnni;
   }
   if ((requested == Q8_0Backend::auto_select || requested == Q8_0Backend::avx512 ||
        requested == Q8_0Backend::avx512_vnni) &&
-      q8_0_backend_available(Q8_0Backend::avx512)) {
+      capabilities.avx512) {
     return Q8_0Backend::avx512;
   }
   if ((requested == Q8_0Backend::auto_select || requested == Q8_0Backend::avx_vnni ||
        requested == Q8_0Backend::avx512 || requested == Q8_0Backend::avx512_vnni) &&
-      q8_0_backend_available(Q8_0Backend::avx_vnni)) {
+      capabilities.avx_vnni) {
     return Q8_0Backend::avx_vnni;
   }
-  return q8_0_backend_available(Q8_0Backend::avx2)
+  return capabilities.avx2
     ? Q8_0Backend::avx2
     : Q8_0Backend::scalar;
+}
+
+CpuCapabilities cpu_capabilities() noexcept {
+  static const CpuCapabilities capabilities{
+    avx2_runtime_available(), avx_vnni_runtime_available(),
+    avx512_runtime_available(), avx512_vnni_runtime_available()};
+  return capabilities;
+}
+
+Q8_0Backend q8_0_resolve_backend(const Q8_0Backend requested) noexcept {
+  return q8_0_resolve_backend_for_capabilities(requested, cpu_capabilities());
+}
+
+Q8_0Backend q8_0_dot_backend_for_capabilities(
+  const Q8_0Backend requested, const CpuCapabilities capabilities) noexcept {
+  const auto resolved = q8_0_resolve_backend_for_capabilities(requested, capabilities);
+  if (resolved == Q8_0Backend::scalar || resolved == Q8_0Backend::avx2) return resolved;
+  return capabilities.avx_vnni ? Q8_0Backend::avx_vnni : Q8_0Backend::avx2;
+}
+
+bool q8_0_backend_uses_avx_vnni(const Q8_0Backend backend) noexcept {
+  return q8_0_dot_backend_for_capabilities(backend, cpu_capabilities()) == Q8_0Backend::avx_vnni;
 }
 
 bool q8_0_backend_uses_avx2(const Q8_0Backend backend) noexcept {
@@ -365,9 +390,9 @@ const char * q8_0_backend_name(const Q8_0Backend backend) noexcept {
     case Q8_0Backend::avx_vnni:
       return "avx-vnni+avx2+fma+f16c";
     case Q8_0Backend::avx512:
-      return "avx512-fp32+avx-vnni+avx2";
+      return "avx512-fp32";
     case Q8_0Backend::avx512_vnni:
-      return "avx512-vnni-q4+avx512-fp32+avx-vnni-q8";
+      return "avx512-vnni-q4+avx512-fp32";
   }
   return "unknown";
 }
@@ -436,9 +461,7 @@ float q8_0_dot(
   const std::size_t block_count,
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX_VNNI_TU
-  const Q8_0Backend resolved = q8_0_resolve_backend(backend);
-  if (resolved == Q8_0Backend::avx_vnni || resolved == Q8_0Backend::avx512 ||
-      resolved == Q8_0Backend::avx512_vnni) {
+  if (q8_0_backend_uses_avx_vnni(backend)) {
     return detail::q8_0_dot_avx_vnni(lhs, rhs, block_count);
   }
 #endif
@@ -460,9 +483,7 @@ void q8_0_matvec(
   const std::size_t blocks_per_row,
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX_VNNI_TU
-  const Q8_0Backend resolved = q8_0_resolve_backend(backend);
-  if (resolved == Q8_0Backend::avx_vnni || resolved == Q8_0Backend::avx512 ||
-      resolved == Q8_0Backend::avx512_vnni) {
+  if (q8_0_backend_uses_avx_vnni(backend)) {
     detail::q8_0_matvec_avx_vnni(matrix, vector, output, row_count, blocks_per_row);
     return;
   }
@@ -490,9 +511,7 @@ void q8_0_matmul(
   const float * vector_scales,
   const float * matrix_scales) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX_VNNI_TU
-  const Q8_0Backend resolved = q8_0_resolve_backend(backend);
-  if (resolved == Q8_0Backend::avx_vnni || resolved == Q8_0Backend::avx512 ||
-      resolved == Q8_0Backend::avx512_vnni) {
+  if (q8_0_backend_uses_avx_vnni(backend)) {
     detail::q8_0_matmul_avx_vnni(
       matrix,
       vectors,

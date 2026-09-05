@@ -11,6 +11,7 @@ param(
     [int]$CpuThreads = 0,
     [ValidateSet("auto", "scalar", "avx2", "avx-vnni", "avx512", "avx512-vnni")]
     [string]$CpuIsa = "auto",
+    [switch]$CpuIsaStrict,
     [ValidateSet("fp16", "fp32")]
     [string]$CpuKvCache = "fp16",
     [int]$CpuPrefixCacheTokens = 0,
@@ -203,6 +204,7 @@ function Invoke-BenchmarkRun {
             "--cpu-threads", "$CpuThreads",
             "--cpu-isa", $CpuIsa
         )
+        if ($CpuIsaStrict) { $args += "--cpu-isa-strict" }
         # FP16 is the historical default; omit its flag to support older binaries.
         if ($CpuKvCache -eq "fp32") {
             $args += @("--cpu-kv-cache", "fp32")

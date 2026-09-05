@@ -8,6 +8,10 @@
 
 namespace qwen35x::cpu {
 
+[[nodiscard]] const char * q4_0_decode_kernel_name(Q8_0Backend backend) noexcept;
+[[nodiscard]] const char * q4_0_prefill_kernel_name(Q8_0Backend backend) noexcept;
+
+
 inline constexpr std::size_t q4_0_values_per_block = 32;
 
 // Binary-compatible with GGML's block_q4_0: one IEEE-754 binary16 scale

@@ -33,6 +33,21 @@ enum class Q8_0Backend : std::uint8_t {
 // next supported implementation. Call q8_0_backend_available() when a hard
 // requirement (for example, an ISA-specific test) must be enforced.
 [[nodiscard]] bool q8_0_backend_available(Q8_0Backend backend) noexcept;
+// Usable capabilities include compiler support and enabled OS register state.
+// These flags are independent: EVEX VNNI does not imply VEX AVX-VNNI.
+struct CpuCapabilities {
+  bool avx2 = false;
+  bool avx_vnni = false;
+  bool avx512 = false;
+  bool avx512_vnni = false;
+};
+[[nodiscard]] CpuCapabilities cpu_capabilities() noexcept;
+[[nodiscard]] Q8_0Backend q8_0_resolve_backend_for_capabilities(
+  Q8_0Backend requested, CpuCapabilities capabilities) noexcept;
+[[nodiscard]] Q8_0Backend q8_0_dot_backend_for_capabilities(
+  Q8_0Backend requested, CpuCapabilities capabilities) noexcept;
+[[nodiscard]] bool q8_0_backend_uses_avx_vnni(Q8_0Backend backend) noexcept;
+
 [[nodiscard]] Q8_0Backend q8_0_resolve_backend(Q8_0Backend requested) noexcept;
 [[nodiscard]] const char * q8_0_backend_name(Q8_0Backend backend) noexcept;
 
@@ -40,9 +55,8 @@ enum class Q8_0Backend : std::uint8_t {
 // AVX2 implementation for FP32 activation, attention, and DeltaNet kernels.
 [[nodiscard]] bool q8_0_backend_uses_avx2(Q8_0Backend backend) noexcept;
 
-// AVX-512 levels keep Q8 projection dots on the 256-bit AVX-VNNI backend while
-// widening naturally data-parallel FP32 kernels; AVX-512 VNNI additionally
-// enables the larger-register packed-Q4 prefill tile.
+// FP32 kernels can use AVX-512 independently of the integer-dot selection.
+// Q8 dots use VEX VNNI when available, otherwise AVX2; Q4 also supports EVEX.
 [[nodiscard]] bool q8_0_backend_uses_avx512(Q8_0Backend backend) noexcept;
 
 // Each operation works on complete 32-value Q8_0 blocks. Source and destination

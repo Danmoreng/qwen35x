@@ -515,8 +515,7 @@ void q4_0_packed_matmul_q8_0(
   }
 #endif
 #if QWEN35X_Q8_0_HAS_AVX_VNNI_TU
-  if (resolved == Q8_0Backend::avx_vnni || resolved == Q8_0Backend::avx512 ||
-      resolved == Q8_0Backend::avx512_vnni) {
+  if (q8_0_backend_uses_avx_vnni(backend)) {
     detail::q4_0_packed_matmul_q8_0_avx_vnni(
       matrix, vectors, output, row_count, vector_count, blocks_per_row,
       output_row_stride);
@@ -545,10 +544,14 @@ void q4_0_packed_matvec_q8_0(
   const std::size_t row_count,
   const std::size_t blocks_per_row,
   const Q8_0Backend backend) noexcept {
+#if QWEN35X_Q8_0_HAS_AVX512_VNNI_TU
+  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx512_vnni) {
+    detail::q4_0_packed_matvec_q8_0_evex_vnni(matrix, vector, output, row_count, blocks_per_row);
+    return;
+  }
+#endif
 #if QWEN35X_Q8_0_HAS_AVX_VNNI_TU
-  const Q8_0Backend resolved = q8_0_resolve_backend(backend);
-  if (resolved == Q8_0Backend::avx_vnni || resolved == Q8_0Backend::avx512 ||
-      resolved == Q8_0Backend::avx512_vnni) {
+  if (q8_0_backend_uses_avx_vnni(backend)) {
     detail::q4_0_packed_matvec_q8_0_avx_vnni(
       matrix, vector, output, row_count, blocks_per_row);
     return;
@@ -574,10 +577,14 @@ void q4_0_packed_matvec_prepared_q8_0(
   const std::size_t row_count,
   const std::size_t blocks_per_row,
   const Q8_0Backend backend) noexcept {
+#if QWEN35X_Q8_0_HAS_AVX512_VNNI_TU
+  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx512_vnni) {
+    detail::q4_0_packed_matvec_prepared_q8_0_evex_vnni(matrix, vector, output, row_count, blocks_per_row);
+    return;
+  }
+#endif
 #if QWEN35X_Q8_0_HAS_AVX_VNNI_TU
-  const Q8_0Backend resolved = q8_0_resolve_backend(backend);
-  if (resolved == Q8_0Backend::avx_vnni || resolved == Q8_0Backend::avx512 ||
-      resolved == Q8_0Backend::avx512_vnni) {
+  if (q8_0_backend_uses_avx_vnni(backend)) {
     detail::q4_0_packed_matvec_prepared_q8_0_avx_vnni(
       matrix, vector, output, row_count, blocks_per_row);
     return;
@@ -605,10 +612,14 @@ Q4_0ArgmaxResult q4_0_packed_matvec_prepared_q8_0_argmax(
   const std::size_t row_count,
   const std::size_t blocks_per_row,
   const Q8_0Backend backend) noexcept {
+#if QWEN35X_Q8_0_HAS_AVX512_VNNI_TU
+  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx512_vnni) {
+    return detail::q4_0_packed_matvec_prepared_q8_0_argmax_evex_vnni(
+      matrix, vector, token_counts, repetition_penalty, row_offset, row_count, blocks_per_row);
+  }
+#endif
 #if QWEN35X_Q8_0_HAS_AVX_VNNI_TU
-  const Q8_0Backend resolved = q8_0_resolve_backend(backend);
-  if (resolved == Q8_0Backend::avx_vnni || resolved == Q8_0Backend::avx512 ||
-      resolved == Q8_0Backend::avx512_vnni) {
+  if (q8_0_backend_uses_avx_vnni(backend)) {
     return detail::q4_0_packed_matvec_prepared_q8_0_argmax_avx_vnni(
       matrix, vector, token_counts, repetition_penalty, row_offset, row_count,
       blocks_per_row);
@@ -626,6 +637,17 @@ Q4_0ArgmaxResult q4_0_packed_matvec_prepared_q8_0_argmax(
   return detail::q4_0_packed_matvec_prepared_q8_0_argmax_scalar(
     matrix, vector, token_counts, repetition_penalty, row_offset, row_count,
     blocks_per_row);
+}
+
+const char * q4_0_decode_kernel_name(const Q8_0Backend backend) noexcept {
+  if (q8_0_resolve_backend(backend) == Q8_0Backend::avx512_vnni) return "evex256-vnni-x8";
+  if (q8_0_backend_uses_avx_vnni(backend)) return "vex256-vnni-x8";
+  return q8_0_backend_uses_avx2(backend) ? "avx2-x8" : "scalar-x8";
+}
+
+const char * q4_0_prefill_kernel_name(const Q8_0Backend backend) noexcept {
+  return q8_0_resolve_backend(backend) == Q8_0Backend::avx512_vnni
+    ? "evex256-vnni-16x8+evex-tails" : q4_0_decode_kernel_name(backend);
 }
 
 } // namespace qwen35x::cpu

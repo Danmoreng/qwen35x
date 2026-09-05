@@ -489,6 +489,26 @@ bool test_backend(const Q8_0Backend backend) {
 } // namespace
 
 int main() {
+  using namespace qwen35x::cpu;
+  for (bool vex : {false, true}) {
+    for (bool wide : {false, true}) {
+      for (bool evex : {false, true}) {
+        const CpuCapabilities caps{true, vex, wide, evex};
+        const auto expected = wide && evex ? Q8_0Backend::avx512_vnni
+          : wide ? Q8_0Backend::avx512 : vex ? Q8_0Backend::avx_vnni : Q8_0Backend::avx2;
+        if (!expect(q8_0_resolve_backend_for_capabilities(Q8_0Backend::auto_select, caps) == expected,
+                    "synthetic independent capability dispatch failed")) return 1;
+        if (!expect(q8_0_dot_backend_for_capabilities(Q8_0Backend::auto_select, caps) ==
+                      (vex ? Q8_0Backend::avx_vnni : Q8_0Backend::avx2),
+                    "Q8 chose unsupported VEX instructions")) return 1;
+        if (!expect(q8_0_resolve_backend_for_capabilities(Q8_0Backend::avx2, caps) == Q8_0Backend::avx2,
+                    "explicit AVX2 request was widened")) return 1;
+      }
+    }
+  }
+  if (!expect(q8_0_resolve_backend_for_capabilities(Q8_0Backend::auto_select, {}) == Q8_0Backend::scalar,
+              "missing AVX state did not select scalar")) return 1;
+
   bool ok = test_known_layout() && test_zero_block() && test_empty_ranges();
   ok = test_silu_mul(Q8_0Backend::auto_select) && ok;
   ok = test_rms_norm(Q8_0Backend::auto_select) && ok;
