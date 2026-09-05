@@ -73,3 +73,23 @@ new measurement on the user's older Intel laptop.
 
 16-row decode, active workers, register-held DeltaNet, prefill workspace, and
 quality/long-context proposals are evaluated separately after this baseline.
+
+## Further measured experiments
+
+- DOT4 ZMM/16-row decode: 120.46 to 116.60 tok/s (-3.20%); reverted.
+  Source patch remains locally at `benchmarks/review-zmm16-experiment.patch`.
+- Four instead of two EVEX integer chains: decode 122.53 to 122.35 tok/s;
+  prefill 1058.74 to 1085.86 tok/s. No decode gain and the small prefill
+  difference was not established by a repeat; retained two chains. Patch:
+  `benchmarks/review-chains4-experiment.patch`.
+- Per-worker mailboxes and participants=min(pool size, work items): decode
+  122.03 to 123.68 tok/s (+1.35%), prefill 1097.38 to 1117.92 (+1.87%).
+  This eliminates empty participants in four-item GQA jobs and also removes
+  the shared job mutex. Inactive workers do not read or acknowledge reused
+  job payload. Release/acquire completion protects the next mailbox write;
+  mailbox generation and completion both use atomic wait/notify.
+  Zero-spin, 64-thread oversubscription, repeated generations, empty jobs,
+  busy/reentrant rejection, all eight CTest suites and persistent-model
+  prefix/cache-precision tests pass. Full model logits are byte-identical.
+  Pool size and spin defaults remain configurable and unchanged; no universal
+  physical-core/topology optimum is inferred from this machine.
