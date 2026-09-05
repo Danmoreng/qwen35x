@@ -412,7 +412,8 @@ void causal_attention_batch_rows_avx2(
   const int head_dim,
   const float attention_scale,
   const std::size_t row_begin,
-  const std::size_t row_end) noexcept {
+  const std::size_t row_end,
+  const bool reuse_score_row) noexcept {
   const int heads_per_kv = head_count / kv_head_count;
   for (std::size_t row = row_begin; row < row_end; ++row) {
     const std::size_t token = row / static_cast<std::size_t>(head_count);
@@ -425,7 +426,7 @@ void causal_attention_batch_rows_avx2(
       static_cast<std::size_t>(kv_head) * static_cast<std::size_t>(head_dim);
     const float * query = queries + token * query_width + head_offset;
     const float * gate = gates + token * query_width + head_offset;
-    float * score_row = scores + row * context_stride;
+    float * score_row = scores + (reuse_score_row ? 0 : row * context_stride);
     float max_score = -std::numeric_limits<float>::infinity();
     for (int context = 0; context < sequence_length; ++context) {
       const std::size_t cache_offset =

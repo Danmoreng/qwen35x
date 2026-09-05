@@ -68,7 +68,8 @@ void causal_attention_batch_rows_scalar(
   const int head_dim,
   const float attention_scale,
   const std::size_t row_begin,
-  const std::size_t row_end) noexcept {
+  const std::size_t row_end,
+  const bool reuse_score_row) noexcept {
   const int heads_per_kv = head_count / kv_head_count;
   for (std::size_t row = row_begin; row < row_end; ++row) {
     const std::size_t token = row / static_cast<std::size_t>(head_count);
@@ -79,7 +80,7 @@ void causal_attention_batch_rows_scalar(
       static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim);
     const float * query = queries + token * query_width + head_offset;
     const float * gate = gates + token * query_width + head_offset;
-    float * score_row = scores + row * context_stride;
+    float * score_row = scores + (reuse_score_row ? 0 : row * context_stride);
     float max_score = -std::numeric_limits<float>::infinity();
     for (int context = 0; context < sequence_length; ++context) {
       const std::size_t cache_offset =
@@ -146,7 +147,8 @@ void causal_attention_batch_rows_avx2(
   int head_dim,
   float attention_scale,
   std::size_t row_begin,
-  std::size_t row_end) noexcept;
+  std::size_t row_end,
+  const bool reuse_score_row) noexcept;
 
 void causal_attention_decode_gqa_pairs_avx2(
   const float * queries,
@@ -208,7 +210,8 @@ void causal_attention_batch_rows(
   const float attention_scale,
   const std::size_t row_begin,
   const std::size_t row_end,
-  const Q8_0Backend backend) noexcept {
+  const Q8_0Backend backend,
+  const bool reuse_score_row) noexcept {
   if (queries == nullptr || gates == nullptr || (k_cache == nullptr && k_cache_f16 == nullptr) ||
       (v_cache == nullptr && v_cache_f16 == nullptr) || scores == nullptr || output == nullptr ||
       context_stride == 0 || query_width == 0 || kv_width == 0 ||
@@ -221,7 +224,7 @@ void causal_attention_batch_rows(
     detail::causal_attention_batch_rows_avx2(
       queries, gates, k_cache, v_cache, k_cache_f16, v_cache_f16, scores, output, context_stride,
       query_width, kv_width, position_start, head_count, kv_head_count,
-      head_dim, attention_scale, row_begin, row_end);
+      head_dim, attention_scale, row_begin, row_end, reuse_score_row);
     return;
   }
 #else
@@ -230,7 +233,7 @@ void causal_attention_batch_rows(
   detail::causal_attention_batch_rows_scalar(
     queries, gates, k_cache, v_cache, k_cache_f16, v_cache_f16, scores, output, context_stride,
     query_width, kv_width, position_start, head_count, kv_head_count,
-    head_dim, attention_scale, row_begin, row_end);
+    head_dim, attention_scale, row_begin, row_end, reuse_score_row);
 }
 
 void causal_attention_decode_gqa_pairs(
@@ -280,7 +283,7 @@ void causal_attention_decode_gqa_pairs(
     queries, gates, k_cache, v_cache, k_cache_f16, v_cache_f16,
     scores, output, context_stride, query_width, kv_width,
     sequence_length - 1, head_count, kv_head_count, head_dim, attention_scale,
-    pair_begin * 2U, pair_end * 2U);
+    pair_begin * 2U, pair_end * 2U, false);
 }
 
 } // namespace qwen35x::cpu

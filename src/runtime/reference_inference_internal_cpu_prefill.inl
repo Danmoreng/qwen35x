@@ -374,7 +374,9 @@ bool run_full_attention_batch_cpu_q8(
   const std::size_t context_stride =
     static_cast<std::size_t>(position_start) + batch_size;
   auto & scores = scratch.scores;
-  scores.resize(attention_rows * context_stride);
+  const std::size_t score_partitions = runtime != nullptr && runtime->executor != nullptr
+    ? std::min(attention_rows, runtime->executor->thread_count()) : 1;
+  scores.resize(score_partitions * context_stride);
   FullAttentionBatchCpuJob job{
     query_batch.data(),
     gate_batch.data(),
@@ -393,17 +395,19 @@ bool run_full_attention_batch_cpu_q8(
     dims.head_dim,
     attention_scale,
     layer.full.o_proj.q8_0_backend,
+    score_partitions,
+    attention_rows,
   };
   if (runtime != nullptr && runtime->executor != nullptr) {
     const cpu::CpuExecutorStatus status = runtime->executor->parallel_for_rows(
-      attention_rows, run_full_attention_batch_cpu_rows, &job);
+      score_partitions, run_full_attention_batch_cpu_rows, &job);
     if (status != cpu::CpuExecutorStatus::ok) {
       error_message = std::string("Batched full-attention CPU executor failed: ") +
         cpu::cpu_executor_status_name(status) + ".";
       return false;
     }
   } else {
-    run_full_attention_batch_cpu_rows(&job, 0, attention_rows);
+    run_full_attention_batch_cpu_rows(&job, 0, score_partitions);
   }
 
   return matmul_2d_quantized_batch(

@@ -276,6 +276,20 @@ bool test_full_attention(const Q8_0Backend backend) {
       query_width, kv_width, context - 1, heads, kv_heads, head_dim,
       1.0F / std::sqrt(static_cast<float>(head_dim)), 0,
       static_cast<std::size_t>(heads), backend);
+    std::vector<float> compact_scores(static_cast<std::size_t>(context) + 2, -12345.0F);
+    std::vector<float> compact_output(query_width, 0.0F);
+    for (const std::size_t begin : {std::size_t{0}, std::size_t{1}}) {
+      qwen35x::cpu::causal_attention_batch_rows(
+        query.data(), gate.data(), key_cache.data(), value_cache.data(), nullptr,
+        nullptr, compact_scores.data() + 1, compact_output.data(),
+        static_cast<std::size_t>(context), query_width, kv_width, context - 1,
+        heads, kv_heads, head_dim, 1.0F / std::sqrt(static_cast<float>(head_dim)),
+        begin, static_cast<std::size_t>(heads), backend, true);
+    }
+    ok = expect(std::memcmp(actual.data(), compact_output.data(), query_width * sizeof(float)) == 0,
+      "private score-row reuse changed attention output") && ok;
+    ok = expect(compact_scores.front() == -12345.0F && compact_scores.back() == -12345.0F,
+      "private score-row scratch overrun") && ok;
     for (std::size_t index = 0; index < actual.size(); ++index) {
       ok = expect(
         near_attention(expected[index], actual[index]),

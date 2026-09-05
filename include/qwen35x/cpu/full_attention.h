@@ -19,6 +19,8 @@ void attention_cache_store_f16(
 // context_stride row per flattened query row, which makes disjoint row ranges
 // safe to execute concurrently. FP16 pointers take precedence when supplied;
 // the corresponding FP32 cache may then be null, including for scalar fallback.
+// With reuse_score_row, scores needs only context_stride floats and must be
+// private to this call. Rows within the call reuse it sequentially.
 void causal_attention_batch_rows(
   const float * queries,
   const float * gates,
@@ -38,7 +40,8 @@ void causal_attention_batch_rows(
   float attention_scale,
   std::size_t row_begin,
   std::size_t row_end,
-  Q8_0Backend backend = Q8_0Backend::auto_select) noexcept;
+  Q8_0Backend backend = Q8_0Backend::auto_select,
+  bool reuse_score_row = false) noexcept;
 
 // Decode-only GQA path that evaluates two query heads sharing one KV head
 // together. pair_begin/pair_end address adjacent query-head pairs.

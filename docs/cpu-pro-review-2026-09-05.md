@@ -113,3 +113,23 @@ quality/long-context proposals are evaluated separately after this baseline.
   full model logits are byte-identical. Decode 122.19 to 122.11 tok/s and
   prefill 1668.12 to 1693.31 tok/s: no substantial speedup claimed at this context,
   retained for deterministic memory savings and removal of duplicate stores.
+
+- Register-held EVEX-256 DeltaNet-128: 122.21 to 122.38 decode tok/s
+  (+0.14%, noise). Full logits remain byte-exact; not retained without gain.
+  The local patch and kernel are in benchmarks/review-delta-experiment.patch
+  and benchmarks/review-delta-net-evex.cpp.
+- Prefill chunks: 64 versus 32 gives 1625.96 versus 1613.47 tok/s;
+  64 versus 128 gives 1651.01 versus 1670.70 tok/s. Retained 64; no robust
+  improvement established by these small differences.
+- Private reusable attention score row per partition: 1704.88 to 1708.59
+  prefill tok/s (no speed claim). With 12 threads, the 64-token/eight-head
+  chunk needs 12 context rows instead of 512. At context 32768 that is
+  1.5 MiB rather than 64 MiB (calculated, not a 32768-context timing).
+  Public kernel API retains the original score layout by default. The new
+  mode explicitly requires private scratch; each runtime partition owns one
+  row. Softmax and summation order are unchanged. Guarded scratch tests
+  cover nonzero row starts and contexts up to 2048 on all available ISAs.
+  Full logits are byte-exact for 65- and 257-token prompts, and prefix/cache
+  precision tests pass.
+
+H256 is deferred at the user's explicit request.

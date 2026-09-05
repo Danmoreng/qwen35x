@@ -523,6 +523,8 @@ struct FullAttentionBatchCpuJob {
   int head_dim = 0;
   float attention_scale = 1.0F;
   cpu::Q8_0Backend backend = cpu::Q8_0Backend::auto_select;
+  std::size_t score_partitions = 0;
+  std::size_t attention_rows = 0;
 };
 
 void run_full_attention_batch_cpu_rows(
@@ -530,12 +532,20 @@ void run_full_attention_batch_cpu_rows(
   const std::size_t row_begin,
   const std::size_t row_end) noexcept {
   auto & job = *static_cast<FullAttentionBatchCpuJob *>(opaque_context);
-  cpu::causal_attention_batch_rows(
-    job.queries, job.gates, job.k_cache, job.v_cache,
-    job.k_cache_f16, job.v_cache_f16, job.scores, job.output,
-    job.context_stride, job.query_width, job.kv_width, job.position_start,
-    job.head_count, job.kv_head_count, job.head_dim, job.attention_scale,
-    row_begin, row_end, job.backend);
+  // Each job item owns one scratch row; a worker can process several items.
+  for (std::size_t partition = row_begin; partition < row_end; ++partition) {
+    const std::size_t base = job.attention_rows / job.score_partitions;
+    const std::size_t extra = job.attention_rows % job.score_partitions;
+    const std::size_t begin = partition * base + std::min(partition, extra);
+    const std::size_t end = begin + base + (partition < extra ? 1 : 0);
+    cpu::causal_attention_batch_rows(
+      job.queries, job.gates, job.k_cache, job.v_cache,
+      job.k_cache_f16, job.v_cache_f16,
+      job.scores + partition * job.context_stride, job.output,
+      job.context_stride, job.query_width, job.kv_width, job.position_start,
+      job.head_count, job.kv_head_count, job.head_dim, job.attention_scale,
+      begin, end, job.backend, true);
+  }
 }
 
 void run_full_attention_decode_cpu_pairs(
