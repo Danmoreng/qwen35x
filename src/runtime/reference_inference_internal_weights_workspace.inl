@@ -16,8 +16,25 @@ struct CpuDecodeWorkspace {
   } full;
 };
 
+// Separate from decode and from each nested stage; all jobs finish before reuse.
+struct CpuPrefillWorkspace {
+  struct Forward {
+    std::vector<float> x, normed, attention, residual, post_norm;
+    std::vector<float> gate_up, mlp_hidden, mlp_output, final_hidden;
+  } forward;
+  struct Linear {
+    std::vector<float> projected, gated, conv_batch;
+    std::vector<float> q_batch, k_batch, v_batch, alpha_batch, beta_batch, core_batch;
+  } linear;
+  struct Full {
+    std::vector<float> projected, attention, query_batch, gate_batch;
+    std::vector<float> q, q_normed, k_normed, scores;
+  } full;
+};
+
 struct CpuQ8Runtime {
   CpuDecodeWorkspace decode;
+  CpuPrefillWorkspace prefill;
   std::unique_ptr<cpu::CpuExecutor> executor;
   std::vector<float> q4_h128_transform_scratch;
   std::vector<cpu::Q8_0Block> quantized_input;

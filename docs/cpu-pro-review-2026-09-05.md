@@ -93,3 +93,13 @@ quality/long-context proposals are evaluated separately after this baseline.
   prefix/cache-precision tests pass. Full model logits are byte-identical.
   Pool size and spin defaults remain configurable and unchanged; no universal
   physical-core/topology optimum is inferred from this machine.
+
+- Persistent per-session prefill workspaces, with separate buffers for forward,
+  linear and full attention: 1110.68 to 1696.05 prefill tok/s (+52.70%).
+  Linear attention normalizes Q/K directly in the convolution output and
+  writes alpha/beta directly into the head-major batch layout. Full attention
+  writes gates directly into the batch output; final normalization consumes
+  the last hidden row without copying. Arithmetic order is unchanged.
+  All eight CTest suites, byte-exact full-model logits and persistent-session
+  prefix/FP16/FP32 switch tests pass. Retained capacities trade resident scratch
+  memory for removal of per-layer allocations and zero-initializations.

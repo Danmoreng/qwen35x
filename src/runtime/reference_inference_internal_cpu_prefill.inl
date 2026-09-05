@@ -105,7 +105,10 @@ bool run_linear_attention_batch_cpu_q8(
     return false;
   }
 
-  std::vector<float> projected;
+  CpuQ8Runtime * const runtime = layer.linear.out_proj.q8_0_runtime;
+  CpuPrefillWorkspace::Linear fallback;
+  auto & scratch = runtime != nullptr ? runtime->prefill.linear : fallback;
+  auto & projected = scratch.projected;
   if (!matmul_2d_quantized_batch(
         layer.linear.in_proj_all_cpu, input, batch_size, projected, error_message)) {
     return false;
@@ -115,22 +118,23 @@ bool run_linear_attention_batch_cpu_q8(
     return false;
   }
 
-  std::vector<float> gated(batch_size * value_width);
-  std::vector<float> conv_batch(batch_size * conv_channels);
-  std::vector<float> q(q_width);
-  std::vector<float> k(q_width);
-  std::vector<float> v(value_width);
-  std::vector<float> alpha(head_count);
-  std::vector<float> beta(head_count);
-  std::vector<float> q_batch(batch_size * q_width);
-  std::vector<float> k_batch(batch_size * q_width);
-  std::vector<float> v_batch(batch_size * value_width);
-  std::vector<float> alpha_batch(batch_size * head_count);
-  std::vector<float> beta_batch(batch_size * head_count);
-  std::vector<float> core_batch(batch_size * value_width);
+  auto & gated = scratch.gated;
+  gated.resize(batch_size * value_width);
+  auto & conv_batch = scratch.conv_batch;
+  conv_batch.resize(batch_size * conv_channels);
+  auto & q_batch = scratch.q_batch;
+  q_batch.resize(batch_size * q_width);
+  auto & k_batch = scratch.k_batch;
+  k_batch.resize(batch_size * q_width);
+  auto & v_batch = scratch.v_batch;
+  v_batch.resize(batch_size * value_width);
+  auto & alpha_batch = scratch.alpha_batch;
+  alpha_batch.resize(batch_size * head_count);
+  auto & beta_batch = scratch.beta_batch;
+  beta_batch.resize(batch_size * head_count);
+  auto & core_batch = scratch.core_batch;
+  core_batch.resize(batch_size * value_width);
   const float q_scale = 1.0F / std::sqrt(static_cast<float>(dims.linear_head_k_dim));
-  CpuQ8Runtime * const runtime = layer.linear.out_proj.q8_0_runtime;
-
   CausalConvBatchCpuJob conv_job{
     state.conv_state.data(),
     state.conv_ring_index,
@@ -168,15 +172,15 @@ bool run_linear_attention_batch_cpu_q8(
     const float * a = b + head_count;
 
     for (std::size_t head = 0; head < head_count; ++head) {
-      beta[head] = sigmoidf_stable(b[head]);
+      beta_batch[head * batch_size + token] = sigmoidf_stable(b[head]);
       const float pre_gate = softplusf_stable(a[head] + layer.linear.dt_bias.data[head]);
-      alpha[head] = std::exp(pre_gate * layer.linear.ssm_a[head]);
+      alpha_batch[head * batch_size + token] = std::exp(pre_gate * layer.linear.ssm_a[head]);
     }
 
-    const float * conv_out = conv_batch.data() + token * conv_channels;
-    std::memcpy(q.data(), conv_out, q_width * sizeof(float));
-    std::memcpy(k.data(), conv_out + q_width, q_width * sizeof(float));
-    std::memcpy(v.data(), conv_out + 2 * q_width, value_width * sizeof(float));
+    float * conv_out = conv_batch.data() + token * conv_channels;
+    std::span<float> q(conv_out, q_width);
+    std::span<float> k(conv_out + q_width, q_width);
+    const float * v = conv_out + 2 * q_width;
     l2_norm_per_head(
       q, dims.linear_num_k_heads, dims.linear_head_k_dim, 1.0e-6F, q_scale);
     l2_norm_per_head(k, dims.linear_num_k_heads, dims.linear_head_k_dim);
@@ -192,10 +196,8 @@ bool run_linear_attention_batch_cpu_q8(
         key_dim * sizeof(float));
       std::memcpy(
         v_batch.data() + head_token * value_dim,
-        v.data() + head * value_dim,
+        v + head * value_dim,
         value_dim * sizeof(float));
-      alpha_batch[head_token] = alpha[head];
-      beta_batch[head_token] = beta[head];
     }
   }
 
@@ -276,7 +278,10 @@ bool run_full_attention_batch_cpu_q8(
   const std::size_t q_full_width = 2 * query_width;
   const std::size_t kv_width = static_cast<std::size_t>(dims.n_kv_heads * dims.head_dim);
   const std::size_t projection_width = q_full_width + 2 * kv_width;
-  std::vector<float> projected;
+  CpuQ8Runtime * const runtime = layer.full.o_proj.q8_0_runtime;
+  CpuPrefillWorkspace::Full fallback;
+  auto & scratch = runtime != nullptr ? runtime->prefill.full : fallback;
+  auto & projected = scratch.projected;
   if (!matmul_2d_quantized_batch(
         layer.full.qkv_proj_cpu, input, batch_size, projected, error_message)) {
     return false;
@@ -286,14 +291,16 @@ bool run_full_attention_batch_cpu_q8(
     return false;
   }
 
-  std::vector<float> attention(batch_size * query_width);
-  std::vector<float> query_batch(batch_size * query_width);
-  std::vector<float> gate_batch(batch_size * query_width);
-  std::vector<float> q(query_width);
-  std::vector<float> gate(query_width);
-  std::vector<float> k_flat(kv_width);
-  std::vector<float> q_normed;
-  std::vector<float> k_normed;
+  auto & attention = scratch.attention;
+  attention.resize(batch_size * query_width);
+  auto & query_batch = scratch.query_batch;
+  query_batch.resize(batch_size * query_width);
+  auto & gate_batch = scratch.gate_batch;
+  gate_batch.resize(batch_size * query_width);
+  auto & q = scratch.q;
+  q.resize(query_width);
+  auto & q_normed = scratch.q_normed;
+  auto & k_normed = scratch.k_normed;
   const int q_span = 2 * dims.head_dim;
   const float attention_scale = 1.0F / std::sqrt(static_cast<float>(dims.head_dim));
   const int rope_half = dims.rope_dim / 2;
@@ -312,15 +319,14 @@ bool run_full_attention_batch_cpu_q8(
         q_full + source,
         static_cast<std::size_t>(dims.head_dim) * sizeof(float));
       std::memcpy(
-        gate.data() + destination,
+        gate_batch.data() + token * query_width + destination,
         q_full + source + static_cast<std::size_t>(dims.head_dim),
         static_cast<std::size_t>(dims.head_dim) * sizeof(float));
     }
-    std::memcpy(k_flat.data(), k_source, kv_width * sizeof(float));
     rms_norm_per_head_qwen3next(
       q, dims.n_heads, dims.head_dim, layer.full.q_norm, dims.rms_eps, q_normed);
     rms_norm_per_head_qwen3next(
-      k_flat, dims.n_kv_heads, dims.head_dim, layer.full.k_norm, dims.rms_eps, k_normed);
+      std::span<const float>(k_source, kv_width), dims.n_kv_heads, dims.head_dim, layer.full.k_norm, dims.rms_eps, k_normed);
     const float * token_cosine =
       rope_cosine + token * static_cast<std::size_t>(rope_half);
     const float * token_sine =
@@ -337,10 +343,6 @@ bool run_full_attention_batch_cpu_q8(
     std::memcpy(
       query_batch.data() + token * query_width,
       q_normed.data(),
-      query_width * sizeof(float));
-    std::memcpy(
-      gate_batch.data() + token * query_width,
-      gate.data(),
       query_width * sizeof(float));
 
     std::memcpy(
@@ -369,7 +371,8 @@ bool run_full_attention_batch_cpu_q8(
     batch_size * static_cast<std::size_t>(dims.n_heads);
   const std::size_t context_stride =
     static_cast<std::size_t>(position_start) + batch_size;
-  std::vector<float> scores(attention_rows * context_stride);
+  auto & scores = scratch.scores;
+  scores.resize(attention_rows * context_stride);
   FullAttentionBatchCpuJob job{
     query_batch.data(),
     gate_batch.data(),
@@ -389,7 +392,6 @@ bool run_full_attention_batch_cpu_q8(
     attention_scale,
     layer.full.o_proj.q8_0_backend,
   };
-  CpuQ8Runtime * const runtime = layer.full.o_proj.q8_0_runtime;
   if (runtime != nullptr && runtime->executor != nullptr) {
     const cpu::CpuExecutorStatus status = runtime->executor->parallel_for_rows(
       attention_rows, run_full_attention_batch_cpu_rows, &job);
@@ -434,7 +436,9 @@ bool run_forward_cpu_q8_batch(
   }
 
   const auto embedding_start = std::chrono::steady_clock::now();
-  std::vector<float> x(batch_size * hidden);
+  auto & scratch = weights.cpu_q8_runtime->prefill.forward;
+  auto & x = scratch.x;
+  x.resize(batch_size * hidden);
   for (std::size_t token = 0; token < batch_size; ++token) {
     const int token_id = token_ids[token];
     if (token_id < 0 || token_id >= dims.vocab_size) {
@@ -459,13 +463,15 @@ bool run_forward_cpu_q8_batch(
     profiling->embedding_ms += elapsed_ms(embedding_start);
   }
 
-  std::vector<float> normed;
-  std::vector<float> attention;
-  std::vector<float> residual(batch_size * hidden);
-  std::vector<float> post_norm;
-  std::vector<float> gate_up;
-  std::vector<float> mlp_hidden(batch_size * intermediate);
-  std::vector<float> mlp_output;
+  auto & normed = scratch.normed;
+  auto & attention = scratch.attention;
+  auto & residual = scratch.residual;
+  residual.resize(batch_size * hidden);
+  auto & post_norm = scratch.post_norm;
+  auto & gate_up = scratch.gate_up;
+  auto & mlp_hidden = scratch.mlp_hidden;
+  mlp_hidden.resize(batch_size * intermediate);
+  auto & mlp_output = scratch.mlp_output;
   int full_index = 0;
   int linear_index = 0;
 
@@ -543,9 +549,10 @@ bool run_forward_cpu_q8_batch(
   }
   const auto logits_start = std::chrono::steady_clock::now();
   const float * last_hidden = x.data() + (batch_size - 1) * hidden;
-  std::vector<float> final_input(last_hidden, last_hidden + hidden);
-  std::vector<float> final_hidden;
-  rms_norm_qwen3next(final_input, weights.final_norm, dims.rms_eps, final_hidden);
+  auto & final_hidden = scratch.final_hidden;
+  final_hidden.resize(hidden);
+  cpu::rms_norm_f32(last_hidden, weights.final_norm.data.data(), final_hidden.data(),
+    1, hidden, dims.rms_eps, 1.0F);
   bool ok = false;
   if (greedy_sampling != nullptr && greedy_sampling->enabled &&
       greedy_sampling->token_counts != nullptr) {
