@@ -345,14 +345,16 @@ bool run_full_attention_batch_cpu_q8(
       q_normed.data(),
       query_width * sizeof(float));
 
-    std::memcpy(
-      state.k_cache.data() + static_cast<std::size_t>(position) * kv_width,
-      k_normed.data(),
-      kv_width * sizeof(float));
-    std::memcpy(
-      state.v_cache.data() + static_cast<std::size_t>(position) * kv_width,
-      v_flat,
-      kv_width * sizeof(float));
+    if (!state.k_cache.empty()) {
+      std::memcpy(
+        state.k_cache.data() + static_cast<std::size_t>(position) * kv_width,
+        k_normed.data(),
+        kv_width * sizeof(float));
+      std::memcpy(
+        state.v_cache.data() + static_cast<std::size_t>(position) * kv_width,
+        v_flat,
+        kv_width * sizeof(float));
+    }
     if (!state.k_cache_f16.empty() && !state.v_cache_f16.empty()) {
       cpu::attention_cache_store_f16(
         k_normed.data(),

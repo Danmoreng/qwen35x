@@ -492,15 +492,14 @@ bool run_reference_qwen35_inference(
   result.cpu_q4_dot4 = weights.embed_tokens.q4_dot4;
   state.full_states.resize(static_cast<std::size_t>(full_layers));
   for (auto & fs : state.full_states) {
-    fs.k_cache.resize(
-      static_cast<std::size_t>(options.max_context) * static_cast<std::size_t>(dims.n_kv_heads) *
-      static_cast<std::size_t>(dims.head_dim));
-    fs.v_cache.resize(
-      static_cast<std::size_t>(options.max_context) * static_cast<std::size_t>(dims.n_kv_heads) *
-      static_cast<std::size_t>(dims.head_dim));
+    const std::size_t cache_values = static_cast<std::size_t>(options.max_context) *
+      static_cast<std::size_t>(dims.n_kv_heads) * static_cast<std::size_t>(dims.head_dim);
     if (use_f16_cpu_cache) {
-      fs.k_cache_f16.resize(fs.k_cache.size());
-      fs.v_cache_f16.resize(fs.v_cache.size());
+      fs.k_cache_f16.resize(cache_values);
+      fs.v_cache_f16.resize(cache_values);
+    } else {
+      fs.k_cache.resize(cache_values);
+      fs.v_cache.resize(cache_values);
     }
     if (options.use_cuda) {
       if (!cuda::allocate_buffer_f32(fs.k_cache.size(), fs.k_cache_device, error_message) ||

@@ -532,14 +532,16 @@ bool run_full_attention_step(
     rope_cosine, rope_sine, layer.full.o_proj.q8_0_backend);
 
   const std::size_t token_stride = static_cast<std::size_t>(dims.n_kv_heads * dims.head_dim);
-  std::memcpy(
-    state.k_cache.data() + static_cast<std::size_t>(position) * token_stride,
-    k_normed.data(),
-    token_stride * sizeof(float));
-  std::memcpy(
-    state.v_cache.data() + static_cast<std::size_t>(position) * token_stride,
-    v_values,
-    token_stride * sizeof(float));
+  if (!state.k_cache.empty()) {
+    std::memcpy(
+      state.k_cache.data() + static_cast<std::size_t>(position) * token_stride,
+      k_normed.data(),
+      token_stride * sizeof(float));
+    std::memcpy(
+      state.v_cache.data() + static_cast<std::size_t>(position) * token_stride,
+      v_values,
+      token_stride * sizeof(float));
+  }
 
   const bool use_cuda_full_kernel =
     use_cuda && state.has_device_state && cuda_workspace != nullptr && cuda_workspace->has_device_buffers &&

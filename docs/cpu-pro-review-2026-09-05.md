@@ -103,3 +103,13 @@ quality/long-context proposals are evaluated separately after this baseline.
   All eight CTest suites, byte-exact full-model logits and persistent-session
   prefix/FP16/FP32 switch tests pass. Retained capacities trade resident scratch
   memory for removal of per-layer allocations and zero-initializations.
+
+- FP16-only KV storage: remove the unused FP32 mirror when FP16 is selected.
+  At context 256 the six full-attention layers use 3 MiB rather than 9 MiB
+  for K/V arrays. FP32 mode remains unchanged. Prefix snapshots already store
+  only the selected representation and invalidate on precision/backend changes;
+  no FP32 reconstruction from rounded FP16 is attempted. Scalar attention now
+  also accepts FP16-only pointers. Kernel and session-switch tests pass, and
+  full model logits are byte-identical. Decode 122.19 to 122.11 tok/s and
+  prefill 1668.12 to 1693.31 tok/s: no substantial speedup claimed at this context,
+  retained for deterministic memory savings and removal of duplicate stores.

@@ -1,4 +1,5 @@
 #include "qwen35x/cpu/full_attention.h"
+#include "q8_0_internal.h"
 
 #include <algorithm>
 #include <bit>
@@ -54,8 +55,8 @@ void causal_attention_batch_rows_scalar(
   const float * gates,
   const float * k_cache,
   const float * v_cache,
-  const std::uint16_t *,
-  const std::uint16_t *,
+  const std::uint16_t * k_cache_f16,
+  const std::uint16_t * v_cache_f16,
   float * scores,
   float * output,
   const std::size_t context_stride,
@@ -81,12 +82,13 @@ void causal_attention_batch_rows_scalar(
     float * score_row = scores + row * context_stride;
     float max_score = -std::numeric_limits<float>::infinity();
     for (int context = 0; context < sequence_length; ++context) {
-      const float * cached_k = k_cache +
+      const std::size_t cache_offset =
         static_cast<std::size_t>(context) * kv_width +
         static_cast<std::size_t>(kv_head * head_dim);
       float dot = 0.0F;
       for (int column = 0; column < head_dim; ++column) {
-        dot += query[static_cast<std::size_t>(column)] * cached_k[column];
+        dot += query[static_cast<std::size_t>(column)] * (k_cache_f16 != nullptr
+          ? half_to_float(k_cache_f16[cache_offset + column]) : k_cache[cache_offset + column]);
       }
       dot *= attention_scale;
       score_row[static_cast<std::size_t>(context)] = dot;
@@ -105,11 +107,12 @@ void causal_attention_batch_rows_scalar(
     for (int context = 0; context < sequence_length; ++context) {
       const float probability =
         score_row[static_cast<std::size_t>(context)] * inverse_denominator;
-      const float * cached_v = v_cache +
+      const std::size_t cache_offset =
         static_cast<std::size_t>(context) * kv_width +
         static_cast<std::size_t>(kv_head * head_dim);
       for (int column = 0; column < head_dim; ++column) {
-        output_head[static_cast<std::size_t>(column)] += probability * cached_v[column];
+        output_head[static_cast<std::size_t>(column)] += probability * (v_cache_f16 != nullptr
+          ? half_to_float(v_cache_f16[cache_offset + column]) : v_cache[cache_offset + column]);
       }
     }
     for (int column = 0; column < head_dim; ++column) {
@@ -206,8 +209,8 @@ void causal_attention_batch_rows(
   const std::size_t row_begin,
   const std::size_t row_end,
   const Q8_0Backend backend) noexcept {
-  if (queries == nullptr || gates == nullptr || k_cache == nullptr ||
-      v_cache == nullptr || scores == nullptr || output == nullptr ||
+  if (queries == nullptr || gates == nullptr || (k_cache == nullptr && k_cache_f16 == nullptr) ||
+      (v_cache == nullptr && v_cache_f16 == nullptr) || scores == nullptr || output == nullptr ||
       context_stride == 0 || query_width == 0 || kv_width == 0 ||
       position_start < 0 || head_count <= 0 || kv_head_count <= 0 ||
       head_dim <= 0 || (head_count % kv_head_count) != 0 || row_begin >= row_end) {
@@ -251,8 +254,8 @@ void causal_attention_decode_gqa_pairs(
   const std::size_t pair_end,
   const Q8_0Backend backend) noexcept {
   const std::size_t pair_count = static_cast<std::size_t>(head_count) / 2U;
-  if (queries == nullptr || gates == nullptr || k_cache == nullptr ||
-      v_cache == nullptr || scores == nullptr || output == nullptr ||
+  if (queries == nullptr || gates == nullptr || (k_cache == nullptr && k_cache_f16 == nullptr) ||
+      (v_cache == nullptr && v_cache_f16 == nullptr) || scores == nullptr || output == nullptr ||
       context_stride < static_cast<std::size_t>(sequence_length) ||
       query_width == 0 || kv_width == 0 || sequence_length <= 0 ||
       head_count <= 0 || kv_head_count <= 0 || head_dim <= 0 ||

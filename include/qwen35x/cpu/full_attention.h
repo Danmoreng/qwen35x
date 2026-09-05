@@ -17,7 +17,8 @@ void attention_cache_store_f16(
 // Queries, gates, and output are token-major. K/V cache entries are
 // [context, kv_head, head_dim]. Scores is caller-owned scratch with one
 // context_stride row per flattened query row, which makes disjoint row ranges
-// safe to execute concurrently.
+// safe to execute concurrently. FP16 pointers take precedence when supplied;
+// the corresponding FP32 cache may then be null, including for scalar fallback.
 void causal_attention_batch_rows(
   const float * queries,
   const float * gates,
