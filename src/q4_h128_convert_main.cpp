@@ -5,6 +5,7 @@
 #include "qwen35x/weights/q4_h128_artifact.h"
 #include "qwen35x/weights/safetensors.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -174,44 +175,116 @@ bool shape_matches(
   return true;
 }
 
+struct ConversionTensor {
+  Q4H128TensorInfo output;
+  std::vector<Q4H128TensorInfo> sources;
+};
+
+std::vector<ConversionTensor> plan_conversion(
+  const std::vector<Q4H128TensorInfo> & sources, const bool cpu_packed) {
+  std::vector<ConversionTensor> plan;
+  for (const auto & source : sources) {
+    auto output = source;
+    if (cpu_packed && source.encoding != Q4H128TensorEncoding::f32) {
+      output.encoding = source.encoding == Q4H128TensorEncoding::q4_h128
+        ? Q4H128TensorEncoding::q4_h128_cpu_x8
+        : Q4H128TensorEncoding::q4_0_cpu_x8;
+      const std::pair<const char *, const char *> merges[] = {
+        {"mlp.gate_proj.weight", "mlp.gate_up_proj.weight"},
+        {"mlp.up_proj.weight", "mlp.gate_up_proj.weight"},
+        {"linear_attn.in_proj_qkv.weight", "linear_attn.in_proj_all.weight"},
+        {"linear_attn.in_proj_z.weight", "linear_attn.in_proj_all.weight"},
+        {"linear_attn.in_proj_b.weight", "linear_attn.in_proj_all.weight"},
+        {"linear_attn.in_proj_a.weight", "linear_attn.in_proj_all.weight"},
+        {"self_attn.q_proj.weight", "self_attn.qkv_proj.weight"},
+        {"self_attn.k_proj.weight", "self_attn.qkv_proj.weight"},
+        {"self_attn.v_proj.weight", "self_attn.qkv_proj.weight"},
+      };
+      for (const auto & merge : merges) {
+        const std::string suffix = merge.first;
+        if (output.name.size() >= suffix.size() &&
+            output.name.compare(output.name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+          output.name.replace(output.name.size() - suffix.size(), suffix.size(), merge.second);
+          break;
+        }
+      }
+    }
+    const auto existing = std::find_if(plan.begin(), plan.end(), [&](const auto & item) {
+      return item.output.name == output.name;
+    });
+    if (existing == plan.end()) {
+      plan.push_back({output, {source}});
+    } else {
+      existing->output.shape[0] += source.shape[0];
+      existing->sources.push_back(source);
+    }
+  }
+  return plan;
+}
+
 bool convert_tensor(
   const std::string & model_dir,
-  const Q4H128TensorInfo & info,
+  const ConversionTensor & conversion,
   qwen35x::Q4H128ArtifactWriter & writer,
   std::string & error) {
-  qwen35x::SafetensorTensorF32 tensor;
-  if (!qwen35x::SafetensorLoader::read_tensor_f32(
-        model_dir, info.name, tensor, error)) {
-    return false;
-  }
-  if (!shape_matches(tensor.shape, info.shape)) {
-    error = "Safetensors shape mismatch for '" + info.name + "'.";
-    return false;
-  }
-
-  if (info.encoding == Q4H128TensorEncoding::f32) {
-    return writer.write_tensor(
-      info.name, tensor.data.data(), tensor.data.size() * sizeof(float), error);
-  }
-
-  const std::size_t block_count =
-    tensor.data.size() / qwen35x::cpu::q4_0_values_per_block;
-  std::vector<qwen35x::cpu::Q4_0Block> blocks(block_count);
-  if (info.encoding == Q4H128TensorEncoding::q4_h128) {
-    if (info.shape.size() != 2 ||
-        !qwen35x::cpu::q4_h128_quantize_matrix(
-          tensor.data.data(), blocks.data(),
-          static_cast<std::size_t>(info.shape[0]),
-          static_cast<std::size_t>(info.shape[1]), info.sign_seed)) {
-      error = "Q4_H128 projection conversion failed for '" + info.name + "'.";
+  const auto & info = conversion.output;
+  const bool packed = qwen35x::q4_h128_encoding_cpu_packed(info.encoding);
+  std::vector<qwen35x::cpu::Q4_0BlockX8> packed_blocks;
+  if (packed) {
+    const auto size = qwen35x::q4_h128_payload_size(info.encoding, info.shape, error);
+    if (size == 0 || size > std::numeric_limits<std::size_t>::max()) {
       return false;
     }
-  } else {
-    qwen35x::cpu::q4_h128_quantize_transformed(
-      tensor.data.data(), blocks.data(), block_count);
+    packed_blocks.resize(static_cast<std::size_t>(size) / sizeof(packed_blocks[0]));
+  }
+  std::size_t packed_offset = 0;
+  for (const auto & source : conversion.sources) {
+    qwen35x::SafetensorTensorF32 tensor;
+    if (!qwen35x::SafetensorLoader::read_tensor_f32(
+          model_dir, source.name, tensor, error)) {
+      return false;
+    }
+    if (!shape_matches(tensor.shape, source.shape)) {
+      error = "Safetensors shape mismatch for '" + source.name + "'.";
+      return false;
+    }
+    if (source.encoding == Q4H128TensorEncoding::f32) {
+      return writer.write_tensor(
+        info.name, tensor.data.data(), tensor.data.size() * sizeof(float), error);
+    }
+    const std::size_t block_count = tensor.data.size() / qwen35x::cpu::q4_0_values_per_block;
+    std::vector<qwen35x::cpu::Q4_0Block> blocks(block_count);
+    if (source.encoding == Q4H128TensorEncoding::q4_h128) {
+      if (!qwen35x::cpu::q4_h128_quantize_matrix(
+            tensor.data.data(), blocks.data(),
+            static_cast<std::size_t>(source.shape[0]),
+            static_cast<std::size_t>(source.shape[1]), source.sign_seed)) {
+        error = "Q4_H128 projection conversion failed for '" + source.name + "'.";
+        return false;
+      }
+    } else {
+      qwen35x::cpu::q4_h128_quantize_transformed(tensor.data.data(), blocks.data(), block_count);
+    }
+    if (!packed) {
+      return writer.write_tensor(info.name, blocks.data(), blocks.size() * sizeof(blocks[0]), error);
+    }
+    if (source.shape[0] % qwen35x::cpu::q4_0_packed_rows != 0 ||
+        block_count / 8 > packed_blocks.size() - packed_offset) {
+      error = "CPU packing requires aligned source rows: " + source.name;
+      return false;
+    }
+    qwen35x::cpu::q4_0_pack_rows_8(
+      blocks.data(), packed_blocks.data() + packed_offset,
+      static_cast<std::size_t>(source.shape[0]),
+      static_cast<std::size_t>(source.shape[1]) / qwen35x::cpu::q4_0_values_per_block);
+    packed_offset += block_count / 8;
+  }
+  if (packed_offset != packed_blocks.size()) {
+    error = "CPU packing did not fill the output tensor: " + info.name;
+    return false;
   }
   return writer.write_tensor(
-    info.name, blocks.data(), blocks.size() * sizeof(qwen35x::cpu::Q4_0Block), error);
+    info.name, packed_blocks.data(), packed_blocks.size() * sizeof(packed_blocks[0]), error);
 }
 
 } // namespace
@@ -219,14 +292,17 @@ bool convert_tensor(
 int main(int argc, char ** argv) {
   std::string model_dir;
   std::string output_path;
+  std::string layout = "cpu-packed";
   for (int index = 1; index < argc; ++index) {
     const std::string argument = argv[index];
     if (argument == "--hf-model-dir" && index + 1 < argc) {
       model_dir = argv[++index];
     } else if (argument == "--output" && index + 1 < argc) {
       output_path = argv[++index];
+    } else if (argument == "--layout" && index + 1 < argc) {
+      layout = argv[++index];
     } else if (argument == "--help") {
-      std::cout << "Usage: qwen35x_q4_h128_convert --hf-model-dir <dir> --output <file>\n";
+      std::cout << "Usage: qwen35x_q4_h128_convert --hf-model-dir <dir> --output <file> [--layout cpu-packed|canonical]\n";
       return 0;
     } else {
       std::cerr << "Unknown or incomplete argument: " << argument << '\n';
@@ -235,6 +311,10 @@ int main(int argc, char ** argv) {
   }
   if (model_dir.empty() || output_path.empty()) {
     std::cerr << "Both --hf-model-dir and --output are required.\n";
+    return 2;
+  }
+  if (layout != "cpu-packed" && layout != "canonical") {
+    std::cerr << "Unknown layout: " << layout << '\n';
     return 2;
   }
   namespace fs = std::filesystem;
@@ -262,6 +342,12 @@ int main(int argc, char ** argv) {
     return 3;
   }
 
+  const auto conversion = plan_conversion(tensors, layout == "cpu-packed");
+  tensors.clear();
+  for (const auto & item : conversion) {
+    tensors.push_back(item.output);
+  }
+
   const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
   const fs::path partial = output_path + ".partial." + std::to_string(nonce);
   qwen35x::Q4H128ArtifactWriter writer;
@@ -271,7 +357,7 @@ int main(int argc, char ** argv) {
   }
   for (std::size_t index = 0; index < tensors.size(); ++index) {
     const auto started = std::chrono::steady_clock::now();
-    if (!convert_tensor(model_dir, tensors[index], writer, error)) {
+    if (!convert_tensor(model_dir, conversion[index], writer, error)) {
       writer.close();
       std::error_code ignored;
       fs::remove(partial, ignored);

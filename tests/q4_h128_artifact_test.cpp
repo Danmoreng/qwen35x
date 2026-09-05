@@ -64,8 +64,40 @@ int main() {
 
   bool ok = true;
   std::string error;
+  auto packed_projection = projection;
+  packed_projection.name = "packed.projection.weight";
+  packed_projection.encoding = qwen35x::Q4H128TensorEncoding::q4_h128_cpu_x8;
+  auto packed_embedding = packed_projection;
+  packed_embedding.name = "packed.embedding.weight";
+  packed_embedding.encoding = qwen35x::Q4H128TensorEncoding::q4_0_cpu_x8;
+  packed_embedding.transform_size = 0;
+  packed_embedding.sign_seed = 0;
+  std::vector<qwen35x::cpu::Q4_0BlockX8> packed_data(4);
+  qwen35x::cpu::q4_0_pack_rows_8(projection_data.data(), packed_data.data(), 8, 4);
+  for (const auto encoding : {packed_projection.encoding, packed_embedding.encoding}) {
+    ok = expect(qwen35x::q4_h128_payload_size(encoding, {7, 128}, error) == 0,
+                "packed encoding accepted incomplete row tile") && ok;
+    ok = expect(qwen35x::q4_h128_payload_size(encoding, {8, 129}, error) == 0,
+                "packed encoding accepted incomplete column tile") && ok;
+    ok = expect(qwen35x::q4_h128_payload_size(encoding, {1024}, error) == 0,
+                "packed encoding accepted non-matrix") && ok;
+  }
+  ok = expect(qwen35x::q4_h128_payload_size(packed_projection.encoding, {8, 32}, error) == 0,
+              "packed H128 accepted partial transform") && ok;
+  ok = expect(qwen35x::q4_h128_payload_size(packed_embedding.encoding, {8, 32}, error) == 144,
+              "untransformed packed Q4 rejected 32-column tile") && ok;
+  error.clear();
   qwen35x::Q4H128ArtifactWriter writer;
-  ok = expect(writer.open(path.string(), metadata, {norm, projection}, error),
+  auto invalid_projection = packed_projection;
+  invalid_projection.transform_size = 64;
+  ok = expect(!writer.open(path.string(), metadata, {invalid_projection}, error),
+              "packed H128 accepted incompatible transform metadata") && ok;
+  auto invalid_embedding = packed_embedding;
+  invalid_embedding.scale_group = 64;
+  ok = expect(!writer.open(path.string(), metadata, {invalid_embedding}, error),
+              "packed embedding accepted incompatible scale group") && ok;
+  error.clear();
+  ok = expect(writer.open(path.string(), metadata, {norm, projection, packed_projection, packed_embedding}, error),
               error.c_str()) && ok;
   ok = expect(writer.write_tensor(
                 norm.name, norm_data.data(), norm_data.size() * sizeof(float), error),
@@ -74,6 +106,10 @@ int main() {
                 projection.name, projection_data.data(),
                 projection_data.size() * sizeof(qwen35x::cpu::Q4_0Block), error),
               error.c_str()) && ok;
+  for (const auto & info : {packed_projection, packed_embedding}) {
+    ok = expect(writer.write_tensor(info.name, packed_data.data(),
+                  packed_data.size() * sizeof(packed_data[0]), error), error.c_str()) && ok;
+  }
   ok = expect(writer.finalize(error), error.c_str()) && ok;
 
   qwen35x::Q4H128ArtifactReader reader;
@@ -90,6 +126,19 @@ int main() {
                 std::memcmp(bytes.data(), projection_data.data(), bytes.size()) == 0,
               "artifact tensor payload mismatch") && ok;
   const std::uint64_t projection_offset = loaded == nullptr ? 0 : loaded->data_offset;
+  const auto * packed_info = reader.find_tensor(packed_projection.name);
+  const std::uint64_t packed_offset = packed_info == nullptr ? 0 : packed_info->data_offset;
+  std::vector<qwen35x::cpu::Q4_0BlockX8> direct(4);
+  for (const auto & info : {packed_projection, packed_embedding}) {
+    ok = expect(reader.read_tensor_into(info.name, direct.data(),
+                  direct.size() * sizeof(direct[0]), error), error.c_str()) && ok;
+    ok = expect(std::memcmp(direct.data(), packed_data.data(), direct.size() * sizeof(direct[0])) == 0,
+                "direct CPU-packed payload differs") && ok;
+  }
+  ok = expect(!reader.read_tensor_into(packed_projection.name, direct.data(), 1, error),
+              "direct read accepted wrong buffer size") && ok;
+  ok = expect(!reader.read_tensor_into(packed_projection.name, nullptr, 576, error),
+              "direct read accepted null buffer") && ok;
   reader.close();
 
   // A payload mutation must pass structural indexing but fail checksum
@@ -107,6 +156,17 @@ int main() {
   ok = expect(reader.open(path.string(), error), "mutated artifact header was rejected") && ok;
   ok = expect(!reader.read_tensor_bytes(projection.name, bytes, error),
               "mutated payload passed checksum validation") && ok;
+  reader.close();
+  if (packed_offset != 0) {
+    std::fstream corrupt(path, std::ios::binary | std::ios::in | std::ios::out);
+    corrupt.seekp(static_cast<std::streamoff>(packed_offset), std::ios::beg);
+    const char value = 0x7f;
+    corrupt.write(&value, 1);
+  }
+  ok = expect(reader.open(path.string(), error), "packed corruption broke header") && ok;
+  ok = expect(!reader.read_tensor_into(packed_projection.name, direct.data(),
+                direct.size() * sizeof(direct[0]), error),
+              "direct read accepted corrupted packed payload") && ok;
   reader.close();
   fs::remove(path);
 

@@ -14,7 +14,21 @@ enum class Q4H128TensorEncoding : std::uint32_t {
   f32 = 0,
   q4_0 = 1,
   q4_h128 = 2,
+  // CPU-ready Q4_0BlockX8: eight FP16 scales, then 128 interleaved
+  // offset-binary nibble bytes. Complete 8-row / 32-column tiles only.
+  q4_0_cpu_x8 = 3,
+  q4_h128_cpu_x8 = 4,
 };
+
+inline bool q4_h128_encoding_transformed(Q4H128TensorEncoding encoding) noexcept {
+  return encoding == Q4H128TensorEncoding::q4_h128 ||
+    encoding == Q4H128TensorEncoding::q4_h128_cpu_x8;
+}
+
+inline bool q4_h128_encoding_cpu_packed(Q4H128TensorEncoding encoding) noexcept {
+  return encoding == Q4H128TensorEncoding::q4_0_cpu_x8 ||
+    encoding == Q4H128TensorEncoding::q4_h128_cpu_x8;
+}
 
 struct Q4H128ArtifactMetadata {
   std::uint32_t num_hidden_layers = 0;
@@ -81,6 +95,14 @@ public:
   bool read_tensor_bytes(
     std::string_view tensor_name,
     std::vector<std::uint8_t> & output,
+    std::string & error_message);
+
+  // Reads directly into the final runtime buffer, with the same checksum
+  // validation as read_tensor_bytes. The caller must discard it on failure.
+  bool read_tensor_into(
+    std::string_view tensor_name,
+    void * output,
+    std::size_t byte_count,
     std::string & error_message);
 
 private:

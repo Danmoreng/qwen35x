@@ -4,9 +4,10 @@ param(
     [string]$HFModelDir = "models/qwen3.5-0.8b",
     [string]$CsvOut = "benchmarks/qwen35x-inference-seq.csv",
     [string]$RunLabel = "",
-    [ValidateSet("gpu-bf16", "gpu-f32", "cpu-reference", "cpu-gguf")]
+    [ValidateSet("gpu-bf16", "gpu-f32", "cpu-reference", "cpu-gguf", "cpu-h128")]
     [string[]]$Modes = @("gpu-bf16", "gpu-f32"),
     [string]$CpuGguf = "",
+    [string]$CpuQ4H128 = "",
     [int]$CpuThreads = 0,
     [ValidateSet("auto", "scalar", "avx2", "avx-vnni", "avx512", "avx512-vnni")]
     [string]$CpuIsa = "auto",
@@ -129,6 +130,7 @@ function Invoke-BenchmarkRun {
         [Parameter(Mandatory = $true)][string]$Mode,
         [Parameter(Mandatory = $true)][string]$ModelDir,
         [Parameter(Mandatory = $false)][string]$CpuGguf,
+        [Parameter(Mandatory = $false)][string]$CpuQ4H128,
         [Parameter(Mandatory = $true)][int]$CpuThreads,
         [Parameter(Mandatory = $true)][string]$CpuIsa,
         [Parameter(Mandatory = $true)][int]$CpuPrefixCacheTokens,
@@ -168,6 +170,9 @@ function Invoke-BenchmarkRun {
         "cpu-gguf" {
             $args += @("--infer-reference")
         }
+        "cpu-h128" {
+            $args += @("--infer-reference")
+        }
         default {
             throw "Unsupported mode: $Mode"
         }
@@ -185,9 +190,11 @@ function Invoke-BenchmarkRun {
         "--profile-json", $ProfileJsonPath
     )
 
-    if ($Mode -eq "cpu-gguf") {
+    if ($Mode -in @("cpu-gguf", "cpu-h128")) {
+        $weightOption = if ($Mode -eq "cpu-h128") { "--cpu-q4-h128" } else { "--cpu-gguf" }
+        $weightPath = if ($Mode -eq "cpu-h128") { $CpuQ4H128 } else { $CpuGguf }
         $args += @(
-            "--cpu-gguf", $CpuGguf,
+            $weightOption, $weightPath,
             "--cpu-threads", "$CpuThreads",
             "--cpu-isa", $CpuIsa
         )
@@ -209,7 +216,7 @@ function Invoke-BenchmarkRun {
         $args += @("--prompt-tokens", $PromptTokensCsv)
     }
 
-    $isCpuMode = $Mode -eq "cpu-reference" -or $Mode -eq "cpu-gguf"
+    $isCpuMode = $Mode -in @("cpu-reference", "cpu-gguf", "cpu-h128")
     if ($ProfileSyncEnabled -and -not $isCpuMode) {
         $args += @("--profile-sync")
     }
@@ -259,6 +266,9 @@ $resolvedModelDir = Resolve-RepoPath -Path $HFModelDir -RepoRoot $repoRoot
 $resolvedCpuGguf = if ([string]::IsNullOrWhiteSpace($CpuGguf)) { "" } else {
     Resolve-RepoPath -Path $CpuGguf -RepoRoot $repoRoot
 }
+$resolvedCpuQ4H128 = if ([string]::IsNullOrWhiteSpace($CpuQ4H128)) { "" } else {
+    Resolve-RepoPath -Path $CpuQ4H128 -RepoRoot $repoRoot
+}
 $resolvedCsvOut = Resolve-RepoPath -Path $CsvOut -RepoRoot $repoRoot
 $profileTmpDir = if ([string]::IsNullOrWhiteSpace($ProfileDir)) {
     Join-Path $repoRoot "build\bench-profiles"
@@ -276,12 +286,15 @@ if (-not (Test-Path $resolvedExe)) {
 if (-not (Test-Path $resolvedModelDir)) {
     throw "Model directory not found: $resolvedModelDir"
 }
-if ($Modes -contains "cpu-gguf") {
-    if ([string]::IsNullOrWhiteSpace($resolvedCpuGguf) -or -not (Test-Path $resolvedCpuGguf)) {
+if ($Modes -contains "cpu-gguf" -or $Modes -contains "cpu-h128") {
+    if ($Modes -contains "cpu-gguf" -and ([string]::IsNullOrWhiteSpace($resolvedCpuGguf) -or -not (Test-Path $resolvedCpuGguf))) {
         throw "CPU GGUF file not found: $resolvedCpuGguf"
     }
+    if ($Modes -contains "cpu-h128" -and ([string]::IsNullOrWhiteSpace($resolvedCpuQ4H128) -or -not (Test-Path $resolvedCpuQ4H128))) {
+        throw "CPU Q4 H128 file not found: $resolvedCpuQ4H128"
+    }
     if ($CpuThreads -lt 1) {
-        throw "CpuThreads must be >= 1 for cpu-gguf mode."
+        throw "CpuThreads must be >= 1 for quantized CPU modes."
     }
     if ($CpuPrefixCacheTokens -lt 0) {
         throw "CpuPrefixCacheTokens must be >= 0."
@@ -311,7 +324,7 @@ if ($PromptMode -eq "prompt-file" -and -not (Test-Path -LiteralPath $resolvedPro
 if ($PromptMode -eq "prompt-tokens" -and [string]::IsNullOrWhiteSpace($PromptTokensCsv)) {
     throw "PromptTokensCsv must be non-empty when PromptMode is 'prompt-tokens'."
 }
-if ($Qwen35xProfile.IsPresent -and ($Modes -contains "cpu-reference" -or $Modes -contains "cpu-gguf")) {
+if ($Qwen35xProfile.IsPresent -and ($Modes -contains "cpu-reference" -or $Modes -contains "cpu-gguf" -or $Modes -contains "cpu-h128")) {
     Write-Warning "Qwen35xProfile is ignored for CPU modes."
 }
 
@@ -333,6 +346,7 @@ foreach ($mode in $Modes) {
                 -Mode $mode `
                 -ModelDir $resolvedModelDir `
                 -CpuGguf $resolvedCpuGguf `
+                -CpuQ4H128 $resolvedCpuQ4H128 `
                 -CpuThreads $CpuThreads `
                 -CpuIsa $CpuIsa `
                 -CpuPrefixCacheTokens $CpuPrefixCacheTokens `
@@ -372,6 +386,7 @@ foreach ($mode in $Modes) {
                 -Mode $mode `
                 -ModelDir $resolvedModelDir `
                 -CpuGguf $resolvedCpuGguf `
+                -CpuQ4H128 $resolvedCpuQ4H128 `
                 -CpuThreads $CpuThreads `
                 -CpuIsa $CpuIsa `
                 -CpuPrefixCacheTokens $CpuPrefixCacheTokens `
@@ -429,8 +444,9 @@ foreach ($mode in $Modes) {
                 run_label        = $RunLabel
                 mode             = $mode
                 cpu_gguf         = if ($mode -eq "cpu-gguf") { $resolvedCpuGguf } else { "" }
-                cpu_threads      = if ($mode -eq "cpu-gguf") { $CpuThreads } else { "" }
-                cpu_isa          = if ($mode -eq "cpu-gguf") { $CpuIsa } else { "" }
+                cpu_q4_h128      = if ($mode -eq "cpu-h128") { $resolvedCpuQ4H128 } else { "" }
+                cpu_threads      = if ($mode -in @("cpu-gguf", "cpu-h128")) { $CpuThreads } else { "" }
+                cpu_isa          = if ($mode -in @("cpu-gguf", "cpu-h128")) { $CpuIsa } else { "" }
                 cached_prefix_tokens = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "cached_prefix_tokens")
                 prefix_cache_restore_time_ms = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "prefix_cache_restore_time_ms")
                 prefix_cache_bytes = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "prefix_cache_bytes")

@@ -24,10 +24,11 @@ static_assert(offsetof(Q4_0Block, qs) == sizeof(std::uint16_t));
 static_assert(sizeof(Q4_0Block) == 18);
 
 // Eight Q4_0 rows for the same 32-column block. Scales are contiguous and
-// quants are interleaved in eight-byte chunks. The packed bytes have bit 3 of
-// both nibbles flipped, allowing an AVX2 byte-shuffle LUT to decode signed
-// values without an extra subtraction. The representation is size-neutral:
-// eight canonical blocks and one packed block are both exactly 144 bytes.
+// quants are interleaved in eight-byte chunks. Nibbles retain the canonical
+// unsigned offset-binary encoding (q + 8); the integer dot subtracts the
+// prepared activation sum times eight. No per-block sign-bit XOR is needed.
+// This runtime layout is also the q4_*_cpu_x8 artifact encoding. It is
+// size-neutral: eight canonical blocks and one packed block are 144 bytes.
 struct Q4_0BlockX8 {
   std::uint16_t d[8];
   std::uint8_t qs[8 * q4_0_values_per_block / 2];

@@ -1,5 +1,10 @@
 # Q4_H128 Design and Evaluation Plan
 
+Current CPU artifact layout and measured results are documented in
+[CPU-ready Q4 H128 packing (2026-09-05)](q4-h128-cpu-packing-2026-09-05.md).
+The converter now defaults to precombined, CPU-packed projection tensors;
+`--layout canonical` reproduces the original layout described below.
+
 ## Scope
 
 This workstream develops an engine-native four-bit weight format for

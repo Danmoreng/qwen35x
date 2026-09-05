@@ -22,19 +22,10 @@ struct DecodedWeights {
 [[nodiscard]] QWEN35X_FORCE_INLINE DecodedWeights decode_weights(
   const Q4_0BlockX8 & weights) noexcept {
   const __m256i nibble_mask = _mm256_set1_epi8(0x0f);
-  const __m256i packed_sign_flip = _mm256_set1_epi8(static_cast<char>(0x88));
-  const __m256i raw_0123_0 = _mm256_xor_si256(
-    _mm256_loadu_si256(reinterpret_cast<const __m256i *>(weights.qs)),
-    packed_sign_flip);
-  const __m256i raw_4567_0 = _mm256_xor_si256(
-    _mm256_loadu_si256(reinterpret_cast<const __m256i *>(weights.qs + 32)),
-    packed_sign_flip);
-  const __m256i raw_0123_1 = _mm256_xor_si256(
-    _mm256_loadu_si256(reinterpret_cast<const __m256i *>(weights.qs + 64)),
-    packed_sign_flip);
-  const __m256i raw_4567_1 = _mm256_xor_si256(
-    _mm256_loadu_si256(reinterpret_cast<const __m256i *>(weights.qs + 96)),
-    packed_sign_flip);
+  const __m256i raw_0123_0 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(weights.qs));
+  const __m256i raw_4567_0 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(weights.qs + 32));
+  const __m256i raw_0123_1 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(weights.qs + 64));
+  const __m256i raw_4567_1 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(weights.qs + 96));
 
   DecodedWeights decoded{};
   decoded.values[0] = _mm256_and_si256(raw_0123_0, nibble_mask);

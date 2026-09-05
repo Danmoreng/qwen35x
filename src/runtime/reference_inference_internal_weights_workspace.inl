@@ -861,11 +861,37 @@ bool load_q4_h128_quantized_checked(
   const Q4H128TensorInfo * info = reader.find_tensor(tensor_name);
   const Q4H128TensorEncoding expected_encoding = expect_h128
     ? Q4H128TensorEncoding::q4_h128 : Q4H128TensorEncoding::q4_0;
-  if (info == nullptr || info->encoding != expected_encoding ||
+  const auto packed_encoding = expect_h128
+    ? Q4H128TensorEncoding::q4_h128_cpu_x8 : Q4H128TensorEncoding::q4_0_cpu_x8;
+  if (info == nullptr || (info->encoding != expected_encoding && info->encoding != packed_encoding) ||
       !q4_h128_shape_matches(info->shape, {rows, cols})) {
     error_message = "Required Q4_H128 tensor is missing, misencoded, or has the wrong shape: " +
       tensor_name;
     return false;
+  }
+  if (info->encoding == packed_encoding) {
+    if (info->data_size > std::numeric_limits<std::size_t>::max() ||
+        info->data_size % sizeof(cpu::Q4_0BlockX8) != 0) {
+      error_message = "CPU-packed Q4 tensor storage is too large or misaligned.";
+      return false;
+    }
+    out.shape = {rows, cols};
+    out.data.clear();
+    out.q4_0_blocks.clear();
+    out.q4_0_scales.clear();
+    out.q8_0_blocks.clear();
+    out.q8_0_scales.clear();
+    out.packed_q4_0_blocks.resize(static_cast<std::size_t>(info->data_size) / sizeof(cpu::Q4_0BlockX8));
+    if (!reader.read_tensor_into(tensor_name, out.packed_q4_0_blocks.data(),
+          static_cast<std::size_t>(info->data_size), error_message)) {
+      out.packed_q4_0_blocks.clear();
+      return false;
+    }
+    out.q8_0_backend = backend;
+    out.q8_0_runtime = runtime;
+    out.uses_q4_h128_transform = expect_h128;
+    out.q4_h128_sign_seed = expect_h128 ? info->sign_seed : 0;
+    return true;
   }
   std::vector<std::uint8_t> bytes;
   if (!reader.read_tensor_bytes(tensor_name, bytes, error_message) ||
@@ -1914,6 +1940,9 @@ bool load_model_weights_from_q4_h128(
   if (!reader.open(artifact_path, error_message)) {
     return false;
   }
+  const auto * embedding_info = reader.find_tensor("model.language_model.embed_tokens.weight");
+  const bool cpu_packed = embedding_info != nullptr &&
+    embedding_info->encoding == Q4H128TensorEncoding::q4_0_cpu_x8;
   const Q4H128ArtifactMetadata & metadata = reader.metadata();
   if (metadata.num_hidden_layers != static_cast<std::uint32_t>(dims.n_layers) ||
       metadata.hidden_size != static_cast<std::uint32_t>(dims.hidden) ||
@@ -1976,28 +2005,34 @@ bool load_model_weights_from_q4_h128(
                   layer.input_layernorm) ||
         !load_f32(base + "post_attention_layernorm.weight", {dims.hidden},
                   layer.post_attention_layernorm) ||
-        !load_q4(base + "mlp.gate_proj.weight", dims.intermediate, dims.hidden,
-                 layer.mlp_gate) ||
-        !load_q4(base + "mlp.up_proj.weight", dims.intermediate, dims.hidden,
-                 layer.mlp_up) ||
+        !(cpu_packed
+          ? load_q4(base + "mlp.gate_up_proj.weight", 2 * dims.intermediate, dims.hidden,
+                    layer.mlp_gate_up_cpu, false)
+          : (load_q4(base + "mlp.gate_proj.weight", dims.intermediate, dims.hidden, layer.mlp_gate) &&
+             load_q4(base + "mlp.up_proj.weight", dims.intermediate, dims.hidden, layer.mlp_up))) ||
         !load_q4(base + "mlp.down_proj.weight", dims.hidden, dims.intermediate,
                  layer.mlp_down)) {
       return false;
     }
 
     if (layer.is_linear) {
-      if (!load_q4(base + "linear_attn.in_proj_qkv.weight",
-                   dims.linear_conv_channels, dims.hidden,
-                   layer.linear.in_proj_qkv) ||
-          !load_q4(base + "linear_attn.in_proj_z.weight",
-                   dims.linear_v_dim, dims.hidden,
-                   layer.linear.in_proj_z) ||
-          !load_q4(base + "linear_attn.in_proj_b.weight",
-                   dims.linear_num_v_heads, dims.hidden,
-                   layer.linear.in_proj_b) ||
-          !load_q4(base + "linear_attn.in_proj_a.weight",
-                   dims.linear_num_v_heads, dims.hidden,
-                   layer.linear.in_proj_a) ||
+      const int combined_rows = dims.linear_conv_channels + dims.linear_v_dim +
+        2 * dims.linear_num_v_heads;
+      if ((cpu_packed
+            ? !load_q4(base + "linear_attn.in_proj_all.weight", combined_rows, dims.hidden,
+                            layer.linear.in_proj_all_cpu, false)
+            : (!load_q4(base + "linear_attn.in_proj_qkv.weight",
+                        dims.linear_conv_channels, dims.hidden,
+                        layer.linear.in_proj_qkv) ||
+               !load_q4(base + "linear_attn.in_proj_z.weight",
+                        dims.linear_v_dim, dims.hidden,
+                        layer.linear.in_proj_z) ||
+               !load_q4(base + "linear_attn.in_proj_b.weight",
+                        dims.linear_num_v_heads, dims.hidden,
+                        layer.linear.in_proj_b) ||
+               !load_q4(base + "linear_attn.in_proj_a.weight",
+                        dims.linear_num_v_heads, dims.hidden,
+                        layer.linear.in_proj_a))) ||
           !load_f32(base + "linear_attn.conv1d.weight",
                     {dims.linear_conv_channels, 1, dims.linear_kernel},
                     layer.linear.conv1d) ||
@@ -2020,12 +2055,15 @@ bool load_model_weights_from_q4_h128(
       }
       pack_conv1d_kernel_major(layer.linear, dims);
     } else {
-      if (!load_q4(base + "self_attn.q_proj.weight", full_q_out, dims.hidden,
-                   layer.full.q_proj) ||
-          !load_q4(base + "self_attn.k_proj.weight", full_kv_out, dims.hidden,
-                   layer.full.k_proj) ||
-          !load_q4(base + "self_attn.v_proj.weight", full_kv_out, dims.hidden,
-                   layer.full.v_proj) ||
+      if ((cpu_packed
+            ? !load_q4(base + "self_attn.qkv_proj.weight", full_q_out + 2 * full_kv_out,
+                       dims.hidden, layer.full.qkv_proj_cpu, false)
+            : (!load_q4(base + "self_attn.q_proj.weight", full_q_out, dims.hidden,
+                        layer.full.q_proj) ||
+               !load_q4(base + "self_attn.k_proj.weight", full_kv_out, dims.hidden,
+                        layer.full.k_proj) ||
+               !load_q4(base + "self_attn.v_proj.weight", full_kv_out, dims.hidden,
+                        layer.full.v_proj))) ||
           !load_q4(base + "self_attn.o_proj.weight", dims.hidden, full_o_in,
                    layer.full.o_proj) ||
           !load_f32(base + "self_attn.q_norm.weight", {dims.head_dim},
@@ -2036,22 +2074,24 @@ bool load_model_weights_from_q4_h128(
       }
     }
 
-    if (!pack_quantized_row_concat(
-          {&layer.mlp_gate, &layer.mlp_up},
-          layer.mlp_gate_up_cpu, error_message)) {
-      return false;
-    }
-    if (layer.is_linear) {
+    if (!cpu_packed) {
       if (!pack_quantized_row_concat(
-            {&layer.linear.in_proj_qkv, &layer.linear.in_proj_z,
-             &layer.linear.in_proj_b, &layer.linear.in_proj_a},
-            layer.linear.in_proj_all_cpu, error_message)) {
+            {&layer.mlp_gate, &layer.mlp_up},
+            layer.mlp_gate_up_cpu, error_message)) {
         return false;
       }
-    } else if (!pack_quantized_row_concat(
-                 {&layer.full.q_proj, &layer.full.k_proj, &layer.full.v_proj},
-                 layer.full.qkv_proj_cpu, error_message)) {
-      return false;
+      if (layer.is_linear) {
+        if (!pack_quantized_row_concat(
+              {&layer.linear.in_proj_qkv, &layer.linear.in_proj_z,
+               &layer.linear.in_proj_b, &layer.linear.in_proj_a},
+              layer.linear.in_proj_all_cpu, error_message)) {
+          return false;
+        }
+      } else if (!pack_quantized_row_concat(
+                   {&layer.full.q_proj, &layer.full.k_proj, &layer.full.v_proj},
+                   layer.full.qkv_proj_cpu, error_message)) {
+        return false;
+      }
     }
   }
 

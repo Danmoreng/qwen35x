@@ -28,7 +28,6 @@ void accumulate_packed_block_x8_vnni(
   __m256 (&accumulators)[TokenCount]) noexcept {
   static_assert(TokenCount == 1 || TokenCount == 4 || TokenCount == 8);
   const __m256i nibble_mask = _mm256_set1_epi8(0x0f);
-  const __m256i packed_sign_flip = _mm256_set1_epi8(static_cast<char>(0x88));
 
   const __m256i raw_0123_0 = _mm256_loadu_si256(
     reinterpret_cast<const __m256i *>(weights.qs));
@@ -39,22 +38,18 @@ void accumulate_packed_block_x8_vnni(
   const __m256i raw_4567_1 = _mm256_loadu_si256(
     reinterpret_cast<const __m256i *>(weights.qs + 96));
 
-  const __m256i unsigned_0123_0 = _mm256_xor_si256(raw_0123_0, packed_sign_flip);
-  const __m256i unsigned_4567_0 = _mm256_xor_si256(raw_4567_0, packed_sign_flip);
-  const __m256i unsigned_0123_1 = _mm256_xor_si256(raw_0123_1, packed_sign_flip);
-  const __m256i unsigned_4567_1 = _mm256_xor_si256(raw_4567_1, packed_sign_flip);
-  const __m256i weight_0123_0 = _mm256_and_si256(unsigned_0123_0, nibble_mask);
-  const __m256i weight_4567_0 = _mm256_and_si256(unsigned_4567_0, nibble_mask);
-  const __m256i weight_0123_1 = _mm256_and_si256(unsigned_0123_1, nibble_mask);
-  const __m256i weight_4567_1 = _mm256_and_si256(unsigned_4567_1, nibble_mask);
+  const __m256i weight_0123_0 = _mm256_and_si256(raw_0123_0, nibble_mask);
+  const __m256i weight_4567_0 = _mm256_and_si256(raw_4567_0, nibble_mask);
+  const __m256i weight_0123_1 = _mm256_and_si256(raw_0123_1, nibble_mask);
+  const __m256i weight_4567_1 = _mm256_and_si256(raw_4567_1, nibble_mask);
   const __m256i weight_0123_2 = _mm256_and_si256(
-    _mm256_srli_epi16(unsigned_0123_0, 4), nibble_mask);
+    _mm256_srli_epi16(raw_0123_0, 4), nibble_mask);
   const __m256i weight_4567_2 = _mm256_and_si256(
-    _mm256_srli_epi16(unsigned_4567_0, 4), nibble_mask);
+    _mm256_srli_epi16(raw_4567_0, 4), nibble_mask);
   const __m256i weight_0123_3 = _mm256_and_si256(
-    _mm256_srli_epi16(unsigned_0123_1, 4), nibble_mask);
+    _mm256_srli_epi16(raw_0123_1, 4), nibble_mask);
   const __m256i weight_4567_3 = _mm256_and_si256(
-    _mm256_srli_epi16(unsigned_4567_1, 4), nibble_mask);
+    _mm256_srli_epi16(raw_4567_1, 4), nibble_mask);
 
   // Lanes remain ordered 0,4,1,5,2,6,3,7 until the final permutation.
   const __m256 natural_weight_scales = _mm256_cvtph_ps(_mm_loadu_si128(

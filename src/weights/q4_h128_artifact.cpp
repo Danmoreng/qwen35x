@@ -146,6 +146,17 @@ std::uint64_t q4_h128_payload_size(
       }
       return bytes;
     }
+    case Q4H128TensorEncoding::q4_0_cpu_x8:
+    case Q4H128TensorEncoding::q4_h128_cpu_x8: {
+      const std::uint64_t columns = q4_h128_encoding_transformed(encoding)
+        ? cpu::q4_h128_transform_size : cpu::q4_0_values_per_block;
+      if (shape.size() != 2 || shape[0] % cpu::q4_0_packed_rows != 0 ||
+          shape[1] % columns != 0) {
+        error_message = "CPU-packed Q4 tensor requires complete 8-row input-aligned tiles.";
+        return 0;
+      }
+      return (elements / cpu::q4_0_values_per_block) * sizeof(cpu::Q4_0Block);
+    }
     case Q4H128TensorEncoding::q4_0:
       if (elements % cpu::q4_0_values_per_block != 0) {
         error_message = "Q4_0 payload element count is not divisible by 32.";
@@ -203,7 +214,7 @@ bool Q4H128ArtifactWriter::open(
       close();
       return false;
     }
-    if (tensor.encoding == Q4H128TensorEncoding::q4_h128) {
+    if (q4_h128_encoding_transformed(tensor.encoding)) {
       if (tensor.transform_size != cpu::q4_h128_transform_size ||
           tensor.scale_group != cpu::q4_0_values_per_block ||
           tensor.sign_seed != metadata.sign_seed) {
@@ -211,8 +222,10 @@ bool Q4H128ArtifactWriter::open(
         close();
         return false;
       }
-    } else if (tensor.transform_size != 0 || tensor.sign_seed != 0) {
-      error_message = "Untransformed tensor contains transform metadata: " + tensor.name;
+    } else if (tensor.transform_size != 0 || tensor.sign_seed != 0 ||
+               (q4_h128_encoding_cpu_packed(tensor.encoding) &&
+                tensor.scale_group != cpu::q4_0_values_per_block)) {
+      error_message = "Untransformed tensor has invalid quantization metadata: " + tensor.name;
       close();
       return false;
     }
@@ -429,7 +442,7 @@ bool Q4H128ArtifactReader::open(const std::string & path, std::string & error_me
       read_value(stream_, tensor.data_offset) && read_value(stream_, tensor.data_size) &&
       read_value(stream_, tensor.checksum);
     if (!ok || name_size == 0 || name_size > 4096 || rank == 0 || rank > 8 ||
-        encoding > static_cast<std::uint32_t>(Q4H128TensorEncoding::q4_h128) ||
+        encoding > static_cast<std::uint32_t>(Q4H128TensorEncoding::q4_h128_cpu_x8) ||
         reserved != 0) {
       error_message = "Invalid Q4_H128 tensor directory entry.";
       close();
@@ -451,12 +464,14 @@ bool Q4H128ArtifactReader::open(const std::string & path, std::string & error_me
         tensor.data_offset % kAlignment != 0 ||
         !checked_add(tensor.data_offset, tensor.data_size, tensor_end) ||
         tensor_end > file_size_ ||
-        (tensor.encoding == Q4H128TensorEncoding::q4_h128 &&
+        (q4_h128_encoding_transformed(tensor.encoding) &&
          (tensor.transform_size != cpu::q4_h128_transform_size ||
           tensor.scale_group != cpu::q4_0_values_per_block ||
           tensor.sign_seed != metadata_.sign_seed)) ||
-        (tensor.encoding != Q4H128TensorEncoding::q4_h128 &&
+        (!q4_h128_encoding_transformed(tensor.encoding) &&
          (tensor.transform_size != 0 || tensor.sign_seed != 0)) ||
+        (q4_h128_encoding_cpu_packed(tensor.encoding) &&
+         tensor.scale_group != cpu::q4_0_values_per_block) ||
         !tensor_index_.emplace(tensor.name, tensors_.size()).second) {
       error_message = "Invalid Q4_H128 tensor metadata: " + tensor.name;
       close();
@@ -519,13 +534,30 @@ bool Q4H128ArtifactReader::read_tensor_bytes(
     return false;
   }
   output.resize(static_cast<std::size_t>(tensor->data_size));
+  if (!read_tensor_into(tensor_name, output.data(), output.size(), error_message)) {
+    output.clear();
+    return false;
+  }
+  return true;
+}
+
+bool Q4H128ArtifactReader::read_tensor_into(
+  const std::string_view tensor_name,
+  void * output,
+  const std::size_t byte_count,
+  std::string & error_message) {
+  const Q4H128TensorInfo * tensor = find_tensor(tensor_name);
+  if (!is_open() || tensor == nullptr || output == nullptr ||
+      tensor->data_size != byte_count ||
+      byte_count > static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max())) {
+    error_message = "Q4_H128 direct read has an invalid destination or byte count.";
+    return false;
+  }
   stream_.clear();
   stream_.seekg(static_cast<std::streamoff>(tensor->data_offset), std::ios::beg);
-  stream_.read(reinterpret_cast<char *>(output.data()),
-               static_cast<std::streamsize>(output.size()));
-  if (!stream_ || checksum_bytes(output.data(), output.size()) != tensor->checksum) {
+  stream_.read(static_cast<char *>(output), static_cast<std::streamsize>(byte_count));
+  if (!stream_ || checksum_bytes(output, byte_count) != tensor->checksum) {
     error_message = "Q4_H128 tensor read or checksum validation failed: " + tensor->name;
-    output.clear();
     return false;
   }
   return true;

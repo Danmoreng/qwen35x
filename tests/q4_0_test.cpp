@@ -80,9 +80,9 @@ bool test_packed_backend(const Q8_0Backend backend) {
       packed_weights[0].d[1] == weights[blocks_per_row].d,
     "packed scale layout mismatch") && ok;
   ok = expect(
-    packed_weights[0].qs[0] == static_cast<std::uint8_t>(weights[0].qs[0] ^ 0x88U) &&
+    packed_weights[0].qs[0] == static_cast<std::uint8_t>(weights[0].qs[0]) &&
       packed_weights[0].qs[8] ==
-        static_cast<std::uint8_t>(weights[blocks_per_row].qs[0] ^ 0x88U),
+        static_cast<std::uint8_t>(weights[blocks_per_row].qs[0]),
     "packed quant layout mismatch") && ok;
   for (std::size_t block = 0; block < packed_activations.size(); ++block) {
     for (std::size_t token = 0; token < 4; ++token) {

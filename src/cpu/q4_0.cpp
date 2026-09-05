@@ -124,7 +124,7 @@ void q4_0_packed_matmul_q8_0_scalar(
               const std::size_t chunk = index / 8;
               const std::size_t within_chunk = index % 8;
               const std::uint8_t packed = static_cast<std::uint8_t>(
-                weights.qs[chunk * 64 + row * 8 + within_chunk] ^ 0x88U);
+                weights.qs[chunk * 64 + row * 8 + within_chunk]);
               integer_dot += (static_cast<int>(packed & 0x0fU) - 8) *
                 static_cast<int>(activations.qs[token * 32 + chunk * 8 + within_chunk]);
               integer_dot += (static_cast<int>(packed >> 4U) - 8) *
@@ -195,7 +195,7 @@ void q4_0_packed_matvec_q8_0_scalar(
           const std::size_t chunk = index / 8;
           const std::size_t within_chunk = index % 8;
           const std::uint8_t packed = static_cast<std::uint8_t>(
-            weights.qs[chunk * 64 + row * 8 + within_chunk] ^ 0x88U);
+            weights.qs[chunk * 64 + row * 8 + within_chunk]);
           integer_dot += (static_cast<int>(packed & 0x0fU) - 8) *
             static_cast<int>(vector[block].qs[index]);
           integer_dot += (static_cast<int>(packed >> 4U) - 8) *
@@ -252,7 +252,7 @@ void q4_0_packed_matvec_prepared_q8_0_scalar(
           const std::size_t chunk = index / 8;
           const std::size_t within_chunk = index % 8;
           const std::uint8_t packed = static_cast<std::uint8_t>(
-            weights.qs[chunk * 64 + row * 8 + within_chunk] ^ 0x88U);
+            weights.qs[chunk * 64 + row * 8 + within_chunk]);
           integer_dot += (static_cast<int>(packed & 0x0fU) - 8) *
             static_cast<int>(activation.qs[index]);
           integer_dot += (static_cast<int>(packed >> 4U) - 8) *
@@ -313,7 +313,7 @@ void q4_0_pack_rows_8(
         for (std::size_t chunk = 0; chunk < 2; ++chunk) {
           for (std::size_t index = 0; index < 8; ++index) {
             destination.qs[chunk * 64 + row * 8 + index] =
-              static_cast<std::uint8_t>(source.qs[chunk * 8 + index] ^ 0x88U);
+              static_cast<std::uint8_t>(source.qs[chunk * 8 + index]);
           }
         }
       }
@@ -401,7 +401,7 @@ void q4_0_packed_dequantize_row(
       const std::size_t chunk = index / 8;
       const std::size_t within_chunk = index % 8;
       const std::uint8_t packed = static_cast<std::uint8_t>(
-        source.qs[chunk * 64 + row * 8 + within_chunk] ^ 0x88U);
+        source.qs[chunk * 64 + row * 8 + within_chunk]);
       destination[index] = scale *
         static_cast<float>(static_cast<int>(packed & 0x0fU) - 8);
       destination[index + 16] = scale *
