@@ -4,7 +4,7 @@ param(
     [string]$HFModelDir = "models/qwen3.5-0.8b",
     [string]$CsvOut = "benchmarks/qwen35x-inference-seq.csv",
     [string]$RunLabel = "",
-    [ValidateSet("gpu-bf16", "gpu-f32", "cpu-reference", "cpu-gguf", "cpu-h128")]
+    [ValidateSet("gpu-bf16", "gpu-f32", "cpu-reference", "cpu-gguf", "cpu-h128", "cpu-llama-fixed")]
     [string[]]$Modes = @("gpu-bf16", "gpu-f32"),
     [string]$CpuGguf = "",
     [string]$CpuQ4H128 = "",
@@ -162,6 +162,27 @@ function Invoke-BenchmarkRun {
         [Parameter(Mandatory = $true)][string]$ProfileJsonPath
     )
 
+    if ($Mode -eq "cpu-llama-fixed") {
+        if ($PromptMode -ne "prompt-tokens" -or $CpuKvCache -ne "fp16" -or $CpuPrefixCacheTokens -ne 0) {
+            throw "cpu-llama-fixed requires explicit tokens, FP16 KV and no prefix cache."
+        }
+        $fixedArgs = @("--cpu-gguf", $CpuGguf, "--cpu-threads", "$CpuThreads",
+            "--prompt-tokens", $PromptTokensCsv, "--max-new-tokens", "$MaxNewTokens",
+            "--max-context", "$MaxContext", "--profile-json", $ProfileJsonPath)
+        if ($PrefillOnlyEnabled) { $fixedArgs += "--prefill-only" }
+        else {
+            if ([string]::IsNullOrWhiteSpace($ForcedOutputTokensCsv)) {
+                throw "cpu-llama-fixed decode requires a fixed continuation."
+            }
+            $fixedArgs += @("--forced-output-tokens", $ForcedOutputTokensCsv)
+        }
+        $fixedOutput = & $ExePath @fixedArgs 2>&1
+        foreach ($line in $fixedOutput) { Write-Host $line }
+        if ($LASTEXITCODE -ne 0) { throw "Fixed llama benchmark failed: $LASTEXITCODE" }
+        if (-not (Test-Path $ProfileJsonPath)) { throw "Missing fixed llama profile: $ProfileJsonPath" }
+        return Get-Content -Raw -LiteralPath $ProfileJsonPath | ConvertFrom-Json
+    }
+
     $args = @()
     switch ($Mode) {
         "gpu-bf16" {
@@ -196,7 +217,7 @@ function Invoke-BenchmarkRun {
         "--profile-json", $ProfileJsonPath
     )
 
-    if ($Mode -in @("cpu-gguf", "cpu-h128")) {
+    if ($Mode -in @("cpu-gguf", "cpu-h128", "cpu-llama-fixed")) {
         $weightOption = if ($Mode -eq "cpu-h128") { "--cpu-q4-h128" } else { "--cpu-gguf" }
         $weightPath = if ($Mode -eq "cpu-h128") { $CpuQ4H128 } else { $CpuGguf }
         $args += @(
@@ -231,7 +252,7 @@ function Invoke-BenchmarkRun {
         $args += @("--forced-output-tokens", $ForcedOutputTokensCsv)
     }
 
-    $isCpuMode = $Mode -in @("cpu-reference", "cpu-gguf", "cpu-h128")
+    $isCpuMode = $Mode -in @("cpu-reference", "cpu-gguf", "cpu-h128", "cpu-llama-fixed")
     if ($ProfileSyncEnabled -and -not $isCpuMode) {
         $args += @("--profile-sync")
     }
@@ -301,8 +322,8 @@ if (-not (Test-Path $resolvedExe)) {
 if (-not (Test-Path $resolvedModelDir)) {
     throw "Model directory not found: $resolvedModelDir"
 }
-if ($Modes -contains "cpu-gguf" -or $Modes -contains "cpu-h128") {
-    if ($Modes -contains "cpu-gguf" -and ([string]::IsNullOrWhiteSpace($resolvedCpuGguf) -or -not (Test-Path $resolvedCpuGguf))) {
+if ($Modes -contains "cpu-gguf" -or $Modes -contains "cpu-h128" -or $Modes -contains "cpu-llama-fixed") {
+    if (($Modes -contains "cpu-gguf" -or $Modes -contains "cpu-llama-fixed") -and ([string]::IsNullOrWhiteSpace($resolvedCpuGguf) -or -not (Test-Path $resolvedCpuGguf))) {
         throw "CPU GGUF file not found: $resolvedCpuGguf"
     }
     if ($Modes -contains "cpu-h128" -and ([string]::IsNullOrWhiteSpace($resolvedCpuQ4H128) -or -not (Test-Path $resolvedCpuQ4H128))) {
@@ -339,7 +360,7 @@ if ($PromptMode -eq "prompt-file" -and -not (Test-Path -LiteralPath $resolvedPro
 if ($PromptMode -eq "prompt-tokens" -and [string]::IsNullOrWhiteSpace($PromptTokensCsv)) {
     throw "PromptTokensCsv must be non-empty when PromptMode is 'prompt-tokens'."
 }
-if ($Qwen35xProfile.IsPresent -and ($Modes -contains "cpu-reference" -or $Modes -contains "cpu-gguf" -or $Modes -contains "cpu-h128")) {
+if ($Qwen35xProfile.IsPresent -and ($Modes -contains "cpu-reference" -or $Modes -contains "cpu-gguf" -or $Modes -contains "cpu-h128" -or $Modes -contains "cpu-llama-fixed")) {
     Write-Warning "Qwen35xProfile is ignored for CPU modes."
 }
 
@@ -462,10 +483,10 @@ foreach ($mode in $Modes) {
                 timestamp_utc    = [DateTime]::UtcNow.ToString("o")
                 run_label        = $RunLabel
                 mode             = $mode
-                cpu_gguf         = if ($mode -eq "cpu-gguf") { $resolvedCpuGguf } else { "" }
+                cpu_gguf         = if ($mode -in @("cpu-gguf", "cpu-llama-fixed")) { $resolvedCpuGguf } else { "" }
                 cpu_q4_h128      = if ($mode -eq "cpu-h128") { $resolvedCpuQ4H128 } else { "" }
-                cpu_threads      = if ($mode -in @("cpu-gguf", "cpu-h128")) { $CpuThreads } else { "" }
-                cpu_isa          = if ($mode -in @("cpu-gguf", "cpu-h128")) { $CpuIsa } else { "" }
+                cpu_threads      = if ($mode -in @("cpu-gguf", "cpu-h128", "cpu-llama-fixed")) { $CpuThreads } else { "" }
+                cpu_isa          = if ($mode -in @("cpu-gguf", "cpu-h128", "cpu-llama-fixed")) { $CpuIsa } else { "" }
                 teacher_forced   = -not [string]::IsNullOrWhiteSpace($ForcedOutputTokensCsv)
                 cpu_kv_cache     = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "cpu_kv_cache")
                 cached_prefix_tokens = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "cached_prefix_tokens")
@@ -523,10 +544,22 @@ foreach ($mode in $Modes) {
                 qwen35x_decode_output_token_download_ms = To-OptionalInvariantString (Get-JsonProperty -Object $qwen35xDecodeJson -Name "output_token_download_ms")
             }
 
-            if (Test-Path $resolvedCsvOut) {
-                $row | Export-Csv -LiteralPath $resolvedCsvOut -NoTypeInformation -Append
-            } else {
-                $row | Export-Csv -LiteralPath $resolvedCsvOut -NoTypeInformation
+            # File watchers can briefly deny the exclusive open on Windows.
+            # Retry only sharing/lock violations (the open failed, so no row was
+            # appended). This happens after inference, outside measured time.
+            for ($csvAttempt = 0; ; ++$csvAttempt) {
+                try {
+                    if (Test-Path $resolvedCsvOut) {
+                        $row | Export-Csv -LiteralPath $resolvedCsvOut -NoTypeInformation -Append -ErrorAction Stop
+                    } else {
+                        $row | Export-Csv -LiteralPath $resolvedCsvOut -NoTypeInformation -ErrorAction Stop
+                    }
+                    break
+                } catch [System.IO.IOException] {
+                    $csvErrorCode = $_.Exception.HResult -band 0xffff
+                    if ($csvErrorCode -notin @(32, 33) -or $csvAttempt -ge 19) { throw }
+                    Start-Sleep -Milliseconds 100
+                }
             }
 
             Write-Host ("Recorded: mode={0} run={1}/{2} tps={3}" -f $mode, $runIndex, $Runs, $row.tokens_per_second) -ForegroundColor Yellow

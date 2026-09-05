@@ -1,15 +1,32 @@
 #include "qwen35x/cpu/q4_dot4.h"
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <iostream>
 #include <random>
 #include <vector>
 
 using namespace qwen35x::cpu;
+namespace {
+bool same_outputs(const float * actual, const float * expected, std::size_t count,
+                  bool exact) {
+  if (exact) return std::memcmp(actual, expected, count * sizeof(float)) == 0;
+  // The old scalar kernel uses separate multiply/add, DOT4 explicitly uses
+  // FMA to match SIMD. On machines without AVX2, compare that legacy reference
+  // numerically; packing, embedding and argmax indices are still exact.
+  for (std::size_t i = 0; i < count; ++i) {
+    if (!std::isfinite(actual[i]) || !std::isfinite(expected[i]) ||
+        std::fabs(actual[i] - expected[i]) >
+          2.0e-5F * std::max({1.0F, std::fabs(actual[i]), std::fabs(expected[i])})) return false;
+  }
+  return true;
+}
+}
 int main() {
   std::mt19937 random(3701);
   const auto reference_backend = q8_0_backend_available(Q8_0Backend::avx2)
     ? Q8_0Backend::avx2 : Q8_0Backend::scalar;
+  const bool exact = reference_backend == Q8_0Backend::avx2;
   std::size_t cases = 0;
   for (std::size_t blocks : {1U, 2U, 4U, 32U, 64U, 112U}) {
     for (std::size_t rows : {8U, 16U, 32U, 64U}) {
@@ -56,11 +73,11 @@ int main() {
         for (auto backend : {Q8_0Backend::scalar, Q8_0Backend::avx2, Q8_0Backend::avx_vnni, Q8_0Backend::avx512_vnni}) {
           if (!q8_0_backend_available(backend)) continue;
           q4_dot4_matmul(dot4.data(), batch.data(), actual.data(), rows, tokens, blocks, rows, backend);
-          if (std::memcmp(actual.data(), expected.data(), actual.size()*sizeof(float))) { std::cerr << "DOT4 prefill mismatch\n"; return 3; }
+          if (!same_outputs(actual.data(), expected.data(), actual.size(), exact)) { std::cerr << "DOT4 prefill mismatch\n"; return 3; }
           q4_dot4_matvec(dot4.data(), vector.data(), actual.data(), rows, blocks, backend);
-          if (std::memcmp(actual.data(), expected.data(), rows*sizeof(float))) return 4;
+          if (!same_outputs(actual.data(), expected.data(), rows, exact)) return 4;
           const auto best = q4_dot4_argmax(dot4.data(), vector.data(), counts.data(), 1.05F, 7, rows, blocks, backend);
-          if (best.value != expected_best.value || best.index != expected_best.index) return 5;
+          if (!same_outputs(&best.value, &expected_best.value, 1, exact) || best.index != expected_best.index) return 5;
           ++cases;
         }
       }

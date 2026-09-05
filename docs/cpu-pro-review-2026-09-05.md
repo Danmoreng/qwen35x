@@ -45,7 +45,7 @@ zero scales, Q8 -128/+127, six K widths, four row counts and all available ISAs.
 Full-model logits for a 65-token prompt plus three forced tokens are byte-exact
 between X8 and DOT4, separately for AVX2 and AVX512-VNNI.
 
-## Measurements so far
+## Sequential measurements
 
 AMD Ryzen 9 9955HX3D, Windows/MSVC Release, 12 threads, FP16 KV. Process affinity
 0x0000ffff for both sides, inherited by child processes. This is experimental
@@ -68,11 +68,6 @@ DOT4 versus the post-dispatch X8 baseline, medians:
 The tiny decode differences are within run variation; no decode gain is claimed
 for this layout alone. The AVX2 numbers are AVX2 dispatch on this Ryzen, not a
 new measurement on the user's older Intel laptop.
-
-## Remaining review experiments
-
-16-row decode, active workers, register-held DeltaNet, prefill workspace, and
-quality/long-context proposals are evaluated separately after this baseline.
 
 ## Further measured experiments
 
@@ -133,3 +128,31 @@ quality/long-context proposals are evaluated separately after this baseline.
   precision tests pass.
 
 H256 is deferred at the user's explicit request.
+
+## Final local tuning (no further optimization trials after this point)
+
+- Zero spin: decode 122.21 to 109.71 tok/s; prefill 1688.01 to 1516.51.
+  Shortened spin (65536): decode 124.98 to 124.02; prefill 1684.80 to 1707.52.
+  Retained the existing default; no consistent throughput gain.
+- Fixed K=1024/2048/3584 decode/argmax variants: an initial EVEX result of
+  121.64 to 122.99 did not repeat (114.26 to 113.02). AVX2 initially improved
+  111.86 to 114.53, but confirmation was 120.06 to 120.37 (+0.26%, noise).
+  Reverted all fixed-K variants; local source patch is
+  benchmarks/review-fixedk-experiment.patch.
+- Thread count with the same 0xffff affinity: 12 versus 8 gives decode
+  118.77 versus 121.34 and prefill 1699.23 versus 2145.76. A separate 12 versus
+  16 comparison gives decode 116.71 versus 115.05 and prefill 1668.29 versus
+  1951.82. These are settings for this placement on this machine, not universal
+  defaults. Pool configuration remains unchanged.
+- Some early thread trials aborted because the CSV was open in an editor.
+  Labels threads8-* and threadscan8-* are incomplete and are excluded from
+  comparisons. The complete threadfinal* series is used above. The runner now
+  retries only Windows sharing/lock violations after inference; later series
+  write separate files. Raw samples are retained, including incomplete series.
+
+The user stopped additional optimization trials and requested a final comparison
+against updated llama.cpp. H256 remains explicitly deferred. A new H128
+quantization recipe needs a separate held-out quality evaluation; the repository's
+single arithmetic regression case is insufficient for acceptance. LUT/T-MAC and
+SSE/other-topology backends remain separate, unimplemented research proposals.
+No claim that every possible CPU optimization has been exhausted is made.
