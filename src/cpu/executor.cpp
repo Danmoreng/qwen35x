@@ -285,13 +285,16 @@ public:
       }
       cpu_relax();
     }
-    {
-      std::unique_lock<std::mutex> lock(job_mutex_);
-      if (!workers_complete) {
-        job_complete_.wait(lock, [this] {
-          return completed_workers_.load(std::memory_order_acquire) == workers_.size();
-        });
+    if (!workers_complete) {
+      auto completed = completed_workers_.load(std::memory_order_acquire);
+      while (completed != workers_.size()) {
+        // The value check and wait cannot lose a completion notification.
+        completed_workers_.wait(completed, std::memory_order_acquire);
+        completed = completed_workers_.load(std::memory_order_acquire);
       }
+    }
+    {
+      const std::lock_guard<std::mutex> lock(job_mutex_);
       task_ = nullptr;
       task_context_ = nullptr;
       job_row_count_ = 0;
@@ -340,7 +343,7 @@ private:
 
       const std::size_t completed = completed_workers_.fetch_add(1, std::memory_order_release) + 1;
       if (completed == workers_.size()) {
-        job_complete_.notify_one();
+        completed_workers_.notify_one();
       }
     }
   }
@@ -352,7 +355,6 @@ private:
 
   std::mutex job_mutex_;
   std::condition_variable job_available_;
-  std::condition_variable job_complete_;
   std::atomic<bool> stopping_{false};
   alignas(64) std::atomic<std::uint64_t> job_generation_{0};
   alignas(64) std::atomic<std::size_t> completed_workers_{0};

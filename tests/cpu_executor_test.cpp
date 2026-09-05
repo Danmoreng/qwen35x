@@ -276,6 +276,25 @@ bool test_q8_matmul(CpuExecutor & executor) {
 } // namespace
 
 int main() {
+  // Exercise the sleeping completion path, immediate completions, empty worker
+  // partitions, repeated generations, and more workers than typical core counts.
+  for (std::size_t threads : {2U, 8U, 64U}) {
+    std::error_code sleep_error;
+    auto sleeping = CpuExecutor::create(
+      {.thread_count = threads, .min_parallel_rows = 1, .spin_count = 0}, sleep_error);
+    if (!expect(sleeping != nullptr, "could not create zero-spin executor")) return 1;
+    for (int repetition = 0; repetition < 256; ++repetition) {
+      const std::size_t count = static_cast<std::size_t>(repetition % 33);
+      std::vector<int> values(count, -1);
+      FillContext context{repetition * 101, &values};
+      if (!expect(sleeping->parallel_for_rows(count, fill_rows, &context) == CpuExecutorStatus::ok,
+                  "zero-spin job failed")) return 1;
+      for (std::size_t row = 0; row < count; ++row) {
+        if (!expect(values[row] == context.seed + static_cast<int>(row * 3),
+                    "zero-spin completion did not publish all writes")) return 1;
+      }
+    }
+  }
   std::error_code error_code;
   auto executor = CpuExecutor::create(
     qwen35x::cpu::CpuExecutorConfig{

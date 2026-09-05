@@ -19,6 +19,7 @@ TARGET = struct.Struct("<i")
 class LogitDump:
     def __init__(self, path: pathlib.Path):
         self.path = path
+        self.position = 0
         self.stream = path.open("rb")
         header = self.stream.read(HEADER.size)
         if len(header) != HEADER.size:
@@ -26,6 +27,9 @@ class LogitDump:
         magic, version, self.vocab, self.positions = HEADER.unpack(header)
         if magic != MAGIC or version != 1:
             raise ValueError(f"Unsupported logit dump format: {path}")
+        if self.positions == 0 or self.vocab < 2:
+            self.stream.close()
+            raise ValueError(f"Empty logit dump or invalid vocabulary: {path}")
         expected = HEADER.size + self.positions * (TARGET.size + self.vocab * 4)
         if path.stat().st_size != expected:
             raise ValueError(
@@ -40,6 +44,11 @@ class LogitDump:
         logits = np.fromfile(self.stream, dtype="<f4", count=self.vocab)
         if logits.size != self.vocab:
             raise ValueError(f"Truncated logits record in {self.path}")
+        if not np.isfinite(logits).all():
+            index = int(np.flatnonzero(~np.isfinite(logits))[0])
+            raise ValueError(f"Non-finite raw logit in {self.path} at output position "
+                             f"{self.position}, vocabulary index {index}")
+        self.position += 1
         return target, logits
 
     def close(self):
@@ -122,7 +131,11 @@ def main():
             logp = log_softmax_f64(logits_t)
             logq = log_softmax_f64(logits_c)
             probabilities = np.exp(logp)
-            kld = max(0.0, float(np.sum(probabilities * (logp - logq))))
+            raw_kld = float(np.sum(probabilities * (logp - logq)))
+            if not math.isfinite(raw_kld):
+                raise ValueError(f"Non-finite KL at output position {position}: "
+                                 f"{args.teacher} versus {args.candidate}")
+            kld = max(0.0, raw_kld)
 
             top_t = top_indices(logits_t, 10)
             top_c = top_indices(logits_c, 10)
@@ -133,8 +146,8 @@ def main():
             teacher_top1 = int(top_t[0])
             candidate_top1 = int(top_c[0])
 
-            centered_t = logits_t.astype(np.float64) - float(np.mean(logits_t))
-            centered_c = logits_c.astype(np.float64) - float(np.mean(logits_c))
+            centered_t = logits_t.astype(np.float64) - float(np.mean(logits_t, dtype=np.float64))
+            centered_c = logits_c.astype(np.float64) - float(np.mean(logits_c, dtype=np.float64))
             difference = centered_c - centered_t
             denominator = float(np.linalg.norm(centered_t) * np.linalg.norm(centered_c))
             cosine = float(np.dot(centered_t, centered_c) / denominator) if denominator else 1.0
@@ -171,8 +184,8 @@ def main():
                 writer.writerows(rows)
         if args.json:
             args.json.parent.mkdir(parents=True, exist_ok=True)
-            args.json.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-        print(json.dumps(summary, indent=2))
+            args.json.write_text(json.dumps(summary, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+        print(json.dumps(summary, indent=2, allow_nan=False))
     finally:
         teacher.close()
         candidate.close()

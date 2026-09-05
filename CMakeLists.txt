@@ -285,6 +285,7 @@ if (BUILD_TESTING)
   add_executable(qwen35x_cpu_executor_test tests/cpu_executor_test.cpp)
   target_link_libraries(qwen35x_cpu_executor_test PRIVATE qwen35x_core)
   add_test(NAME qwen35x_cpu_executor COMMAND qwen35x_cpu_executor_test)
+  set_tests_properties(qwen35x_cpu_executor PROPERTIES TIMEOUT 30)
 
   add_executable(qwen35x_gguf_reader_test tests/gguf_reader_test.cpp)
   target_link_libraries(qwen35x_gguf_reader_test PRIVATE qwen35x_core)
