@@ -18,6 +18,11 @@ void q4_h128_transform_block_avx2_unscaled(
     q4_h128_sign_word(transform_block_index, 0, sign_seed),
     q4_h128_sign_word(transform_block_index, 1, sign_seed),
   };
+  q4_h128_transform_block_avx2_signed(input, output, sign_words);
+}
+
+void q4_h128_transform_block_avx2_signed(
+  const float * input, float * output, const std::uint64_t * sign_words) noexcept {
   const __m256i sign_shifts = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
   for (std::size_t vector = 0; vector < 16; ++vector) {
     const std::size_t value_base = vector * 8;

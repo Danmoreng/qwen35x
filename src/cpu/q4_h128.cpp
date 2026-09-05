@@ -1,6 +1,7 @@
 #include "qwen35x/cpu/q4_h128.h"
 
 #include "q4_h128_internal.h"
+#include "q4_0_internal.h"
 #include "q8_0_internal.h"
 
 #include <algorithm>
@@ -238,18 +239,79 @@ bool q4_h128_prepare_activation(
   return true;
 }
 
+void q4_h128_prepare_signs(Q4H128SignBlock * output, const std::size_t block_count,
+                          const std::uint64_t sign_seed) noexcept {
+  for (std::size_t block = 0; block < block_count; ++block) {
+    output[block].words[0] = detail::q4_h128_sign_word(block, 0, sign_seed);
+    output[block].words[1] = detail::q4_h128_sign_word(block, 1, sign_seed);
+  }
+}
+
+bool q4_h128_prepare_activation_1(
+  const float * input, Q8_0BlockX1 * output, const std::size_t column_count,
+  const std::uint64_t sign_seed, const Q8_0Backend backend,
+  const Q4H128SignBlock * signs) noexcept {
+  if (input == nullptr || output == nullptr || column_count == 0 ||
+      column_count % q4_h128_transform_size != 0) {
+    return false;
+  }
+  [[maybe_unused]] const bool avx2 = q8_0_backend_uses_avx2(backend);
+  [[maybe_unused]] const bool avx512 = q8_0_backend_uses_avx512(backend);
+  alignas(32) float transformed[q4_h128_transform_size];
+  for (std::size_t block = 0; block < column_count / q4_h128_transform_size; ++block) {
+    auto * destination = output + block * q4_h128_q4_blocks_per_transform;
+#if QWEN35X_Q8_0_HAS_AVX2_TU
+    if (avx2) {
+#if QWEN35X_Q8_0_HAS_AVX512_TU
+      if (avx512) {
+        Q4H128SignBlock local_signs;
+        if (signs == nullptr) {
+          local_signs.words[0] = detail::q4_h128_sign_word(block, 0, sign_seed);
+          local_signs.words[1] = detail::q4_h128_sign_word(block, 1, sign_seed);
+        }
+        detail::q4_h128_transform_block_avx512_signed(
+          input + block * q4_h128_transform_size, transformed,
+          signs == nullptr ? local_signs.words : signs[block].words);
+      } else
+#endif
+      if (signs != nullptr) {
+        detail::q4_h128_transform_block_avx2_signed(
+          input + block * q4_h128_transform_size, transformed, signs[block].words);
+      } else {
+        detail::q4_h128_transform_block_avx2_unscaled(
+          input + block * q4_h128_transform_size, transformed, block, sign_seed);
+      }
+      detail::q8_0_quantize_vector_1_avx2(
+        transformed, destination, q4_h128_q4_blocks_per_transform);
+    } else
+#endif
+    {
+      detail::q4_h128_transform_block_scalar_unscaled(
+        input + block * q4_h128_transform_size, transformed, block, sign_seed);
+      detail::q8_0_quantize_vector_1_scalar(
+        transformed, destination, q4_h128_q4_blocks_per_transform);
+    }
+    for (std::size_t group = 0; group < q4_h128_q4_blocks_per_transform; ++group) {
+      destination[group].scales[0] *= q4_h128_inverse_sqrt_size;
+    }
+  }
+  return true;
+}
+
 bool q4_h128_prepare_activations_4(
   const float * input,
   Q8_0BlockX4 * output,
   const std::size_t vector_count,
   const std::size_t column_count,
   const std::uint64_t sign_seed,
-  const Q8_0Backend backend) noexcept {
+  const Q8_0Backend backend, const Q4H128SignBlock * signs) noexcept {
   if (input == nullptr || output == nullptr || vector_count == 0 ||
       vector_count % q8_0_packed_vectors != 0 || column_count == 0 ||
       column_count % q4_h128_transform_size != 0) {
     return false;
   }
+  // Full-model trials favor keeping the four-token prefill transform on AVX2.
+  [[maybe_unused]] const bool avx2 = q8_0_backend_uses_avx2(backend);
   const std::size_t blocks_per_vector = column_count / q8_0_values_per_block;
   const std::size_t transform_blocks = column_count / q4_h128_transform_size;
   alignas(32) float transformed[
@@ -260,16 +322,21 @@ bool q4_h128_prepare_activations_4(
     for (std::size_t transform_block = 0;
          transform_block < transform_blocks;
          ++transform_block) {
+      Q4H128SignBlock local_signs;
+      const Q4H128SignBlock * block_signs = signs == nullptr ? &local_signs : signs + transform_block;
+      if (signs == nullptr) {
+        local_signs.words[0] = detail::q4_h128_sign_word(transform_block, 0, sign_seed);
+        local_signs.words[1] = detail::q4_h128_sign_word(transform_block, 1, sign_seed);
+      }
       for (std::size_t token = 0; token < q8_0_packed_vectors; ++token) {
         const std::size_t vector = vector_tile * q8_0_packed_vectors + token;
 #if QWEN35X_Q8_0_HAS_AVX2_TU
-        if (q8_0_backend_uses_avx2(backend)) {
-          detail::q4_h128_transform_block_avx2_unscaled(
+        if (avx2) {
+          detail::q4_h128_transform_block_avx2_signed(
             input + vector * column_count +
               transform_block * q4_h128_transform_size,
             transformed + token * q4_h128_transform_size,
-            transform_block,
-            sign_seed);
+            block_signs->words);
           continue;
         }
 #endif

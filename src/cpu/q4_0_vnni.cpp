@@ -11,8 +11,9 @@
 namespace qwen35x::cpu::detail {
 namespace {
 
+template <typename Block>
 [[nodiscard]] __m256i load_q8_token_half(
-  const Q8_0BlockX4 & block,
+  const Block & block,
   const std::size_t token,
   const std::size_t half) noexcept {
   const std::int8_t * base = block.qs + token * 32 + half * 16;
@@ -20,11 +21,11 @@ namespace {
     _mm_loadu_si128(reinterpret_cast<const __m128i *>(base)));
 }
 
-template <std::size_t TokenCount>
+template <std::size_t TokenCount, typename Block>
 void accumulate_packed_block_x8_vnni(
   const Q4_0BlockX8 & weights,
-  const Q8_0BlockX4 & activations0,
-  const Q8_0BlockX4 * activations1,
+  const Block & activations0,
+  const std::type_identity_t<Block> * activations1,
   __m256 (&accumulators)[TokenCount]) noexcept {
   static_assert(TokenCount == 1 || TokenCount == 4 || TokenCount == 8);
   const __m256i nibble_mask = _mm256_set1_epi8(0x0f);
@@ -59,7 +60,7 @@ void accumulate_packed_block_x8_vnni(
     _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
 
   for (std::size_t token = 0; token < TokenCount; ++token) {
-    const Q8_0BlockX4 & activation_block = token < 4
+    const Block & activation_block = token < 4
       ? activations0 : *activations1;
     const std::size_t activation_lane = token % 4;
     const __m256i activation_0 =
@@ -200,7 +201,7 @@ void q4_0_packed_matvec_q8_0_avx_vnni(
 
 void q4_0_packed_matvec_prepared_q8_0_avx_vnni(
   const Q4_0BlockX8 * matrix,
-  const Q8_0BlockX4 * vector,
+  const Q8_0BlockX1 * vector,
   float * output,
   const std::size_t row_count,
   const std::size_t blocks_per_row) noexcept {
@@ -217,7 +218,7 @@ void q4_0_packed_matvec_prepared_q8_0_avx_vnni(
 
 Q4_0ArgmaxResult q4_0_packed_matvec_prepared_q8_0_argmax_avx_vnni(
   const Q4_0BlockX8 * matrix,
-  const Q8_0BlockX4 * vector,
+  const Q8_0BlockX1 * vector,
   const int * token_counts,
   const float repetition_penalty,
   const std::size_t row_offset,

@@ -358,7 +358,11 @@ bool run_forward_single_token(
   }
 
   const auto embedding_start = std::chrono::steady_clock::now();
-  std::vector<float> x(static_cast<std::size_t>(dims.hidden), 0.0f);
+  CpuDecodeWorkspace::Forward local_workspace;
+  auto & workspace = !use_cuda && weights.embed_tokens.q8_0_runtime != nullptr
+    ? weights.embed_tokens.q8_0_runtime->decode.forward : local_workspace;
+  auto & x = workspace.x;
+  x.resize(static_cast<std::size_t>(dims.hidden));
   if (weights.embed_tokens.is_cpu_quantized()) {
     if ((dims.hidden % static_cast<int>(cpu::q8_0_values_per_block)) != 0) {
       error_message = "Quantized embedding width is not divisible by 32.";
@@ -396,14 +400,14 @@ bool run_forward_single_token(
 
   int full_idx = 0;
   int linear_idx = 0;
-  std::vector<float> normed;
-  std::vector<float> attn_out;
-  std::vector<float> residual;
-  std::vector<float> post_norm;
-  std::vector<float> mlp_gate;
-  std::vector<float> mlp_up;
-  std::vector<float> mlp_hidden;
-  std::vector<float> mlp_out;
+  auto & normed = workspace.normed;
+  auto & attn_out = workspace.attn_out;
+  auto & residual = workspace.residual;
+  auto & post_norm = workspace.post_norm;
+  auto & mlp_gate = workspace.mlp_gate;
+  auto & mlp_up = workspace.mlp_up;
+  auto & mlp_hidden = workspace.mlp_hidden;
+  auto & mlp_out = workspace.mlp_out;
 
   for (int il = 0; il < dims.n_layers; ++il) {
     const LayerWeights & layer = weights.layers[static_cast<std::size_t>(il)];
@@ -458,8 +462,10 @@ bool run_forward_single_token(
         return false;
       }
     } else {
+      const float * gate_values;
+      const float * up_values;
       if (layer.mlp_gate_up_cpu.is_cpu_quantized()) {
-        std::vector<float> packed;
+        auto & packed = workspace.mlp_packed;
         if (!matvec_2d(layer.mlp_gate_up_cpu, post_norm, packed, false, error_message)) {
           return false;
         }
@@ -468,17 +474,19 @@ bool run_forward_single_token(
           error_message = "Packed MLP gate/up projection output size mismatch.";
           return false;
         }
-        mlp_gate.assign(packed.begin(), packed.begin() + static_cast<std::ptrdiff_t>(intermediate));
-        mlp_up.assign(packed.begin() + static_cast<std::ptrdiff_t>(intermediate), packed.end());
+        gate_values = packed.data();
+        up_values = packed.data() + intermediate;
       } else {
         if (!matvec_2d(layer.mlp_gate, post_norm, mlp_gate, use_cuda, error_message) ||
             !matvec_2d(layer.mlp_up, post_norm, mlp_up, use_cuda, error_message)) {
           return false;
         }
+        gate_values = mlp_gate.data();
+        up_values = mlp_up.data();
       }
-      mlp_hidden.resize(mlp_gate.size());
+      mlp_hidden.resize(static_cast<std::size_t>(dims.intermediate));
       cpu::silu_mul_f32(
-        mlp_gate.data(), mlp_up.data(), mlp_hidden.data(), mlp_hidden.size(),
+        gate_values, up_values, mlp_hidden.data(), mlp_hidden.size(),
         layer.mlp_down.is_cpu_quantized()
           ? layer.mlp_down.q8_0_backend
           : cpu::Q8_0Backend::auto_select);
@@ -501,7 +509,7 @@ bool run_forward_single_token(
   }
 
   const auto logits_start = std::chrono::steady_clock::now();
-  std::vector<float> final_hidden;
+  auto & final_hidden = workspace.final_hidden;
   rms_norm_qwen3next(x, weights.final_norm, dims.rms_eps, final_hidden);
   bool ok = false;
   if (use_cuda_gpu_sampling && use_cuda && cuda_workspace != nullptr && cuda_workspace->has_gpu_sampling_buffers) {

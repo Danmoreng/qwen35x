@@ -241,10 +241,13 @@ bool run_linear_attention_step(
   const bool use_cuda,
   CudaForwardWorkspace * cuda_workspace,
   std::string & error_message) {
-  std::vector<float> mixed_qkv;
-  std::vector<float> z_vec;
-  std::vector<float> b_vec;
-  std::vector<float> a_vec;
+  CpuDecodeWorkspace::Linear local_workspace;
+  auto & workspace = !use_cuda && layer.linear.out_proj.q8_0_runtime != nullptr
+    ? layer.linear.out_proj.q8_0_runtime->decode.linear : local_workspace;
+  auto & mixed_qkv = workspace.mixed_qkv;
+  auto & z_vec = workspace.z_vec;
+  auto & b_vec = workspace.b_vec;
+  auto & a_vec = workspace.a_vec;
   const bool use_cuda_linear_kernel =
     use_cuda && cuda_workspace != nullptr && cuda_workspace->has_device_buffers && state.has_device_state &&
     layer.linear.has_device_params && layer.linear.in_proj_qkv.has_device_matrix && layer.linear.in_proj_z.has_device_matrix &&
@@ -288,6 +291,7 @@ bool run_linear_attention_step(
     return true;
   }
 
+  bool packed_projection = false;
   const bool use_cuda_projection_batch =
     use_cuda && cuda_workspace != nullptr && cuda_workspace->has_device_buffers;
   if (use_cuda_projection_batch) {
@@ -320,7 +324,7 @@ bool run_linear_attention_step(
     }
   } else {
     if (layer.linear.in_proj_all_cpu.is_cpu_quantized()) {
-      std::vector<float> packed;
+      auto & packed = workspace.packed;
       if (!matvec_2d(layer.linear.in_proj_all_cpu, x, packed, false, error_message)) {
         return false;
       }
@@ -332,14 +336,7 @@ bool run_linear_attention_step(
         error_message = "Packed linear-attention projection output size mismatch.";
         return false;
       }
-      auto cursor = packed.begin();
-      mixed_qkv.assign(cursor, cursor + static_cast<std::ptrdiff_t>(qkv_count));
-      cursor += static_cast<std::ptrdiff_t>(qkv_count);
-      z_vec.assign(cursor, cursor + static_cast<std::ptrdiff_t>(z_count));
-      cursor += static_cast<std::ptrdiff_t>(z_count);
-      b_vec.assign(cursor, cursor + static_cast<std::ptrdiff_t>(ba_count));
-      cursor += static_cast<std::ptrdiff_t>(ba_count);
-      a_vec.assign(cursor, cursor + static_cast<std::ptrdiff_t>(ba_count));
+      packed_projection = true;
     } else {
       if (!matvec_2d(layer.linear.in_proj_qkv, x, mixed_qkv, use_cuda, error_message) ||
           !matvec_2d(layer.linear.in_proj_z, x, z_vec, use_cuda, error_message) ||
@@ -350,15 +347,22 @@ bool run_linear_attention_step(
     }
   }
 
-  std::vector<float> beta(static_cast<std::size_t>(dims.linear_num_v_heads), 0.0f);
-  std::vector<float> alpha(static_cast<std::size_t>(dims.linear_num_v_heads), 0.0f);
+  const float * mixed_values = packed_projection ? workspace.packed.data() : mixed_qkv.data();
+  const float * z_values = packed_projection ? mixed_values + dims.linear_conv_channels : z_vec.data();
+  const float * b_values = packed_projection ? z_values + dims.linear_v_dim : b_vec.data();
+  const float * a_values = packed_projection ? b_values + dims.linear_num_v_heads : a_vec.data();
+  auto & beta = workspace.beta;
+  beta.resize(static_cast<std::size_t>(dims.linear_num_v_heads));
+  auto & alpha = workspace.alpha;
+  alpha.resize(static_cast<std::size_t>(dims.linear_num_v_heads));
   for (int h = 0; h < dims.linear_num_v_heads; ++h) {
-    beta[static_cast<std::size_t>(h)] = sigmoidf_stable(b_vec[static_cast<std::size_t>(h)]);
-    const float pre_gate = softplusf_stable(a_vec[static_cast<std::size_t>(h)] + layer.linear.dt_bias.data[static_cast<std::size_t>(h)]);
+    beta[static_cast<std::size_t>(h)] = sigmoidf_stable(b_values[static_cast<std::size_t>(h)]);
+    const float pre_gate = softplusf_stable(a_values[static_cast<std::size_t>(h)] + layer.linear.dt_bias.data[static_cast<std::size_t>(h)]);
     alpha[static_cast<std::size_t>(h)] = std::exp(pre_gate * layer.linear.ssm_a[static_cast<std::size_t>(h)]);
   }
 
-  std::vector<float> conv_out(static_cast<std::size_t>(dims.linear_conv_channels), 0.0f);
+  auto & conv_out = workspace.conv_out;
+  conv_out.resize(static_cast<std::size_t>(dims.linear_conv_channels));
   const std::size_t conv_channels = static_cast<std::size_t>(dims.linear_conv_channels);
   const std::size_t conv_kernel = static_cast<std::size_t>(dims.linear_kernel);
   const std::size_t conv_history = conv_kernel - 1;
@@ -367,7 +371,7 @@ bool run_linear_attention_step(
     return false;
   }
   cpu::causal_conv1d_silu_f32(
-    state.conv_state.data(), state.conv_ring_index, mixed_qkv.data(), conv_channels,
+    state.conv_state.data(), state.conv_ring_index, mixed_values, conv_channels,
     layer.linear.conv1d_kernel_major.data(), conv_out.data(), 1, conv_channels,
     conv_kernel, 0, conv_channels,
     layer.linear.out_proj.q8_0_backend);
@@ -375,15 +379,16 @@ bool run_linear_attention_step(
     state.conv_ring_index = (state.conv_ring_index + 1) % conv_history;
   }
 
-  std::vector<float> q(conv_out.begin(), conv_out.begin() + dims.linear_q_dim);
-  std::vector<float> k(conv_out.begin() + dims.linear_q_dim, conv_out.begin() + 2 * dims.linear_q_dim);
-  std::vector<float> v(conv_out.begin() + 2 * dims.linear_q_dim, conv_out.end());
+  const std::span<float> q(conv_out.data(), static_cast<std::size_t>(dims.linear_q_dim));
+  const std::span<float> k(conv_out.data() + dims.linear_q_dim, static_cast<std::size_t>(dims.linear_q_dim));
+  const std::span<const float> v(conv_out.data() + 2 * dims.linear_q_dim, static_cast<std::size_t>(dims.linear_v_dim));
   const float q_scale = 1.0f / std::sqrt(static_cast<float>(dims.linear_head_k_dim));
   l2_norm_per_head(
     q, dims.linear_num_k_heads, dims.linear_head_k_dim, 1.0e-6F, q_scale);
   l2_norm_per_head(k, dims.linear_num_k_heads, dims.linear_head_k_dim);
 
-  std::vector<float> core_out(static_cast<std::size_t>(dims.linear_v_dim), 0.0f);
+  auto & core_out = workspace.core_out;
+  core_out.resize(static_cast<std::size_t>(dims.linear_v_dim));
   const cpu::Q8_0Backend cpu_backend = layer.linear.out_proj.is_cpu_quantized()
     ? layer.linear.out_proj.q8_0_backend
     : cpu::Q8_0Backend::auto_select;
@@ -428,14 +433,15 @@ bool run_linear_attention_step(
       cpu_backend);
   }
 
-  std::vector<float> gated_norm(static_cast<std::size_t>(dims.linear_v_dim), 0.0f);
+  auto & gated_norm = workspace.gated_norm;
+  gated_norm.resize(static_cast<std::size_t>(dims.linear_v_dim));
   cpu::rms_norm_f32(
     core_out.data(), layer.linear.norm.data.data(), gated_norm.data(),
     static_cast<std::size_t>(dims.linear_num_v_heads),
     static_cast<std::size_t>(dims.linear_head_v_dim), dims.rms_eps, 0.0F,
     cpu_backend);
   cpu::silu_mul_f32(
-    z_vec.data(), gated_norm.data(), gated_norm.data(), gated_norm.size(),
+    z_values, gated_norm.data(), gated_norm.data(), gated_norm.size(),
     cpu_backend);
 
   if (!matvec_2d(layer.linear.out_proj, gated_norm, out, use_cuda, error_message)) {
@@ -456,9 +462,13 @@ bool run_full_attention_step(
   const bool use_cuda,
   CudaForwardWorkspace * cuda_workspace,
   std::string & error_message) {
-  std::vector<float> q_full;
-  std::vector<float> k_flat;
-  std::vector<float> v_flat;
+  CpuDecodeWorkspace::Full local_workspace;
+  auto & workspace = !use_cuda && layer.full.o_proj.q8_0_runtime != nullptr
+    ? layer.full.o_proj.q8_0_runtime->decode.full : local_workspace;
+  auto & q_full = workspace.q_full;
+  auto & k_flat = workspace.k_flat;
+  auto & v_flat = workspace.v_flat;
+  bool packed_projection = false;
   const bool use_cuda_projection_batch =
     use_cuda && cuda_workspace != nullptr && cuda_workspace->has_device_buffers;
   const std::size_t full_q_out = static_cast<std::size_t>(dims.n_heads * dims.head_dim * 2);
@@ -472,7 +482,7 @@ bool run_full_attention_step(
     }
   } else {
     if (layer.full.qkv_proj_cpu.is_cpu_quantized()) {
-      std::vector<float> packed;
+      auto & packed = workspace.packed;
       if (!matvec_2d(layer.full.qkv_proj_cpu, x, packed, false, error_message)) {
         return false;
       }
@@ -481,13 +491,7 @@ bool run_full_attention_step(
         error_message = "Packed full-attention projection output size mismatch.";
         return false;
       }
-      q_full.assign(packed.begin(), packed.begin() + static_cast<std::ptrdiff_t>(full_q_out));
-      k_flat.assign(
-        packed.begin() + static_cast<std::ptrdiff_t>(full_q_out),
-        packed.begin() + static_cast<std::ptrdiff_t>(full_q_out + full_kv_out));
-      v_flat.assign(
-        packed.begin() + static_cast<std::ptrdiff_t>(full_q_out + full_kv_out),
-        packed.end());
+      packed_projection = true;
     } else {
       if (!matvec_2d(layer.full.q_proj, x, q_full, use_cuda, error_message) ||
           !matvec_2d(layer.full.k_proj, x, k_flat, use_cuda, error_message) ||
@@ -497,21 +501,26 @@ bool run_full_attention_step(
     }
   }
 
+  const float * q_values = packed_projection ? workspace.packed.data() : q_full.data();
+  const float * k_values = packed_projection ? q_values + full_q_out : k_flat.data();
+  const float * v_values = packed_projection ? k_values + full_kv_out : v_flat.data();
   const int q_span = dims.head_dim * 2;
-  std::vector<float> q(static_cast<std::size_t>(dims.n_heads * dims.head_dim));
-  std::vector<float> gate(static_cast<std::size_t>(dims.n_heads * dims.head_dim));
+  auto & q = workspace.q;
+  q.resize(static_cast<std::size_t>(dims.n_heads * dims.head_dim));
+  auto & gate = workspace.gate;
+  gate.resize(static_cast<std::size_t>(dims.n_heads * dims.head_dim));
   for (int h = 0; h < dims.n_heads; ++h) {
     const std::size_t src = static_cast<std::size_t>(h * q_span);
     const std::size_t dst = static_cast<std::size_t>(h * dims.head_dim);
-    std::memcpy(q.data() + dst, q_full.data() + src, static_cast<std::size_t>(dims.head_dim) * sizeof(float));
-    std::memcpy(gate.data() + dst, q_full.data() + src + static_cast<std::size_t>(dims.head_dim),
+    std::memcpy(q.data() + dst, q_values + src, static_cast<std::size_t>(dims.head_dim) * sizeof(float));
+    std::memcpy(gate.data() + dst, q_values + src + static_cast<std::size_t>(dims.head_dim),
                 static_cast<std::size_t>(dims.head_dim) * sizeof(float));
   }
 
-  std::vector<float> q_normed;
-  std::vector<float> k_normed;
+  auto & q_normed = workspace.q_normed;
+  auto & k_normed = workspace.k_normed;
   rms_norm_per_head_qwen3next(q, dims.n_heads, dims.head_dim, layer.full.q_norm, dims.rms_eps, q_normed);
-  rms_norm_per_head_qwen3next(k_flat, dims.n_kv_heads, dims.head_dim, layer.full.k_norm, dims.rms_eps, k_normed);
+  rms_norm_per_head_qwen3next(std::span<const float>(k_values, full_kv_out), dims.n_kv_heads, dims.head_dim, layer.full.k_norm, dims.rms_eps, k_normed);
 
   cpu::rope_f32(
     q_normed.data(), static_cast<std::size_t>(dims.n_heads),
@@ -529,7 +538,7 @@ bool run_full_attention_step(
     token_stride * sizeof(float));
   std::memcpy(
     state.v_cache.data() + static_cast<std::size_t>(position) * token_stride,
-    v_flat.data(),
+    v_values,
     token_stride * sizeof(float));
 
   const bool use_cuda_full_kernel =
@@ -541,14 +550,14 @@ bool run_full_attention_step(
       k_normed.data(), state.k_cache_f16.data() + offset, token_stride,
       layer.full.o_proj.q8_0_backend);
     cpu::attention_cache_store_f16(
-      v_flat.data(), state.v_cache_f16.data() + offset, token_stride,
+      v_values, state.v_cache_f16.data() + offset, token_stride,
       layer.full.o_proj.q8_0_backend);
   }
   if (use_cuda_full_kernel) {
     const std::size_t offset = static_cast<std::size_t>(position) * token_stride;
     const std::size_t full_q_count = static_cast<std::size_t>(dims.n_heads * dims.head_dim);
     if (!cuda::upload_to_buffer_f32(k_normed.data(), token_stride, state.k_cache_device, offset, error_message) ||
-        !cuda::upload_to_buffer_f32(v_flat.data(), token_stride, state.v_cache_device, offset, error_message) ||
+        !cuda::upload_to_buffer_f32(v_values, token_stride, state.v_cache_device, offset, error_message) ||
         !cuda::upload_to_buffer_f32(q_normed.data(), full_q_count, cuda_workspace->full_q, 0, error_message) ||
         !cuda::upload_to_buffer_f32(gate.data(), full_q_count, cuda_workspace->full_gate, 0, error_message) ||
         !cuda::run_full_attention_decode_gqa(
@@ -582,8 +591,10 @@ bool run_full_attention_step(
   const std::size_t attention_rows = static_cast<std::size_t>(dims.n_heads);
   const std::size_t attention_pairs = attention_rows / 2U;
   const std::size_t context_stride = static_cast<std::size_t>(seq_len);
-  std::vector<float> attn_cat(query_width, 0.0f);
-  std::vector<float> scores(attention_rows * context_stride, 0.0f);
+  auto & attn_cat = workspace.attn_cat;
+  attn_cat.resize(query_width);
+  auto & scores = workspace.scores;
+  scores.resize(attention_rows * context_stride);
   FullAttentionBatchCpuJob job{
     q_normed.data(),
     gate.data(),

@@ -211,10 +211,10 @@ void q4_0_packed_matvec_q8_0_scalar(
 
 void q8_0_quantize_vector_1_scalar(
   const float * input,
-  Q8_0BlockX4 * packed,
+  Q8_0BlockX1 * packed,
   const std::size_t blocks_per_vector) noexcept {
   for (std::size_t block = 0; block < blocks_per_vector; ++block) {
-    Q8_0BlockX4 & destination = packed[block];
+    Q8_0BlockX1 & destination = packed[block];
     const float * source = input + block * 32;
     float absolute_max = 0.0F;
     for (std::size_t index = 0; index < 32; ++index) {
@@ -237,7 +237,7 @@ void q8_0_quantize_vector_1_scalar(
 
 void q4_0_packed_matvec_prepared_q8_0_scalar(
   const Q4_0BlockX8 * matrix,
-  const Q8_0BlockX4 * vector,
+  const Q8_0BlockX1 * vector,
   float * output,
   const std::size_t row_count,
   const std::size_t blocks_per_row) noexcept {
@@ -245,7 +245,7 @@ void q4_0_packed_matvec_prepared_q8_0_scalar(
     float accumulators[8]{};
     for (std::size_t block = 0; block < blocks_per_row; ++block) {
       const Q4_0BlockX8 & weights = matrix[row_tile * blocks_per_row + block];
-      const Q8_0BlockX4 & activation = vector[block];
+      const Q8_0BlockX1 & activation = vector[block];
       for (std::size_t row = 0; row < 8; ++row) {
         std::int32_t integer_dot = 0;
         for (std::size_t index = 0; index < 16; ++index) {
@@ -268,7 +268,7 @@ void q4_0_packed_matvec_prepared_q8_0_scalar(
 
 Q4_0ArgmaxResult q4_0_packed_matvec_prepared_q8_0_argmax_scalar(
   const Q4_0BlockX8 * matrix,
-  const Q8_0BlockX4 * vector,
+  const Q8_0BlockX1 * vector,
   const int * token_counts,
   const float repetition_penalty,
   const std::size_t row_offset,
@@ -372,7 +372,7 @@ void q8_0_quantize_vectors_4(
 
 void q8_0_quantize_vector_1(
   const float * input,
-  Q8_0BlockX4 * packed,
+  Q8_0BlockX1 * packed,
   const std::size_t blocks_per_vector,
   const Q8_0Backend backend) noexcept {
 #if QWEN35X_Q8_0_HAS_AVX2_TU
@@ -569,7 +569,7 @@ void q4_0_packed_matvec_q8_0(
 
 void q4_0_packed_matvec_prepared_q8_0(
   const Q4_0BlockX8 * matrix,
-  const Q8_0BlockX4 * vector,
+  const Q8_0BlockX1 * vector,
   float * output,
   const std::size_t row_count,
   const std::size_t blocks_per_row,
@@ -598,7 +598,7 @@ void q4_0_packed_matvec_prepared_q8_0(
 
 Q4_0ArgmaxResult q4_0_packed_matvec_prepared_q8_0_argmax(
   const Q4_0BlockX8 * matrix,
-  const Q8_0BlockX4 * vector,
+  const Q8_0BlockX1 * vector,
   const int * token_counts,
   const float repetition_penalty,
   const std::size_t row_offset,

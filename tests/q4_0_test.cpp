@@ -123,7 +123,7 @@ bool test_packed_backend(const Q8_0Backend backend) {
   std::vector<float> reference_matvec(rows);
   std::vector<float> packed_matvec(rows);
   std::vector<float> prepared_matvec(rows);
-  std::vector<Q8_0BlockX4> prepared_input(blocks_per_row);
+  std::vector<qwen35x::cpu::Q8_0BlockX1> prepared_input(blocks_per_row);
   qwen35x::cpu::q4_0_matvec_q8_0(
     weights.data(), activations.data(), reference_matvec.data(), rows,
     blocks_per_row, Q8_0Backend::scalar);

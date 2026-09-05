@@ -7,6 +7,14 @@
 
 namespace qwen35x::cpu {
 
+struct Q4H128SignBlock { std::uint64_t words[2]; };
+
+// Prepare once per seed/width. The immutable blocks can be shared by workers.
+// Optional signs in the preparation functions must contain column_count/128
+// blocks generated with the supplied seed; nullptr computes signs on demand.
+void q4_h128_prepare_signs(Q4H128SignBlock * output, std::size_t block_count,
+                          std::uint64_t sign_seed) noexcept;
+
 inline constexpr std::size_t q4_h128_transform_size = 128;
 inline constexpr std::size_t q4_h128_q4_blocks_per_transform =
   q4_h128_transform_size / q4_0_values_per_block;
@@ -76,6 +84,15 @@ void q4_h128_quantize_transformed(
   std::uint64_t sign_seed = q4_h128_default_sign_seed,
   Q8_0Backend backend = Q8_0Backend::auto_select) noexcept;
 
+// Fused single-token decode preparation; column_count must be divisible by
+// 128. Quantization rounds the unnormalized Q8 scale to FP16 before folding
+// the H128 normalization into its prepared FP32 scale.
+[[nodiscard]] bool q4_h128_prepare_activation_1(
+  const float * input, Q8_0BlockX1 * output, std::size_t column_count,
+  std::uint64_t sign_seed = q4_h128_default_sign_seed,
+  Q8_0Backend backend = Q8_0Backend::auto_select,
+  const Q4H128SignBlock * signs = nullptr) noexcept;
+
 // Transforms groups of four token-major activation rows and immediately
 // quantizes them into the packed Q8_0 prefill layout. Keeping each transformed
 // H128 block in a small local buffer avoids a batch-sized FP32 scratch pass.
@@ -86,6 +103,7 @@ void q4_h128_quantize_transformed(
   std::size_t vector_count,
   std::size_t column_count,
   std::uint64_t sign_seed = q4_h128_default_sign_seed,
-  Q8_0Backend backend = Q8_0Backend::auto_select) noexcept;
+  Q8_0Backend backend = Q8_0Backend::auto_select,
+  const Q4H128SignBlock * signs = nullptr) noexcept;
 
 } // namespace qwen35x::cpu

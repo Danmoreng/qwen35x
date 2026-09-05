@@ -113,6 +113,8 @@ struct ReferenceInferenceOptions {
   bool profile_qwen35x = false;
   bool prefill_only = false;
   int cpu_threads = 0;
+  // FP32 cache keeps SIMD attention enabled; false prefers FP16 on SIMD CPUs.
+  bool cpu_kv_cache_f32 = false;
   cpu::Q8_0Backend cpu_q8_backend = cpu::Q8_0Backend::auto_select;
   ReferenceCpuModelSession * cpu_model_session = nullptr;
   ReferenceCpuPrefixCache * cpu_prefix_cache = nullptr;
@@ -163,6 +165,7 @@ struct ReferenceInferenceResult {
   double tokens_per_second = 0.0;
   int forward_pass_tokens = 0;
   bool cpu_model_session_hit = false;
+  bool cpu_kv_cache_f16 = false;
   int cached_prefix_tokens = 0;
   double prefix_cache_restore_time_ms = 0.0;
   std::size_t prefix_cache_bytes = 0;

@@ -486,6 +486,9 @@ bool run_reference_qwen35_inference(
     }
   }
 
+  const bool use_f16_cpu_cache = !options.use_cuda && weights.cpu_q8_runtime != nullptr &&
+    !options.cpu_kv_cache_f32 && cpu::q8_0_backend_uses_avx2(options.cpu_q8_backend);
+  result.cpu_kv_cache_f16 = use_f16_cpu_cache;
   state.full_states.resize(static_cast<std::size_t>(full_layers));
   for (auto & fs : state.full_states) {
     fs.k_cache.resize(
@@ -494,7 +497,7 @@ bool run_reference_qwen35_inference(
     fs.v_cache.resize(
       static_cast<std::size_t>(options.max_context) * static_cast<std::size_t>(dims.n_kv_heads) *
       static_cast<std::size_t>(dims.head_dim));
-    if (!options.use_cuda && weights.cpu_q8_runtime != nullptr) {
+    if (use_f16_cpu_cache) {
       fs.k_cache_f16.resize(fs.k_cache.size());
       fs.v_cache_f16.resize(fs.v_cache.size());
     }
@@ -721,6 +724,7 @@ bool run_reference_qwen35_inference(
         snapshot->model_signature == prefix_model_signature && tokens_match &&
         snapshot->backend == cpu::q8_0_resolve_backend(options.cpu_q8_backend) &&
         snapshot->prefill_mode == options.qwen35x_prefill_mode &&
+        snapshot->use_f16_cache == use_f16_cpu_cache &&
         snapshot->hidden == dims.hidden && snapshot->head_dim == dims.head_dim &&
         snapshot->kv_heads == dims.n_kv_heads &&
         restore_cpu_prefix_state(
@@ -752,7 +756,7 @@ bool run_reference_qwen35_inference(
     snapshot->kv_heads = dims.n_kv_heads;
     capture_cpu_prefix_state(
       state, prefix_token_count, kv_width,
-      snapshot->backend == cpu::Q8_0Backend::avx2, *snapshot);
+      use_f16_cpu_cache, *snapshot);
     result.prefix_cache_bytes = cpu_prefix_cache_size_bytes(*snapshot);
     options.cpu_prefix_cache->implementation_ = std::move(snapshot);
   };

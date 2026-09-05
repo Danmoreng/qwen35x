@@ -320,22 +320,26 @@ bool test_full_attention_decode_pairs(const Q8_0Backend backend) {
       std::vector<float> reference(query_width);
       std::vector<float> paired(query_width);
       const float scale = 1.0F / std::sqrt(static_cast<float>(head_dim));
-      qwen35x::cpu::causal_attention_batch_rows(
-        query.data(), gate.data(), key_cache.data(), value_cache.data(),
-        key_cache_f16.data(), value_cache_f16.data(), reference_scores.data(),
-        reference.data(), static_cast<std::size_t>(context), query_width, kv_width,
-        context - 1, heads, kv_heads, head_dim, scale, 0,
-        static_cast<std::size_t>(heads), backend);
-      qwen35x::cpu::causal_attention_decode_gqa_pairs(
-        query.data(), gate.data(), key_cache.data(), value_cache.data(),
-        key_cache_f16.data(), value_cache_f16.data(), paired_scores.data(),
-        paired.data(), static_cast<std::size_t>(context), query_width, kv_width,
-        context, heads, kv_heads, head_dim, scale, 0,
-        static_cast<std::size_t>(heads / 2), backend);
-      for (std::size_t index = 0; index < paired.size(); ++index) {
-        ok = expect(
-          near_attention(reference[index], paired[index]),
-          "paired GQA decode output differs from row kernel") && ok;
+      for (const bool use_f16 : {false, true}) {
+        qwen35x::cpu::causal_attention_batch_rows(
+          query.data(), gate.data(), key_cache.data(), value_cache.data(),
+          use_f16 ? key_cache_f16.data() : nullptr,
+          use_f16 ? value_cache_f16.data() : nullptr, reference_scores.data(),
+          reference.data(), static_cast<std::size_t>(context), query_width, kv_width,
+          context - 1, heads, kv_heads, head_dim, scale, 0,
+          static_cast<std::size_t>(heads), backend);
+        qwen35x::cpu::causal_attention_decode_gqa_pairs(
+          query.data(), gate.data(), key_cache.data(), value_cache.data(),
+          use_f16 ? key_cache_f16.data() : nullptr,
+          use_f16 ? value_cache_f16.data() : nullptr, paired_scores.data(),
+          paired.data(), static_cast<std::size_t>(context), query_width, kv_width,
+          context, heads, kv_heads, head_dim, scale, 0,
+          static_cast<std::size_t>(heads / 2), backend);
+        for (std::size_t index = 0; index < paired.size(); ++index) {
+          ok = expect(
+            near_attention(reference[index], paired[index]),
+            "paired GQA decode output differs from row kernel") && ok;
+        }
       }
     }
   }

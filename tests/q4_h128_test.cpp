@@ -115,8 +115,8 @@ bool test_unscaled_q8_preparation() {
   std::vector<float> normalized(columns);
   std::vector<float> unscaled(columns);
   const std::size_t block_count = columns / qwen35x::cpu::q8_0_values_per_block;
-  std::vector<qwen35x::cpu::Q8_0BlockX4> reference(block_count);
-  std::vector<qwen35x::cpu::Q8_0BlockX4> folded(block_count);
+  std::vector<qwen35x::cpu::Q8_0BlockX1> reference(block_count);
+  std::vector<qwen35x::cpu::Q8_0BlockX1> folded(block_count);
   bool ok = expect(qwen35x::cpu::q4_h128_transform_rows(
                      input.data(), normalized.data(), 1, columns,
                      qwen35x::cpu::q4_h128_default_sign_seed,
@@ -186,41 +186,77 @@ bool test_quantized_projection() {
 }
 
 bool test_fused_packed_activation() {
-  constexpr std::size_t vectors = 8;
-  constexpr std::size_t columns = 256;
-  constexpr std::size_t blocks_per_vector =
-    columns / qwen35x::cpu::q8_0_values_per_block;
-  const std::vector<float> input = make_values(vectors * columns, 0.77F);
-  std::vector<float> transformed(input.size());
-  std::vector<qwen35x::cpu::Q8_0BlockX4> reference(
-    (vectors / qwen35x::cpu::q8_0_packed_vectors) * blocks_per_vector);
-  std::vector<qwen35x::cpu::Q8_0BlockX4> fused(reference.size());
-  bool ok = expect(qwen35x::cpu::q4_h128_transform_rows_unscaled(
-                     input.data(), transformed.data(), vectors, columns,
-                     qwen35x::cpu::q4_h128_default_sign_seed,
-                     qwen35x::cpu::Q8_0Backend::avx2),
-                   "packed comparison transform failed");
-  qwen35x::cpu::q8_0_quantize_vectors_4(
-    transformed.data(), reference.data(), vectors, blocks_per_vector,
-    qwen35x::cpu::Q8_0Backend::avx2);
-  for (qwen35x::cpu::Q8_0BlockX4 & block : reference) {
-    for (float & scale : block.scales) {
-      scale *= qwen35x::cpu::q4_h128_inverse_sqrt_size;
+  using namespace qwen35x::cpu;
+  bool ok = true;
+  for (auto backend : {Q8_0Backend::scalar, Q8_0Backend::avx2,
+                       Q8_0Backend::avx512_vnni}) {
+    for (std::size_t columns : {128U, 256U, 3584U}) {
+      for (std::uint64_t seed : {UINT64_C(0), q4_h128_default_sign_seed}) {
+        constexpr std::size_t vectors = 8;
+        const auto input = make_values(vectors * columns, 0.77F);
+        std::vector<float> transformed(input.size());
+        std::vector<Q8_0BlockX4> reference((vectors / 4) * (columns / 32));
+        std::vector<Q8_0BlockX4> fused(reference.size());
+        std::vector<Q4H128SignBlock> signs(columns / 128);
+        q4_h128_prepare_signs(signs.data(), signs.size(), seed);
+        ok = expect(q4_h128_transform_rows_unscaled(input.data(), transformed.data(),
+                      vectors, columns, seed, backend), "packed reference transform failed") && ok;
+        q8_0_quantize_vectors_4(transformed.data(), reference.data(), vectors, columns / 32, backend);
+        for (auto & block : reference) {
+          for (float & scale : block.scales) scale *= q4_h128_inverse_sqrt_size;
+        }
+        for (bool cached : {false, true}) {
+          ok = expect(q4_h128_prepare_activations_4(input.data(), fused.data(), vectors,
+                        columns, seed, backend, cached ? signs.data() : nullptr),
+                      "fused packed preparation failed") && ok;
+          ok = expect(std::equal(
+                        reinterpret_cast<const unsigned char *>(reference.data()),
+                        reinterpret_cast<const unsigned char *>(reference.data() + reference.size()),
+                        reinterpret_cast<const unsigned char *>(fused.data())),
+                      "fused packed differs from two-pass preparation") && ok;
+        }
+        ok = expect(!q4_h128_prepare_activations_4(input.data(), fused.data(), 6, columns),
+                    "invalid packed vector count accepted") && ok;
+      }
     }
   }
-  ok = expect(qwen35x::cpu::q4_h128_prepare_activations_4(
-                input.data(), fused.data(), vectors, columns,
-                qwen35x::cpu::q4_h128_default_sign_seed,
-                qwen35x::cpu::Q8_0Backend::avx2),
-              "fused packed activation preparation failed") && ok;
-  ok = expect(std::equal(
-                reinterpret_cast<const unsigned char *>(reference.data()),
-                reinterpret_cast<const unsigned char *>(reference.data() + reference.size()),
-                reinterpret_cast<const unsigned char *>(fused.data())),
-              "fused packed activation differs from unscaled two-pass preparation") && ok;
-  ok = expect(!qwen35x::cpu::q4_h128_prepare_activations_4(
-                input.data(), fused.data(), 6, columns),
-              "invalid packed vector count was accepted") && ok;
+  return ok;
+}
+
+bool test_fused_decode_activation() {
+  using namespace qwen35x::cpu;
+  bool ok = true;
+  for (auto backend : {Q8_0Backend::scalar, Q8_0Backend::avx2,
+                       Q8_0Backend::avx_vnni, Q8_0Backend::avx512_vnni}) {
+    for (std::size_t columns : {128U, 256U, 1024U, 3584U}) {
+      for (std::uint64_t seed : {UINT64_C(0), q4_h128_default_sign_seed}) {
+        for (bool zero : {false, true}) {
+          auto input = make_values(columns, 0.31F);
+          if (zero) std::fill(input.begin(), input.end(), 0.0F);
+          std::vector<float> transformed(columns);
+          std::vector<Q8_0BlockX1> reference(columns / 32), fused(columns / 32);
+          std::vector<Q4H128SignBlock> signs(columns / 128);
+          q4_h128_prepare_signs(signs.data(), signs.size(), seed);
+          ok = expect(q4_h128_transform_rows_unscaled(input.data(), transformed.data(),
+                        1, columns, seed, backend), "decode reference transform failed") && ok;
+          q8_0_quantize_vector_1(transformed.data(), reference.data(), columns / 32, backend);
+          for (auto & block : reference) block.scales[0] *= q4_h128_inverse_sqrt_size;
+          for (bool cached : {false, true}) {
+            ok = expect(q4_h128_prepare_activation_1(input.data(), fused.data(), columns,
+                          seed, backend, cached ? signs.data() : nullptr), "fused decode preparation failed") && ok;
+            for (std::size_t b = 0; b < reference.size(); ++b) {
+              ok = expect(reference[b].scales[0] == fused[b].scales[0] &&
+                            reference[b].sums[0] == fused[b].sums[0] &&
+                            std::equal(reference[b].qs, reference[b].qs + 32, fused[b].qs),
+                          "fused decode differs from two-pass preparation") && ok;
+            }
+          }
+          ok = expect(!q4_h128_prepare_activation_1(input.data(), fused.data(), columns - 1,
+                        seed, backend), "invalid decode width accepted") && ok;
+        }
+      }
+    }
+  }
   return ok;
 }
 
@@ -234,6 +270,7 @@ int main() {
   ok = test_unscaled_q8_preparation() && ok;
   ok = test_quantized_projection() && ok;
   ok = test_fused_packed_activation() && ok;
+  ok = test_fused_decode_activation() && ok;
   if (ok) {
     std::cout << "Q4_H128 tests passed\n";
     return 0;

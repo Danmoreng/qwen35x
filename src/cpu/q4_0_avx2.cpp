@@ -37,9 +37,10 @@ namespace {
     scaled, _mm256_or_ps(_mm256_set1_ps(0.5F), sign));
 }
 
+template <typename Block>
 void quantize_q8_block_packed(
   const float * input,
-  Q8_0BlockX4 & output,
+  Block & output,
   const std::size_t token) noexcept {
   const __m256 x0 = _mm256_loadu_ps(input);
   const __m256 x1 = _mm256_loadu_ps(input + 8);
@@ -133,8 +134,9 @@ void quantize_q8_block_packed(
     _mm256_madd_epi16(pair_products, _mm256_set1_epi16(1)));
 }
 
+template <typename Block>
 [[nodiscard]] __m256i load_q8_token_half(
-  const Q8_0BlockX4 & block,
+  const Block & block,
   const std::size_t token,
   const std::size_t half) noexcept {
   const std::int8_t * base = block.qs + token * 32 + half * 16;
@@ -142,11 +144,11 @@ void quantize_q8_block_packed(
     _mm_loadu_si128(reinterpret_cast<const __m128i *>(base)));
 }
 
-template <std::size_t TokenCount>
+template <std::size_t TokenCount, typename Block>
 void accumulate_packed_block_x8(
   const Q4_0BlockX8 & weights,
-  const Q8_0BlockX4 & activations0,
-  const Q8_0BlockX4 * activations1,
+  const Block & activations0,
+  const std::type_identity_t<Block> * activations1,
   __m256 (&accumulators)[TokenCount]) noexcept {
   static_assert(TokenCount == 1 || TokenCount == 4 || TokenCount == 8);
   const __m256i nibble_mask = _mm256_set1_epi8(0x0f);
@@ -181,7 +183,7 @@ void accumulate_packed_block_x8(
     _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
 
   for (std::size_t token = 0; token < TokenCount; ++token) {
-    const Q8_0BlockX4 & activation_block = token < 4
+    const Block & activation_block = token < 4
       ? activations0 : *activations1;
     const std::size_t activation_lane = token % 4;
     const __m256i activation_0 =
@@ -531,7 +533,7 @@ void q8_0_quantize_vectors_4_avx2(
 
 void q8_0_quantize_vector_1_avx2(
   const float * input,
-  Q8_0BlockX4 * packed,
+  Q8_0BlockX1 * packed,
   const std::size_t blocks_per_vector) noexcept {
   for (std::size_t block = 0; block < blocks_per_vector; ++block) {
     quantize_q8_block_packed(input + block * 32, packed[block], 0);
@@ -573,7 +575,7 @@ void q4_0_packed_matvec_q8_0_avx2(
 
 void q4_0_packed_matvec_prepared_q8_0_avx2(
   const Q4_0BlockX8 * matrix,
-  const Q8_0BlockX4 * vector,
+  const Q8_0BlockX1 * vector,
   float * output,
   const std::size_t row_count,
   const std::size_t blocks_per_row) noexcept {
@@ -593,7 +595,7 @@ void q4_0_packed_matvec_prepared_q8_0_avx2(
 
 Q4_0ArgmaxResult q4_0_packed_matvec_prepared_q8_0_argmax_avx2(
   const Q4_0BlockX8 * matrix,
-  const Q8_0BlockX4 * vector,
+  const Q8_0BlockX1 * vector,
   const int * token_counts,
   const float repetition_penalty,
   const std::size_t row_offset,

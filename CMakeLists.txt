@@ -91,7 +91,7 @@ if (QWEN35X_SYSTEM_PROCESSOR_LOWER MATCHES "^(x86_64|amd64|i[3-6]86)$" OR
         src/cpu/q4_0_vnni.cpp src/cpu/q8_0_vnni.cpp
         PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
       set_source_files_properties(
-        src/cpu/activation_avx512.cpp
+        src/cpu/activation_avx512.cpp src/cpu/q4_h128_avx512.cpp
         PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
       set_source_files_properties(
         src/cpu/q4_0_avx512_vnni.cpp
@@ -112,7 +112,7 @@ if (QWEN35X_SYSTEM_PROCESSOR_LOWER MATCHES "^(x86_64|amd64|i[3-6]86)$" OR
       if (QWEN35X_COMPILER_HAS_MAVX512F)
         set(QWEN35X_Q8_0_HAS_AVX512_TU ON)
         set_source_files_properties(
-          src/cpu/activation_avx512.cpp
+          src/cpu/activation_avx512.cpp src/cpu/q4_h128_avx512.cpp
           PROPERTIES COMPILE_OPTIONS "-mavx512f;-mfma")
         check_cxx_compiler_flag("-mavx512vnni" QWEN35X_COMPILER_HAS_MAVX512VNNI)
         check_cxx_compiler_flag("-mavx512vl" QWEN35X_COMPILER_HAS_MAVX512VL)
@@ -144,7 +144,7 @@ else ()
 endif ()
 
 if (QWEN35X_Q8_0_HAS_AVX512_TU)
-  target_sources(qwen35x_core PRIVATE src/cpu/activation_avx512.cpp)
+  target_sources(qwen35x_core PRIVATE src/cpu/activation_avx512.cpp src/cpu/q4_h128_avx512.cpp)
   target_compile_definitions(qwen35x_core PRIVATE QWEN35X_Q8_0_HAS_AVX512_TU=1)
 else ()
   target_compile_definitions(qwen35x_core PRIVATE QWEN35X_Q8_0_HAS_AVX512_TU=0)
@@ -278,6 +278,10 @@ target_link_libraries(qwen35x_q4_h128_convert PRIVATE qwen35x_core)
 
 include(CTest)
 if (BUILD_TESTING)
+  # Requires local model files, so it is invoked explicitly rather than by CTest.
+  add_executable(qwen35x_cpu_kv_cache_model_test tests/cpu_kv_cache_model_test.cpp)
+  target_link_libraries(qwen35x_cpu_kv_cache_model_test PRIVATE qwen35x_core)
+
   add_executable(qwen35x_cpu_executor_test tests/cpu_executor_test.cpp)
   target_link_libraries(qwen35x_cpu_executor_test PRIVATE qwen35x_core)
   add_test(NAME qwen35x_cpu_executor COMMAND qwen35x_cpu_executor_test)

@@ -24,6 +24,7 @@
 #include <numeric>
 #include <random>
 #include <sstream>
+#include <span>
 #include <unordered_set>
 
 namespace qwen35x {

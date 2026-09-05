@@ -51,7 +51,7 @@ void q8_0_quantize_vectors_4_scalar(
 
 void q8_0_quantize_vector_1_scalar(
   const float * input,
-  Q8_0BlockX4 * packed,
+  Q8_0BlockX1 * packed,
   std::size_t blocks_per_vector) noexcept;
 
 void q4_0_packed_matvec_q8_0_scalar(
@@ -63,7 +63,7 @@ void q4_0_packed_matvec_q8_0_scalar(
 
 void q4_0_packed_matvec_prepared_q8_0_scalar(
   const Q4_0BlockX8 * matrix,
-  const Q8_0BlockX4 * vector,
+  const Q8_0BlockX1 * vector,
   float * output,
   std::size_t row_count,
   std::size_t blocks_per_row) noexcept;
@@ -71,7 +71,7 @@ void q4_0_packed_matvec_prepared_q8_0_scalar(
 [[nodiscard]] Q4_0ArgmaxResult
 q4_0_packed_matvec_prepared_q8_0_argmax_scalar(
   const Q4_0BlockX8 * matrix,
-  const Q8_0BlockX4 * vector,
+  const Q8_0BlockX1 * vector,
   const int * token_counts,
   float repetition_penalty,
   std::size_t row_offset,
@@ -124,7 +124,7 @@ void q8_0_quantize_vectors_4_avx2(
 
 void q8_0_quantize_vector_1_avx2(
   const float * input,
-  Q8_0BlockX4 * packed,
+  Q8_0BlockX1 * packed,
   std::size_t blocks_per_vector) noexcept;
 
 void q4_0_packed_matvec_q8_0_avx2(
@@ -136,7 +136,7 @@ void q4_0_packed_matvec_q8_0_avx2(
 
 void q4_0_packed_matvec_prepared_q8_0_avx2(
   const Q4_0BlockX8 * matrix,
-  const Q8_0BlockX4 * vector,
+  const Q8_0BlockX1 * vector,
   float * output,
   std::size_t row_count,
   std::size_t blocks_per_row) noexcept;
@@ -144,7 +144,7 @@ void q4_0_packed_matvec_prepared_q8_0_avx2(
 [[nodiscard]] Q4_0ArgmaxResult
 q4_0_packed_matvec_prepared_q8_0_argmax_avx2(
   const Q4_0BlockX8 * matrix,
-  const Q8_0BlockX4 * vector,
+  const Q8_0BlockX1 * vector,
   const int * token_counts,
   float repetition_penalty,
   std::size_t row_offset,
@@ -171,7 +171,7 @@ void q4_0_packed_matvec_q8_0_avx_vnni(
 
 void q4_0_packed_matvec_prepared_q8_0_avx_vnni(
   const Q4_0BlockX8 * matrix,
-  const Q8_0BlockX4 * vector,
+  const Q8_0BlockX1 * vector,
   float * output,
   std::size_t row_count,
   std::size_t blocks_per_row) noexcept;
@@ -179,7 +179,7 @@ void q4_0_packed_matvec_prepared_q8_0_avx_vnni(
 [[nodiscard]] Q4_0ArgmaxResult
 q4_0_packed_matvec_prepared_q8_0_argmax_avx_vnni(
   const Q4_0BlockX8 * matrix,
-  const Q8_0BlockX4 * vector,
+  const Q8_0BlockX1 * vector,
   const int * token_counts,
   float repetition_penalty,
   std::size_t row_offset,

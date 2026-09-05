@@ -11,6 +11,8 @@ param(
     [int]$CpuThreads = 0,
     [ValidateSet("auto", "scalar", "avx2", "avx-vnni", "avx512", "avx512-vnni")]
     [string]$CpuIsa = "auto",
+    [ValidateSet("fp16", "fp32")]
+    [string]$CpuKvCache = "fp16",
     [int]$CpuPrefixCacheTokens = 0,
     [int]$CpuPrefixCacheReplays = 1,
     [ValidateSet("chat-user", "prompt-text", "prompt-file", "prompt-tokens")]
@@ -19,6 +21,7 @@ param(
     [string]$PromptText = "Tell me a short joke.",
     [string]$PromptFile = "",
     [string]$PromptTokensCsv = "",
+    [string]$ForcedOutputTokensCsv = "",
     [int]$Runs = 3,
     [int]$WarmupRuns = 1,
     [int]$MaxNewTokens = 128,
@@ -133,12 +136,14 @@ function Invoke-BenchmarkRun {
         [Parameter(Mandatory = $false)][string]$CpuQ4H128,
         [Parameter(Mandatory = $true)][int]$CpuThreads,
         [Parameter(Mandatory = $true)][string]$CpuIsa,
+        [Parameter(Mandatory = $true)][string]$CpuKvCache,
         [Parameter(Mandatory = $true)][int]$CpuPrefixCacheTokens,
         [Parameter(Mandatory = $true)][int]$CpuPrefixCacheReplays,
         [Parameter(Mandatory = $true)][string]$PromptMode,
         [Parameter(Mandatory = $true)][string]$PromptText,
         [Parameter(Mandatory = $false)][string]$PromptFile,
         [Parameter(Mandatory = $false)][string]$PromptTokensCsv,
+        [Parameter(Mandatory = $false)][string]$ForcedOutputTokensCsv,
         [Parameter(Mandatory = $true)][int]$MaxNewTokens,
         [Parameter(Mandatory = $true)][int]$MaxContext,
         [Parameter(Mandatory = $true)][int]$GpuDecodeBlocks,
@@ -198,6 +203,10 @@ function Invoke-BenchmarkRun {
             "--cpu-threads", "$CpuThreads",
             "--cpu-isa", $CpuIsa
         )
+        # FP16 is the historical default; omit its flag to support older binaries.
+        if ($CpuKvCache -eq "fp32") {
+            $args += @("--cpu-kv-cache", "fp32")
+        }
         if ($CpuPrefixCacheTokens -gt 0) {
             $args += @(
                 "--cpu-prefix-cache-tokens", "$CpuPrefixCacheTokens",
@@ -214,6 +223,10 @@ function Invoke-BenchmarkRun {
         $args += @("--prompt-file", $PromptFile)
     } else {
         $args += @("--prompt-tokens", $PromptTokensCsv)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ForcedOutputTokensCsv)) {
+        $args += @("--forced-output-tokens", $ForcedOutputTokensCsv)
     }
 
     $isCpuMode = $Mode -in @("cpu-reference", "cpu-gguf", "cpu-h128")
@@ -349,12 +362,14 @@ foreach ($mode in $Modes) {
                 -CpuQ4H128 $resolvedCpuQ4H128 `
                 -CpuThreads $CpuThreads `
                 -CpuIsa $CpuIsa `
+                -CpuKvCache $CpuKvCache `
                 -CpuPrefixCacheTokens $CpuPrefixCacheTokens `
                 -CpuPrefixCacheReplays $CpuPrefixCacheReplays `
                 -PromptMode $PromptMode `
                 -PromptText $PromptText `
                 -PromptFile $resolvedPromptFile `
                 -PromptTokensCsv $PromptTokensCsv `
+                -ForcedOutputTokensCsv $ForcedOutputTokensCsv `
                 -MaxNewTokens $MaxNewTokens `
                 -MaxContext $MaxContext `
                 -GpuDecodeBlocks $GpuDecodeBlocks `
@@ -389,12 +404,14 @@ foreach ($mode in $Modes) {
                 -CpuQ4H128 $resolvedCpuQ4H128 `
                 -CpuThreads $CpuThreads `
                 -CpuIsa $CpuIsa `
+                -CpuKvCache $CpuKvCache `
                 -CpuPrefixCacheTokens $CpuPrefixCacheTokens `
                 -CpuPrefixCacheReplays $CpuPrefixCacheReplays `
                 -PromptMode $PromptMode `
                 -PromptText $PromptText `
                 -PromptFile $resolvedPromptFile `
                 -PromptTokensCsv $PromptTokensCsv `
+                -ForcedOutputTokensCsv $ForcedOutputTokensCsv `
                 -MaxNewTokens $MaxNewTokens `
                 -MaxContext $MaxContext `
                 -GpuDecodeBlocks $GpuDecodeBlocks `
@@ -447,6 +464,8 @@ foreach ($mode in $Modes) {
                 cpu_q4_h128      = if ($mode -eq "cpu-h128") { $resolvedCpuQ4H128 } else { "" }
                 cpu_threads      = if ($mode -in @("cpu-gguf", "cpu-h128")) { $CpuThreads } else { "" }
                 cpu_isa          = if ($mode -in @("cpu-gguf", "cpu-h128")) { $CpuIsa } else { "" }
+                teacher_forced   = -not [string]::IsNullOrWhiteSpace($ForcedOutputTokensCsv)
+                cpu_kv_cache     = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "cpu_kv_cache")
                 cached_prefix_tokens = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "cached_prefix_tokens")
                 prefix_cache_restore_time_ms = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "prefix_cache_restore_time_ms")
                 prefix_cache_bytes = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "prefix_cache_bytes")
