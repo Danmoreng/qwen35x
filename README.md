@@ -2,13 +2,67 @@
 
 `qwen35x` is a vibe-coded inference engine project focused on **Qwen3.5**.
 
-The goal is not a generic multi-model runtime. The goal is a small, hardware-aware engine that can be aggressively optimized for a specific Qwen3.5 architecture and target GPU class.
+The goal is not a generic multi-model runtime. The goal is a small, hardware-aware engine that can be aggressively optimized for specific Qwen3.5 architectures on CPUs and CUDA GPUs.
+
+## CPU benchmark: Qwen3.5-0.8B Q4 vs. llama.cpp
+
+**September 5, 2026 — Qwen35x was faster in all 16 matched cases.** With 8 threads,
+prefill throughput was **19–94% higher**, and decode throughput **17–19% higher**
+than the updated llama.cpp build. With 12 threads, the respective gains were
+**28–63%** and **21–22%**. Both engines were faster with 8 threads in this setup.
+
+Measured on an **AMD Ryzen 9 9955HX3D**, Windows/MSVC Release, with identical
+process affinity `0x0000ffff` (logical CPUs 0–15), **FP16 KV**, and the same fixed
+token IDs. Qwen35x uses **H128/Q4-G32 with DOT4 packing**; llama.cpp
+[`74a7c897`](https://github.com/ggml-org/llama.cpp/commit/74a7c897f049c17e7080423aa2111776eff6ebbf)
+uses fresh **Q4_0 (`--pure`)** from the same BF16 source, AVX-512/VNNI, CPU
+repacking and Flash Attention. Medians of **3 runs after 1 warmup**, all sequential.
+These are two different Q4 recipes; this benchmark does not establish a new
+quality ranking or cover Q4_K_M/IQ4.
+
+**Prefill — tokens/s, no LM-head output**
+
+| Prompt tokens | Qwen35x · 8 threads | llama.cpp · 8 threads | Qwen35x · 12 threads | llama.cpp · 12 threads |
+|---:|---:|---:|---:|---:|
+| 512 | 2,133.47 | 1,101.73 | 1,673.97 | 1,028.32 |
+| 1,024 | 1,938.11 | 1,097.80 | 1,624.43 | 997.54 |
+| 2,048 | 1,615.98 | 1,050.80 | 1,414.79 | 958.22 |
+| 4,096 | 1,190.83 | 1,000.60 | 1,132.12 | 885.64 |
+
+**Decode — tokens/s after a fixed 512-token prompt**
+
+| Output tokens | Qwen35x · 8 threads | llama.cpp · 8 threads | Qwen35x · 12 threads | llama.cpp · 12 threads |
+|---:|---:|---:|---:|---:|
+| 128 | 122.42 | 102.63 | 119.76 | 98.63 |
+| 256 | 121.92 | 103.65 | 119.34 | 98.85 |
+| 512 | 121.42 | 102.35 | 118.35 | 97.23 |
+| 1,024 | 118.81 | 101.33 | 116.73 | 96.71 |
+
+Decode uses a fixed continuation and full-vocabulary logits in both engines.
+Rates count **N−1 timed decode forwards for N outputs**: the first prediction
+is produced during prefill. Loading and tokenization are excluded; context
+capacity is 8192. Batch execution is engine-specific (Qwen35x chunks 64;
+llama.cpp batch 2048 / microbatch 512). No GPU or speculative decoding.
+
+**[Full methodology and results](docs/cpu-engine-comparison-2026-09-05.md)** ·
+[All 96 samples](docs/cpu-engine-comparison-2026-09-05-samples.csv) ·
+[Summary CSV](docs/cpu-engine-comparison-2026-09-05-summary.csv) ·
+[Versions, hashes and settings](docs/cpu-engine-comparison-2026-09-05-metadata.json) ·
+[Build and model preparation](scripts/bench/llama-fixed-cpu/README.md)
+
+Reproduce with the [sequential comparison script](scripts/benchmark-cpu-engine-comparison.ps1):
+
+```powershell
+.\scripts\benchmark-cpu-engine-comparison.ps1 -OutDir benchmarks/cpu-comparison-rerun
+python scripts/summarize-cpu-engine-comparison.py benchmarks/cpu-comparison-rerun
+```
 
 ## What This Repo Is
 
 - A C++/CUDA codebase for Qwen3.5-focused inference experiments
 - A hybrid reference runtime for correctness and architecture bring-up
-- A playground for moving from reference CPU logic to specialized GPU kernels
+- Specialized H128/Q4 CPU inference with AVX2 and VNNI kernels
+- A playground for moving from reference logic to specialized CPU and GPU kernels
 
 ## Current Capabilities
 
@@ -18,6 +72,7 @@ The goal is not a generic multi-model runtime. The goal is a small, hardware-awa
 - `--infer-gpu` defaults to the in-tree Qwen35x CUDA backend and auto-selects the compiled 0.8B or 4B CUDA layout from the loaded model profile
 - Legacy CUDA runtime decode backend remains available with `--gpu-decode-backend default`
 - Batched Qwen35x prefill is the default prompt-processing path and warms the prefill backend during initialization
+- Custom CPU H128/Q4 artifacts support checkpoint-time DOT4 packing, compact decode activations, persistent prefill workspaces, and FP16-only KV storage; see [CPU implementation results](docs/cpu-pro-review-2026-09-05.md)
 - Direct-GGUF CPU Q8_0 prefill includes portable scalar and runtime-dispatched AVX2 kernels; see `docs/cpu-q8-prefill-2026-08-31.md`
 - Device-resident decode path for per-layer hidden/residual/norm/attention/MLP math in `--infer-gpu`
 - GPU logits + GPU sampling path in the legacy runtime decode backend
