@@ -193,6 +193,67 @@ bool test_packed_backend(const Q8_0Backend backend) {
   return ok;
 }
 
+// Integer extrema catch saturation/overflow in packed SIMD partial sums.
+// Unit scales keep the expected dot products exactly representable in FP32.
+bool test_packed_integer_extrema(const Q8_0Backend backend) {
+  using namespace qwen35x::cpu;
+  constexpr std::size_t rows = 16, vectors = 12, blocks = 3;
+  bool ok = true;
+  for (int pattern = 0; pattern < 5; ++pattern) {
+    std::vector<Q4_0Block> weights(rows * blocks);
+    std::vector<Q8_0Block> activations(vectors * blocks);
+    for (std::size_t row = 0; row < rows; ++row) {
+      for (std::size_t block = 0; block < blocks; ++block) {
+        auto & weight = weights[row * blocks + block];
+        weight.d = row % 2 == 0 ? 0x3c00U : 0xbc00U;
+        for (std::size_t k = 0; k < 16; ++k) {
+          weight.qs[k] = pattern == 2 ? 0 : pattern < 4 ? 255 :
+            static_cast<std::uint8_t>((row * 37 + block * 19 + k * 11) & 255);
+        }
+      }
+    }
+    for (std::size_t token = 0; token < vectors; ++token) {
+      for (std::size_t block = 0; block < blocks; ++block) {
+        auto & activation = activations[token * blocks + block];
+        activation.d = 0x3c00U;
+        for (std::size_t k = 0; k < 32; ++k) {
+          activation.qs[k] = static_cast<std::int8_t>(
+            pattern == 0 ? 127 : pattern == 1 ? -128 :
+            ((k + token + block) % 2 == 0 ? 127 : -128));
+        }
+      }
+    }
+    std::vector<Q4_0BlockX8> packed_weights(rows / 8 * blocks);
+    std::vector<Q8_0BlockX4> packed_activations(vectors / 4 * blocks);
+    q4_0_pack_rows_8(weights.data(), packed_weights.data(), rows, blocks);
+    q8_0_pack_vectors_4(activations.data(), packed_activations.data(), vectors, blocks);
+    std::vector<float> expected(vectors * rows), actual(vectors * rows);
+    q4_0_matmul_q8_0(weights.data(), activations.data(), expected.data(),
+                    rows, vectors, blocks, rows, Q8_0Backend::scalar);
+    q4_0_packed_matmul_q8_0(packed_weights.data(), packed_activations.data(),
+                           actual.data(), rows, vectors, blocks, rows, backend);
+    ok = expect(expected == actual, "packed extreme matmul differs from exact scalar dot") && ok;
+    for (std::size_t token = 0; token < vectors; ++token) {
+      std::vector<Q8_0BlockX1> prepared(blocks);
+      for (std::size_t block = 0; block < blocks; ++block) {
+        auto & out = prepared[block];
+        out.scales[0] = 1.0F;
+        out.sums[0] = 0;
+        for (std::size_t k = 0; k < 32; ++k) {
+          out.qs[k] = activations[token * blocks + block].qs[k];
+          out.sums[0] += out.qs[k];
+        }
+      }
+      q4_0_packed_matvec_prepared_q8_0(packed_weights.data(), prepared.data(),
+                                      actual.data(), rows, blocks, backend);
+      ok = expect(std::equal(actual.begin(), actual.begin() + rows,
+                             expected.begin() + token * rows),
+                  "packed extreme prepared matvec differs from exact scalar dot") && ok;
+    }
+  }
+  return ok;
+}
+
 bool test_backend(const Q8_0Backend backend) {
   constexpr std::size_t blocks_per_row = 5;
   constexpr std::size_t rows = 9;
@@ -272,7 +333,8 @@ int main() {
     test_packed_backend(Q8_0Backend::auto_select);
   if (qwen35x::cpu::q8_0_backend_available(Q8_0Backend::avx2)) {
     ok = test_backend(Q8_0Backend::avx2) &&
-      test_packed_backend(Q8_0Backend::avx2) && ok;
+      test_packed_backend(Q8_0Backend::avx2) &&
+      test_packed_integer_extrema(Q8_0Backend::avx2) && ok;
   }
   if (qwen35x::cpu::q8_0_backend_available(Q8_0Backend::avx_vnni)) {
     ok = test_backend(Q8_0Backend::avx_vnni) &&

@@ -121,29 +121,6 @@ void quantize_q8_block_packed(
     _mm256_madd_epi16(pair_products, _mm256_set1_epi16(1)));
 }
 
-[[nodiscard]] __m256i mul_sum_u8_s8_pairs_acc(
-  const __m256i accumulator,
-  const __m256i unsigned_weights,
-  const __m256i signed_activations) noexcept {
-  // Q4 is at most 15, so each adjacent pair is bounded by
-  // 2 * 15 * 127 = 3810 and VPMADDUBSW cannot saturate.
-  const __m256i pair_products = _mm256_maddubs_epi16(
-    unsigned_weights, signed_activations);
-  return _mm256_add_epi32(
-    accumulator,
-    _mm256_madd_epi16(pair_products, _mm256_set1_epi16(1)));
-}
-
-template <typename Block>
-[[nodiscard]] __m256i load_q8_token_half(
-  const Block & block,
-  const std::size_t token,
-  const std::size_t half) noexcept {
-  const std::int8_t * base = block.qs + token * 32 + half * 16;
-  return _mm256_broadcastsi128_si256(
-    _mm_loadu_si128(reinterpret_cast<const __m128i *>(base)));
-}
-
 template <std::size_t TokenCount, typename Block>
 void accumulate_packed_block_x8(
   const Q4_0BlockX8 & weights,
@@ -186,43 +163,36 @@ void accumulate_packed_block_x8(
     const Block & activation_block = token < 4
       ? activations0 : *activations1;
     const std::size_t activation_lane = token % 4;
-    const __m256i activation_0 =
-      load_q8_token_half(activation_block, activation_lane, 0);
-    const __m256i activation_1 =
-      load_q8_token_half(activation_block, activation_lane, 1);
-    __m256i integer_dot = _mm256_setzero_si256();
-    integer_dot = mul_sum_u8_s8_pairs_acc(
-      integer_dot,
-      _mm256_blend_epi32(weight_0123_0, _mm256_shuffle_epi32(weight_4567_0, 177), 170),
-      _mm256_shuffle_epi32(activation_0, 0));
-    integer_dot = mul_sum_u8_s8_pairs_acc(
-      integer_dot,
-      _mm256_blend_epi32(_mm256_shuffle_epi32(weight_0123_0, 177), weight_4567_0, 170),
-      _mm256_shuffle_epi32(activation_0, 85));
-    integer_dot = mul_sum_u8_s8_pairs_acc(
-      integer_dot,
-      _mm256_blend_epi32(weight_0123_1, _mm256_shuffle_epi32(weight_4567_1, 177), 170),
-      _mm256_shuffle_epi32(activation_0, 170));
-    integer_dot = mul_sum_u8_s8_pairs_acc(
-      integer_dot,
-      _mm256_blend_epi32(_mm256_shuffle_epi32(weight_0123_1, 177), weight_4567_1, 170),
-      _mm256_shuffle_epi32(activation_0, 255));
-    integer_dot = mul_sum_u8_s8_pairs_acc(
-      integer_dot,
-      _mm256_blend_epi32(weight_0123_2, _mm256_shuffle_epi32(weight_4567_2, 177), 170),
-      _mm256_shuffle_epi32(activation_1, 0));
-    integer_dot = mul_sum_u8_s8_pairs_acc(
-      integer_dot,
-      _mm256_blend_epi32(_mm256_shuffle_epi32(weight_0123_2, 177), weight_4567_2, 170),
-      _mm256_shuffle_epi32(activation_1, 85));
-    integer_dot = mul_sum_u8_s8_pairs_acc(
-      integer_dot,
-      _mm256_blend_epi32(weight_0123_3, _mm256_shuffle_epi32(weight_4567_3, 177), 170),
-      _mm256_shuffle_epi32(activation_1, 170));
-    integer_dot = mul_sum_u8_s8_pairs_acc(
-      integer_dot,
-      _mm256_blend_epi32(_mm256_shuffle_epi32(weight_0123_3, 177), weight_4567_3, 170),
-      _mm256_shuffle_epi32(activation_1, 255));
+    // Each packed row contributes eight bytes per chunk. Broadcast those
+    // eight activation bytes and reduce in the existing row layout, avoiding
+    // per-product weight shuffles/blends. A signed 16-bit lane accumulates
+    // eight products at most: 8 * 15 * 128 = 15360, so neither the pairwise
+    // saturating multiply-add nor the following additions can overflow.
+    const std::int8_t * activation = activation_block.qs + activation_lane * 32;
+    const __m256i a0 = _mm256_broadcastq_epi64(
+      _mm_loadl_epi64(reinterpret_cast<const __m128i *>(activation)));
+    const __m256i a1 = _mm256_broadcastq_epi64(
+      _mm_loadl_epi64(reinterpret_cast<const __m128i *>(activation + 8)));
+    const __m256i a2 = _mm256_broadcastq_epi64(
+      _mm_loadl_epi64(reinterpret_cast<const __m128i *>(activation + 16)));
+    const __m256i a3 = _mm256_broadcastq_epi64(
+      _mm_loadl_epi64(reinterpret_cast<const __m128i *>(activation + 24)));
+    const __m256i pairs0123 = _mm256_add_epi16(
+      _mm256_add_epi16(_mm256_maddubs_epi16(weight_0123_0, a0),
+                       _mm256_maddubs_epi16(weight_0123_1, a1)),
+      _mm256_add_epi16(_mm256_maddubs_epi16(weight_0123_2, a2),
+                       _mm256_maddubs_epi16(weight_0123_3, a3)));
+    const __m256i pairs4567 = _mm256_add_epi16(
+      _mm256_add_epi16(_mm256_maddubs_epi16(weight_4567_0, a0),
+                       _mm256_maddubs_epi16(weight_4567_1, a1)),
+      _mm256_add_epi16(_mm256_maddubs_epi16(weight_4567_2, a2),
+                       _mm256_maddubs_epi16(weight_4567_3, a3)));
+    const __m256i ones = _mm256_set1_epi16(1);
+    // HADD yields 0,1,4,5,2,3,6,7. Match the established accumulator order
+    // 0,4,1,5,2,6,3,7 without changing scale/FMA or block reduction order.
+    __m256i integer_dot = _mm256_shuffle_epi32(_mm256_hadd_epi32(
+      _mm256_madd_epi16(pairs0123, ones),
+      _mm256_madd_epi16(pairs4567, ones)), 0xd8);
 
     integer_dot = _mm256_sub_epi32(
       integer_dot,
