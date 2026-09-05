@@ -1,4 +1,4 @@
-"""Verify lossless canonical-to-CPU-X8 packing, including merged projections.
+"""Verify lossless canonical-to-CPU-X8/DOT4 packing, including merged projections.
 
 Requires NumPy. This is a correctness check, not a benchmark. Both inputs
 should first pass the production artifact reader's checksum validation.
@@ -70,7 +70,7 @@ def verify(canonical_path, packed_path):
                         raise ValueError(f"F32 metadata mismatch: {source}")
                     expected.append(data)
                     continue
-                if info["encoding"] not in (3, 4) or source_info["encoding"] != info["encoding"] - 2:
+                if info["encoding"] not in (3, 4, 5, 6) or source_info["encoding"] != (info["encoding"] - 1) % 2 + 1:
                     raise ValueError(f"Encoding mismatch: {source}")
                 if any(info[key] != source_info[key] for key in ("transform", "group", "seed")):
                     raise ValueError(f"Quantization metadata changed: {source}")
@@ -80,8 +80,15 @@ def verify(canonical_path, packed_path):
                 rows += r
                 blocks = np.frombuffer(data, dtype=np.uint8).reshape(r // 8, 8, c // 32, 18)
                 scales = blocks[..., :2].transpose(0, 2, 1, 3).reshape(r // 8, c // 32, 16)
-                quants = blocks[..., 2:].reshape(r // 8, 8, c // 32, 2, 8)
-                quants = quants.transpose(0, 2, 3, 1, 4).reshape(r // 8, c // 32, 128)
+                raw = blocks[..., 2:]
+                if info["encoding"] in (5, 6):
+                    nibs = np.concatenate((raw & 15, raw >> 4), axis=-1)
+                    nibs = nibs.reshape(r // 8, 8, c // 32, 4, 8)
+                    quants = (nibs[..., :4] | (nibs[..., 4:] << 4)).transpose(0, 2, 3, 1, 4)
+                    quants = quants.reshape(r // 8, c // 32, 128)
+                else:
+                    quants = raw.reshape(r // 8, 8, c // 32, 2, 8)
+                    quants = quants.transpose(0, 2, 3, 1, 4).reshape(r // 8, c // 32, 128)
                 expected.append(np.concatenate((scales, quants), axis=2).tobytes())
             if info["encoding"] != 0 and rows != info["shape"][0]:
                 raise ValueError(f"Merged row count mismatch: {name}")

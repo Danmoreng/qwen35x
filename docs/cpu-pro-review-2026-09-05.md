@@ -1,0 +1,75 @@
+# CPU review implementation, 2026-09-05
+
+Origin AVX2 changes `33b1b6a` were pulled before any experiment. The new X8 AVX2
+kernel from that commit is preserved. Review claims are checked against the
+code; the supplied document's prototype ZIP was not supplied, so DOT4 was
+implemented independently from its stated layout.
+
+## Completed correctness and dispatch work
+
+- `bf0ec32`: completion uses atomic wait/notify, including zero-spin and
+  oversubscribed generation/empty-partition tests. The evaluator rejects
+  NaN/Inf raw logits with file/position/index and rejects empty dumps and
+  non-finite KL. Three Python CLI regression tests pass (including six
+  non-finite input cases); seven CTest suites pass.
+- `b443bd1`: independent usable CPU capabilities and compiler checks; synthetic
+  VEX/EVEX combinations; safe Q8 AVX2 fallback; actual EVEX Q4 decode/argmax
+  and safe EVEX prefill tails. MSVC AVX512 dispatch checks the full extension
+  set enabled by /arch:AVX512. A strict CLI ISA request is available via
+  `--cpu-isa-strict`, also exposed as `-CpuIsaStrict` by the benchmark script.
+  JSON and console profiles identify selected per-operation kernels.
+  Actual EVEX `vpdpbusd` (62 prefix) was checked in the object disassembly.
+
+## DOT4 packing
+
+Encoding IDs 5 (plain Q4) and 6 (H128 Q4) store eight FP16 scales and 128 bytes
+per eight-row/32-column block. For each row r and eight-value group t:
+`qs[32*t+4*r+j] = u[r][8*t+j] | (u[r][8*t+4+j] << 4)`.
+Old IDs 1-4 remain supported and are never reinterpreted. The existing
+`--layout cpu-packed` default is unchanged; use `--layout cpu-dot4` explicitly.
+All ISAs can read both formats. No dequantized duplicate or runtime repacking
+is introduced. Embedding, decode, fused argmax, prefill and tails support DOT4.
+
+The AVX2 DOT4 kernel accumulates pair-products in int16, with an explicit bound
+of `16*15*128=30720` per lane, then performs one widening pair sum. VEX/EVEX
+use two independent integer accumulator chains. FP32 cross-block FMA order
+is preserved. EVEX prefill uses 16 tokens; AVX2/VEX use four.
+
+New local artifact: `models/qwen3.5-0.8b/model-q4-h128-cpu-dot4.q35h` (not committed).
+Generated directly from the original BF16 model. Independent NumPy verification
+against the canonical checkpoint checks every FP16 scale, Q4 nibble and F32
+byte, including merged projections: 320 canonical tensors to 230 packed.
+Eight CTest suites pass. DOT4 tests cover exact packing roundtrip, embedding,
+decode, prefill including 16+4-token tails, argmax/penalty/offset, negative and
+zero scales, Q8 -128/+127, six K widths, four row counts and all available ISAs.
+Full-model logits for a 65-token prompt plus three forced tokens are byte-exact
+between X8 and DOT4, separately for AVX2 and AVX512-VNNI.
+
+## Measurements so far
+
+AMD Ryzen 9 9955HX3D, Windows/MSVC Release, 12 threads, FP16 KV. Process affinity
+0x0000ffff for both sides, inherited by child processes. This is experimental
+control only, not an engine default or a claim about other CPU families.
+All runs use `scripts/benchmark-inference-seq.ps1`, three runs after one warmup,
+128 new tokens, max context 256. Per-workload A/B/B/A gives six samples per
+variant. No simultaneous compilation/conversion/benchmarks. Throughput uses
+normal greedy generation, not the forced-logit mode used for correctness.
+The CSV retains every measured sample, including unfavorable ones.
+
+DOT4 versus the post-dispatch X8 baseline, medians:
+
+| ISA | Workload | X8 tok/s | DOT4 tok/s | Change |
+|---|---|---:|---:|---:|
+| avx2 | decode128 | 125.12 | 125.21 | +0.08% |
+| avx2 | prefill256 | 763.08 | 808.10 | +5.90% |
+| avx512-vnni | decode128 | 126.12 | 126.36 | +0.19% |
+| avx512-vnni | prefill256 | 957.96 | 1069.38 | +11.63% |
+
+The tiny decode differences are within run variation; no decode gain is claimed
+for this layout alone. The AVX2 numbers are AVX2 dispatch on this Ryzen, not a
+new measurement on the user's older Intel laptop.
+
+## Remaining review experiments
+
+16-row decode, active workers, register-held DeltaNet, prefill workspace, and
+quality/long-context proposals are evaluated separately after this baseline.

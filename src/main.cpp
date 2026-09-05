@@ -303,8 +303,8 @@ bool write_profile_json(
   if (!options.use_cuda) {
     out << "  \"cpu_isa_resolved\": \"" << qwen35x::cpu::q8_0_backend_name(
       qwen35x::cpu::q8_0_resolve_backend(options.cpu_q8_backend)) << "\",\n";
-    out << "  \"cpu_q4_decode_kernel\": \"" << qwen35x::cpu::q4_0_decode_kernel_name(options.cpu_q8_backend) << "\",\n";
-    out << "  \"cpu_q4_prefill_kernel\": \"" << qwen35x::cpu::q4_0_prefill_kernel_name(options.cpu_q8_backend) << "\",\n";
+    out << "  \"cpu_q4_decode_kernel\": \"" << (result.cpu_q4_dot4 ? "dot4/" : "x8/") << qwen35x::cpu::q4_0_decode_kernel_name(options.cpu_q8_backend) << "\",\n";
+    out << "  \"cpu_q4_prefill_kernel\": \"" << (result.cpu_q4_dot4 ? "dot4/" : "x8/") << qwen35x::cpu::q4_0_prefill_kernel_name(options.cpu_q8_backend) << "\",\n";
     out << "  \"cpu_q8_dot_kernel\": \"" << qwen35x::cpu::q8_0_backend_name(
       qwen35x::cpu::q8_0_dot_backend_for_capabilities(options.cpu_q8_backend, qwen35x::cpu::cpu_capabilities())) << "\",\n";
   }
@@ -1194,8 +1194,8 @@ int main(int argc, char ** argv) {
     std::cout << "  cpu_isa: " << qwen35x::cpu::q8_0_backend_name(
       qwen35x::cpu::q8_0_resolve_backend(infer_options.cpu_q8_backend)) << "\n";
     if (!infer_options.use_cuda) {
-      std::cout << "  cpu_kernels: q4_decode=" << qwen35x::cpu::q4_0_decode_kernel_name(infer_options.cpu_q8_backend)
-                << " q4_prefill=" << qwen35x::cpu::q4_0_prefill_kernel_name(infer_options.cpu_q8_backend)
+      std::cout << "  cpu_kernels: q4_decode=" << (infer_result.cpu_q4_dot4 ? "dot4/" : "x8/") << qwen35x::cpu::q4_0_decode_kernel_name(infer_options.cpu_q8_backend)
+                << " q4_prefill=" << (infer_result.cpu_q4_dot4 ? "dot4/" : "x8/") << qwen35x::cpu::q4_0_prefill_kernel_name(infer_options.cpu_q8_backend)
                 << " q8_dot=" << qwen35x::cpu::q8_0_backend_name(qwen35x::cpu::q8_0_dot_backend_for_capabilities(
                      infer_options.cpu_q8_backend, qwen35x::cpu::cpu_capabilities())) << "\n";
     }

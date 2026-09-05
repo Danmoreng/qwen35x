@@ -1,4 +1,5 @@
 #include "qwen35x/cpu/q4_0.h"
+#include "qwen35x/cpu/q4_dot4.h"
 #include "qwen35x/cpu/q4_h128.h"
 #include "qwen35x/weights/q4_h128_artifact.h"
 
@@ -72,9 +73,17 @@ int main() {
   packed_embedding.encoding = qwen35x::Q4H128TensorEncoding::q4_0_cpu_x8;
   packed_embedding.transform_size = 0;
   packed_embedding.sign_seed = 0;
+  auto dot4_projection = packed_projection;
+  dot4_projection.name = "dot4.projection.weight";
+  dot4_projection.encoding = qwen35x::Q4H128TensorEncoding::q4_h128_cpu_dot4;
+  auto dot4_embedding = packed_embedding;
+  dot4_embedding.name = "dot4.embedding.weight";
+  dot4_embedding.encoding = qwen35x::Q4H128TensorEncoding::q4_0_cpu_dot4;
+  std::vector<qwen35x::cpu::Q4_0BlockX8> dot4_data(4);
+  qwen35x::cpu::q4_dot4_pack_rows_8(projection_data.data(), dot4_data.data(), 8, 4);
   std::vector<qwen35x::cpu::Q4_0BlockX8> packed_data(4);
   qwen35x::cpu::q4_0_pack_rows_8(projection_data.data(), packed_data.data(), 8, 4);
-  for (const auto encoding : {packed_projection.encoding, packed_embedding.encoding}) {
+  for (const auto encoding : {packed_projection.encoding, packed_embedding.encoding, dot4_projection.encoding, dot4_embedding.encoding}) {
     ok = expect(qwen35x::q4_h128_payload_size(encoding, {7, 128}, error) == 0,
                 "packed encoding accepted incomplete row tile") && ok;
     ok = expect(qwen35x::q4_h128_payload_size(encoding, {8, 129}, error) == 0,
@@ -97,7 +106,7 @@ int main() {
   ok = expect(!writer.open(path.string(), metadata, {invalid_embedding}, error),
               "packed embedding accepted incompatible scale group") && ok;
   error.clear();
-  ok = expect(writer.open(path.string(), metadata, {norm, projection, packed_projection, packed_embedding}, error),
+  ok = expect(writer.open(path.string(), metadata, {norm, projection, packed_projection, packed_embedding, dot4_projection, dot4_embedding}, error),
               error.c_str()) && ok;
   ok = expect(writer.write_tensor(
                 norm.name, norm_data.data(), norm_data.size() * sizeof(float), error),
@@ -106,8 +115,9 @@ int main() {
                 projection.name, projection_data.data(),
                 projection_data.size() * sizeof(qwen35x::cpu::Q4_0Block), error),
               error.c_str()) && ok;
-  for (const auto & info : {packed_projection, packed_embedding}) {
-    ok = expect(writer.write_tensor(info.name, packed_data.data(),
+  for (const auto & info : {packed_projection, packed_embedding, dot4_projection, dot4_embedding}) {
+    const auto & payload = qwen35x::q4_h128_encoding_dot4(info.encoding) ? dot4_data : packed_data;
+    ok = expect(writer.write_tensor(info.name, payload.data(),
                   packed_data.size() * sizeof(packed_data[0]), error), error.c_str()) && ok;
   }
   ok = expect(writer.finalize(error), error.c_str()) && ok;
@@ -129,10 +139,11 @@ int main() {
   const auto * packed_info = reader.find_tensor(packed_projection.name);
   const std::uint64_t packed_offset = packed_info == nullptr ? 0 : packed_info->data_offset;
   std::vector<qwen35x::cpu::Q4_0BlockX8> direct(4);
-  for (const auto & info : {packed_projection, packed_embedding}) {
+  for (const auto & info : {packed_projection, packed_embedding, dot4_projection, dot4_embedding}) {
+    const auto & payload = qwen35x::q4_h128_encoding_dot4(info.encoding) ? dot4_data : packed_data;
     ok = expect(reader.read_tensor_into(info.name, direct.data(),
                   direct.size() * sizeof(direct[0]), error), error.c_str()) && ok;
-    ok = expect(std::memcmp(direct.data(), packed_data.data(), direct.size() * sizeof(direct[0])) == 0,
+    ok = expect(std::memcmp(direct.data(), payload.data(), direct.size() * sizeof(direct[0])) == 0,
                 "direct CPU-packed payload differs") && ok;
   }
   ok = expect(!reader.read_tensor_into(packed_projection.name, direct.data(), 1, error),

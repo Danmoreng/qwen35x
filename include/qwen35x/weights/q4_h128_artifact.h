@@ -18,16 +18,24 @@ enum class Q4H128TensorEncoding : std::uint32_t {
   // offset-binary nibble bytes. Complete 8-row / 32-column tiles only.
   q4_0_cpu_x8 = 3,
   q4_h128_cpu_x8 = 4,
+  q4_0_cpu_dot4 = 5,
+  q4_h128_cpu_dot4 = 6,
 };
 
 inline bool q4_h128_encoding_transformed(Q4H128TensorEncoding encoding) noexcept {
   return encoding == Q4H128TensorEncoding::q4_h128 ||
-    encoding == Q4H128TensorEncoding::q4_h128_cpu_x8;
+    encoding == Q4H128TensorEncoding::q4_h128_cpu_x8 ||
+    encoding == Q4H128TensorEncoding::q4_h128_cpu_dot4;
+}
+
+inline bool q4_h128_encoding_dot4(Q4H128TensorEncoding encoding) noexcept {
+  return encoding == Q4H128TensorEncoding::q4_0_cpu_dot4 ||
+    encoding == Q4H128TensorEncoding::q4_h128_cpu_dot4;
 }
 
 inline bool q4_h128_encoding_cpu_packed(Q4H128TensorEncoding encoding) noexcept {
   return encoding == Q4H128TensorEncoding::q4_0_cpu_x8 ||
-    encoding == Q4H128TensorEncoding::q4_h128_cpu_x8;
+    encoding == Q4H128TensorEncoding::q4_h128_cpu_x8 || q4_h128_encoding_dot4(encoding);
 }
 
 struct Q4H128ArtifactMetadata {

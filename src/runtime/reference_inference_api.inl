@@ -489,6 +489,7 @@ bool run_reference_qwen35_inference(
   const bool use_f16_cpu_cache = !options.use_cuda && weights.cpu_q8_runtime != nullptr &&
     !options.cpu_kv_cache_f32 && cpu::q8_0_backend_uses_avx2(options.cpu_q8_backend);
   result.cpu_kv_cache_f16 = use_f16_cpu_cache;
+  result.cpu_q4_dot4 = weights.embed_tokens.q4_dot4;
   state.full_states.resize(static_cast<std::size_t>(full_layers));
   for (auto & fs : state.full_states) {
     fs.k_cache.resize(

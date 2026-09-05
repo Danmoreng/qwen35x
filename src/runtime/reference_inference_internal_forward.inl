@@ -376,7 +376,7 @@ bool run_forward_single_token(
       return false;
     }
     if (weights.embed_tokens.is_q4_0()) {
-      cpu::q4_0_packed_dequantize_row(
+      (weights.embed_tokens.q4_dot4 ? cpu::q4_dot4_dequantize_row : cpu::q4_0_packed_dequantize_row)(
         weights.embed_tokens.packed_q4_0_blocks.data(),
         static_cast<std::size_t>(token_id), x.data(), blocks_per_row);
     } else {

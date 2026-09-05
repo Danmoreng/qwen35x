@@ -166,6 +166,7 @@ struct ReferenceInferenceResult {
   int forward_pass_tokens = 0;
   bool cpu_model_session_hit = false;
   bool cpu_kv_cache_f16 = false;
+  bool cpu_q4_dot4 = false;
   int cached_prefix_tokens = 0;
   double prefix_cache_restore_time_ms = 0.0;
   std::size_t prefix_cache_bytes = 0;

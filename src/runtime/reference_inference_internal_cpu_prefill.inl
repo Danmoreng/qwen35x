@@ -442,7 +442,7 @@ bool run_forward_cpu_q8_batch(
       return false;
     }
     if (weights.embed_tokens.is_q4_0()) {
-      cpu::q4_0_packed_dequantize_row(
+      (weights.embed_tokens.q4_dot4 ? cpu::q4_dot4_dequantize_row : cpu::q4_0_packed_dequantize_row)(
         weights.embed_tokens.packed_q4_0_blocks.data(),
         static_cast<std::size_t>(token_id),
         x.data() + token * hidden, embedding_blocks);

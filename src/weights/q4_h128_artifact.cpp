@@ -146,6 +146,8 @@ std::uint64_t q4_h128_payload_size(
       }
       return bytes;
     }
+    case Q4H128TensorEncoding::q4_0_cpu_dot4:
+    case Q4H128TensorEncoding::q4_h128_cpu_dot4:
     case Q4H128TensorEncoding::q4_0_cpu_x8:
     case Q4H128TensorEncoding::q4_h128_cpu_x8: {
       const std::uint64_t columns = q4_h128_encoding_transformed(encoding)
@@ -442,7 +444,7 @@ bool Q4H128ArtifactReader::open(const std::string & path, std::string & error_me
       read_value(stream_, tensor.data_offset) && read_value(stream_, tensor.data_size) &&
       read_value(stream_, tensor.checksum);
     if (!ok || name_size == 0 || name_size > 4096 || rank == 0 || rank > 8 ||
-        encoding > static_cast<std::uint32_t>(Q4H128TensorEncoding::q4_h128_cpu_x8) ||
+        encoding > static_cast<std::uint32_t>(Q4H128TensorEncoding::q4_h128_cpu_dot4) ||
         reserved != 0) {
       error_message = "Invalid Q4_H128 tensor directory entry.";
       close();

@@ -1,3 +1,4 @@
+#include "qwen35x/cpu/q4_dot4.h"
 #include "qwen35x/common/model_profile.h"
 #include "qwen35x/compiler/compiler.h"
 #include "qwen35x/cpu/q4_0.h"
@@ -181,7 +182,7 @@ struct ConversionTensor {
 };
 
 std::vector<ConversionTensor> plan_conversion(
-  const std::vector<Q4H128TensorInfo> & sources, const bool cpu_packed) {
+  const std::vector<Q4H128TensorInfo> & sources, const bool cpu_packed, const bool dot4) {
   std::vector<ConversionTensor> plan;
   for (const auto & source : sources) {
     auto output = source;
@@ -189,6 +190,8 @@ std::vector<ConversionTensor> plan_conversion(
       output.encoding = source.encoding == Q4H128TensorEncoding::q4_h128
         ? Q4H128TensorEncoding::q4_h128_cpu_x8
         : Q4H128TensorEncoding::q4_0_cpu_x8;
+      if (dot4) output.encoding = source.encoding == Q4H128TensorEncoding::q4_h128
+        ? Q4H128TensorEncoding::q4_h128_cpu_dot4 : Q4H128TensorEncoding::q4_0_cpu_dot4;
       const std::pair<const char *, const char *> merges[] = {
         {"mlp.gate_proj.weight", "mlp.gate_up_proj.weight"},
         {"mlp.up_proj.weight", "mlp.gate_up_proj.weight"},
@@ -273,7 +276,8 @@ bool convert_tensor(
       error = "CPU packing requires aligned source rows: " + source.name;
       return false;
     }
-    qwen35x::cpu::q4_0_pack_rows_8(
+    (qwen35x::q4_h128_encoding_dot4(info.encoding)
+      ? qwen35x::cpu::q4_dot4_pack_rows_8 : qwen35x::cpu::q4_0_pack_rows_8)(
       blocks.data(), packed_blocks.data() + packed_offset,
       static_cast<std::size_t>(source.shape[0]),
       static_cast<std::size_t>(source.shape[1]) / qwen35x::cpu::q4_0_values_per_block);
@@ -302,7 +306,7 @@ int main(int argc, char ** argv) {
     } else if (argument == "--layout" && index + 1 < argc) {
       layout = argv[++index];
     } else if (argument == "--help") {
-      std::cout << "Usage: qwen35x_q4_h128_convert --hf-model-dir <dir> --output <file> [--layout cpu-packed|canonical]\n";
+      std::cout << "Usage: qwen35x_q4_h128_convert --hf-model-dir <dir> --output <file> [--layout cpu-packed|cpu-dot4|canonical]\n";
       return 0;
     } else {
       std::cerr << "Unknown or incomplete argument: " << argument << '\n';
@@ -313,7 +317,7 @@ int main(int argc, char ** argv) {
     std::cerr << "Both --hf-model-dir and --output are required.\n";
     return 2;
   }
-  if (layout != "cpu-packed" && layout != "canonical") {
+  if (layout != "cpu-packed" && layout != "cpu-dot4" && layout != "canonical") {
     std::cerr << "Unknown layout: " << layout << '\n';
     return 2;
   }
@@ -342,7 +346,7 @@ int main(int argc, char ** argv) {
     return 3;
   }
 
-  const auto conversion = plan_conversion(tensors, layout == "cpu-packed");
+  const auto conversion = plan_conversion(tensors, layout != "canonical", layout == "cpu-dot4");
   tensors.clear();
   for (const auto & item : conversion) {
     tensors.push_back(item.output);

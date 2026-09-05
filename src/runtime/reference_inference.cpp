@@ -3,6 +3,7 @@
 #include "qwen35x/cpu/activation.h"
 
 #include "qwen35x/cpu/q4_0.h"
+#include "qwen35x/cpu/q4_dot4.h"
 #include "qwen35x/cpu/q4_h128.h"
 #include "qwen35x/cpu/q8_0.h"
 #include "qwen35x/cpu/executor.h"
