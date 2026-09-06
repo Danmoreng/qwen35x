@@ -7,6 +7,7 @@
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
@@ -49,6 +50,8 @@ std::uint64_t peak_rss() {
 }
 } // namespace
 
+#include "cpu_serving_bench.inl"
+
 int main(int argc, char **argv) try {
   ReferenceInferenceOptions options;
   CpuEngineConfig config;
@@ -58,10 +61,14 @@ int main(int argc, char **argv) try {
   bool identical_prompts = false;
   std::string profile_path;
   bool serial = false, strict = false;
+  bool serving = false;
+  std::size_t residents = 16;
+  double arrival_gap_ms = 0;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--infer-reference")
       continue;
+    if (arg == "--cpu-serving") { serving = true; continue; }
     if (arg == "--cpu-identical-prompts") {
       identical_prompts = true;
       continue;
@@ -106,6 +113,12 @@ int main(int argc, char **argv) try {
       options.cpu_q4_h128_path = value;
     else if (arg == "--cpu-batch")
       batch_size = positive();
+    else if (arg == "--cpu-residents") residents = positive();
+    else if (arg == "--cpu-decode-batch-limit") config.max_decode_batch_size = positive();
+    else if (arg == "--cpu-arrival-gap-ms") {
+      arrival_gap_ms = std::stod(value);
+      if (!std::isfinite(arrival_gap_ms) || arrival_gap_ms < 0) throw std::runtime_error("Invalid arrival gap");
+    }
     else if (arg == "--cpu-registered-prefix")
       prefix_tokens = positive();
     else if (arg == "--max-context")
@@ -170,7 +183,11 @@ int main(int argc, char **argv) try {
   check(bool(profile));
   auto model = CpuModel::load(*profile, options, error);
   check(bool(model));
-  config.max_resident_requests = batch_size;
+  config.max_resident_requests = serving ? residents : batch_size;
+  if (serving) {
+    if (serial) throw std::runtime_error("Use decode batch limit 1 for serial serving");
+    config.max_queued_requests = batch_size;
+  }
   auto engine = CpuEngine::create(model, config, error);
   check(bool(engine));
   const double load_ms = ms(load_start);
@@ -188,6 +205,9 @@ int main(int argc, char **argv) try {
     check(bool(prefix));
     prefix_build_ms = ms(start);
   }
+  if (serving) return serving_benchmark(*engine, spec, prefix, batch_size,
+      profile->text.vocab_size, identical_prompts, arrival_gap_ms, load_ms,
+      prefix_build_ms, profile_path);
   std::vector<CpuRequestId> ids;
   const auto prefill_start = Clock::now();
   for (std::size_t r = 0; r < batch_size; ++r) {

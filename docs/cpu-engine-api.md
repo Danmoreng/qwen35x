@@ -122,3 +122,43 @@ Prefix construction is timed separately from warm request initialization.
 Cached tokens are reported separately and never counted as newly computed
 prefill throughput. The optional `qwen35x_cpu_prefix_model_test` takes the same
 two model paths as the engine model test.
+
+## Bounded serving mode
+
+Set a nonzero max_queued_requests to enable the single-owner scheduler.
+submit queues metadata without allocating KV or recurrent state; step admits
+at most one request and performs at most one prefill chunk or decode batch.
+max_resident_requests, max_decode_batch_size and max_queued_requests are
+independent bounds. Prefill and decode alternate when both are runnable;
+each class rotates request IDs so long prompts or small decode limits cannot
+starve later active requests. No tick waits for a full batch.
+
+Drive queued mode through step(progressed, error), not advance/advance_batch.
+A successful idle tick returns progressed=false, for example when every resident
+request is blocked on output. Read confirmed tokens with read_output and release
+terminal result records when no longer needed. Completion and cancellation free
+private model state; terminal results still count toward the bounded record
+limit (resident limit plus queue limit) until release.
+
+max_buffered_tokens bounds undrained generated tokens, including withheld partial
+stop sequences. A full buffer pauses only that request. Stop sequences longer
+than the buffer are rejected to prevent a holdback deadlock. read_output appends
+only confirmed tokens; result.output_tokens is a diagnostic history and may
+temporarily contain an incomplete stop prefix. Output history itself is bounded
+by max_new_tokens/context. This API remains synchronous and has no HTTP server
+or background owner thread.
+
+The optional cpu_scheduler_model_test compares complete logits with direct
+execution under delayed arrivals and mixed prompt lengths, exercises slow
+consumers, stop-sequence withholding, queue limits, cancellation and slot reuse.
+
+For serving measurements, pass -Serving to benchmark-cpu-batch.ps1 together
+with -Residents, -DecodeBatchLimit and optionally -ArrivalGapMs. BatchSizes
+then specifies total requests in a finite arrival trace, not constant
+concurrency. Zero gap is a burst; nonzero gap prescribes arrival times. TTFT
+includes lateness before the owner can submit, queueing and prompt work. ITL
+uses delivered-token timestamps. Registered-prefix construction remains outside
+the measured serving interval and is reported separately. The CSV field
+tokens_per_second denotes aggregate delivered serving throughput when
+cpu_serving=true; it must not be compared directly with decode-only throughput.
+Separate prefill/decode wall-time fields are blank for this interleaved mode.

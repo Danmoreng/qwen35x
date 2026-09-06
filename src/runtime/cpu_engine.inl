@@ -44,6 +44,9 @@ struct CpuEngine::Impl {
     std::mt19937 rng;
     std::vector<float> logits;
     int pending_token = -1;
+    bool resident = false;
+    std::size_t consumed = 0;
+    std::chrono::steady_clock::time_point arrival = std::chrono::steady_clock::now();
   };
   std::shared_ptr<const CpuModel> model;
   CpuEngineConfig config;
@@ -52,6 +55,8 @@ struct CpuEngine::Impl {
   CpuRequestId next_id = 1;
   std::string attention_kernel;
   CpuEngineStats stats;
+  bool scheduling = false, prefer_decode = true;
+  CpuRequestId last_prefill = 0, last_decode = 0;
   std::vector<std::shared_ptr<const CpuPrefix>> prefixes;
   std::size_t prefix_bytes = 0;
   bool prefix_room(std::size_t bytes, std::string &error) {
@@ -256,6 +261,52 @@ struct CpuEngine::Impl {
                    : static_cast<std::uint32_t>(s.spec.sampling.seed));
     return true;
   }
+  bool activate(Sequence &s, std::string &error) {
+    if (!initialize(s, error)) return false;
+    if (s.spec.prefix) {
+      const auto start = std::chrono::steady_clock::now();
+      const auto count = s.spec.prefix->token_count();
+      const auto &d = model->impl_->dims;
+      if (!restore_cpu_prefix_state(s.spec.prefix->impl_->snapshot, s.state,
+                                    count, d.n_kv_heads * d.head_dim)) {
+        error = "Invalid complete hybrid prefix snapshot.";
+        return false;
+      }
+      s.result.prefix_restore_ms = elapsed_ms(start);
+      s.result.cached_prefix_tokens = count;
+      s.result.committed_tokens = count;
+      if (!adopt_prefix(s.spec.prefix, error)) return false;
+    }
+    s.resident = true;
+    s.result.status = CpuRequestStatus::prefill;
+    return true;
+  }
+  static bool terminal(const Sequence &s) {
+    return s.result.status == CpuRequestStatus::complete ||
+           s.result.status == CpuRequestStatus::cancelled ||
+           s.result.status == CpuRequestStatus::failed;
+  }
+  static std::size_t confirmed(const Sequence &s) {
+    const auto &tokens = s.result.output_tokens;
+    if (terminal(s)) return tokens.size();
+    std::size_t held = 0;
+    for (const auto &stop : s.spec.stop_token_sequences)
+      for (std::size_t n=1; n<stop.size() && n<=tokens.size(); ++n)
+        if (std::equal(stop.begin(), stop.begin()+n, tokens.end()-n))
+          held = std::max(held, n);
+    return tokens.size()-held;
+  }
+  bool output_ready(const Sequence &s) const {
+    return s.result.output_tokens.size()-s.consumed < config.max_buffered_tokens;
+  }
+  void retire(Sequence &s) {
+    if (!config.max_queued_requests || !s.resident || !terminal(s)) return;
+    s.state = ModelState{};
+    std::vector<int>().swap(s.counts);
+    std::vector<float>().swap(s.logits);
+    s.spec.prefix.reset();
+    s.resident = false;
+  }
   bool select(Sequence &s, int greedy_token, std::string &error) {
     const auto index = s.result.output_tokens.size();
     if (s.spec.logits_callback &&
@@ -375,7 +426,9 @@ CpuEngine::create(std::shared_ptr<const CpuModel> model,
       !config.max_context ||
       config.max_context >
           static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
-      config.prefill_chunk_size > 2048) {
+      config.prefill_chunk_size > 2048 ||
+      config.max_queued_requests > std::numeric_limits<std::size_t>::max() - config.max_resident_requests ||
+      (config.max_queued_requests && (!config.max_decode_batch_size || !config.max_buffered_tokens))) {
     error = "Invalid CPU engine configuration.";
     return nullptr;
   }
@@ -401,7 +454,7 @@ CpuRequestId CpuEngine::submit(CpuRequestSpec spec, std::string &error) {
   error.clear();
   const auto &d = impl_->model->impl_->dims;
   auto valid_token = [&](std::int32_t t) { return t >= 0 && t < d.vocab_size; };
-  if (impl_->requests.size() >= impl_->config.max_resident_requests ||
+  if (impl_->requests.size() >= impl_->config.max_resident_requests + impl_->config.max_queued_requests ||
       !impl_->next_id || spec.prompt_tokens.empty() || !spec.max_new_tokens ||
       spec.prompt_tokens.size() > impl_->config.max_context ||
       spec.max_new_tokens - 1 >
@@ -421,6 +474,16 @@ CpuRequestId CpuEngine::submit(CpuRequestSpec spec, std::string &error) {
     error = "Invalid request or resident/context limit reached.";
     return 0;
   }
+  if (impl_->config.max_queued_requests) {
+    const auto queued = std::count_if(impl_->requests.begin(), impl_->requests.end(),
+      [](const auto &entry) { return entry.second->result.status == CpuRequestStatus::queued; });
+    if (static_cast<std::size_t>(queued) >= impl_->config.max_queued_requests ||
+        std::any_of(spec.stop_token_sequences.begin(), spec.stop_token_sequences.end(),
+          [&](const auto &stop) { return stop.size() > impl_->config.max_buffered_tokens; })) {
+      error = "Queue full or stop sequence exceeds output buffer capacity.";
+      return 0;
+    }
+  }
   try {
     if (spec.prefix) {
       const auto &prefix = *spec.prefix->impl_;
@@ -438,23 +501,9 @@ CpuRequestId CpuEngine::submit(CpuRequestSpec spec, std::string &error) {
     }
     auto sequence = std::make_unique<Impl::Sequence>();
     sequence->spec = std::move(spec);
-    if (!impl_->initialize(*sequence, error))
-      return 0;
-    if (sequence->spec.prefix) {
-      const auto start = std::chrono::steady_clock::now();
-      const auto count = sequence->spec.prefix->token_count();
-      if (!restore_cpu_prefix_state(sequence->spec.prefix->impl_->snapshot,
-                                    sequence->state, count,
-                                    d.n_kv_heads * d.head_dim)) {
-        error = "Invalid complete hybrid prefix snapshot.";
-        return 0;
-      }
-      sequence->result.prefix_restore_ms = elapsed_ms(start);
-      sequence->result.cached_prefix_tokens = count;
-      sequence->result.committed_tokens = count;
-      if (!impl_->adopt_prefix(sequence->spec.prefix, error))
-        return 0;
-    }
+    if (impl_->config.max_queued_requests)
+      sequence->result.status = CpuRequestStatus::queued;
+    else if (!impl_->activate(*sequence, error)) return 0;
     const auto id = impl_->next_id;
     impl_->requests.emplace(id, std::move(sequence));
     ++impl_->next_id;
@@ -466,6 +515,10 @@ CpuRequestId CpuEngine::submit(CpuRequestSpec spec, std::string &error) {
 }
 bool CpuEngine::advance(CpuRequestId id, std::string &error) {
   error.clear();
+  if (impl_->config.max_queued_requests && !impl_->scheduling) {
+    error = "Serving mode must be driven through step.";
+    return false;
+  }
   auto it = impl_->requests.find(id);
   if (it == impl_->requests.end()) {
     error = "Unknown request ID.";
@@ -476,6 +529,10 @@ bool CpuEngine::advance(CpuRequestId id, std::string &error) {
 bool CpuEngine::advance_batch(std::span<const CpuRequestId> ids,
                               std::string &error) {
   error.clear();
+  if (impl_->config.max_queued_requests && !impl_->scheduling) {
+    error = "Serving mode must be driven through step.";
+    return false;
+  }
   std::vector<Impl::Sequence *> rows;
   rows.reserve(ids.size());
   std::unordered_set<CpuRequestId> seen;
@@ -534,15 +591,24 @@ bool CpuEngine::advance_batch(std::span<const CpuRequestId> ids,
   }
   return ok;
 }
-CpuEngineStats CpuEngine::stats() const { return impl_->stats; }
+CpuEngineStats CpuEngine::stats() const {
+  auto stats = impl_->stats;
+  for (const auto &[id,s] : impl_->requests) {
+    stats.queued_requests += s->result.status == CpuRequestStatus::queued;
+    stats.resident_requests += s->resident;
+  }
+  return stats;
+}
 
 bool CpuEngine::cancel(CpuRequestId id) {
   auto it = impl_->requests.find(id);
   if (it == impl_->requests.end())
     return false;
-  if (it->second->result.status == CpuRequestStatus::prefill ||
+  if (it->second->result.status == CpuRequestStatus::queued ||
+      it->second->result.status == CpuRequestStatus::prefill ||
       it->second->result.status == CpuRequestStatus::decode)
     it->second->result.status = CpuRequestStatus::cancelled;
+  impl_->retire(*it->second);
   return true;
 }
 bool CpuEngine::release(CpuRequestId id) {
@@ -557,3 +623,4 @@ bool CpuEngine::result(CpuRequestId id, CpuRequestResult &out) const {
 }
 
 #include "cpu_engine_prefix.inl"
+#include "cpu_engine_scheduler.inl"

@@ -259,3 +259,38 @@ resolved; broader serving and shared-page work remains pending.
 
 [Samples](cpu-prefix-tail-fix-2026-09-06-samples.csv) and
 [settings/hashes](cpu-prefix-tail-fix-2026-09-06-metadata.json).
+
+## Step 4a: Bounded continuous scheduler
+
+Serving mode now queues request metadata before allocating private model state,
+admits at most one request per tick and alternates bounded prefill chunks with
+decode batches. Independent queue, resident and decode limits, round-robin
+progress, cancellation, terminal-state retirement and per-request output
+backpressure are implemented. Stop-prefix withholding prevents streaming tokens
+that a later stop match must remove. Direct execution mode remains available.
+
+The full-model scheduler test passes with delayed arrivals, prompt lengths
+65/129/257/1024, exact full logits against direct execution, a slow consumer,
+bounded queues, stop withholding, cancellation before/after admission and idle
+backpressure. The existing engine model test also passes.
+
+A finite burst of C16 requests, A16 residents, P512, 128 outputs, registered
+511-token prefix, eight threads/mask 0xffff compares decode batch limit 1 with
+16. Sequential A/B/B/A, six measured samples per path; all outputs match:
+
+| Decode batch limit | Delivered token/s | TTFT p50 ms | ITL p50 ms | ITL p95 ms |
+|---:|---:|---:|---:|---:|
+| 1 | 119.20 | 202.83 | 133.40 | 134.58 |
+| 16 | 593.20 | 236.44 | 23.98 | 28.86 |
+
+This 4.98x delivered-throughput ratio includes queueing, admission, restore,
+prefill/head work, decode, sampling and immediate output draining. Immutable
+model loading and the separately reported prefix build are outside the interval.
+This is a burst experiment, not constant concurrency or decode-only timing.
+Both paths use the same scheduler and cache mode; only the decode batch limit
+changes. Peak RSS medians are 958.30/963.84 MB. Wider arrival traces remain to
+be evaluated. Automatic single-flight builds and shared KV pages are separate
+subsequent changes.
+
+[Samples](cpu-serving-2026-09-06-samples.csv) and
+[settings/hashes](cpu-serving-2026-09-06-metadata.json).

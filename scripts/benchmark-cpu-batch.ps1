@@ -15,7 +15,11 @@ param(
     [switch]$ParallelStateBatches,
     [switch]$SerialStateBatches,
     [int]$RegisteredPrefixTokens = 0,
-    [switch]$IdenticalPrompts
+    [switch]$IdenticalPrompts,
+    [switch]$Serving,
+    [int]$Residents = 16,
+    [int]$DecodeBatchLimit = 16,
+    [double]$ArrivalGapMs = 0
 )
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
@@ -37,6 +41,10 @@ $previousAffinity = $process.ProcessorAffinity
     serial_state_batches = [bool]$SerialStateBatches
     registered_prefix_tokens = $RegisteredPrefixTokens
     identical_prompts = [bool]$IdenticalPrompts
+    serving = [bool]$Serving
+    resident_limit = $Residents
+    decode_batch_limit = $DecodeBatchLimit
+    arrival_gap_ms = $ArrivalGapMs
     fixture = "configs/qwen3_5_0_8b_text_1024x512_tokens.csv"
     prompt_rule = "Repeat/truncate fixture; request r increments final prompt token by r modulo vocabulary."
     timing = "Decode after all first tokens; actual B*(N-1) forwards over common wall time including sampling and loop."
@@ -57,6 +65,8 @@ try {
                 CpuBatchSerialState = $SerialStateBatches
                 CpuRegisteredPrefixTokens = $RegisteredPrefixTokens
                 CpuIdenticalPrompts = $IdenticalPrompts
+                CpuServing = $Serving; CpuResidents = $Residents
+                CpuDecodeBatchLimit = $DecodeBatchLimit; CpuArrivalGapMs = $ArrivalGapMs
                 PromptMode = 'prompt-tokens'; PromptTokensCsv = $prompt; PromptName = $label
                 MaxContext = $length + $MaxNewTokens; MaxNewTokens = $MaxNewTokens
                 Runs = $Runs; WarmupRuns = $WarmupRuns

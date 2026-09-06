@@ -16,6 +16,10 @@ param(
     [switch]$CpuBatchParallelState,
     [switch]$CpuBatchSerialState,
     [int]$CpuRegisteredPrefixTokens = 0,
+    [switch]$CpuServing,
+    [int]$CpuResidents = 16,
+    [int]$CpuDecodeBatchLimit = 16,
+    [double]$CpuArrivalGapMs = 0,
     [switch]$CpuIdenticalPrompts,
     [ValidateSet("auto", "scalar", "avx2", "avx-vnni", "avx512", "avx512-vnni")]
     [string]$CpuIsa = "auto",
@@ -218,6 +222,7 @@ function Invoke-BenchmarkRun {
         if ($script:CpuBatchParallelState) { $args += "--cpu-batch-parallel-state" }
         if ($script:CpuBatchSerialState) { $args += "--cpu-batch-serial-state" }
         if ($script:CpuRegisteredPrefixTokens -gt 0) { $args += @("--cpu-registered-prefix", "$script:CpuRegisteredPrefixTokens") }
+        if ($script:CpuServing) { $args += @("--cpu-serving", "--cpu-residents", "$script:CpuResidents", "--cpu-decode-batch-limit", "$script:CpuDecodeBatchLimit", "--cpu-arrival-gap-ms", $script:CpuArrivalGapMs.ToString([Globalization.CultureInfo]::InvariantCulture)) }
         if ($script:CpuIdenticalPrompts) { $args += "--cpu-identical-prompts" }
     }
     switch ($Mode) {
@@ -541,6 +546,15 @@ foreach ($mode in $Modes) {
                 cpu_isa          = if ($mode -in @("cpu-gguf", "cpu-h128", "cpu-llama-fixed")) { $CpuIsa } else { "" }
                 teacher_forced   = -not [string]::IsNullOrWhiteSpace($ForcedOutputTokensCsv)
                 cpu_batch = To-OptionalInvariantString (Get-JsonProperty $profile "cpu_batch")
+                cpu_serving = To-OptionalInvariantString (Get-JsonProperty $profile "cpu_serving")
+                serving_time_ms = To-OptionalInvariantString (Get-JsonProperty $profile "serving_time_ms")
+                ttft_p50_ms = To-OptionalInvariantString (Get-JsonProperty $profile "ttft_p50_ms")
+                ttft_p95_ms = To-OptionalInvariantString (Get-JsonProperty $profile "ttft_p95_ms")
+                itl_p50_ms = To-OptionalInvariantString (Get-JsonProperty $profile "itl_p50_ms")
+                itl_p95_ms = To-OptionalInvariantString (Get-JsonProperty $profile "itl_p95_ms")
+                itl_p99_ms = To-OptionalInvariantString (Get-JsonProperty $profile "itl_p99_ms")
+                queue_p50_ms = To-OptionalInvariantString (Get-JsonProperty $profile "queue_p50_ms")
+                queue_p95_ms = To-OptionalInvariantString (Get-JsonProperty $profile "queue_p95_ms")
                 cpu_batch_serial = To-OptionalInvariantString (Get-JsonProperty $profile "cpu_batch_serial")
                 decode_forwards = To-OptionalInvariantString (Get-JsonProperty $profile "decode_forwards")
                 per_request_tokens_per_second = To-OptionalInvariantString (Get-JsonProperty $profile "per_request_tokens_per_second")
@@ -564,15 +578,15 @@ foreach ($mode in $Modes) {
                 qwen35x_weight_precision = $effectiveQwen35xWeightPrecision
                 qwen35x_cache_precision = $effectiveQwen35xCachePrecision
                 qwen35x_decode_blocks_requested = $GpuDecodeBlocks
-                prefill_only     = [bool]$profile.prefill_only
+                prefill_only     = [bool](Get-JsonProperty $profile "prefill_only")
                 run_index        = $runIndex
                 prompt_name      = $PromptName
                 prompt_tokens    = [int]$profile.prompt_tokens
                 generated_tokens = [int]$profile.generated_tokens
                 load_time_ms     = To-InvariantString $profile.load_time_ms
-                prefill_time_ms  = To-InvariantString $profile.prefill_time_ms
-                prefill_tokens_per_second = To-InvariantString $profile.prefill_tokens_per_second
-                decode_time_ms   = To-InvariantString $profile.decode_time_ms
+                prefill_time_ms  = To-OptionalInvariantString (Get-JsonProperty $profile "prefill_time_ms")
+                prefill_tokens_per_second = To-OptionalInvariantString (Get-JsonProperty $profile "prefill_tokens_per_second")
+                decode_time_ms   = To-OptionalInvariantString (Get-JsonProperty $profile "decode_time_ms")
                 tokens_per_second = To-InvariantString $profile.tokens_per_second
                 profile_json     = $profilePathForCsv
                 qwen35x_profile_enabled = [bool]$qwen35xProfileEnabledValue

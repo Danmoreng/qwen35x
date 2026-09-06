@@ -36,7 +36,7 @@ private:
   std::shared_ptr<const Impl> impl_;
   friend class CpuEngine;
 };
-enum class CpuRequestStatus { prefill, decode, complete, cancelled, failed };
+enum class CpuRequestStatus { prefill, decode, complete, cancelled, failed, queued };
 struct CpuEngineConfig {
   int threads = 8;
   std::size_t max_resident_requests = 32;
@@ -48,6 +48,12 @@ struct CpuEngineConfig {
   // Dispatch private state rows jointly when B >= executor thread count.
   bool parallel_state_batches = true;
   std::size_t max_prefix_bytes = 256 * 1024 * 1024;
+  // Nonzero enables bounded serving mode. Drive it through step/read_output.
+  // The record limit is max_resident_requests + max_queued_requests, including
+  // terminal results until release. Queued requests have no allocated KV state.
+  std::size_t max_queued_requests = 0;
+  std::size_t max_decode_batch_size = 32;
+  std::size_t max_buffered_tokens = 256;
 };
 struct CpuRequestSpec {
   std::vector<std::int32_t> prompt_tokens;
@@ -70,6 +76,7 @@ struct CpuRequestResult {
   std::size_t prefill_tokens = 0, decode_forwards = 0;
   std::size_t cached_prefix_tokens = 0;
   double prefix_restore_ms = 0;
+  double queue_ms = 0;
   // Forward-call time only; aggregate serving timing must also include sampling
   // and scheduling.
   double prefill_ms = 0, decode_ms = 0;
@@ -81,6 +88,7 @@ struct CpuEngineStats {
   std::uint64_t projection_batches = 0, lm_head_batches = 0;
   std::uint64_t greedy_lm_head_batches = 0;
   std::uint64_t state_batches = 0;
+  std::size_t queued_requests = 0, resident_requests = 0;
 };
 
 // One owner calls these methods serially. Each engine owns one executor and
@@ -95,7 +103,6 @@ public:
   CpuEngine(const CpuEngine &) = delete;
   CpuEngine &operator=(const CpuEngine &) = delete;
   CpuRequestId submit(CpuRequestSpec spec, std::string &error);
-  // Experimental: partial-hit numerical validation remains open; see progress doc.
   // Explicit synchronous build, deduplicated by exact tokens and namespace.
   // Budgets include KV, DeltaNet, convolution, token IDs and final hidden data.
   std::shared_ptr<const CpuPrefix>
@@ -107,6 +114,13 @@ public:
   // Prompts must be initialized first. Empty batches are a no-op; B=1 keeps
   // the existing fast path. Validation errors leave every request untouched.
   bool advance_batch(std::span<const CpuRequestId> ids, std::string &error);
+  // At most one admission and one prefill chunk or decode batch. No waiting for
+  // a full batch. Returns success separately from whether any work progressed.
+  bool step(bool &progressed, std::string &error);
+  // Append up to max_tokens confirmed tokens; incomplete stop sequences are
+  // withheld until resolved. Drain to unblock a slow request independently.
+  bool read_output(CpuRequestId id, std::size_t max_tokens,
+                   std::vector<std::int32_t> &output, std::string &error);
   CpuEngineStats stats() const;
   bool cancel(CpuRequestId id);
   bool release(CpuRequestId id);
