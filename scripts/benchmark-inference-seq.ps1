@@ -9,6 +9,8 @@ param(
     [string]$CpuGguf = "",
     [string]$CpuQ4H128 = "",
     [int]$CpuThreads = 0,
+    [ValidateRange(0, 100)][int]$CpuBatch = 0,
+    [switch]$CpuBatchSerial,
     [ValidateSet("auto", "scalar", "avx2", "avx-vnni", "avx512", "avx512-vnni")]
     [string]$CpuIsa = "auto",
     [switch]$CpuIsaStrict,
@@ -199,6 +201,11 @@ function Invoke-BenchmarkRun {
     }
 
     $args = @()
+    if ($script:CpuBatch -gt 0) {
+        if ($Mode -ne "cpu-h128") { throw "CpuBatch requires cpu-h128 mode." }
+        $args += @("--cpu-batch", "$script:CpuBatch")
+        if ($script:CpuBatchSerial) { $args += "--cpu-batch-serial" }
+    }
     switch ($Mode) {
         "gpu-bf16" {
             $args += @("--infer-gpu", "--gpu-bf16")
@@ -519,6 +526,16 @@ foreach ($mode in $Modes) {
                 cpu_threads      = if ($mode -in @("cpu-gguf", "cpu-h128", "cpu-llama-fixed")) { $CpuThreads } else { "" }
                 cpu_isa          = if ($mode -in @("cpu-gguf", "cpu-h128", "cpu-llama-fixed")) { $CpuIsa } else { "" }
                 teacher_forced   = -not [string]::IsNullOrWhiteSpace($ForcedOutputTokensCsv)
+                cpu_batch = To-OptionalInvariantString (Get-JsonProperty $profile "cpu_batch")
+                cpu_batch_serial = To-OptionalInvariantString (Get-JsonProperty $profile "cpu_batch_serial")
+                decode_forwards = To-OptionalInvariantString (Get-JsonProperty $profile "decode_forwards")
+                per_request_tokens_per_second = To-OptionalInvariantString (Get-JsonProperty $profile "per_request_tokens_per_second")
+                tick_p50_ms = To-OptionalInvariantString (Get-JsonProperty $profile "tick_p50_ms")
+                tick_p95_ms = To-OptionalInvariantString (Get-JsonProperty $profile "tick_p95_ms")
+                tick_p99_ms = To-OptionalInvariantString (Get-JsonProperty $profile "tick_p99_ms")
+                peak_rss_bytes = To-OptionalInvariantString (Get-JsonProperty $profile "peak_rss_bytes")
+                batch_rows = To-OptionalInvariantString (Get-JsonProperty $profile "batch_rows")
+                lm_head_batches = To-OptionalInvariantString (Get-JsonProperty $profile "lm_head_batches")
                 cpu_kv_cache     = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "cpu_kv_cache")
                 cpu_attention_kernel = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "cpu_attention_kernel")
                 cached_prefix_tokens = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "cached_prefix_tokens")

@@ -43,6 +43,105 @@ struct CpuEngine::Impl {
   std::unordered_map<CpuRequestId, std::unique_ptr<Sequence>> requests;
   CpuRequestId next_id = 1;
   std::string attention_kernel;
+  CpuEngineStats stats;
+  struct BatchScratch {
+    std::vector<float> x, normed, projected, core, row, attention, residual;
+    std::vector<float> post_norm, gate_up, mlp_hidden, mlp_output, final_hidden;
+    std::vector<float> logits;
+  } batch;
+
+  bool forward_batch(std::span<Sequence *> rows, std::string &error) {
+    const auto &d = model->impl_->dims;
+    const auto &w = model->impl_->weights;
+    const std::size_t count = rows.size(), hidden = d.hidden;
+    const std::size_t intermediate = d.intermediate;
+    auto &b = batch;
+    b.x.resize(count * hidden);
+    b.residual.resize(count * hidden);
+    b.mlp_hidden.resize(count * intermediate);
+    for (std::size_t r = 0; r < count; ++r)
+      (w.embed_tokens.q4_dot4 ? cpu::q4_dot4_dequantize_row
+                              : cpu::q4_0_packed_dequantize_row)(
+          w.embed_tokens.packed_q4_0_blocks.data(), rows[r]->pending_token,
+          b.x.data() + r * hidden, hidden / 32);
+    std::size_t linear_index = 0, full_index = 0;
+    auto project = [&](const TensorData &weight,
+                       const std::vector<float> &input,
+                       std::vector<float> &output) {
+      if (!matmul_2d_quantized_batch(context.get(), weight, input, count,
+                                     output, error))
+        return false;
+      ++stats.projection_batches;
+      return true;
+    };
+    for (const auto &layer : w.layers) {
+      rms_norm_qwen3next_batch(b.x, count, hidden, layer.input_layernorm,
+                               d.rms_eps, b.normed);
+      const auto &input_weight = layer.is_linear ? layer.linear.in_proj_all_cpu
+                                                 : layer.full.qkv_proj_cpu;
+      if (!project(input_weight, b.normed, b.projected))
+        return false;
+      const std::size_t width = b.projected.size() / count;
+      const std::size_t core_width =
+          layer.is_linear ? d.linear_v_dim : d.n_heads * d.head_dim;
+      b.core.resize(count * core_width);
+      // Only projections are shared here. Each stateful kernel sees one
+      // request's state and absolute position; no padded row can mutate state.
+      for (std::size_t r = 0; r < count; ++r) {
+        auto &s = *rows[r];
+        const std::span<const float> projected(b.projected.data() + r * width,
+                                               width);
+        bool ok;
+        if (layer.is_linear)
+          ok = run_linear_attention_step(
+              context.get(), layer, d, s.state.linear_states[linear_index],
+              b.normed, b.row, false, nullptr, error, projected, true);
+        else {
+          const auto position = s.result.committed_tokens;
+          const auto rope_offset = position * (d.rope_dim / 2);
+          ok = run_full_attention_step(
+              context.get(), layer, d, s.state.full_states[full_index],
+              b.normed, static_cast<int>(position),
+              s.state.rope_cosine.data() + rope_offset,
+              s.state.rope_sine.data() + rope_offset, b.row, false, nullptr,
+              error, projected, true);
+        }
+        if (!ok)
+          return false;
+        std::copy(b.row.begin(), b.row.end(), b.core.begin() + r * core_width);
+      }
+      if (layer.is_linear)
+        ++linear_index;
+      else
+        ++full_index;
+      if (!project(layer.is_linear ? layer.linear.out_proj : layer.full.o_proj,
+                   b.core, b.attention))
+        return false;
+      cpu::add_f32(b.x.data(), b.attention.data(), b.residual.data(),
+                   b.x.size());
+      rms_norm_qwen3next_batch(b.residual, count, hidden,
+                               layer.post_attention_layernorm, d.rms_eps,
+                               b.post_norm);
+      if (!project(layer.mlp_gate_up_cpu, b.post_norm, b.gate_up))
+        return false;
+      for (std::size_t r = 0; r < count; ++r) {
+        const auto *gate = b.gate_up.data() + r * 2 * intermediate;
+        cpu::silu_mul_f32(gate, gate + intermediate,
+                          b.mlp_hidden.data() + r * intermediate, intermediate,
+                          layer.mlp_down.q8_0_backend);
+      }
+      if (!project(layer.mlp_down, b.mlp_hidden, b.mlp_output))
+        return false;
+      cpu::add_f32(b.residual.data(), b.mlp_output.data(), b.x.data(),
+                   b.x.size());
+    }
+    rms_norm_qwen3next_batch(b.x, count, hidden, w.final_norm, d.rms_eps,
+                             b.final_hidden);
+    if (!project(w.embed_tokens, b.final_hidden, b.logits))
+      return false;
+    ++stats.lm_head_batches;
+    return true;
+  }
 
   bool initialize(Sequence &s, std::string &error) {
     const auto &d = model->impl_->dims;
@@ -264,6 +363,66 @@ bool CpuEngine::advance(CpuRequestId id, std::string &error) {
   }
   return impl_->advance(*it->second, error);
 }
+bool CpuEngine::advance_batch(std::span<const CpuRequestId> ids,
+                              std::string &error) {
+  error.clear();
+  std::vector<Impl::Sequence *> rows;
+  rows.reserve(ids.size());
+  std::unordered_set<CpuRequestId> seen;
+  for (auto id : ids) {
+    auto it = impl_->requests.find(id);
+    if (it == impl_->requests.end() || !seen.insert(id).second ||
+        it->second->result.status != CpuRequestStatus::decode) {
+      error = "Decode batch requires distinct active decode requests.";
+      return false;
+    }
+    rows.push_back(it->second.get());
+  }
+  if (rows.empty())
+    return true;
+  if (rows.size() == 1)
+    return impl_->advance(*rows[0], error);
+  const auto start = std::chrono::steady_clock::now();
+  bool ok = false;
+  try {
+    ok = impl_->forward_batch(rows, error);
+  } catch (const std::bad_alloc &) {
+    error = "Could not allocate decode batch workspace.";
+  }
+  const double ms = elapsed_ms(start);
+  if (!ok) {
+    // A failed forward may have updated state. Never silently retry it.
+    for (auto *s : rows) {
+      s->result.status = CpuRequestStatus::failed;
+      s->result.error = error;
+    }
+    return false;
+  }
+  ++impl_->stats.batch_ticks;
+  impl_->stats.batch_rows += rows.size();
+  const auto vocab =
+      static_cast<std::size_t>(impl_->model->impl_->dims.vocab_size);
+  for (std::size_t r = 0; r < rows.size(); ++r) {
+    auto &s = *rows[r];
+    ++s.result.committed_tokens;
+    ++s.result.decode_forwards;
+    // Attribution only, not a substitute for common wall-clock throughput.
+    s.result.decode_ms += ms / rows.size();
+    s.logits.assign(impl_->batch.logits.data() + r * vocab,
+                    impl_->batch.logits.data() + (r + 1) * vocab);
+    std::string local_error;
+    if (!impl_->select(s, -1, local_error)) {
+      s.result.status = CpuRequestStatus::failed;
+      s.result.error = local_error;
+      if (error.empty())
+        error = local_error;
+      ok = false;
+    }
+  }
+  return ok;
+}
+CpuEngineStats CpuEngine::stats() const { return impl_->stats; }
+
 bool CpuEngine::cancel(CpuRequestId id) {
   auto it = impl_->requests.find(id);
   if (it == impl_->requests.end())

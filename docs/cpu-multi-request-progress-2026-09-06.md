@@ -47,7 +47,61 @@ also checks cancellation, admission limits, stopping, IDs and model sharing
 between engines. The existing full-model cache/precision regression passes.
 These are structural changes; no additional speedup is claimed.
 
+## Step 2a: Static decode with shared projections
+
+`advance_batch` jointly projects independent rows through all layers, including
+the tied LM-head. It produces full logits, applies request-local sampling, and
+retains the existing fast path for B=1. Stateful attention and recurrence are
+initially dispatched per request. Counters expose the shared projection path.
+
+The model test checks byte-exact raw logits and seeded outputs for B=2/3/4/5/17,
+including different positions (3/65/128/257 prompt tokens), row permutations,
+completion/removal and duplicate-ID rejection. All nine CTest suites pass and
+the normal CUDA-enabled executable builds. On P512, every output token in all
+three B4/B8 batched runs also matches the corresponding serial workload.
+
+### Static throughput baseline
+
+Ryzen 9 9955HX3D, eight threads, 0xffff affinity, FP16 KV, same DOT4 artifact.
+Medians of three measured runs after one warmup, official sequential runner.
+Decode counts B*(128-1) forwards after all first tokens have been produced,
+including sampling and the caller loop. No shared-prefix reuse yet.
+
+| Prompt per request | B | Aggregate token/s | Tick p50 (ms) | Peak process RSS (MiB) |
+|---:|---:|---:|---:|---:|
+| 512 | 1 | 125.16 | 7.95 | 469 |
+| 512 | 2 | 163.21 | 12.23 | 501 |
+| 512 | 4 | 318.92 | 12.47 | 561 |
+| 512 | 8 | 345.61 | 23.06 | 681 |
+| 512 | 16 | 503.23 | 31.78 | 920 |
+| 512 | 32 | 517.01 | 61.57 | 1400 |
+| 4096 | 1 | 99.01 | 10.06 | 512 |
+| 4096 | 4 | 181.53 | 22.01 | 733 |
+| 4096 | 8 | 202.43 | 39.50 | 1024 |
+| 4096 | 16 | 238.84 | 67.16 | 1607 |
+| 4096 | 32 | 236.94 | 133.66 | 2773 |
+
+Serial execution of the same P512 B4/B8 workloads gives 119.35/119.10 token/s.
+Shared projections therefore improve aggregate throughput by 2.67x/2.90x in
+those directly matched cases. Larger batches trade latency for throughput;
+these results do not establish a universal optimum. The P4096 B2 point and
+extensions above B32 are deferred until thread/layout experiments.
+
+[All 39 samples](cpu-multi-request-static-2026-09-06-samples.csv) and
+[binary hashes, settings and topology](cpu-multi-request-static-2026-09-06-metadata.json).
+Metadata records the parent revision plus the exact measured executable hash;
+the static implementation was uncommitted when those binaries were measured.
+See [API and reproduction instructions](cpu-engine-api.md).
+
+Single-request ABBA confirmation against the frozen pre-refactor executable
+(six samples each): decode P128 is 126.03 versus 125.33 token/s (-0.56%);
+prefill P512 is 2250.95 versus 2217.13 token/s (-1.50%). The candidate includes
+one 1277.55 token/s prefill outlier, retained in the data, and its fastest sample
+is 2265.47 versus 2256.59 for baseline. These noisy runs do not show a material
+single-request regression. Raw records:
+`benchmarks/cpu-experiments-2026-09-06/multi-static-single-confirm`.
+
 ## Next
 
-Steps 2-7 remain pending. Step 2 adds actual shared decode projections and
-measurement of aggregate throughput over a common wall-clock interval.
+Test thread count and both cache domains for larger batches, then evaluate
+batched greedy vocabulary reduction separately. Steps 3-7 remain pending.

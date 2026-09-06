@@ -240,7 +240,14 @@ bool run_linear_attention_step(CpuExecutionContext *cpu_context,
   std::vector<float> & out,
   const bool use_cuda,
   CudaForwardWorkspace * cuda_workspace,
-  std::string & error_message) {
+  std::string & error_message,
+  const std::span<const float> projected = {},
+  const bool return_core = false) {
+  if ((!projected.empty() && (use_cuda || projected.size() != static_cast<std::size_t>(dims.linear_conv_channels + dims.linear_v_dim + 2 * dims.linear_num_v_heads))) ||
+      (return_core && projected.empty())) {
+    error_message = "Invalid preprojected CPU attention row.";
+    return false;
+  }
   CpuDecodeWorkspace::Linear local_workspace;
   auto & workspace = !use_cuda && cpu_context != nullptr
     ? cpu_context->decode.linear : local_workspace;
@@ -294,7 +301,9 @@ bool run_linear_attention_step(CpuExecutionContext *cpu_context,
   bool packed_projection = false;
   const bool use_cuda_projection_batch =
     use_cuda && cuda_workspace != nullptr && cuda_workspace->has_device_buffers;
-  if (use_cuda_projection_batch) {
+  if (!projected.empty()) {
+    packed_projection = true;
+  } else if (use_cuda_projection_batch) {
     if (!cuda::upload_to_buffer_f32(x.data(), x.size(), cuda_workspace->hidden_in, 0, error_message) ||
         !project_from_uploaded_hidden_cuda(
           layer.linear.in_proj_qkv,
@@ -347,7 +356,7 @@ bool run_linear_attention_step(CpuExecutionContext *cpu_context,
     }
   }
 
-  const float * mixed_values = packed_projection ? workspace.packed.data() : mixed_qkv.data();
+  const float * mixed_values = packed_projection ? (projected.empty() ? workspace.packed.data() : projected.data()) : mixed_qkv.data();
   const float * z_values = packed_projection ? mixed_values + dims.linear_conv_channels : z_vec.data();
   const float * b_values = packed_projection ? z_values + dims.linear_v_dim : b_vec.data();
   const float * a_values = packed_projection ? b_values + dims.linear_num_v_heads : a_vec.data();
@@ -445,6 +454,10 @@ bool run_linear_attention_step(CpuExecutionContext *cpu_context,
     z_values, gated_norm.data(), gated_norm.data(), gated_norm.size(),
     cpu_backend);
 
+  if (return_core) {
+    out.assign(gated_norm.begin(), gated_norm.end());
+    return true;
+  }
   if (!matvec_2d(cpu_context, layer.linear.out_proj, gated_norm, out, use_cuda, error_message)) {
     return false;
   }
@@ -462,7 +475,14 @@ bool run_full_attention_step(CpuExecutionContext *cpu_context,
   std::vector<float> & out,
   const bool use_cuda,
   CudaForwardWorkspace * cuda_workspace,
-  std::string & error_message) {
+  std::string & error_message,
+  const std::span<const float> projected = {},
+  const bool return_core = false) {
+  if ((!projected.empty() && (use_cuda || projected.size() != static_cast<std::size_t>((dims.n_heads + dims.n_kv_heads) * dims.head_dim * 2))) ||
+      (return_core && projected.empty())) {
+    error_message = "Invalid preprojected CPU attention row.";
+    return false;
+  }
   CpuDecodeWorkspace::Full local_workspace;
   auto & workspace = !use_cuda && cpu_context != nullptr
     ? cpu_context->decode.full : local_workspace;
@@ -474,7 +494,9 @@ bool run_full_attention_step(CpuExecutionContext *cpu_context,
     use_cuda && cuda_workspace != nullptr && cuda_workspace->has_device_buffers;
   const std::size_t full_q_out = static_cast<std::size_t>(dims.n_heads * dims.head_dim * 2);
   const std::size_t full_kv_out = static_cast<std::size_t>(dims.n_kv_heads * dims.head_dim);
-  if (use_cuda_projection_batch) {
+  if (!projected.empty()) {
+    packed_projection = true;
+  } else if (use_cuda_projection_batch) {
     if (!cuda::upload_to_buffer_f32(x.data(), x.size(), cuda_workspace->hidden_in, 0, error_message) ||
         !project_from_uploaded_hidden_cuda(layer.full.q_proj, *cuda_workspace, full_q_out, q_full, error_message) ||
         !project_from_uploaded_hidden_cuda(layer.full.k_proj, *cuda_workspace, full_kv_out, k_flat, error_message) ||
@@ -502,7 +524,7 @@ bool run_full_attention_step(CpuExecutionContext *cpu_context,
     }
   }
 
-  const float * q_values = packed_projection ? workspace.packed.data() : q_full.data();
+  const float * q_values = packed_projection ? (projected.empty() ? workspace.packed.data() : projected.data()) : q_full.data();
   const float * k_values = packed_projection ? q_values + full_q_out : k_flat.data();
   const float * v_values = packed_projection ? k_values + full_kv_out : v_flat.data();
   const int q_span = dims.head_dim * 2;
@@ -631,6 +653,10 @@ bool run_full_attention_step(CpuExecutionContext *cpu_context,
     run_full_attention_decode_cpu_pairs(&job, 0, attention_pairs);
   }
 
+  if (return_core) {
+    out.assign(attn_cat.begin(), attn_cat.end());
+    return true;
+  }
   if (!matvec_2d(cpu_context, layer.full.o_proj, attn_cat, out, use_cuda, error_message)) {
     return false;
   }

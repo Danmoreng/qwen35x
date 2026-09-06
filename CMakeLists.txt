@@ -380,3 +380,8 @@ endif ()
 
 add_executable(qwen35x_cpu_engine_model_test tests/cpu_engine_model_test.cpp)
 target_link_libraries(qwen35x_cpu_engine_model_test PRIVATE qwen35x_core)
+add_executable(qwen35x_cpu_engine_bench src/cpu_engine_bench_main.cpp)
+target_link_libraries(qwen35x_cpu_engine_bench PRIVATE qwen35x_core)
+if (WIN32)
+  target_link_libraries(qwen35x_cpu_engine_bench PRIVATE psapi)
+endif ()

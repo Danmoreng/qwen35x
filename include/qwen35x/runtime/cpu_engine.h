@@ -52,6 +52,11 @@ struct CpuRequestResult {
   std::string error;
 };
 
+struct CpuEngineStats {
+  std::uint64_t batch_ticks = 0, batch_rows = 0;
+  std::uint64_t projection_batches = 0, lm_head_batches = 0;
+};
+
 // One owner calls these methods serially. Each engine owns one executor and
 // scratch workspace; independent engines can share CpuModel read-only.
 // Request IDs are monotonic within an engine and are never reused.
@@ -66,6 +71,11 @@ public:
   CpuRequestId submit(CpuRequestSpec spec, std::string &error);
   // One bounded prefill chunk or one decode forward; no background work.
   bool advance(CpuRequestId id, std::string &error);
+  // One decode row per distinct active request, in the supplied row order.
+  // Prompts must be initialized first. Empty batches are a no-op; B=1 keeps
+  // the existing fast path. Validation errors leave every request untouched.
+  bool advance_batch(std::span<const CpuRequestId> ids, std::string &error);
+  CpuEngineStats stats() const;
   bool cancel(CpuRequestId id);
   bool release(CpuRequestId id);
   bool result(CpuRequestId id, CpuRequestResult &out) const;

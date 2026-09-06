@@ -1,5 +1,6 @@
 #include "qwen35x/compiler/compiler.h"
 #include "qwen35x/runtime/cpu_engine.h"
+#include <algorithm>
 #include <cstring>
 #include <iostream>
 using namespace qwen35x;
@@ -105,6 +106,79 @@ int main(int argc, char **argv) {
       }
       engine->release(ids[r]);
     }
+  }
+  // Compare every vocabulary logit across tiled batches, tails, reordered
+  // rows and removal. Different prompt lengths also cover convolution rings.
+  for (int size : {2, 3, 4, 5, 17}) {
+    auto batched = CpuEngine::create(
+        model, {.threads = 8, .max_resident_requests = 32, .max_context = 512},
+        error);
+    std::vector<CpuRequestId> ids;
+    std::vector<std::vector<float>> expected(size), actual(size);
+    std::vector<std::vector<std::int32_t>> tokens(size);
+    for (int r = 0; r < size; ++r) {
+      CpuRequestSpec request;
+      const int lengths[] = {65, 128, 257, 3};
+      request.prompt_tokens.assign(size == 4 ? lengths[r] : 3 + r % 5, r + 1);
+      request.max_new_tokens = 3 + r % 2;
+      request.sampling.seed = 100 + r;
+      request.logits_callback = capture;
+      request.logits_callback_context = &expected[r];
+      auto serial = CpuEngine::create(
+          model, {.threads = 8, .max_resident_requests = 1, .max_context = 512},
+          error);
+      auto id = serial->submit(request, error);
+      CpuRequestResult result;
+      do {
+        if (!serial->advance(id, error)) {
+          std::cerr << error;
+          return 11;
+        }
+        serial->result(id, result);
+      } while (result.status != CpuRequestStatus::complete);
+      tokens[r] = result.output_tokens;
+      request.logits_callback_context = &actual[r];
+      ids.push_back(batched->submit(request, error));
+      do {
+        if (!batched->advance(ids.back(), error)) return 12;
+        batched->result(ids.back(), result);
+      } while (result.status == CpuRequestStatus::prefill);
+    }
+    auto active = ids;
+    std::vector<CpuRequestId> invalid{ids[0], ids[0]};
+    if (batched->advance_batch(invalid, error))
+      return 13;
+    while (!active.empty()) {
+      std::reverse(active.begin(), active.end());
+      if (!batched->advance_batch(active, error)) {
+        std::cerr << error;
+        return 14;
+      }
+      std::erase_if(active, [&](auto id) {
+        CpuRequestResult result;
+        batched->result(id, result);
+        return result.status == CpuRequestStatus::complete;
+      });
+    }
+    for (int r = 0; r < size; ++r) {
+      CpuRequestResult result;
+      batched->result(ids[r], result);
+      if (!equal(expected[r], actual[r]) || tokens[r] != result.output_tokens) {
+        double max_error = 0;
+        for (std::size_t i = 0;
+             i < std::min(expected[r].size(), actual[r].size()); ++i)
+          max_error = std::max(max_error,
+                               std::abs(double(expected[r][i]) - actual[r][i]));
+        std::cerr << "Batch mismatch B=" << size << " row=" << r
+                  << " max=" << max_error << '\n';
+        return 15;
+      }
+    }
+    auto stats = batched->stats();
+    if (!stats.batch_ticks || stats.lm_head_batches != stats.batch_ticks ||
+        stats.projection_batches != stats.batch_ticks * (24 * 4 + 1))
+      return 16;
+    std::cout << "Exact multi-request logits and sampling B=" << size << '\n';
   }
   CpuRequestSpec spec;
   spec.prompt_tokens = {1};

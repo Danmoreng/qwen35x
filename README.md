@@ -4,6 +4,20 @@
 
 The goal is not a generic multi-model runtime. The goal is a small, hardware-aware engine that can be aggressively optimized for specific Qwen3.5 architectures on CPUs and CUDA GPUs.
 
+## CPU multi-request decode: September 6, 2026
+
+The new incremental CPU API batches projections across independent requests,
+including the LM-head. On the Ryzen 9 9955HX3D with eight threads and 512 prompt
+tokens per request, B=4 reaches **319 token/s aggregate versus 119 token/s** for
+the same requests executed serially (**2.67x**). B=16 reaches **503 token/s**,
+with a 31.8 ms median tick. Full-model tests verify byte-identical logits and
+request-local sampling. This is a static decode baseline; continuous scheduling
+and shared-prefix reuse are subsequent stages.
+
+**[Throughput, latency, memory and samples](docs/cpu-multi-request-progress-2026-09-06.md)** ·
+[API and reproduction](docs/cpu-engine-api.md) ·
+[Staged plan](docs/cpu-multi-request-plan-2026-09-06.md)
+
 ## CPU prefill update: September 6, 2026
 
 **The new automatic attention path improves long-context prefill by 58% at

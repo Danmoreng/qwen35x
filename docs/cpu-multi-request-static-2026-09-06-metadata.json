@@ -1,0 +1,511 @@
+{
+  "static-initial": {
+    "affinity": 65535,
+    "fixture": "configs/qwen3_5_0_8b_text_1024x512_tokens.csv",
+    "executable_sha256": "1A69ED0F07946AC797DA8A128891C7C4ADC4DB4F2D80BC99BBED22EBB115F5AE",
+    "executable": "build-multi-request/qwen35x_cpu_engine_bench.exe",
+    "timing": "Decode after all first tokens; actual B*(N-1) forwards over common wall time including sampling and loop.",
+    "serial_reference": false,
+    "threads": 8,
+    "prompt_rule": "Repeat/truncate fixture; request r increments final prompt token by r modulo vocabulary.",
+    "revision": "4676a0bb3a3f818b1f45755da050cdc59284500b"
+  },
+  "static-serial": {
+    "threads": 8,
+    "revision": "4676a0bb3a3f818b1f45755da050cdc59284500b",
+    "affinity": 65535,
+    "executable_sha256": "1A69ED0F07946AC797DA8A128891C7C4ADC4DB4F2D80BC99BBED22EBB115F5AE",
+    "fixture": "configs/qwen3_5_0_8b_text_1024x512_tokens.csv",
+    "timing": "Decode after all first tokens; actual B*(N-1) forwards over common wall time including sampling and loop.",
+    "serial_reference": true,
+    "prompt_rule": "Repeat/truncate fixture; request r increments final prompt token by r modulo vocabulary.",
+    "executable": "build-multi-request/qwen35x_cpu_engine_bench.exe"
+  },
+  "static-expand": {
+    "threads": 8,
+    "revision": "4676a0bb3a3f818b1f45755da050cdc59284500b",
+    "affinity": 65535,
+    "executable_sha256": "1A69ED0F07946AC797DA8A128891C7C4ADC4DB4F2D80BC99BBED22EBB115F5AE",
+    "fixture": "configs/qwen3_5_0_8b_text_1024x512_tokens.csv",
+    "timing": "Decode after all first tokens; actual B*(N-1) forwards over common wall time including sampling and loop.",
+    "serial_reference": false,
+    "prompt_rule": "Repeat/truncate fixture; request r increments final prompt token by r modulo vocabulary.",
+    "executable": "build-multi-request/qwen35x_cpu_engine_bench.exe"
+  },
+  "static-long": {
+    "threads": 8,
+    "revision": "4676a0bb3a3f818b1f45755da050cdc59284500b",
+    "affinity": 65535,
+    "executable_sha256": "1A69ED0F07946AC797DA8A128891C7C4ADC4DB4F2D80BC99BBED22EBB115F5AE",
+    "fixture": "configs/qwen3_5_0_8b_text_1024x512_tokens.csv",
+    "timing": "Decode after all first tokens; actual B*(N-1) forwards over common wall time including sampling and loop.",
+    "serial_reference": false,
+    "prompt_rule": "Repeat/truncate fixture; request r increments final prompt token by r modulo vocabulary.",
+    "executable": "build-multi-request/qwen35x_cpu_engine_bench.exe"
+  },
+  "topology": [
+    {
+      "type": "core",
+      "flags": 1,
+      "masks": [
+        "0x3"
+      ]
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 49152,
+      "kind": 2,
+      "mask": "0x3"
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 32768,
+      "kind": 1,
+      "mask": "0x3"
+    },
+    {
+      "type": "cache",
+      "level": 2,
+      "bytes": 1048576,
+      "kind": 0,
+      "mask": "0x3"
+    },
+    {
+      "type": "cache",
+      "level": 3,
+      "bytes": 100663296,
+      "kind": 0,
+      "mask": "0xffff"
+    },
+    {
+      "type": "core",
+      "flags": 1,
+      "masks": [
+        "0xc"
+      ]
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 49152,
+      "kind": 2,
+      "mask": "0xc"
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 32768,
+      "kind": 1,
+      "mask": "0xc"
+    },
+    {
+      "type": "cache",
+      "level": 2,
+      "bytes": 1048576,
+      "kind": 0,
+      "mask": "0xc"
+    },
+    {
+      "type": "core",
+      "flags": 1,
+      "masks": [
+        "0x30"
+      ]
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 49152,
+      "kind": 2,
+      "mask": "0x30"
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 32768,
+      "kind": 1,
+      "mask": "0x30"
+    },
+    {
+      "type": "cache",
+      "level": 2,
+      "bytes": 1048576,
+      "kind": 0,
+      "mask": "0x30"
+    },
+    {
+      "type": "core",
+      "flags": 1,
+      "masks": [
+        "0xc0"
+      ]
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 49152,
+      "kind": 2,
+      "mask": "0xc0"
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 32768,
+      "kind": 1,
+      "mask": "0xc0"
+    },
+    {
+      "type": "cache",
+      "level": 2,
+      "bytes": 1048576,
+      "kind": 0,
+      "mask": "0xc0"
+    },
+    {
+      "type": "core",
+      "flags": 1,
+      "masks": [
+        "0x300"
+      ]
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 49152,
+      "kind": 2,
+      "mask": "0x300"
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 32768,
+      "kind": 1,
+      "mask": "0x300"
+    },
+    {
+      "type": "cache",
+      "level": 2,
+      "bytes": 1048576,
+      "kind": 0,
+      "mask": "0x300"
+    },
+    {
+      "type": "core",
+      "flags": 1,
+      "masks": [
+        "0xc00"
+      ]
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 49152,
+      "kind": 2,
+      "mask": "0xc00"
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 32768,
+      "kind": 1,
+      "mask": "0xc00"
+    },
+    {
+      "type": "cache",
+      "level": 2,
+      "bytes": 1048576,
+      "kind": 0,
+      "mask": "0xc00"
+    },
+    {
+      "type": "core",
+      "flags": 1,
+      "masks": [
+        "0x3000"
+      ]
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 49152,
+      "kind": 2,
+      "mask": "0x3000"
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 32768,
+      "kind": 1,
+      "mask": "0x3000"
+    },
+    {
+      "type": "cache",
+      "level": 2,
+      "bytes": 1048576,
+      "kind": 0,
+      "mask": "0x3000"
+    },
+    {
+      "type": "core",
+      "flags": 1,
+      "masks": [
+        "0xc000"
+      ]
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 49152,
+      "kind": 2,
+      "mask": "0xc000"
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 32768,
+      "kind": 1,
+      "mask": "0xc000"
+    },
+    {
+      "type": "cache",
+      "level": 2,
+      "bytes": 1048576,
+      "kind": 0,
+      "mask": "0xc000"
+    },
+    {
+      "type": "core",
+      "flags": 1,
+      "masks": [
+        "0x30000"
+      ]
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 49152,
+      "kind": 2,
+      "mask": "0x30000"
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 32768,
+      "kind": 1,
+      "mask": "0x30000"
+    },
+    {
+      "type": "cache",
+      "level": 2,
+      "bytes": 1048576,
+      "kind": 0,
+      "mask": "0x30000"
+    },
+    {
+      "type": "cache",
+      "level": 3,
+      "bytes": 33554432,
+      "kind": 0,
+      "mask": "0xffff0000"
+    },
+    {
+      "type": "core",
+      "flags": 1,
+      "masks": [
+        "0xc0000"
+      ]
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 49152,
+      "kind": 2,
+      "mask": "0xc0000"
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 32768,
+      "kind": 1,
+      "mask": "0xc0000"
+    },
+    {
+      "type": "cache",
+      "level": 2,
+      "bytes": 1048576,
+      "kind": 0,
+      "mask": "0xc0000"
+    },
+    {
+      "type": "core",
+      "flags": 1,
+      "masks": [
+        "0x300000"
+      ]
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 49152,
+      "kind": 2,
+      "mask": "0x300000"
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 32768,
+      "kind": 1,
+      "mask": "0x300000"
+    },
+    {
+      "type": "cache",
+      "level": 2,
+      "bytes": 1048576,
+      "kind": 0,
+      "mask": "0x300000"
+    },
+    {
+      "type": "core",
+      "flags": 1,
+      "masks": [
+        "0xc00000"
+      ]
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 49152,
+      "kind": 2,
+      "mask": "0xc00000"
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 32768,
+      "kind": 1,
+      "mask": "0xc00000"
+    },
+    {
+      "type": "cache",
+      "level": 2,
+      "bytes": 1048576,
+      "kind": 0,
+      "mask": "0xc00000"
+    },
+    {
+      "type": "core",
+      "flags": 1,
+      "masks": [
+        "0x3000000"
+      ]
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 49152,
+      "kind": 2,
+      "mask": "0x3000000"
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 32768,
+      "kind": 1,
+      "mask": "0x3000000"
+    },
+    {
+      "type": "cache",
+      "level": 2,
+      "bytes": 1048576,
+      "kind": 0,
+      "mask": "0x3000000"
+    },
+    {
+      "type": "core",
+      "flags": 1,
+      "masks": [
+        "0xc000000"
+      ]
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 49152,
+      "kind": 2,
+      "mask": "0xc000000"
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 32768,
+      "kind": 1,
+      "mask": "0xc000000"
+    },
+    {
+      "type": "cache",
+      "level": 2,
+      "bytes": 1048576,
+      "kind": 0,
+      "mask": "0xc000000"
+    },
+    {
+      "type": "core",
+      "flags": 1,
+      "masks": [
+        "0x30000000"
+      ]
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 49152,
+      "kind": 2,
+      "mask": "0x30000000"
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 32768,
+      "kind": 1,
+      "mask": "0x30000000"
+    },
+    {
+      "type": "cache",
+      "level": 2,
+      "bytes": 1048576,
+      "kind": 0,
+      "mask": "0x30000000"
+    },
+    {
+      "type": "core",
+      "flags": 1,
+      "masks": [
+        "0xc0000000"
+      ]
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 49152,
+      "kind": 2,
+      "mask": "0xc0000000"
+    },
+    {
+      "type": "cache",
+      "level": 1,
+      "bytes": 32768,
+      "kind": 1,
+      "mask": "0xc0000000"
+    },
+    {
+      "type": "cache",
+      "level": 2,
+      "bytes": 1048576,
+      "kind": 0,
+      "mask": "0xc0000000"
+    }
+  ],
+  "model_sha256": "e73de30bf646dee502dd5e519939221f7d2b60068ccbbe16dc1701597919c42f"
+}
