@@ -1,0 +1,311 @@
+{
+  "metadata": {
+    "candidate": "build/qwen35x.exe",
+    "baseline": "benchmarks/prefill-tiled-2026-09-06/qwen35x-baseline.exe",
+    "teacher": "build-llama-fixed-cpu/bin/llama-fixed-cpu-bench.exe",
+    "out": "benchmarks\\prefill-tiled-2026-09-06\\quality-final",
+    "chunk": "0",
+    "query_tile": "0",
+    "kv_tile": "32",
+    "mode": "auto",
+    "gqa": "False",
+    "sha256": {
+      "benchmarks/prefill-tiled-2026-09-06/qwen35x-baseline.exe": "f36a1b572532344795954c572dcf9c28935a6971c8f832dd6071e4aaf5c965c5",
+      "build/qwen35x.exe": "e6db3b22ad9436350989f7c0b1e5eb7779eb3bbc9bce33e1b765c572bbfec08e",
+      "build-llama-fixed-cpu/bin/llama-fixed-cpu-bench.exe": "bcea39cbcfa559b2ec9b373c6fcb872b3284d1f34a1ace974b8b23b44ff7e08d",
+      "models/qwen3.5-0.8b/model-q4-h128-cpu-dot4.q35h": "e73de30bf646dee502dd5e519939221f7d2b60068ccbbe16dc1701597919c42f",
+      "models/gguf/qwen3.5-0.8b-review-target-bf16.gguf": "7723873fa8e3b67e1ff75beaf04c2aa37864a622c06494aa9e05f9c8da723699"
+    },
+    "implementation_commit": "8185b485323f18cf1b9055f949d4ad51d2b80daf"
+  },
+  "comparisons": {
+    "narrative/baseline-vs-candidate": {
+      "positions": 21,
+      "kld": {
+        "mean": 0.000423487188753219,
+        "median": 0.0003038045335163535,
+        "p95": 0.0011215919755972025,
+        "p99": 0.0014293570242648803,
+        "max": 0.0015062982864317994
+      },
+      "target_nll": {
+        "teacher_mean": 1.7240424355224893,
+        "candidate_mean": 1.7268165912728053,
+        "delta_mean": 0.002774155750316085,
+        "delta_p95": 0.052515671649516094,
+        "perplexity_ratio": 1.0027780072811383
+      },
+      "agreement": {
+        "top1": 1.0,
+        "teacher_top1_in_candidate_top5": 1.0,
+        "teacher_top1_in_candidate_top10": 1.0,
+        "top5_overlap": 0.9904761904761905,
+        "top10_overlap": 0.9857142857142857
+      },
+      "logits": {
+        "centered_rmse_mean": 0.03913278981213757,
+        "centered_cosine_mean": 0.9998817384634662
+      },
+      "argmax_flips": 0,
+      "teacher": "benchmarks\\prefill-tiled-2026-09-06\\quality-final\\narrative-baseline.bin",
+      "candidate": "benchmarks\\prefill-tiled-2026-09-06\\quality-final\\narrative-candidate.bin",
+      "vocabulary_size": 248320
+    },
+    "narrative/bf16-vs-baseline": {
+      "positions": 21,
+      "kld": {
+        "mean": 0.1315549440530123,
+        "median": 0.09766076583259035,
+        "p95": 0.32990228892650114,
+        "p99": 0.33668963757883125,
+        "max": 0.33838647474191375
+      },
+      "target_nll": {
+        "teacher_mean": 1.4598232434961371,
+        "candidate_mean": 1.7240424355224893,
+        "delta_mean": 0.26421919202635213,
+        "delta_p95": 1.094023868249625,
+        "perplexity_ratio": 1.3024136437015659
+      },
+      "agreement": {
+        "top1": 0.9047619047619048,
+        "teacher_top1_in_candidate_top5": 1.0,
+        "teacher_top1_in_candidate_top10": 1.0,
+        "top5_overlap": 0.7809523809523811,
+        "top10_overlap": 0.7619047619047621
+      },
+      "logits": {
+        "centered_rmse_mean": 0.7305374063566861,
+        "centered_cosine_mean": 0.9578605498072651
+      },
+      "argmax_flips": 2,
+      "teacher": "benchmarks\\prefill-tiled-2026-09-06\\quality-final\\narrative-bf16.bin",
+      "candidate": "benchmarks\\prefill-tiled-2026-09-06\\quality-final\\narrative-baseline.bin",
+      "vocabulary_size": 248320
+    },
+    "narrative/bf16-vs-candidate": {
+      "positions": 21,
+      "kld": {
+        "mean": 0.13088460295358634,
+        "median": 0.1016537524019192,
+        "p95": 0.32139851912916007,
+        "p99": 0.3391777852745445,
+        "max": 0.3436226018108906
+      },
+      "target_nll": {
+        "teacher_mean": 1.4598232434961371,
+        "candidate_mean": 1.7268165912728053,
+        "delta_mean": 0.2669933477766682,
+        "delta_p95": 1.1451958032233982,
+        "perplexity_ratio": 1.3060317582868224
+      },
+      "agreement": {
+        "top1": 0.9047619047619048,
+        "teacher_top1_in_candidate_top5": 1.0,
+        "teacher_top1_in_candidate_top10": 1.0,
+        "top5_overlap": 0.7809523809523811,
+        "top10_overlap": 0.7666666666666669
+      },
+      "logits": {
+        "centered_rmse_mean": 0.7333436477233738,
+        "centered_cosine_mean": 0.9575498555829598
+      },
+      "argmax_flips": 2,
+      "teacher": "benchmarks\\prefill-tiled-2026-09-06\\quality-final\\narrative-bf16.bin",
+      "candidate": "benchmarks\\prefill-tiled-2026-09-06\\quality-final\\narrative-candidate.bin",
+      "vocabulary_size": 248320
+    },
+    "ids/baseline-vs-candidate": {
+      "positions": 26,
+      "kld": {
+        "mean": 0.0004394772989107102,
+        "median": 0.0004001829473029322,
+        "p95": 0.0010760741830550577,
+        "p99": 0.0010948714123926828,
+        "max": 0.0010995149860682514
+      },
+      "target_nll": {
+        "teacher_mean": 2.4431888963489374,
+        "candidate_mean": 2.437287318948405,
+        "delta_mean": -0.005901577400531885,
+        "delta_p95": 0.057026736683564394,
+        "perplexity_ratio": 0.9941158027005634
+      },
+      "agreement": {
+        "top1": 1.0,
+        "teacher_top1_in_candidate_top5": 1.0,
+        "teacher_top1_in_candidate_top10": 1.0,
+        "top5_overlap": 0.9769230769230769,
+        "top10_overlap": 0.9884615384615384
+      },
+      "logits": {
+        "centered_rmse_mean": 0.041717816954476884,
+        "centered_cosine_mean": 0.9998246463124829
+      },
+      "argmax_flips": 0,
+      "teacher": "benchmarks\\prefill-tiled-2026-09-06\\quality-final\\ids-baseline.bin",
+      "candidate": "benchmarks\\prefill-tiled-2026-09-06\\quality-final\\ids-candidate.bin",
+      "vocabulary_size": 248320
+    },
+    "ids/bf16-vs-baseline": {
+      "positions": 26,
+      "kld": {
+        "mean": 0.12398729311914258,
+        "median": 0.10687533099174588,
+        "p95": 0.27341579715565684,
+        "p99": 0.2816232201222123,
+        "max": 0.28330797594161883
+      },
+      "target_nll": {
+        "teacher_mean": 2.58973589831021,
+        "candidate_mean": 2.4431888963489374,
+        "delta_mean": -0.14654700196127296,
+        "delta_p95": 0.7195600887382803,
+        "perplexity_ratio": 0.8636851364853904
+      },
+      "agreement": {
+        "top1": 0.8461538461538461,
+        "teacher_top1_in_candidate_top5": 1.0,
+        "teacher_top1_in_candidate_top10": 1.0,
+        "top5_overlap": 0.7769230769230769,
+        "top10_overlap": 0.8153846153846154
+      },
+      "logits": {
+        "centered_rmse_mean": 0.7250571079592691,
+        "centered_cosine_mean": 0.9468372183273027
+      },
+      "argmax_flips": 4,
+      "teacher": "benchmarks\\prefill-tiled-2026-09-06\\quality-final\\ids-bf16.bin",
+      "candidate": "benchmarks\\prefill-tiled-2026-09-06\\quality-final\\ids-baseline.bin",
+      "vocabulary_size": 248320
+    },
+    "ids/bf16-vs-candidate": {
+      "positions": 26,
+      "kld": {
+        "mean": 0.12425955879108892,
+        "median": 0.10707345313173831,
+        "p95": 0.27428159786005796,
+        "p99": 0.2813901036146844,
+        "max": 0.2817208026822007
+      },
+      "target_nll": {
+        "teacher_mean": 2.58973589831021,
+        "candidate_mean": 2.437287318948405,
+        "delta_mean": -0.15244857936180486,
+        "delta_p95": 0.7765868254218447,
+        "perplexity_ratio": 0.8586030427377196
+      },
+      "agreement": {
+        "top1": 0.8461538461538461,
+        "teacher_top1_in_candidate_top5": 1.0,
+        "teacher_top1_in_candidate_top10": 1.0,
+        "top5_overlap": 0.776923076923077,
+        "top10_overlap": 0.8076923076923077
+      },
+      "logits": {
+        "centered_rmse_mean": 0.725582095833642,
+        "centered_cosine_mean": 0.9468223782368091
+      },
+      "argmax_flips": 4,
+      "teacher": "benchmarks\\prefill-tiled-2026-09-06\\quality-final\\ids-bf16.bin",
+      "candidate": "benchmarks\\prefill-tiled-2026-09-06\\quality-final\\ids-candidate.bin",
+      "vocabulary_size": 248320
+    },
+    "structured_recall/baseline-vs-candidate": {
+      "positions": 27,
+      "kld": {
+        "mean": 0.000552057815263666,
+        "median": 0.00047224585099974473,
+        "p95": 0.0011009537232739765,
+        "p99": 0.001195648352220686,
+        "max": 0.0012128446958289286
+      },
+      "target_nll": {
+        "teacher_mean": 2.702679165952944,
+        "candidate_mean": 2.704813600780793,
+        "delta_mean": 0.002134434827849437,
+        "delta_p95": 0.056225854560505086,
+        "perplexity_ratio": 1.0021367143554125
+      },
+      "agreement": {
+        "top1": 0.9629629629629629,
+        "teacher_top1_in_candidate_top5": 1.0,
+        "teacher_top1_in_candidate_top10": 1.0,
+        "top5_overlap": 0.9925925925925926,
+        "top10_overlap": 0.974074074074074
+      },
+      "logits": {
+        "centered_rmse_mean": 0.040818944686758826,
+        "centered_cosine_mean": 0.9998456818519552
+      },
+      "argmax_flips": 1,
+      "teacher": "benchmarks\\prefill-tiled-2026-09-06\\quality-final\\structured_recall-baseline.bin",
+      "candidate": "benchmarks\\prefill-tiled-2026-09-06\\quality-final\\structured_recall-candidate.bin",
+      "vocabulary_size": 248320
+    },
+    "structured_recall/bf16-vs-baseline": {
+      "positions": 27,
+      "kld": {
+        "mean": 0.20687181442273272,
+        "median": 0.15307533744149668,
+        "p95": 0.4361249104504529,
+        "p99": 0.7667465678679305,
+        "max": 0.8811761317094203
+      },
+      "target_nll": {
+        "teacher_mean": 2.408880894536188,
+        "candidate_mean": 2.702679165952944,
+        "delta_mean": 0.29379827141675513,
+        "delta_p95": 1.5350418582292005,
+        "perplexity_ratio": 1.3415132548007878
+      },
+      "agreement": {
+        "top1": 0.7777777777777778,
+        "teacher_top1_in_candidate_top5": 0.9629629629629629,
+        "teacher_top1_in_candidate_top10": 1.0,
+        "top5_overlap": 0.7703703703703704,
+        "top10_overlap": 0.7518518518518519
+      },
+      "logits": {
+        "centered_rmse_mean": 0.7795217909259643,
+        "centered_cosine_mean": 0.9432939520729058
+      },
+      "argmax_flips": 6,
+      "teacher": "benchmarks\\prefill-tiled-2026-09-06\\quality-final\\structured_recall-bf16.bin",
+      "candidate": "benchmarks\\prefill-tiled-2026-09-06\\quality-final\\structured_recall-baseline.bin",
+      "vocabulary_size": 248320
+    },
+    "structured_recall/bf16-vs-candidate": {
+      "positions": 27,
+      "kld": {
+        "mean": 0.2103931436887385,
+        "median": 0.1572450377849181,
+        "p95": 0.42844758685163575,
+        "p99": 0.7783566387561629,
+        "max": 0.9001411440663583
+      },
+      "target_nll": {
+        "teacher_mean": 2.408880894536188,
+        "candidate_mean": 2.704813600780793,
+        "delta_mean": 0.2959327062446046,
+        "delta_p95": 1.570271418878325,
+        "perplexity_ratio": 1.3443796854302967
+      },
+      "agreement": {
+        "top1": 0.7777777777777778,
+        "teacher_top1_in_candidate_top5": 0.9629629629629629,
+        "teacher_top1_in_candidate_top10": 1.0,
+        "top5_overlap": 0.7703703703703704,
+        "top10_overlap": 0.7481481481481481
+      },
+      "logits": {
+        "centered_rmse_mean": 0.7799964680606775,
+        "centered_cosine_mean": 0.9432683680877254
+      },
+      "argmax_flips": 6,
+      "teacher": "benchmarks\\prefill-tiled-2026-09-06\\quality-final\\structured_recall-bf16.bin",
+      "candidate": "benchmarks\\prefill-tiled-2026-09-06\\quality-final\\structured_recall-candidate.bin",
+      "vocabulary_size": 248320
+    }
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "model_sha256": "E73DE30BF646DEE502DD5E519939221F7D2B60068CCBBE16DC1701597919C42F",
+  "kv": "fp16",
+  "exe_sha256": "E6DB3B22AD9436350989F7C0B1E5EB7779EB3BBC9BCE33E1B765C572BBFEC08E",
+  "threads": 8,
+  "warmups": 3,
+  "git": "822a453ce78afa8c2ddfd2f33ea11a33be70ad60",
+  "fine_profile": false,
+  "runs": 3,
+  "lengths": [
+    512
+  ],
+  "executable": "build/qwen35x.exe",
+  "affinity": 65535,
+  "variants": [
+    "rows/auto/0/8/64/64",
+    "auto/auto/0/0/32/0",
+    "auto/auto/0/0/32/0",
+    "rows/auto/0/8/64/64"
+  ],
+  "output_tokens": 0,
+  "implementation_commit": "8185b485323f18cf1b9055f949d4ad51d2b80daf"
+}

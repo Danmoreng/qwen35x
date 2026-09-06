@@ -4,6 +4,33 @@
 
 The goal is not a generic multi-model runtime. The goal is a small, hardware-aware engine that can be aggressively optimized for specific Qwen3.5 architectures on CPUs and CUDA GPUs.
 
+## CPU prefill update: September 6, 2026
+
+**The new automatic attention path improves long-context prefill by 58% at
+4096 tokens and 114% at 8192 tokens.** The H128/Q4-DOT4 weights and FP16 KV
+are unchanged. Short contexts retain the row kernel; longer contexts use
+FP32 tiled attention with GQA panel sharing and bounded 128-token chunks.
+
+| Prompt tokens | Previous row path · tokens/s | New automatic path · tokens/s | Gain |
+|---:|---:|---:|---:|
+| 512 | 2,121.35 | 2,236.41 | +5.4% |
+| 1,024 | 1,932.05 | 2,162.66 | +11.9% |
+| 2,048 | 1,605.26 | 2,065.76 | +28.7% |
+| 4,096 | 1,187.20 | 1,875.22 | +58.0% |
+| 8,192 | 756.05 | 1,619.47 | +114.2% |
+
+Ryzen 9 9955HX3D, 8 threads, affinity `0xffff`, fixed token IDs, sequential
+A/B/B/A, six measured samples per path. The 512-token row uses a separate
+confirmation with three warmups; both series are retained. Decode was effectively
+unchanged (126.17 vs. 125.46 tokens/s). Nine test suites and numerical/quality
+checks cover the change; different floating-point reduction orders produce small,
+documented logit differences. `--cpu-attention rows` preserves the old path.
+
+**[Methodology, numerical differences and reproducible results](docs/cpu-prefill-tiled-2026-09-06.md)** ·
+[Samples](docs/cpu-prefill-tiled-2026-09-06-samples.csv) · [Quality metrics](docs/cpu-prefill-tiled-2026-09-06-quality.json)
+
+The engine comparison below is the historical September 5 measurement.
+
 ## CPU benchmark: Qwen3.5-0.8B Q4 vs. llama.cpp
 
 **September 5, 2026 — Qwen35x was faster in all 16 matched cases.** With 8 threads,

@@ -1,0 +1,13 @@
+case,prompt_tokens,variant,run,prefill_ms,prefill_tps,generated_tokens,decode_forward_steps,decode_ms,decode_tps,kernel,chunk
+0,512,rows/auto/0/8/64/64,1,240.9116,2125.260884,0,0,0.0,0,rows,64
+0,512,rows/auto/0/8/64/64,2,241.0285,2124.230122,0,0,0.0,0,rows,64
+0,512,rows/auto/0/8/64/64,3,241.6154,2119.070225,0,0,0.0,0,rows,64
+1,512,auto/auto/0/0/32/0,1,237.1514,2158.95837,0,0,0.0,0,mixed:rows+tiled-avx512-fp32,128
+1,512,auto/auto/0/0/32/0,2,228.9447,2236.347904,0,0,0.0,0,mixed:rows+tiled-avx512-fp32,128
+1,512,auto/auto/0/0/32/0,3,240.3523,2130.206368,0,0,0.0,0,mixed:rows+tiled-avx512-fp32,128
+2,512,auto/auto/0/0/32/0,1,228.9321,2236.470989,0,0,0.0,0,mixed:rows+tiled-avx512-fp32,128
+2,512,auto/auto/0/0/32/0,2,228.0768,2244.857872,0,0,0.0,0,mixed:rows+tiled-avx512-fp32,128
+2,512,auto/auto/0/0/32/0,3,228.0317,2245.301859,0,0,0.0,0,mixed:rows+tiled-avx512-fp32,128
+3,512,rows/auto/0/8/64/64,1,243.6875,2101.051552,0,0,0.0,0,rows,64
+3,512,rows/auto/0/8/64/64,2,247.2633,2070.667179,0,0,0.0,0,rows,64
+3,512,rows/auto/0/8/64/64,3,241.0976,2123.621305,0,0,0.0,0,rows,64

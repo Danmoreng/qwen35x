@@ -1,0 +1,3 @@
+prompt_tokens,variant,samples,prefill_tps_median,prefill_tps_min,prefill_tps_max,decode_tps_median
+512,auto/auto/0/0/32/0,6,2194.1194560000004,2140.680327,2206.904162,125.45869657095643
+512,rows/auto/0/8/64/64,6,2075.8141745000003,1607.502516,2099.790062,126.17239133650395
