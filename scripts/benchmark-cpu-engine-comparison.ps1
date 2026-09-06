@@ -11,6 +11,9 @@ param(
     [int]$DecodePromptLength = 512,
     [int]$Runs = 3,
     [int]$WarmupRuns = 1,
+    # Preserve the September 5 row-kernel comparison unless explicitly changed.
+    [ValidateSet('rows','auto','tiled')][string]$CpuAttention = 'rows',
+    [int]$CpuPrefillChunkSize = 64,
     [int64]$Affinity = 65535
 )
 Set-StrictMode -Version Latest
@@ -40,7 +43,7 @@ try {
         qwen_exe_sha256 = (Get-FileHash $QwenExe).Hash; llama_exe_sha256 = (Get-FileHash $LlamaExe).Hash
         fixture_sha256 = (Get-FileHash configs/qwen3_5_0_8b_text_1024x512_tokens.csv).Hash
         kv_cache = 'fp16'; llama_flash_attention = 'on'; llama_batch = 2048; llama_ubatch = 512
-        qwen_chunk = 64; max_context = 8192; workloads = $workloads
+        qwen_chunk = $CpuPrefillChunkSize; qwen_attention = $CpuAttention; max_context = 8192; workloads = $workloads
         semantics = 'Prefill-only emits no logits. Decode uses fixed continuation with full-vocabulary logits; N outputs require N-1 timed forwards, first prediction occurs in prefill. No sampling or speculative decoding.'
     }
     $metadata | ConvertTo-Json -Depth 8 | Set-Content "$OutDir/metadata.json"
@@ -54,6 +57,7 @@ try {
                 $caseName = "$engine-t$threadCount-$($workload.Name)"
                 $settings = @{Executable=$QwenExe;Modes=@('cpu-h128');CpuQ4H128=$QwenModel;CpuThreads=$threadCount;CpuIsa='auto';CpuKvCache='fp16';PromptMode='prompt-tokens';PromptName=$workload.Name;PromptTokensCsv=$prompt;Runs=$Runs;WarmupRuns=$WarmupRuns;MaxNewTokens=[Math]::Max(1,$workload.Output);MaxContext=8192;CsvOut="$OutDir/$caseName.csv";RunLabel=$caseName;KeepProfiles=$true;ProfileDir="$OutDir/profiles"}
                 if ($engine -eq 'llama') { $settings.Executable=$LlamaExe; $settings.Modes=@('cpu-llama-fixed'); $settings.CpuGguf=$LlamaModel; $settings.Remove('CpuQ4H128') }
+                else { $settings.CpuAttention=$CpuAttention; $settings.CpuPrefillChunkSize=$CpuPrefillChunkSize }
                 if ($workload.Output -eq 0) { $settings.PrefillOnly=$true } else { $settings.ForcedOutputTokensCsv=$forced }
                 Write-Host "Starting $caseName"
                 & "$PSScriptRoot/benchmark-inference-seq.ps1" @settings *> "$OutDir/$caseName.log"

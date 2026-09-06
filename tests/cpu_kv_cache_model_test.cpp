@@ -18,8 +18,8 @@ bool collect_logits(void * context, std::size_t, std::int32_t,
 }
 
 int main(int argc, char ** argv) {
-  if (argc != 3) {
-    std::cerr << "Usage: qwen35x_cpu_kv_cache_model_test <HF directory> <Q4 H128 artifact>\n";
+  if (argc != 3 && argc != 4) {
+    std::cerr << "Usage: qwen35x_cpu_kv_cache_model_test <HF directory> <Q4 H128 artifact> [rows|tiled|auto]\n";
     return 2;
   }
   std::string error;
@@ -33,13 +33,16 @@ int main(int argc, char ** argv) {
   qwen35x::ReferenceInferenceOptions options;
   options.model_dir = argv[1];
   options.cpu_q4_h128_path = argv[2];
+  if(argc==4) options.cpu_attention=argv[3];
+  options.cpu_attention_gqa=true;
+  options.profile_cpu_prefill=true;
   options.cpu_threads = 12;
   options.cpu_model_session = &session;
   options.cpu_q8_backend = qwen35x::cpu::Q8_0Backend::avx512_vnni;
-  options.prompt_tokens.assign(65, 1);
+  options.prompt_tokens.assign(257, 1);
   options.forced_output_tokens = {19, 13, 198};
   options.max_new_tokens = 3;
-  options.max_context = 128;
+  options.max_context = 512;
   options.sampling.temperature = 0;
   options.logits_callback = collect_logits;
   bool have_snapshot = false;
@@ -52,7 +55,7 @@ int main(int argc, char ** argv) {
     std::vector<float> reference;
     for (int run = 0; run < 3; ++run) {
       options.cpu_prefix_cache = run == 0 ? nullptr : &cache;
-      options.cpu_prefix_token_count = run == 0 ? 0 : 64;
+      options.cpu_prefix_token_count = run == 0 ? 0 : 256;
       std::vector<float> logits;
       options.logits_callback_context = &logits;
       qwen35x::ReferenceInferenceResult result;
@@ -60,8 +63,13 @@ int main(int argc, char ** argv) {
         std::cerr << error << '\n';
         return 1;
       }
+      bool actual_prefill=false;
+      for(const auto &stage:result.cpu_prefill_stages) {
+        if(stage.kind=="full" && stage.tokens>1) actual_prefill=true;
+      }
+      if(run==0 && !actual_prefill) {std::cerr<<"Test did not execute batched prefill\n";return 1;}
       const int expected_prefix = run == 2 ||
-        (run == 1 && have_snapshot && snapshot_f16 == expected_f16) ? 64 : 0;
+        (run == 1 && have_snapshot && snapshot_f16 == expected_f16) ? 256 : 0;
       if (result.cpu_kv_cache_f16 != expected_f16 ||
           result.cached_prefix_tokens != expected_prefix ||
           (run != 0 && !result.cpu_model_session_hit)) {
@@ -78,6 +86,18 @@ int main(int argc, char ** argv) {
     }
     have_snapshot = true;
     snapshot_f16 = expected_f16;
+  }
+  // The same session keeps weights, but a different arithmetic policy must
+  // invalidate its prefix state, then permit replay of the new snapshot.
+  options.cpu_attention=options.cpu_attention=="rows" ? "auto" : "rows";
+  for(int run=0;run<2;++run) {
+    std::vector<float> logits;
+    options.logits_callback_context=&logits;
+    qwen35x::ReferenceInferenceResult result;
+    if(!qwen35x::run_reference_qwen35_inference(*profile,options,result,error) ||
+       result.cached_prefix_tokens!=(run==0 ? 0 : 256) || !result.cpu_model_session_hit) {
+      std::cerr<<"Attention policy switch did not invalidate prefix state: "<<error<<'\n';return 1;
+    }
   }
   std::cout << "FP16/FP32 cache replay and precision-switch tests passed\n";
   return 0;

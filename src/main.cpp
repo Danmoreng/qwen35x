@@ -300,6 +300,28 @@ bool write_profile_json(
   out << "  \"qwen35x_weight_precision\": \"" << json_escape(qwen35x_weight_precision_name(options.qwen35x_weight_precision)) << "\",\n";
   out << "  \"qwen35x_cache_precision\": \"" << json_escape(qwen35x_cache_precision_name(options.qwen35x_cache_precision)) << "\",\n";
   out << "  \"cpu_kv_cache\": \"" << (options.use_cuda ? "not-applicable" : (result.cpu_kv_cache_f16 ? "fp16" : "fp32")) << "\",\n";
+  out << "  \"cpu_attention_kernel\": \"" << result.cpu_attention_kernel << "\",\n";
+  out << "  \"cpu_attention_requested\": \"" << options.cpu_attention << "\",\n";
+  out << "  \"cpu_attention_gqa\": " << (options.cpu_attention_gqa ? "true" : "false") << ",\n";
+  out << "  \"cpu_attention_query_tile\": " << options.cpu_attention_query_tile << ",\n";
+  out << "  \"cpu_attention_kv_tile\": " << options.cpu_attention_kv_tile << ",\n";
+  out << "  \"cpu_prefill_chunk_size\": " << options.cpu_prefill_chunk_size << ",\n";
+  out << "  \"cpu_prefill_chunk_size_resolved\": " << result.cpu_prefill_chunk_size_resolved << ",\n";
+  out << "  \"cpu_prefill_fine_profile\": " << (options.profile_cpu_prefill ? "true" : "false") << ",\n";
+  out << "  \"cpu_prefill_stages\": [";
+  for (std::size_t i=0;i<result.cpu_prefill_stages.size();++i) {
+    const auto &s=result.cpu_prefill_stages[i];
+    if(i) out << ",";
+    out << "{\"kind\":\"" << s.kind << "\",\"kernel\":\"" << s.kernel
+        << "\",\"position\":" << s.position << ",\"tokens\":" << s.tokens
+        << ",\"participants\":" << s.participants << ",\"query_key_pairs\":" << s.query_key_pairs
+        << ",\"query_tile\":" << s.query_tile << ",\"kv_tile\":" << s.kv_tile << ",\"shared_gqa\":" << (s.shared_gqa ? "true" : "false")
+        << ",\"projection_ms\":" << s.projection_ms << ",\"prepare_ms\":" << s.prepare_ms
+        << ",\"attention_wall_ms\":" << s.attention_wall_ms << ",\"output_ms\":" << s.output_ms
+        << ",\"pack_worker_ms\":" << s.pack_worker_ms << ",\"qk_worker_ms\":" << s.qk_worker_ms
+        << ",\"softmax_worker_ms\":" << s.softmax_worker_ms << ",\"pv_worker_ms\":" << s.pv_worker_ms << "}";
+  }
+  out << "],\n";
   if (!options.use_cuda) {
     out << "  \"cpu_isa_resolved\": \"" << qwen35x::cpu::q8_0_backend_name(
       qwen35x::cpu::q8_0_resolve_backend(options.cpu_q8_backend)) << "\",\n";
@@ -473,6 +495,23 @@ int main(int argc, char ** argv) {
       infer_options.cpu_gguf_path = argv[++i];
     } else if (arg == "--cpu-q4-h128" && i + 1 < argc) {
       infer_options.cpu_q4_h128_path = argv[++i];
+    } else if (arg == "--profile-cpu-prefill") {
+      infer_options.profile_cpu_prefill = true;
+    } else if (arg == "--cpu-attention-gqa") {
+      infer_options.cpu_attention_gqa = true;
+    } else if (arg == "--cpu-attention-isa" && i + 1 < argc) {
+      const std::string isa=argv[++i];
+      if(isa=="avx2") infer_options.cpu_attention_backend=qwen35x::cpu::Q8_0Backend::avx2;
+      else if(isa=="avx512") infer_options.cpu_attention_backend=qwen35x::cpu::Q8_0Backend::avx512;
+      else if(isa!="auto") {std::cerr<<"Attention ISA expects auto, avx2 or avx512\n";return 11;}
+    } else if (arg == "--cpu-attention" && i + 1 < argc) {
+      infer_options.cpu_attention = argv[++i];
+    } else if (arg == "--cpu-prefill-chunk-size" && i + 1 < argc) {
+      infer_options.cpu_prefill_chunk_size = std::stoi(argv[++i]);
+    } else if (arg == "--cpu-attention-query-tile" && i + 1 < argc) {
+      infer_options.cpu_attention_query_tile = std::stoi(argv[++i]);
+    } else if (arg == "--cpu-attention-kv-tile" && i + 1 < argc) {
+      infer_options.cpu_attention_kv_tile = std::stoi(argv[++i]);
     } else if (arg == "--cpu-kv-cache" && i + 1 < argc) {
       const std::string precision = argv[++i];
       if (precision != "fp16" && precision != "fp32") {
@@ -561,6 +600,14 @@ int main(int argc, char ** argv) {
       nvfp4_gate_up_bench_options.benchmark_iterations = bench_options.benchmark_iterations;
     } else if (arg == "--prompt-tokens" && i + 1 < argc) {
       prompt_tokens_csv = argv[++i];
+    } else if (arg == "--prompt-tokens-file" && i + 1 < argc) {
+      std::ifstream token_file(argv[++i]);
+      std::ostringstream token_text;
+      token_text << token_file.rdbuf();
+      if (!token_file || token_text.str().empty()) {
+        std::cerr << "Could not read nonempty prompt token file\n"; return 11;
+      }
+      prompt_tokens_csv = token_text.str();
     } else if (arg == "--prompt-text" && i + 1 < argc) {
       prompt_text = argv[++i];
     } else if (arg == "--prompt-file" && i + 1 < argc) {
@@ -669,7 +716,7 @@ int main(int argc, char ** argv) {
       std::cout << "       qwen35x --bench-nvfp4-projection --hf-model-dir <path> [--nvfp4-tensor <base-name>] [--nvfp4-projection-kernel <row|warp|scale-group|blackwell-fp4>] [--bench-warmup <n>] [--bench-iters <n>]\n";
       std::cout << "       qwen35x --bench-nvfp4-prefill-projection --hf-model-dir <path> [--nvfp4-tensor <base-name>] [--nvfp4-prefill-seq-len <n>] [--bench-warmup <n>] [--bench-iters <n>]\n";
       std::cout << "       qwen35x --bench-nvfp4-gate-up --hf-model-dir <path> [--nvfp4-gate-tensor <base-name>] [--nvfp4-up-tensor <base-name>] [--bench-warmup <n>] [--bench-iters <n>]\n";
-      std::cout << "       qwen35x --infer-reference --hf-model-dir <path> [--cpu-gguf <q4_0-or-q8_0.gguf> | --cpu-q4-h128 <artifact>] [--cpu-threads <n>] [--cpu-kv-cache <fp16|fp32>] [--cpu-isa <auto|scalar|avx2|avx-vnni|avx512|avx512-vnni>] [--cpu-isa-strict] [--cpu-model-session-replays <n>] [--cpu-prefix-cache-tokens <n> --cpu-prefix-cache-replays <n>] [--top-logits <n>] (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--forced-output-tokens <csv> | --forced-output-text <text>] [--logits-out <path>] [--max-new-tokens <n>] [--max-context <n>]\n";
+      std::cout << "       qwen35x --infer-reference --hf-model-dir <path> [--cpu-gguf <q4_0-or-q8_0.gguf> | --cpu-q4-h128 <artifact>] [--cpu-threads <n>] [--cpu-kv-cache <fp16|fp32>] [--cpu-attention <rows|tiled|auto>] [--cpu-attention-isa <auto|avx2|avx512>] [--cpu-attention-gqa] [--cpu-prefill-chunk-size <0=auto|1..2048>] [--cpu-attention-query-tile <0=auto|4|8|16>] [--cpu-attention-kv-tile <32|64|128>] [--profile-cpu-prefill] [--cpu-isa <auto|scalar|avx2|avx-vnni|avx512|avx512-vnni>] [--cpu-isa-strict] [--cpu-model-session-replays <n>] [--cpu-prefix-cache-tokens <n> --cpu-prefix-cache-replays <n>] [--top-logits <n>] (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--forced-output-tokens <csv> | --forced-output-text <text>] [--logits-out <path>] [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "       qwen35x --infer-gpu --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "               [--temperature <float>] [--top-p <float>] [--top-k <int>] [--repeat-penalty <float>] [--seed <int64>]\n";
       std::cout << "               [--gpu-bf16|--gpu-f32-matvec] [--gpu-decode-backend <default|qwen35x>] [--gpu-decode-blocks <n>] [--qwen35x-prefill-mode <replay|batched>]\n";

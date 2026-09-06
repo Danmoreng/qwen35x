@@ -14,6 +14,13 @@ param(
     [switch]$CpuIsaStrict,
     [ValidateSet("fp16", "fp32")]
     [string]$CpuKvCache = "fp16",
+    [ValidateSet("", "rows", "tiled", "auto")][string]$CpuAttention = "",
+    [switch]$ProfileCpuPrefill,
+    [switch]$CpuAttentionGqa,
+    [ValidateSet("auto", "avx2", "avx512")][string]$CpuAttentionIsa = "auto",
+    [int]$CpuPrefillChunkSize = 64,
+    [int]$CpuAttentionQueryTile = 8,
+    [int]$CpuAttentionKvTile = 64,
     [int]$CpuPrefixCacheTokens = 0,
     [int]$CpuPrefixCacheReplays = 1,
     [ValidateSet("chat-user", "prompt-text", "prompt-file", "prompt-tokens")]
@@ -169,6 +176,12 @@ function Invoke-BenchmarkRun {
         $fixedArgs = @("--cpu-gguf", $CpuGguf, "--cpu-threads", "$CpuThreads",
             "--prompt-tokens", $PromptTokensCsv, "--max-new-tokens", "$MaxNewTokens",
             "--max-context", "$MaxContext", "--profile-json", $ProfileJsonPath)
+        $tokenFile = $null
+        if ($PromptTokensCsv.Length -gt 24000) {
+            $tokenFile = "$ProfileJsonPath.tokens.csv"
+            Set-Content -LiteralPath $tokenFile -Value $PromptTokensCsv -NoNewline -Encoding ascii
+            $fixedArgs[4] = "--prompt-tokens-file"; $fixedArgs[5] = $tokenFile
+        }
         if ($PrefillOnlyEnabled) { $fixedArgs += "--prefill-only" }
         else {
             if ([string]::IsNullOrWhiteSpace($ForcedOutputTokensCsv)) {
@@ -176,7 +189,8 @@ function Invoke-BenchmarkRun {
             }
             $fixedArgs += @("--forced-output-tokens", $ForcedOutputTokensCsv)
         }
-        $fixedOutput = & $ExePath @fixedArgs 2>&1
+        try { $fixedOutput = & $ExePath @fixedArgs 2>&1 }
+        finally { if ($tokenFile) { Remove-Item -LiteralPath $tokenFile } }
         foreach ($line in $fixedOutput) { Write-Host $line }
         if ($LASTEXITCODE -ne 0) { throw "Fixed llama benchmark failed: $LASTEXITCODE" }
         if (-not (Test-Path $ProfileJsonPath)) { throw "Missing fixed llama profile: $ProfileJsonPath" }
@@ -226,6 +240,15 @@ function Invoke-BenchmarkRun {
             "--cpu-isa", $CpuIsa
         )
         if ($CpuIsaStrict) { $args += "--cpu-isa-strict" }
+        if ($script:CpuAttentionGqa) { $args += "--cpu-attention-gqa" }
+        if ($script:CpuAttentionIsa -ne "auto") { $args += @("--cpu-attention-isa",$script:CpuAttentionIsa) }
+        if ($script:ProfileCpuPrefill) { $args += "--profile-cpu-prefill" }
+        if ($script:CpuAttention) {
+            $args += @("--cpu-attention", $script:CpuAttention,
+              "--cpu-prefill-chunk-size", "$script:CpuPrefillChunkSize",
+              "--cpu-attention-query-tile", "$script:CpuAttentionQueryTile",
+              "--cpu-attention-kv-tile", "$script:CpuAttentionKvTile")
+        }
         # FP16 is the historical default; omit its flag to support older binaries.
         if ($CpuKvCache -eq "fp32") {
             $args += @("--cpu-kv-cache", "fp32")
@@ -238,6 +261,7 @@ function Invoke-BenchmarkRun {
         }
     }
 
+    $tokenFile = $null
     if ($PromptMode -eq "chat-user") {
         $args += @("--chat-user", $PromptText)
     } elseif ($PromptMode -eq "prompt-text") {
@@ -245,7 +269,11 @@ function Invoke-BenchmarkRun {
     } elseif ($PromptMode -eq "prompt-file") {
         $args += @("--prompt-file", $PromptFile)
     } else {
-        $args += @("--prompt-tokens", $PromptTokensCsv)
+        if ($PromptTokensCsv.Length -gt 24000) {
+            $tokenFile = "$ProfileJsonPath.tokens.csv"
+            Set-Content -LiteralPath $tokenFile -Value $PromptTokensCsv -NoNewline -Encoding ascii
+            $args += @("--prompt-tokens-file", $tokenFile)
+        } else { $args += @("--prompt-tokens", $PromptTokensCsv) }
     }
 
     if (-not [string]::IsNullOrWhiteSpace($ForcedOutputTokensCsv)) {
@@ -279,7 +307,8 @@ function Invoke-BenchmarkRun {
     }
 
     Write-Host ("Running mode={0} prompt={1}" -f $Mode, $PromptMode) -ForegroundColor Cyan
-    $runOutput = & $ExePath @args 2>&1
+    try { $runOutput = & $ExePath @args 2>&1 }
+    finally { if ($tokenFile) { Remove-Item -LiteralPath $tokenFile } }
     foreach ($line in $runOutput) {
         Write-Host $line
     }
@@ -489,6 +518,7 @@ foreach ($mode in $Modes) {
                 cpu_isa          = if ($mode -in @("cpu-gguf", "cpu-h128", "cpu-llama-fixed")) { $CpuIsa } else { "" }
                 teacher_forced   = -not [string]::IsNullOrWhiteSpace($ForcedOutputTokensCsv)
                 cpu_kv_cache     = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "cpu_kv_cache")
+                cpu_attention_kernel = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "cpu_attention_kernel")
                 cached_prefix_tokens = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "cached_prefix_tokens")
                 prefix_cache_restore_time_ms = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "prefix_cache_restore_time_ms")
                 prefix_cache_bytes = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "prefix_cache_bytes")

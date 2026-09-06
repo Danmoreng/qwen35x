@@ -486,8 +486,34 @@ bool run_reference_qwen35_inference(
     }
   }
 
+  const std::string attention_signature = options.cpu_attention + ":" +
+    std::to_string(options.cpu_prefill_chunk_size) + ":" +
+    std::to_string(options.cpu_attention_query_tile) + ":" + std::to_string(options.cpu_attention_kv_tile) +
+    ":" + std::to_string(options.cpu_attention_gqa) + ":" + cpu::q8_0_backend_name(options.cpu_attention_backend);
   const bool use_f16_cpu_cache = !options.use_cuda && weights.cpu_q8_runtime != nullptr &&
     !options.cpu_kv_cache_f32 && cpu::q8_0_backend_uses_avx2(options.cpu_q8_backend);
+  if ((options.cpu_attention != "rows" && options.cpu_attention != "tiled" && options.cpu_attention != "auto") ||
+      options.cpu_prefill_chunk_size < 0 || options.cpu_prefill_chunk_size > 2048 ||
+      (options.cpu_attention_query_tile != 0 && options.cpu_attention_query_tile != 4 && options.cpu_attention_query_tile != 8 && options.cpu_attention_query_tile != 16) ||
+      (options.cpu_attention_kv_tile != 32 && options.cpu_attention_kv_tile != 64 && options.cpu_attention_kv_tile != 128)) {
+    error_message = "Invalid CPU attention mode or tile/chunk size.";
+    return false;
+  }
+  if (weights.cpu_q8_runtime) {
+    auto &rt=*weights.cpu_q8_runtime;
+    rt.attention_backend = options.cpu_attention_backend == cpu::Q8_0Backend::auto_select ? options.cpu_q8_backend : options.cpu_attention_backend;
+    rt.automatic_attention = options.cpu_attention == "auto";
+    rt.attention_gqa = options.cpu_attention_gqa || rt.automatic_attention;
+    rt.attention_rows_used = rt.attention_tiles_used = false;
+    rt.attention_kernel_result = &result.cpu_attention_kernel;
+    rt.tiled_attention = options.cpu_attention != "rows" && dims.head_dim == 256 && dims.n_heads/dims.n_kv_heads <= 4 &&
+      cpu::q8_0_backend_uses_avx2(rt.attention_backend);
+    rt.stages = options.profile_cpu_prefill ? &result.cpu_prefill_stages : nullptr;
+    rt.query_tile = options.cpu_attention_query_tile ? options.cpu_attention_query_tile :
+      (cpu::q8_0_backend_uses_avx512(rt.attention_backend) ? 16 : 8);
+    rt.kv_tile = options.cpu_attention_kv_tile;
+    result.cpu_attention_kernel = "not-run";
+  }
   result.cpu_kv_cache_f16 = use_f16_cpu_cache;
   result.cpu_q4_dot4 = weights.embed_tokens.q4_dot4;
   state.full_states.resize(static_cast<std::size_t>(full_layers));
@@ -722,6 +748,7 @@ bool run_reference_qwen35_inference(
         options.prompt_tokens.begin());
     if (snapshot->state_abi_version == kCpuPrefixCacheStateAbiVersion &&
         snapshot->model_signature == prefix_model_signature && tokens_match &&
+        snapshot->attention_signature == attention_signature &&
         snapshot->backend == cpu::q8_0_resolve_backend(options.cpu_q8_backend) &&
         snapshot->prefill_mode == options.qwen35x_prefill_mode &&
         snapshot->use_f16_cache == use_f16_cpu_cache &&
@@ -749,6 +776,7 @@ bool run_reference_qwen35_inference(
     snapshot->prefix_tokens.assign(
       options.prompt_tokens.begin(),
       options.prompt_tokens.begin() + static_cast<std::ptrdiff_t>(prefix_token_count));
+    snapshot->attention_signature = attention_signature;
     snapshot->backend = cpu::q8_0_resolve_backend(options.cpu_q8_backend);
     snapshot->prefill_mode = options.qwen35x_prefill_mode;
     snapshot->hidden = dims.hidden;
@@ -764,7 +792,10 @@ bool run_reference_qwen35_inference(
     !options.use_cuda && weights.cpu_q8_runtime != nullptr &&
     options.qwen35x_prefill_mode == Qwen35xPrefillMode::batched;
   if (use_cpu_q8_batch_prefill) {
-    constexpr std::size_t cpu_prefill_chunk_size = 64;
+    const std::size_t cpu_prefill_chunk_size = options.cpu_prefill_chunk_size ?
+      static_cast<std::size_t>(options.cpu_prefill_chunk_size) :
+      (options.cpu_attention == "rows" || options.prompt_tokens.size() <= 128 ? 64 : 128);
+    result.cpu_prefill_chunk_size_resolved=cpu_prefill_chunk_size;
     for (std::size_t chunk_begin = static_cast<std::size_t>(position);
          chunk_begin < options.prompt_tokens.size();) {
       std::size_t chunk_size = std::min(

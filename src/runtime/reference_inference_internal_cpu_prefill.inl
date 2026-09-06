@@ -80,6 +80,7 @@ bool run_linear_attention_batch_cpu_q8(
   LinearAttentionState & state,
   const std::vector<float> & input,
   const std::size_t batch_size,
+  const int position_start,
   std::vector<float> & output,
   std::string & error_message) {
   if (!layer.linear.in_proj_all_cpu.is_cpu_quantized() || !layer.linear.out_proj.is_cpu_quantized()) {
@@ -108,11 +109,16 @@ bool run_linear_attention_batch_cpu_q8(
   CpuQ8Runtime * const runtime = layer.linear.out_proj.q8_0_runtime;
   CpuPrefillWorkspace::Linear fallback;
   auto & scratch = runtime != nullptr ? runtime->prefill.linear : fallback;
+  const bool fine = runtime && runtime->stages;
+  CpuPrefillStage stage;
+  std::chrono::steady_clock::time_point mark;
+  if(fine) { stage.kind="linear"; stage.position=position_start; stage.tokens=batch_size; mark=std::chrono::steady_clock::now(); }
   auto & projected = scratch.projected;
   if (!matmul_2d_quantized_batch(
         layer.linear.in_proj_all_cpu, input, batch_size, projected, error_message)) {
     return false;
   }
+  if(fine) {stage.projection_ms=elapsed_ms(mark);mark=std::chrono::steady_clock::now();}
   if (projected.size() != batch_size * projection_width) {
     error_message = "Batched linear-attention projection output size mismatch.";
     return false;
@@ -201,6 +207,7 @@ bool run_linear_attention_batch_cpu_q8(
     }
   }
 
+  if(fine) {stage.prepare_ms=elapsed_ms(mark);mark=std::chrono::steady_clock::now();stage.kernel="deltanet";stage.participants=runtime->executor ? std::min(head_count,runtime->executor->thread_count()) : 1;}
   if (runtime != nullptr && runtime->executor != nullptr) {
     GatedDeltaNetBatchCpuJob job{
       state.recurrent_state.data(),
@@ -241,6 +248,7 @@ bool run_linear_attention_batch_cpu_q8(
       layer.linear.out_proj.q8_0_backend);
   }
 
+  if(fine) {stage.attention_wall_ms=elapsed_ms(mark);mark=std::chrono::steady_clock::now();}
   for (std::size_t token = 0; token < batch_size; ++token) {
     const float * projection = projected.data() + token * projection_width;
     const float * z = projection + conv_channels;
@@ -255,8 +263,10 @@ bool run_linear_attention_batch_cpu_q8(
       layer.linear.out_proj.q8_0_backend);
   }
 
-  return matmul_2d_quantized_batch(
+  const bool ok = matmul_2d_quantized_batch(
     layer.linear.out_proj, gated, batch_size, output, error_message);
+  if(fine) {stage.output_ms=elapsed_ms(mark);runtime->stages->push_back(stage);}
+  return ok;
 }
 
 bool run_full_attention_batch_cpu_q8(
@@ -281,11 +291,16 @@ bool run_full_attention_batch_cpu_q8(
   CpuQ8Runtime * const runtime = layer.full.o_proj.q8_0_runtime;
   CpuPrefillWorkspace::Full fallback;
   auto & scratch = runtime != nullptr ? runtime->prefill.full : fallback;
+  const bool fine = runtime && runtime->stages;
+  CpuPrefillStage stage;
+  std::chrono::steady_clock::time_point mark;
+  if(fine) { stage.kind="full"; stage.tokens=batch_size; mark=std::chrono::steady_clock::now(); }
   auto & projected = scratch.projected;
   if (!matmul_2d_quantized_batch(
         layer.full.qkv_proj_cpu, input, batch_size, projected, error_message)) {
     return false;
   }
+  if(fine) {stage.projection_ms=elapsed_ms(mark);mark=std::chrono::steady_clock::now();}
   if (projected.size() != batch_size * projection_width) {
     error_message = "Batched full-attention projection output size mismatch.";
     return false;
@@ -369,6 +384,54 @@ bool run_full_attention_batch_cpu_q8(
     }
   }
 
+  const bool tiled = runtime && runtime->tiled_attention &&
+    (!runtime->automatic_attention || (batch_size >= 4 && position_start + batch_size > 128));
+  if(runtime && runtime->attention_kernel_result &&
+     ((tiled && !runtime->attention_tiles_used) || (!tiled && !runtime->attention_rows_used))) {
+    runtime->attention_tiles_used |= tiled;
+    runtime->attention_rows_used |= !tiled;
+    *runtime->attention_kernel_result = runtime->attention_tiles_used ?
+      std::string(runtime->attention_rows_used ? "mixed:rows+" : "") + cpu::tiled_attention_kernel(runtime->attention_backend) : "rows";
+  }
+  if(fine) {
+    stage.prepare_ms=elapsed_ms(mark);mark=std::chrono::steady_clock::now();
+    stage.position=position_start;
+    stage.query_key_pairs=static_cast<std::uint64_t>(dims.n_heads)*batch_size*(2ULL*position_start+batch_size+1)/2;
+    stage.kernel=tiled ? cpu::tiled_attention_kernel(runtime->attention_backend) : "rows";
+  }
+  if (tiled) {
+    cpu::TiledAttention args{
+      query_batch.data(), gate_batch.data(), state.k_cache.data(), state.v_cache.data(),
+      state.k_cache_f16.empty() ? nullptr : state.k_cache_f16.data(),
+      state.v_cache_f16.empty() ? nullptr : state.v_cache_f16.data(), attention.data(),
+      batch_size, static_cast<std::size_t>(position_start), query_width, kv_width,
+      dims.n_heads, dims.n_kv_heads, dims.head_dim, attention_scale,
+      runtime->query_tile, runtime->kv_tile, runtime->attention_gqa};
+    if(runtime->automatic_attention && runtime->executor && args.share_gqa) {
+      // Keep enough independent tasks for the actual pool, including short tails.
+      while(args.query_tile>4 && cpu::tiled_attention_tasks(args)<runtime->executor->thread_count()) args.query_tile/=2;
+      if(cpu::tiled_attention_tasks(args)<runtime->executor->thread_count()) args.share_gqa=false;
+    }
+    const auto tasks=cpu::tiled_attention_tasks(args);
+    const auto partitions=runtime->executor ? std::min(tasks,runtime->executor->thread_count()) : 1;
+    const auto stride=cpu::tiled_attention_scratch_floats(args);
+    scratch.tiled_scratch.resize(partitions*stride);
+    TiledAttentionCpuJob job{args,scratch.tiled_scratch.data(),partitions,tasks,stride,runtime->attention_backend};
+    if(fine) {
+      stage.query_tile=args.query_tile; stage.kv_tile=args.kv_tile; stage.shared_gqa=args.share_gqa;
+      stage.participants=partitions;
+      scratch.tile_times.assign(partitions,{});job.times=scratch.tile_times.data();
+    }
+    if(runtime->executor) {
+      if(runtime->executor->parallel_for_rows(partitions,run_tiled_attention_cpu,&job)!=cpu::CpuExecutorStatus::ok) {
+        error_message="Tiled attention executor failed."; return false;
+      }
+    } else run_tiled_attention_cpu(&job,0,partitions);
+    if(fine) for(const auto &t:scratch.tile_times) {
+      stage.pack_worker_ms+=t.pack_ms; stage.qk_worker_ms+=t.qk_ms;
+      stage.softmax_worker_ms+=t.softmax_ms; stage.pv_worker_ms+=t.pv_ms;
+    }
+  } else {
   const std::size_t attention_rows =
     batch_size * static_cast<std::size_t>(dims.n_heads);
   const std::size_t context_stride =
@@ -376,6 +439,7 @@ bool run_full_attention_batch_cpu_q8(
   auto & scores = scratch.scores;
   const std::size_t score_partitions = runtime != nullptr && runtime->executor != nullptr
     ? std::min(attention_rows, runtime->executor->thread_count()) : 1;
+  if(fine) stage.participants=score_partitions;
   scores.resize(score_partitions * context_stride);
   FullAttentionBatchCpuJob job{
     query_batch.data(),
@@ -409,9 +473,13 @@ bool run_full_attention_batch_cpu_q8(
   } else {
     run_full_attention_batch_cpu_rows(&job, 0, score_partitions);
   }
+  }
 
-  return matmul_2d_quantized_batch(
+  if(fine) {stage.attention_wall_ms=elapsed_ms(mark);mark=std::chrono::steady_clock::now();}
+  const bool ok = matmul_2d_quantized_batch(
     layer.full.o_proj, attention, batch_size, output, error_message);
+  if(fine) {stage.output_ms=elapsed_ms(mark);runtime->stages->push_back(stage);}
+  return ok;
 }
 
 bool run_forward_cpu_q8_batch(
@@ -494,6 +562,7 @@ bool run_forward_cpu_q8_batch(
         state.linear_states[static_cast<std::size_t>(linear_index++)],
         normed,
         batch_size,
+        position_start,
         attention,
         error_message);
     } else {

@@ -46,3 +46,11 @@ build/qwen35x_q4_h128_convert.exe --hf-model-dir models/qwen3.5-0.8b --output mo
 The H128 converter refuses to overwrite an existing artifact. CUDA support in
 the Qwen35x executable is optional; this comparison selects CPU execution only.
 The model files are local artifacts and are not committed.
+
+For quality evaluation, the adapter also accepts `--prompt-tokens-file` and
+`--logits-out`. The latter writes teacher-forced full-vocabulary records in the
+Qwen35x dump format and marks the profile `quality_capture: true`. Those runs
+are not performance measurements: copying/writing logits affects decode time.
+The BF16 GGUF can serve as an unquantized-weight teacher with the same FP16 KV
+setting. `scripts/evaluate-cpu-prefill-attention.py` checks prompt/output counts
+and compares both the frozen Q4 baseline and candidate against this teacher.

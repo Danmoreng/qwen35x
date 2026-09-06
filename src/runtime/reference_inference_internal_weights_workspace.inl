@@ -28,11 +28,18 @@ struct CpuPrefillWorkspace {
   } linear;
   struct Full {
     std::vector<float> projected, attention, query_batch, gate_batch;
-    std::vector<float> q, q_normed, k_normed, scores;
+    std::vector<float> q, q_normed, k_normed, scores, tiled_scratch;
+    std::vector<cpu::AttentionTileTimes> tile_times;
   } full;
 };
 
 struct CpuQ8Runtime {
+  std::vector<CpuPrefillStage> *stages = nullptr;
+  bool tiled_attention = false, attention_gqa = false, automatic_attention = false;
+  bool attention_rows_used = false, attention_tiles_used = false;
+  std::string *attention_kernel_result = nullptr;
+  cpu::Q8_0Backend attention_backend = cpu::Q8_0Backend::auto_select;
+  int query_tile = 8, kv_tile = 64;
   CpuDecodeWorkspace decode;
   CpuPrefillWorkspace prefill;
   std::unique_ptr<cpu::CpuExecutor> executor;
@@ -336,6 +343,7 @@ struct ModelState {
 constexpr std::uint32_t kCpuPrefixCacheStateAbiVersion = 2;
 
 struct CpuPrefixCacheSnapshot {
+  std::string attention_signature;
   bool use_f16_cache = false;
   std::uint32_t state_abi_version = kCpuPrefixCacheStateAbiVersion;
   std::string model_signature;
@@ -502,6 +510,22 @@ void pack_conv1d_kernel_major(
         weights.conv1d.data[
           static_cast<std::size_t>(channel * dims.linear_kernel + kernel)];
     }
+  }
+}
+
+struct TiledAttentionCpuJob {
+  cpu::TiledAttention args;
+  float *scratch;
+  std::size_t partitions, tasks, scratch_stride;
+  cpu::Q8_0Backend backend;
+  cpu::AttentionTileTimes *times = nullptr;
+};
+void run_tiled_attention_cpu(void *opaque, std::size_t begin, std::size_t end) noexcept {
+  auto &job=*static_cast<TiledAttentionCpuJob *>(opaque);
+  for(std::size_t p=begin;p<end;++p) {
+    // Cyclic tiles distribute the triangular workload across participants.
+    for(std::size_t t=p;t<job.tasks;t+=job.partitions)
+      cpu::causal_attention_tiled(job.args,t,job.scratch+p*job.scratch_stride,job.backend,job.times ? job.times+p : nullptr);
   }
 }
 

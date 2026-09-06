@@ -23,7 +23,7 @@ static std::vector<llama_token> tokens(const std::string & csv) {
   return result;
 }
 int main(int argc, char ** argv) try {
-  std::string model_path, profile_path;
+  std::string model_path, profile_path, logits_path;
   std::vector<llama_token> prompt, forced;
   int threads = 8, context = 8192, generated = 128;
   bool prefill_only = false;
@@ -35,6 +35,12 @@ int main(int argc, char ** argv) try {
     };
     if (arg == "--cpu-gguf") model_path = value();
     else if (arg == "--profile-json") profile_path = value();
+    else if (arg == "--logits-out") logits_path = value();
+    else if (arg == "--prompt-tokens-file") {
+      std::ifstream file(value()); std::stringstream text; text << file.rdbuf();
+      if(!file) throw std::runtime_error("Could not read prompt tokens");
+      prompt=tokens(text.str());
+    }
     else if (arg == "--prompt-tokens") prompt = tokens(value());
     else if (arg == "--forced-output-tokens") forced = tokens(value());
     else if (arg == "--cpu-threads") threads = std::stoi(value());
@@ -91,9 +97,34 @@ int main(int argc, char ** argv) try {
     position += count;
   }
   const double prefill_ms = elapsed(prefill_start);
+  // Optional quality capture only. Its I/O invalidates decode timing; the
+  // performance runner never enables it. Format matches qwen35x logit dumps.
+  std::ofstream dump;
+  if(!logits_path.empty()) {
+    if(prefill_only) throw std::runtime_error("Logit capture requires outputs");
+    dump.open(logits_path,std::ios::binary);
+    const std::uint32_t version=1,vocabulary=vocab;
+    const std::uint64_t records=generated;
+    dump.write("Q35LGT1\0",8);
+    dump.write(reinterpret_cast<const char*>(&version),4);
+    dump.write(reinterpret_cast<const char*>(&vocabulary),4);
+    dump.write(reinterpret_cast<const char*>(&records),8);
+  }
+  auto capture=[&](int i) {
+    if(logits_path.empty()) return;
+    const auto *logits=llama_get_logits_ith(ctx.get(),-1);
+    if(!logits) throw std::runtime_error("Missing quality logits");
+    for(int v=0;v<vocab;++v) if(!std::isfinite(logits[v])) throw std::runtime_error("Non-finite quality logit");
+    dump.write(reinterpret_cast<const char*>(&forced[i]),4);
+    dump.write(reinterpret_cast<const char*>(logits),vocab*sizeof(float));
+    if(!dump) throw std::runtime_error("Could not write quality logits");
+  };
+  if(!prefill_only) capture(0);
   const auto decode_start = Clock::now();
-  if (!prefill_only) for (int i = 0; i + 1 < generated; ++i)
+  if (!prefill_only) for (int i = 0; i + 1 < generated; ++i) {
     evaluate(forced.data() + i, 1, int(prompt.size()) + i, true);
+    capture(i+1);
+  }
   const double decode_ms = prefill_only ? 0.0 : elapsed(decode_start);
   // Match engine semantics: first output is predicted during prefill. The
   // summary normalizes throughput by generated-1 actual decode forwards.
@@ -106,6 +137,7 @@ int main(int argc, char ** argv) try {
   }
   std::ofstream out(profile_path);
   out << std::setprecision(12) << "{\"prefill_only\":" << (prefill_only ? "true" : "false")
+      << ",\"quality_capture\":" << (logits_path.empty() ? "false" : "true")
       << ",\"prompt_tokens\":" << prompt.size() << ",\"generated_tokens\":" << outputs
       << ",\"decode_forward_steps\":" << (prefill_only ? 0 : generated - 1)
       << ",\"load_time_ms\":" << load_ms << ",\"prefill_time_ms\":" << prefill_ms

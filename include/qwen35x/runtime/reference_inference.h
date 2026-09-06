@@ -115,6 +115,15 @@ struct ReferenceInferenceOptions {
   int cpu_threads = 0;
   // FP32 cache keeps SIMD attention enabled; false prefers FP16 on SIMD CPUs.
   bool cpu_kv_cache_f32 = false;
+  // rows remains the frozen numerical/performance baseline.
+  std::string cpu_attention = "auto";
+  bool profile_cpu_prefill = false;
+  bool cpu_attention_gqa = false;
+  cpu::Q8_0Backend cpu_attention_backend = cpu::Q8_0Backend::auto_select;
+  // Zero selects a bounded automatic chunk/query tile; explicit values aid A/B tests.
+  int cpu_prefill_chunk_size = 0;
+  int cpu_attention_query_tile = 0;
+  int cpu_attention_kv_tile = 32;
   cpu::Q8_0Backend cpu_q8_backend = cpu::Q8_0Backend::auto_select;
   ReferenceCpuModelSession * cpu_model_session = nullptr;
   ReferenceCpuPrefixCache * cpu_prefix_cache = nullptr;
@@ -155,7 +164,19 @@ struct ReferenceTransferBreakdown {
   std::uint64_t copy_calls = 0;
 };
 
+struct CpuPrefillStage {
+  std::string kind, kernel;
+  int query_tile{}, kv_tile{};
+  bool shared_gqa{};
+  std::size_t position{}, tokens{}, participants{};
+  std::uint64_t query_key_pairs{};
+  double projection_ms{}, prepare_ms{}, attention_wall_ms{}, output_ms{};
+  // Summed elapsed worker intervals, not wall time or OS CPU accounting.
+  double pack_worker_ms{}, qk_worker_ms{}, softmax_worker_ms{}, pv_worker_ms{};
+};
 struct ReferenceInferenceResult {
+  std::vector<CpuPrefillStage> cpu_prefill_stages;
+  std::size_t cpu_prefill_chunk_size_resolved{};
   std::vector<std::int32_t> generated_tokens;
   std::vector<ReferenceTopLogitsStep> top_logits_by_step;
   double load_time_ms = 0.0;
@@ -166,6 +187,7 @@ struct ReferenceInferenceResult {
   int forward_pass_tokens = 0;
   bool cpu_model_session_hit = false;
   bool cpu_kv_cache_f16 = false;
+  std::string cpu_attention_kernel = "rows";
   bool cpu_q4_dot4 = false;
   int cached_prefix_tokens = 0;
   double prefix_cache_restore_time_ms = 0.0;

@@ -49,6 +49,7 @@ add_library(qwen35x_core
   src/cpu/delta_net.cpp
   src/cpu/executor.cpp
   src/cpu/full_attention.cpp
+  src/cpu/full_attention_tiled.cpp
   src/cpu/q4_dot4.cpp
   src/cpu/q4_0.cpp
   src/cpu/q4_h128.cpp
@@ -80,7 +81,7 @@ if (QWEN35X_SYSTEM_PROCESSOR_LOWER MATCHES "^(x86_64|amd64|i[3-6]86)$" OR
   if (MSVC)
     set(QWEN35X_Q8_0_HAS_AVX2_TU ON)
     set_source_files_properties(
-      src/cpu/activation_avx2.cpp src/cpu/q4_0_avx2.cpp src/cpu/q4_dot4_avx2.cpp src/cpu/q4_h128_avx2.cpp src/cpu/q8_0_avx2.cpp src/cpu/delta_net_avx2.cpp src/cpu/full_attention_avx2.cpp
+      src/cpu/activation_avx2.cpp src/cpu/q4_0_avx2.cpp src/cpu/q4_dot4_avx2.cpp src/cpu/q4_h128_avx2.cpp src/cpu/q8_0_avx2.cpp src/cpu/delta_net_avx2.cpp src/cpu/full_attention_avx2.cpp src/cpu/full_attention_tiled_avx2.cpp
       PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     # The AVX-VNNI intrinsic spellings used by the isolated backend are
     # available in the VS 2022 toolset. Older MSVCs keep the AVX2 backend.
@@ -92,7 +93,7 @@ if (QWEN35X_SYSTEM_PROCESSOR_LOWER MATCHES "^(x86_64|amd64|i[3-6]86)$" OR
         src/cpu/q4_0_vnni.cpp src/cpu/q4_dot4_vex.cpp src/cpu/q8_0_vnni.cpp
         PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
       set_source_files_properties(
-        src/cpu/activation_avx512.cpp src/cpu/q4_h128_avx512.cpp
+        src/cpu/activation_avx512.cpp src/cpu/q4_h128_avx512.cpp src/cpu/full_attention_tiled_avx512.cpp
         PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
       set_source_files_properties(
         src/cpu/q4_0_avx512_vnni.cpp src/cpu/q4_0_evex_vnni.cpp src/cpu/q4_dot4_evex.cpp
@@ -101,7 +102,7 @@ if (QWEN35X_SYSTEM_PROCESSOR_LOWER MATCHES "^(x86_64|amd64|i[3-6]86)$" OR
   elseif (CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
     set(QWEN35X_Q8_0_HAS_AVX2_TU ON)
     set_source_files_properties(
-      src/cpu/activation_avx2.cpp src/cpu/q4_0_avx2.cpp src/cpu/q4_dot4_avx2.cpp src/cpu/q4_h128_avx2.cpp src/cpu/q8_0_avx2.cpp src/cpu/delta_net_avx2.cpp src/cpu/full_attention_avx2.cpp
+      src/cpu/activation_avx2.cpp src/cpu/q4_0_avx2.cpp src/cpu/q4_dot4_avx2.cpp src/cpu/q4_h128_avx2.cpp src/cpu/q8_0_avx2.cpp src/cpu/delta_net_avx2.cpp src/cpu/full_attention_avx2.cpp src/cpu/full_attention_tiled_avx2.cpp
       PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-mtune=skylake")
     check_cxx_compiler_flag("-mavxvnni" QWEN35X_COMPILER_HAS_MAVXVNNI)
     if (QWEN35X_COMPILER_HAS_MAVXVNNI)
@@ -114,8 +115,8 @@ if (QWEN35X_SYSTEM_PROCESSOR_LOWER MATCHES "^(x86_64|amd64|i[3-6]86)$" OR
     if (QWEN35X_COMPILER_HAS_MAVX512F)
       set(QWEN35X_Q8_0_HAS_AVX512_TU ON)
       set_source_files_properties(
-        src/cpu/activation_avx512.cpp src/cpu/q4_h128_avx512.cpp
-        PROPERTIES COMPILE_OPTIONS "-mavx512f;-mfma")
+        src/cpu/activation_avx512.cpp src/cpu/q4_h128_avx512.cpp src/cpu/full_attention_tiled_avx512.cpp
+        PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx2;-mf16c;-mfma")
       check_cxx_compiler_flag("-mavx512vnni" QWEN35X_COMPILER_HAS_MAVX512VNNI)
       check_cxx_compiler_flag("-mavx512vl" QWEN35X_COMPILER_HAS_MAVX512VL)
       if (QWEN35X_COMPILER_HAS_MAVX512VNNI AND QWEN35X_COMPILER_HAS_MAVX512VL)
@@ -131,7 +132,7 @@ endif ()
 if (QWEN35X_Q8_0_HAS_AVX2_TU)
   target_sources(
     qwen35x_core PRIVATE
-    src/cpu/activation_avx2.cpp src/cpu/q4_0_avx2.cpp src/cpu/q4_dot4_avx2.cpp src/cpu/q4_h128_avx2.cpp src/cpu/q8_0_avx2.cpp src/cpu/delta_net_avx2.cpp src/cpu/full_attention_avx2.cpp)
+    src/cpu/activation_avx2.cpp src/cpu/q4_0_avx2.cpp src/cpu/q4_dot4_avx2.cpp src/cpu/q4_h128_avx2.cpp src/cpu/q8_0_avx2.cpp src/cpu/delta_net_avx2.cpp src/cpu/full_attention_avx2.cpp src/cpu/full_attention_tiled_avx2.cpp)
   target_compile_definitions(qwen35x_core PRIVATE QWEN35X_Q8_0_HAS_AVX2_TU=1)
 else ()
   target_compile_definitions(qwen35x_core PRIVATE QWEN35X_Q8_0_HAS_AVX2_TU=0)
@@ -145,7 +146,7 @@ else ()
 endif ()
 
 if (QWEN35X_Q8_0_HAS_AVX512_TU)
-  target_sources(qwen35x_core PRIVATE src/cpu/activation_avx512.cpp src/cpu/q4_h128_avx512.cpp)
+  target_sources(qwen35x_core PRIVATE src/cpu/activation_avx512.cpp src/cpu/q4_h128_avx512.cpp src/cpu/full_attention_tiled_avx512.cpp)
   target_compile_definitions(qwen35x_core PRIVATE QWEN35X_Q8_0_HAS_AVX512_TU=1)
 else ()
   target_compile_definitions(qwen35x_core PRIVATE QWEN35X_Q8_0_HAS_AVX512_TU=0)
@@ -279,6 +280,9 @@ target_link_libraries(qwen35x_q4_h128_convert PRIVATE qwen35x_core)
 
 include(CTest)
 if (BUILD_TESTING)
+  add_executable(qwen35x_full_attention_tiled_test tests/full_attention_tiled_test.cpp)
+  target_link_libraries(qwen35x_full_attention_tiled_test PRIVATE qwen35x_core)
+  add_test(NAME qwen35x_full_attention_tiled COMMAND qwen35x_full_attention_tiled_test)
   add_executable(qwen35x_q4_dot4_test tests/q4_dot4_test.cpp)
   target_link_libraries(qwen35x_q4_dot4_test PRIVATE qwen35x_core)
   add_test(NAME qwen35x_q4_dot4 COMMAND qwen35x_q4_dot4_test)

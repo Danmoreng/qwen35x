@@ -79,7 +79,8 @@ Alle Messungen liefen sequenziell durch `scripts/benchmark-inference-seq.ps1`.
   Quantisierungsrezepte bleiben ein Unterschied; Q4_K_M/IQ4 wurden nicht gemessen.
 - Nur CPU. llama.cpp: GGML_NATIVE, AVX-512/VNNI und AVX-VNNI, Repacking und
   Flash Attention aktiv, Batch 2048 / Microbatch 512. Qwen35x: automatische
-  ISA-Auswahl, EVEX-VNNI/DOT4, Prefill-Chunks 64. Jede Engine verwendet ihre
+  ISA-Auswahl, EVEX-VNNI/DOT4, Attention `{meta.get('qwen_attention', 'rows')}`,
+  Prefill-Chunk-Einstellung {meta.get('qwen_chunk', 64)} (0 = automatisch). Jede Engine verwendet ihre
   eigene bestehende Batch-Ausführung, statt beide auf denselben Kernel zu zwingen.
 - Beide: FP16-KV, FP32-Rekurrenzzustand, reservierter Kontext 8192, Batchgröße
   einer Sequenz. Lade-/Kontextaufbauzeiten sind getrennt erfasst und nicht in
