@@ -7,6 +7,18 @@
 
 namespace qwen35x::cpu {
 
+// Optional FP16 row table for segmented/paged caches. Each entry references one
+// contiguous [kv_head, head_dim] row and stays valid for the synchronous call.
+struct AttentionKvRows {
+  const std::uint16_t *const *keys = nullptr;
+  const std::uint16_t *const *values = nullptr;
+};
+inline const std::uint16_t *attention_cache_row(
+    const std::uint16_t *base, const std::uint16_t *const *rows,
+    std::size_t context, std::size_t width) noexcept {
+  return rows ? rows[context] : base + context * width;
+}
+
 void attention_cache_store_f16(
   const float * input,
   std::uint16_t * output,
@@ -41,7 +53,8 @@ void causal_attention_batch_rows(
   std::size_t row_begin,
   std::size_t row_end,
   Q8_0Backend backend = Q8_0Backend::auto_select,
-  bool reuse_score_row = false) noexcept;
+  bool reuse_score_row = false,
+  const AttentionKvRows *pages = nullptr) noexcept;
 
 // Decode-only GQA path that evaluates two query heads sharing one KV head
 // together. pair_begin/pair_end address adjacent query-head pairs.
@@ -64,6 +77,7 @@ void causal_attention_decode_gqa_pairs(
   float attention_scale,
   std::size_t pair_begin,
   std::size_t pair_end,
-  Q8_0Backend backend = Q8_0Backend::auto_select) noexcept;
+  Q8_0Backend backend = Q8_0Backend::auto_select,
+  const AttentionKvRows *pages = nullptr) noexcept;
 
 } // namespace qwen35x::cpu

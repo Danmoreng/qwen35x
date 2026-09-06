@@ -69,6 +69,7 @@ int main(int argc, char **argv) try {
     if (arg == "--infer-reference")
       continue;
     if (arg == "--cpu-serving") { serving = true; continue; }
+    if (arg == "--cpu-shared-kv-pages") { config.shared_kv_pages = true; continue; }
     if (arg == "--cpu-identical-prompts") {
       identical_prompts = true;
       continue;
@@ -294,6 +295,7 @@ int main(int argc, char **argv) try {
       << ",\"tick_p95_ms\":" << percentile(.95)
       << ",\"tick_p99_ms\":" << percentile(.99)
       << ",\"peak_rss_bytes\":" << peak_rss()
+      << ",\"physical_kv_bytes\":" << stats.physical_kv_bytes
       << ",\"batch_ticks\":" << stats.batch_ticks
       << ",\"batch_rows\":" << stats.batch_rows
       << ",\"projection_batches\":" << stats.projection_batches

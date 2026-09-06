@@ -18,6 +18,7 @@ param(
     [int]$SingleFlightPrefixTokens = 0,
     [switch]$IdenticalPrompts,
     [switch]$Serving,
+    [switch]$SharedKvPages,
     [int]$Residents = 16,
     [int]$DecodeBatchLimit = 16,
     [double]$ArrivalGapMs = 0
@@ -44,6 +45,7 @@ $previousAffinity = $process.ProcessorAffinity
     single_flight_prefix_tokens = $SingleFlightPrefixTokens
     identical_prompts = [bool]$IdenticalPrompts
     serving = [bool]$Serving
+    shared_kv_pages = [bool]$SharedKvPages
     resident_limit = $Residents
     decode_batch_limit = $DecodeBatchLimit
     arrival_gap_ms = $ArrivalGapMs
@@ -69,6 +71,7 @@ try {
                 CpuSingleFlightPrefixTokens = $SingleFlightPrefixTokens
                 CpuIdenticalPrompts = $IdenticalPrompts
                 CpuServing = $Serving; CpuResidents = $Residents
+                CpuSharedKvPages = $SharedKvPages
                 CpuDecodeBatchLimit = $DecodeBatchLimit; CpuArrivalGapMs = $ArrivalGapMs
                 PromptMode = 'prompt-tokens'; PromptTokensCsv = $prompt; PromptName = $label
                 MaxContext = $length + $MaxNewTokens; MaxNewTokens = $MaxNewTokens

@@ -183,3 +183,30 @@ Stats expose successful prefix_builds and prefix_build_fallbacks. In the serving
 benchmark, -SingleFlightPrefixTokens enables this path; construction is inside
 the common serving interval, unlike -RegisteredPrefixTokens, which prepares a
 snapshot before the interval. Neither mode is enabled by default.
+
+## Shared FP16 KV pages (opt-in)
+
+shared_kv_pages enables append-only 256-token KV pages. Prefix snapshots retain
+immutable references; a branch copies only a shared partial tail page before
+its first append. Completed full pages remain shared. DeltaNet and convolution
+state are copied privately at the branch point. Contiguous FP16 caches remain
+the default reference, and prefix handles require matching page mode.
+
+Attention consumes direct FP16 row tables over those pages. There is no
+per-scalar hash lookup or full-prefix materialization per tick. Scalar row,
+AVX2 row/GQA-pair and tiled attention comparisons against contiguous data are
+byte-identical in the kernel test. The optional --pages argument to the
+scheduler model test compares paged branches with contiguous cold full logits.
+
+physical_kv_bytes counts distinct live KV payload once across requests and the
+prefix store, excluding row tables, allocator overhead, recurrent state and
+weights. Prefix budgets conservatively charge each snapshot for its referenced
+whole pages and row tables, even when snapshots share pages. Active handles
+keep their pages alive. Page allocation is on demand, so short contexts may
+have unused tail-page capacity; memory benefit depends on prefix length.
+
+The tiled attention interface also accepts half-open KV segments and can export
+ungated partial maxima, sums and weighted values. merge_attention_partial handles
+empty segments and stable rescaling; the output gate is applied only after the
+final merge. Splitting a reduction can change rounding, so grouped attention
+must receive separate numerical and performance validation before adoption.

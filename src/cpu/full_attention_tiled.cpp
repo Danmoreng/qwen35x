@@ -1,8 +1,11 @@
 #include "qwen35x/cpu/full_attention_tiled.h"
+#include <algorithm>
+#include <cmath>
 namespace qwen35x::cpu {
 namespace {
 bool valid(const TiledAttention &a) noexcept {
   return a.dimension == 256 && a.heads > 0 && a.kv_heads > 0 && a.heads % a.kv_heads == 0 &&
+         (bool(a.partial_maxima) == bool(a.partial_sums)) && (!a.kv_end || a.kv_end >= a.kv_begin) &&
          (!a.share_gqa || a.heads / a.kv_heads <= 4) &&
          (a.query_tile == 4 || a.query_tile == 8 || a.query_tile == 16) &&
          (a.kv_tile == 32 || a.kv_tile == 64 || a.kv_tile == 128);
@@ -40,8 +43,9 @@ std::size_t tiled_attention_tasks(const TiledAttention &a) noexcept {
 }
 bool causal_attention_tiled(const TiledAttention &a, std::size_t task, float *scratch,
                             Q8_0Backend backend, AttentionTileTimes *times) noexcept {
-  if (!valid(a) || task >= tiled_attention_tasks(a) || !scratch || !a.queries || !a.gates ||
-      !a.output || (!a.keys && !a.keys_f16) || (!a.values && !a.values_f16) ||
+  if (!valid(a) || task >= tiled_attention_tasks(a) || !scratch || !a.queries || (!a.gates && !a.partial_sums) ||
+      !a.output || (!a.keys && !a.keys_f16 && !(a.pages && a.pages->keys)) ||
+      (!a.values && !a.values_f16 && !(a.pages && a.pages->values)) ||
       a.query_stride < static_cast<std::size_t>(a.heads) * 256 ||
       a.kv_stride < static_cast<std::size_t>(a.kv_heads) * 256)
     return false;
@@ -58,5 +62,18 @@ bool causal_attention_tiled(const TiledAttention &a, std::size_t task, float *sc
   }
 #endif
   return false;
+}
+void merge_attention_partial(float &maximum, float &sum, float *values,
+                             float other_maximum, float other_sum,
+                             const float *other_values, std::size_t dimension) noexcept {
+  if (other_sum == 0) return;
+  if (sum == 0) {
+    maximum=other_maximum;sum=other_sum;
+    std::copy_n(other_values,dimension,values);return;
+  }
+  const float m=std::max(maximum,other_maximum);
+  const float a=std::exp(maximum-m),b=std::exp(other_maximum-m);
+  for(std::size_t i=0;i<dimension;++i)values[i]=a*values[i]+b*other_values[i];
+  sum=a*sum+b*other_sum;maximum=m;
 }
 } // namespace qwen35x::cpu

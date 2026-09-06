@@ -33,6 +33,7 @@ struct CpuPrefix::Impl {
   std::vector<float> final_hidden;
   std::string trust_namespace;
   std::size_t prefill_chunk_size = 0, bytes = 0;
+  bool paged_kv = false;
 };
 
 struct CpuEngine::Impl {
@@ -244,7 +245,9 @@ struct CpuEngine::Impl {
         auto &state = s.state.full_states.emplace_back();
         const auto values =
             capacity * static_cast<std::size_t>(d.n_kv_heads) * d.head_dim;
-        if (cpu::q8_0_backend_uses_avx2(model->impl_->backend)) {
+        if (config.shared_kv_pages) {
+          state.pages=cpu::KvPagesF16(static_cast<std::size_t>(d.n_kv_heads)*d.head_dim,capacity);
+        } else if (cpu::q8_0_backend_uses_avx2(model->impl_->backend)) {
           state.k_cache_f16.resize(values);
           state.v_cache_f16.resize(values);
         } else {
@@ -435,6 +438,7 @@ CpuEngine::create(std::shared_ptr<const CpuModel> model,
       config.max_context >
           static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
       config.prefill_chunk_size > 2048 ||
+      (model && config.shared_kv_pages && !cpu::q8_0_backend_uses_avx2(model->impl_->backend)) ||
       config.max_queued_requests > std::numeric_limits<std::size_t>::max() - config.max_resident_requests ||
       (config.max_queued_requests && (!config.max_decode_batch_size || !config.max_buffered_tokens))) {
     error = "Invalid CPU engine configuration.";
@@ -504,6 +508,7 @@ CpuRequestId CpuEngine::submit(CpuRequestSpec spec, std::string &error) {
       if (prefix.model != impl_->model ||
           prefix.trust_namespace != spec.trust_namespace ||
           prefix.prefill_chunk_size != impl_->config.prefill_chunk_size ||
+          prefix.paged_kv != impl_->config.shared_kv_pages ||
           prefix.snapshot.prefix_tokens.size() > spec.prompt_tokens.size() ||
           !std::equal(prefix.snapshot.prefix_tokens.begin(),
                       prefix.snapshot.prefix_tokens.end(),
@@ -607,10 +612,21 @@ bool CpuEngine::advance_batch(std::span<const CpuRequestId> ids,
 }
 CpuEngineStats CpuEngine::stats() const {
   auto stats = impl_->stats;
+  std::unordered_set<const void*> pages;
+  auto count_state=[&](const auto &state) {
+    stats.physical_kv_bytes+=(state.k_cache.size()+state.v_cache.size())*sizeof(float)+
+      (state.k_cache_f16.size()+state.v_cache_f16.size())*sizeof(std::uint16_t);
+    for(const auto &page:state.pages.pages())
+      if(pages.insert(page.get()).second)
+        stats.physical_kv_bytes+=(page->keys.size()+page->values.size())*sizeof(std::uint16_t);
+  };
   for (const auto &[id,s] : impl_->requests) {
     stats.queued_requests += s->result.status == CpuRequestStatus::queued;
     stats.resident_requests += s->resident;
+    for(const auto &state:s->state.full_states)count_state(state);
   }
+  for(const auto &prefix:impl_->prefixes)
+    for(const auto &state:prefix->impl_->snapshot.full_states)count_state(state);
   return stats;
 }
 

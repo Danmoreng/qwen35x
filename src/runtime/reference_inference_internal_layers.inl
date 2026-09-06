@@ -557,6 +557,12 @@ bool run_full_attention_step(CpuExecutionContext *cpu_context,
     rope_cosine, rope_sine, layer.full.o_proj.q8_0_backend);
 
   const std::size_t token_stride = static_cast<std::size_t>(dims.n_kv_heads * dims.head_dim);
+  if (state.pages.width()) {
+    if (state.pages.size()!=static_cast<std::size_t>(position)) {
+      error_message="Paged KV append position mismatch.";return false;
+    }
+    state.pages.append(k_normed.data(),v_values,layer.full.o_proj.q8_0_backend);
+  }
   if (!state.k_cache.empty()) {
     std::memcpy(
       state.k_cache.data() + static_cast<std::size_t>(position) * token_stride,
@@ -622,6 +628,7 @@ bool run_full_attention_step(CpuExecutionContext *cpu_context,
   attn_cat.resize(query_width);
   auto & scores = workspace.scores;
   scores.resize(attention_rows * context_stride);
+  const cpu::AttentionKvRows page_rows{state.pages.keys(),state.pages.values()};
   FullAttentionBatchCpuJob job{
     q_normed.data(),
     gate.data(),
@@ -641,6 +648,7 @@ bool run_full_attention_step(CpuExecutionContext *cpu_context,
     scale,
     layer.full.o_proj.q8_0_backend,
   };
+  job.pages=state.pages.width()?&page_rows:nullptr;
   CpuExecutionContext * const runtime = cpu_context;
   if (runtime != nullptr && runtime->executor != nullptr) {
     CpuDecodeProbe probe(runtime, "full-attention", attention_pairs, seq_len);

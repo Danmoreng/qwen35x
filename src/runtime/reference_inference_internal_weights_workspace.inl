@@ -348,6 +348,7 @@ struct RuntimeDims {
 };
 
 struct FullAttentionState {
+  cpu::KvPagesF16 pages;
   std::vector<float> k_cache;
   std::vector<float> v_cache;
   std::vector<std::uint16_t> k_cache_f16;
@@ -448,7 +449,9 @@ void capture_cpu_prefix_state(
   for (std::size_t layer = 0; layer < state.full_states.size(); ++layer) {
     const FullAttentionState & source = state.full_states[layer];
     FullAttentionState & destination = snapshot.full_states[layer];
-    if (use_f16_cache && !source.k_cache_f16.empty()) {
+    if (source.pages.width()) {
+      destination.pages = source.pages.prefix(prefix_tokens);
+    } else if (use_f16_cache && !source.k_cache_f16.empty()) {
       destination.k_cache_f16.assign(
         source.k_cache_f16.begin(), source.k_cache_f16.begin() +
           static_cast<std::ptrdiff_t>(cache_values));
@@ -483,6 +486,13 @@ void capture_cpu_prefix_state(
   for (std::size_t layer = 0; layer < state.full_states.size(); ++layer) {
     const FullAttentionState & source = snapshot.full_states[layer];
     FullAttentionState & destination = state.full_states[layer];
+    if (source.pages.width() || destination.pages.width()) {
+      if (!source.pages.width() || !destination.pages.width() ||
+          source.pages.width()!=kv_width || source.pages.size()!=prefix_tokens ||
+          destination.pages.capacity()<prefix_tokens) return false;
+      destination.pages=source.pages.branch(destination.pages.capacity());
+      continue;
+    }
     const bool has_f32 = !source.k_cache.empty();
     const bool has_f16 = !source.k_cache_f16.empty();
     if (has_f32 == has_f16 || source.k_cache.size() != source.v_cache.size() ||
@@ -523,6 +533,7 @@ void capture_cpu_prefix_state(
   const CpuPrefixCacheSnapshot & snapshot) noexcept {
   std::size_t bytes = snapshot.prefix_tokens.size() * sizeof(std::int32_t);
   for (const FullAttentionState & state : snapshot.full_states) {
+    bytes += state.pages.payload_bytes() + state.pages.size()*2*sizeof(const std::uint16_t*);
     bytes += (state.k_cache.size() + state.v_cache.size()) * sizeof(float);
     bytes += (state.k_cache_f16.size() + state.v_cache_f16.size()) *
       sizeof(std::uint16_t);
@@ -583,6 +594,7 @@ struct FullAttentionBatchCpuJob {
   cpu::Q8_0Backend backend = cpu::Q8_0Backend::auto_select;
   std::size_t score_partitions = 0;
   std::size_t attention_rows = 0;
+  const cpu::AttentionKvRows *pages = nullptr;
 };
 
 void run_full_attention_batch_cpu_rows(
@@ -602,7 +614,7 @@ void run_full_attention_batch_cpu_rows(
       job.scores + partition * job.context_stride, job.output,
       job.context_stride, job.query_width, job.kv_width, job.position_start,
       job.head_count, job.kv_head_count, job.head_dim, job.attention_scale,
-      begin, end, job.backend, true);
+      begin, end, job.backend, true, job.pages);
   }
 }
 
@@ -616,7 +628,7 @@ void run_full_attention_decode_cpu_pairs(
     job.k_cache_f16, job.v_cache_f16, job.scores, job.output,
     job.context_stride, job.query_width, job.kv_width, job.position_start + 1,
     job.head_count, job.kv_head_count, job.head_dim, job.attention_scale,
-    pair_begin, pair_end, job.backend);
+    pair_begin, pair_end, job.backend, job.pages);
 }
 
 struct CudaForwardWorkspace {

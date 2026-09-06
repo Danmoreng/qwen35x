@@ -1,5 +1,6 @@
 #pragma once
 #include "qwen35x/cpu/q8_0.h"
+#include "qwen35x/cpu/full_attention.h"
 #include <cstddef>
 #include <cstdint>
 
@@ -14,6 +15,12 @@ struct TiledAttention {
   float scale{};
   int query_tile = 8, kv_tile = 64;
   bool share_gqa = false;
+  const AttentionKvRows *pages = nullptr;
+  // Optional half-open KV segment; end=0 means the full causal extent.
+  std::size_t kv_begin = 0, kv_end = 0;
+  // Both nonnull export ungated partial maxima/sums [token,head] and write the
+  // unnormalized weighted values to output. Empty segments export sum=0.
+  float *partial_maxima = nullptr, *partial_sums = nullptr;
 };
 struct AttentionTileTimes {
   double pack_ms{}, qk_ms{}, softmax_ms{}, pv_ms{};
@@ -28,4 +35,9 @@ std::size_t tiled_attention_scratch_floats(const TiledAttention &a) noexcept;
 std::size_t tiled_attention_tasks(const TiledAttention &a) noexcept;
 bool causal_attention_tiled(const TiledAttention &a, std::size_t task, float *scratch,
                             Q8_0Backend backend, AttentionTileTimes *times = nullptr) noexcept;
+// Stable merge of ungated partials. Zero-sum partials are identities, including
+// when both maxima are -infinity. Normalize and apply the gate only after merging.
+void merge_attention_partial(float &maximum, float &sum, float *values,
+                             float other_maximum, float other_sum,
+                             const float *other_values, std::size_t dimension) noexcept;
 } // namespace qwen35x::cpu

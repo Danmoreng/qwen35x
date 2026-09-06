@@ -360,6 +360,12 @@ bool run_full_attention_batch_cpu_q8(CpuExecutionContext *cpu_context,
       q_normed.data(),
       query_width * sizeof(float));
 
+    if (state.pages.width()) {
+      if (state.pages.size()!=static_cast<std::size_t>(position)) {
+        error_message="Paged KV append position mismatch.";return false;
+      }
+      state.pages.append(k_normed.data(),v_flat,layer.full.o_proj.q8_0_backend);
+    }
     if (!state.k_cache.empty()) {
       std::memcpy(
         state.k_cache.data() + static_cast<std::size_t>(position) * kv_width,
@@ -384,6 +390,7 @@ bool run_full_attention_batch_cpu_q8(CpuExecutionContext *cpu_context,
     }
   }
 
+  const cpu::AttentionKvRows page_rows{state.pages.keys(),state.pages.values()};
   // A short suffix after prefix restore must retain the same arithmetic as
   // those token positions in a larger cold-prefill tile.
   const bool tiled = runtime && runtime->tiled_attention &&
@@ -409,6 +416,7 @@ bool run_full_attention_batch_cpu_q8(CpuExecutionContext *cpu_context,
       batch_size, static_cast<std::size_t>(position_start), query_width, kv_width,
       dims.n_heads, dims.n_kv_heads, dims.head_dim, attention_scale,
       runtime->query_tile, runtime->kv_tile, runtime->attention_gqa};
+    args.pages=state.pages.width()?&page_rows:nullptr;
     if(runtime->automatic_attention && runtime->executor && args.share_gqa) {
       // Keep enough independent tasks for the actual pool, including short tails.
       while(args.query_tile>4 && cpu::tiled_attention_tasks(args)<runtime->executor->thread_count()) args.query_tile/=2;
@@ -463,6 +471,7 @@ bool run_full_attention_batch_cpu_q8(CpuExecutionContext *cpu_context,
     layer.full.o_proj.q8_0_backend,
     score_partitions,
     attention_rows,
+    state.pages.width()?&page_rows:nullptr,
   };
   if (runtime != nullptr && runtime->executor != nullptr) {
     const cpu::CpuExecutorStatus status = runtime->executor->parallel_for_rows(

@@ -18,6 +18,7 @@ param(
     [int]$CpuRegisteredPrefixTokens = 0,
     [int]$CpuSingleFlightPrefixTokens = 0,
     [switch]$CpuServing,
+    [switch]$CpuSharedKvPages,
     [int]$CpuResidents = 16,
     [int]$CpuDecodeBatchLimit = 16,
     [double]$CpuArrivalGapMs = 0,
@@ -224,6 +225,7 @@ function Invoke-BenchmarkRun {
         if ($script:CpuBatchSerialState) { $args += "--cpu-batch-serial-state" }
         if ($script:CpuRegisteredPrefixTokens -gt 0) { $args += @("--cpu-registered-prefix", "$script:CpuRegisteredPrefixTokens") }
         if ($script:CpuSingleFlightPrefixTokens -gt 0) { $args += @("--cpu-single-flight-prefix", "$script:CpuSingleFlightPrefixTokens") }
+        if ($script:CpuSharedKvPages) { $args += "--cpu-shared-kv-pages" }
         if ($script:CpuServing) { $args += @("--cpu-serving", "--cpu-residents", "$script:CpuResidents", "--cpu-decode-batch-limit", "$script:CpuDecodeBatchLimit", "--cpu-arrival-gap-ms", $script:CpuArrivalGapMs.ToString([Globalization.CultureInfo]::InvariantCulture)) }
         if ($script:CpuIdenticalPrompts) { $args += "--cpu-identical-prompts" }
     }
@@ -564,6 +566,7 @@ foreach ($mode in $Modes) {
                 tick_p95_ms = To-OptionalInvariantString (Get-JsonProperty $profile "tick_p95_ms")
                 tick_p99_ms = To-OptionalInvariantString (Get-JsonProperty $profile "tick_p99_ms")
                 peak_rss_bytes = To-OptionalInvariantString (Get-JsonProperty $profile "peak_rss_bytes")
+                physical_kv_bytes = To-OptionalInvariantString (Get-JsonProperty $profile "physical_kv_bytes")
                 batch_rows = To-OptionalInvariantString (Get-JsonProperty $profile "batch_rows")
                 lm_head_batches = To-OptionalInvariantString (Get-JsonProperty $profile "lm_head_batches")
                 greedy_lm_head_batches = To-OptionalInvariantString (Get-JsonProperty $profile "greedy_lm_head_batches")

@@ -69,7 +69,8 @@ void causal_attention_batch_rows_scalar(
   const float attention_scale,
   const std::size_t row_begin,
   const std::size_t row_end,
-  const bool reuse_score_row) noexcept {
+  const bool reuse_score_row,
+  const AttentionKvRows *pages) noexcept {
   const int heads_per_kv = head_count / kv_head_count;
   for (std::size_t row = row_begin; row < row_end; ++row) {
     const std::size_t token = row / static_cast<std::size_t>(head_count);
@@ -88,8 +89,8 @@ void causal_attention_batch_rows_scalar(
         static_cast<std::size_t>(kv_head * head_dim);
       float dot = 0.0F;
       for (int column = 0; column < head_dim; ++column) {
-        dot += query[static_cast<std::size_t>(column)] * (k_cache_f16 != nullptr
-          ? half_to_float(k_cache_f16[cache_offset + column]) : k_cache[cache_offset + column]);
+        dot += query[static_cast<std::size_t>(column)] * ((k_cache_f16 != nullptr || (pages && pages->keys))
+          ? half_to_float(attention_cache_row(k_cache_f16, pages ? pages->keys : nullptr, context, kv_width)[kv_head * head_dim + column]) : k_cache[cache_offset + column]);
       }
       dot *= attention_scale;
       score_row[static_cast<std::size_t>(context)] = dot;
@@ -112,8 +113,8 @@ void causal_attention_batch_rows_scalar(
         static_cast<std::size_t>(context) * kv_width +
         static_cast<std::size_t>(kv_head * head_dim);
       for (int column = 0; column < head_dim; ++column) {
-        output_head[static_cast<std::size_t>(column)] += probability * (v_cache_f16 != nullptr
-          ? half_to_float(v_cache_f16[cache_offset + column]) : v_cache[cache_offset + column]);
+        output_head[static_cast<std::size_t>(column)] += probability * ((v_cache_f16 != nullptr || (pages && pages->values))
+          ? half_to_float(attention_cache_row(v_cache_f16, pages ? pages->values : nullptr, context, kv_width)[kv_head * head_dim + column]) : v_cache[cache_offset + column]);
       }
     }
     for (int column = 0; column < head_dim; ++column) {
@@ -148,7 +149,8 @@ void causal_attention_batch_rows_avx2(
   float attention_scale,
   std::size_t row_begin,
   std::size_t row_end,
-  const bool reuse_score_row) noexcept;
+  const bool reuse_score_row,
+  const AttentionKvRows *pages) noexcept;
 
 void causal_attention_decode_gqa_pairs_avx2(
   const float * queries,
@@ -168,7 +170,8 @@ void causal_attention_decode_gqa_pairs_avx2(
   int head_dim,
   float attention_scale,
   std::size_t pair_begin,
-  std::size_t pair_end) noexcept;
+  std::size_t pair_end,
+  const AttentionKvRows *pages) noexcept;
 #endif
 
 } // namespace detail
@@ -211,9 +214,10 @@ void causal_attention_batch_rows(
   const std::size_t row_begin,
   const std::size_t row_end,
   const Q8_0Backend backend,
-  const bool reuse_score_row) noexcept {
-  if (queries == nullptr || gates == nullptr || (k_cache == nullptr && k_cache_f16 == nullptr) ||
-      (v_cache == nullptr && v_cache_f16 == nullptr) || scores == nullptr || output == nullptr ||
+  const bool reuse_score_row,
+  const AttentionKvRows *pages) noexcept {
+  if (queries == nullptr || gates == nullptr || (k_cache == nullptr && k_cache_f16 == nullptr && !(pages && pages->keys)) ||
+      (v_cache == nullptr && v_cache_f16 == nullptr && !(pages && pages->values)) || scores == nullptr || output == nullptr ||
       context_stride == 0 || query_width == 0 || kv_width == 0 ||
       position_start < 0 || head_count <= 0 || kv_head_count <= 0 ||
       head_dim <= 0 || (head_count % kv_head_count) != 0 || row_begin >= row_end) {
@@ -224,7 +228,7 @@ void causal_attention_batch_rows(
     detail::causal_attention_batch_rows_avx2(
       queries, gates, k_cache, v_cache, k_cache_f16, v_cache_f16, scores, output, context_stride,
       query_width, kv_width, position_start, head_count, kv_head_count,
-      head_dim, attention_scale, row_begin, row_end, reuse_score_row);
+      head_dim, attention_scale, row_begin, row_end, reuse_score_row, pages);
     return;
   }
 #else
@@ -233,7 +237,7 @@ void causal_attention_batch_rows(
   detail::causal_attention_batch_rows_scalar(
     queries, gates, k_cache, v_cache, k_cache_f16, v_cache_f16, scores, output, context_stride,
     query_width, kv_width, position_start, head_count, kv_head_count,
-    head_dim, attention_scale, row_begin, row_end, reuse_score_row);
+    head_dim, attention_scale, row_begin, row_end, reuse_score_row, pages);
 }
 
 void causal_attention_decode_gqa_pairs(
@@ -255,10 +259,11 @@ void causal_attention_decode_gqa_pairs(
   const float attention_scale,
   const std::size_t pair_begin,
   const std::size_t pair_end,
-  const Q8_0Backend backend) noexcept {
+  const Q8_0Backend backend,
+  const AttentionKvRows *pages) noexcept {
   const std::size_t pair_count = static_cast<std::size_t>(head_count) / 2U;
-  if (queries == nullptr || gates == nullptr || (k_cache == nullptr && k_cache_f16 == nullptr) ||
-      (v_cache == nullptr && v_cache_f16 == nullptr) || scores == nullptr || output == nullptr ||
+  if (queries == nullptr || gates == nullptr || (k_cache == nullptr && k_cache_f16 == nullptr && !(pages && pages->keys)) ||
+      (v_cache == nullptr && v_cache_f16 == nullptr && !(pages && pages->values)) || scores == nullptr || output == nullptr ||
       context_stride < static_cast<std::size_t>(sequence_length) ||
       query_width == 0 || kv_width == 0 || sequence_length <= 0 ||
       head_count <= 0 || kv_head_count <= 0 || head_dim <= 0 ||
@@ -273,7 +278,7 @@ void causal_attention_decode_gqa_pairs(
       queries, gates, k_cache, v_cache, k_cache_f16, v_cache_f16,
       scores, output, context_stride, query_width, kv_width,
       sequence_length, head_count, kv_head_count, head_dim, attention_scale,
-      pair_begin, pair_end);
+      pair_begin, pair_end, pages);
     return;
   }
 #else
@@ -283,7 +288,7 @@ void causal_attention_decode_gqa_pairs(
     queries, gates, k_cache, v_cache, k_cache_f16, v_cache_f16,
     scores, output, context_stride, query_width, kv_width,
     sequence_length - 1, head_count, kv_head_count, head_dim, attention_scale,
-    pair_begin * 2U, pair_end * 2U, false);
+    pair_begin * 2U, pair_end * 2U, false, pages);
 }
 
 } // namespace qwen35x::cpu

@@ -16,6 +16,7 @@ int serving_benchmark(CpuEngine &engine, const CpuRequestSpec &spec,
   std::vector<double> ttft(count, -1), last(count, -1), submitted(count), itl,
       ticks;
   std::size_t next = 0, finished = 0;
+  std::size_t peak_kv_bytes = 0;
   std::vector<bool> done(count);
   const auto start = Clock::now();
   while (finished < count) {
@@ -35,6 +36,7 @@ int serving_benchmark(CpuEngine &engine, const CpuRequestSpec &spec,
     bool progressed = false;
     const auto tick = Clock::now();
     check(engine.step(progressed, error));
+    peak_kv_bytes=std::max(peak_kv_bytes,engine.stats().physical_kv_bytes);
     if (progressed)
       ticks.push_back(ms(tick));
     now = ms(start);
@@ -107,6 +109,7 @@ int serving_benchmark(CpuEngine &engine, const CpuRequestSpec &spec,
       << ",\"queue_p95_ms\":" << percentile(queue, .95)
       << ",\"tick_p50_ms\":" << percentile(ticks, .5)
       << ",\"peak_rss_bytes\":" << peak_rss()
+      << ",\"physical_kv_bytes\":" << peak_kv_bytes
       << ",\"batch_ticks\":" << stats.batch_ticks
       << ",\"batch_rows\":" << stats.batch_rows
       << ",\"state_batches\":" << stats.state_batches

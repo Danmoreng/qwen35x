@@ -356,3 +356,47 @@ remain validation work before prescribing production serving defaults.
 
 [Samples](cpu-singleflight-2026-09-06-samples.csv) and
 [settings/hashes](cpu-singleflight-2026-09-06-metadata.json).
+
+## Step 5: Physically shared FP16 KV pages
+
+Implemented append-only 256-token pages with immutable prefix references,
+private suffixes and tail-page copy-on-write. DeltaNet/convolution remain
+private. Scalar/AVX2 row and GQA-pair kernels and tiled attention consume direct
+row tables. Contiguous/page kernel comparisons are byte-identical. Segmented
+tiled outputs expose ungated maxima/sums/weighted values; stable merge tests
+include causal and empty segments and match unsplit outputs within 2e-5.
+
+All ten CTest tests pass. The paged scheduler model test compares full logits
+against contiguous cold execution, including branch isolation, cancellation,
+single-flight and budget fallback; all comparisons are byte-identical.
+
+B16, 128 outputs, 16 physical threads/mask 0x55555555, registered prefix P-1
+and distinct final prompt tokens, sequential A/B/B/A, six samples per path:
+
+| P | KV layout | Decode token/s | Initialization ms | Restore copies ms | Physical KV MB | Peak RSS MB |
+|---:|---|---:|---:|---:|---:|---:|
+| 512 | Private contiguous | 590.05 | 253.22 | 19.54 | 131.91 | 964.19 |
+| 512 | Shared pages | 606.67 | 230.24 | 15.25 | 106.95 | 942.18 |
+| 4096 | Private contiguous | 226.46 | 432.29 | 52.43 | 880.59 | 1731.73 |
+| 4096 | Shared pages | 465.83 | 312.20 | 15.16 | 150.99 | 1011.09 |
+
+All 128-token output arrays match for all measured requests. At P4096 the
+shared-page path improves decode 2.06x and reduces physical KV payload 82.9%.
+At P512 the median decode gain is 2.8%. The longer-context gain is consistent
+with better cache reuse of shared KV, but no hardware-counter study isolates
+the cause. Prefix construction is outside initialization and reported separately.
+The comparison uses the same page-capable binary and identical model/thread
+settings; no grouped-prefix attention kernel is enabled.
+
+[Samples](cpu-shared-pages-2026-09-06-samples.csv) and
+[settings/hashes](cpu-shared-pages-2026-09-06-metadata.json).
+
+## Closing scope
+
+The user requested a bounded release-oriented finish. Original steps 6/7
+(grouped prefix attention and mixed prefill/decode projections) are deferred,
+not claimed complete. The next priorities are a usable server interface,
+matched single/multi-request llama.cpp comparisons, and validation of supported
+CPU/OS combinations. See [release scope](cpu-server-release-plan-2026-09-06.md).
+The later request to extract a narrow standalone CPU-only project moves that
+release work into a neighboring repository.

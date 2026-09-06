@@ -10,6 +10,7 @@
 #include "qwen35x/cpu/executor.h"
 #include "qwen35x/cpu/delta_net.h"
 #include "qwen35x/cpu/full_attention.h"
+#include "qwen35x/cpu/kv_pages.h"
 #include "qwen35x/cpu/full_attention_tiled.h"
 #include "qwen35x/runtime/cuda_inference.h"
 #include "qwen35x/runtime/qwen35x_cuda_backend.h"

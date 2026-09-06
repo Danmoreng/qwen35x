@@ -6,14 +6,22 @@ The goal is not a generic multi-model runtime. The goal is a small, hardware-awa
 
 ## CPU multi-request decode: September 6, 2026
 
-The new incremental CPU API batches projections across independent requests,
-including the LM-head. On the Ryzen 9 9955HX3D with eight threads and 512 prompt
-tokens per request, B=4 reaches **319 token/s aggregate versus 119 token/s** for
-the same requests executed serially (**2.67x**). Subsequent shared greedy
-selection and state dispatch bring B=16 to **647 token/s**, with a 24.7 ms
-median tick. Full-model tests verify byte-identical logits and
-request-local sampling. This is a static decode baseline; continuous scheduling
-and shared-prefix reuse are subsequent stages.
+The incremental CPU API now includes independent batched projections and LM-head,
+bounded continuous scheduling, output backpressure and single-flight hybrid
+prefix caching. On the **Ryzen 9 9955HX3D**, P512, 128 outputs:
+
+| Workload | Reference | Improved path | Measured scope |
+|---|---:|---:|---|
+| C16 burst, prepared common prefix, 8 threads | 119 delivered token/s, decode B1 | **593 delivered token/s**, decode B16 | Same scheduler and prefix mode; 4.98x |
+| C16 burst, 16 physical threads | 318 delivered token/s, no reuse | **562 delivered token/s**, single-flight prefix | Prefix construction included; +76.7% |
+| Static B100, 16 physical threads | — | **801 aggregate decode token/s** | 124.7 ms median tick; 3.42 GB peak RSS |
+
+Full-model tests cover private logits/sampling, interleaving, cancellation,
+queue limits, slow consumers, prefix restoration and builder cancellation.
+These are comparisons between qwen35x execution paths, **not multi-request
+speedups over llama.cpp**. A matched multi-request engine comparison and an
+HTTP server integration are still pending. Larger batches trade per-request
+latency and memory for aggregate throughput; 100 is not a serving default.
 
 **[Throughput, latency, memory and samples](docs/cpu-multi-request-progress-2026-09-06.md)** ·
 [API and reproduction](docs/cpu-engine-api.md) ·

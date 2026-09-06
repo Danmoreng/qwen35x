@@ -209,9 +209,10 @@ void tile_impl(const TiledAttention &a, std::size_t task, float *scratch,
   std::fill_n(maxima, rows, -std::numeric_limits<float>::infinity());
   std::fill_n(A, rows * D, 0.f);
   Clock::time_point start;
-  for (std::size_t base = 0; base < a.position + first + tokens; base += B) {
+  const auto end = a.kv_end ? std::min(a.kv_end, a.position + first + tokens) : a.position + first + tokens;
+  for (std::size_t base = a.kv_begin; base < end; base += B) {
     const int count =
-        static_cast<int>(std::min<std::size_t>(B, a.position + first + tokens - base));
+        static_cast<int>(std::min<std::size_t>(B, end - base));
     if constexpr (Profile)
       start = Clock::now();
     for (int d = 0; d < D; d += 8)
@@ -220,12 +221,12 @@ void tile_impl(const TiledAttention &a, std::size_t task, float *scratch,
         for (int j = 0; j < 8; ++j) {
           const auto offset = (base + k + j) * a.kv_stride + kv_head * D + d;
           if (k + j < count) {
-            x[j] = a.keys_f16 ? _mm256_cvtph_ps(_mm_loadu_si128(
-                                    reinterpret_cast<const __m128i *>(a.keys_f16 + offset)))
+            x[j] = (a.keys_f16 || (a.pages && a.pages->keys)) ? _mm256_cvtph_ps(_mm_loadu_si128(
+                                    reinterpret_cast<const __m128i *>(attention_cache_row(a.keys_f16, a.pages ? a.pages->keys : nullptr, base+k+j, a.kv_stride) + kv_head*D+d)))
                               : _mm256_loadu_ps(a.keys + offset);
-            const auto v = a.values_f16
+            const auto v = (a.values_f16 || (a.pages && a.pages->values))
                                ? _mm256_cvtph_ps(_mm_loadu_si128(
-                                     reinterpret_cast<const __m128i *>(a.values_f16 + offset)))
+                                     reinterpret_cast<const __m128i *>(attention_cache_row(a.values_f16, a.pages ? a.pages->values : nullptr, base+k+j, a.kv_stride) + kv_head*D+d)))
                                : _mm256_loadu_ps(a.values + offset);
             _mm256_storeu_ps(V + (k + j) * D + d, v);
           } else {
@@ -334,13 +335,19 @@ void tile_impl(const TiledAttention &a, std::size_t task, float *scratch,
   }
   if constexpr (Profile)
     start = Clock::now();
-  for (int r = 0; r < rows; ++r)
+  for (int r = 0; r < rows; ++r) {
+    if (a.partial_sums) {
+      const auto row = (first+r/group)*a.heads+head+r%group;
+      a.partial_maxima[row]=maxima[r];a.partial_sums[row]=sums[r];
+    }
     for (int d = 0; d < D; ++d) {
       const auto offset = (first + r / group) * a.query_stride + (head + r % group) * D + d;
+      if (a.partial_sums) {a.output[offset]=A[r*D+d];continue;}
       const float g = a.gates[offset], e = std::exp(-std::abs(g));
       const float gate = g >= 0 ? 1.f / (1.f + e) : e / (1.f + e);
       a.output[offset] = (A[r * D + d] / sums[r]) * gate;
     }
+  }
   if constexpr (Profile)
     times->pv_ms += tile_elapsed(start);
 }

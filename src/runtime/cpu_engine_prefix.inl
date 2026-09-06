@@ -28,6 +28,8 @@ CpuEngine::register_prefix(std::span<const std::int32_t> tokens,
   const bool fp16 = cpu::q8_0_backend_uses_avx2(impl_->model->impl_->backend);
   std::size_t bytes =
       tokens.size() * sizeof(std::int32_t) + d.hidden * sizeof(float);
+  const auto kv_tokens=impl_->config.shared_kv_pages?
+    ((tokens.size()+cpu::KvPagesF16::page_tokens-1)/cpu::KvPagesF16::page_tokens)*cpu::KvPagesF16::page_tokens:tokens.size();
   for (const auto &layer : impl_->model->impl_->weights.layers)
     if (layer.is_linear)
       bytes += (static_cast<std::size_t>(d.linear_kernel - 1) *
@@ -36,8 +38,9 @@ CpuEngine::register_prefix(std::span<const std::int32_t> tokens,
                     d.linear_head_k_dim * d.linear_head_v_dim) *
                sizeof(float);
     else
-      bytes += tokens.size() * d.n_kv_heads * d.head_dim * 2 *
-               (fp16 ? sizeof(std::uint16_t) : sizeof(float));
+      bytes += kv_tokens * d.n_kv_heads * d.head_dim * 2 *
+               (fp16 ? sizeof(std::uint16_t) : sizeof(float))+
+               (impl_->config.shared_kv_pages?tokens.size()*2*sizeof(const std::uint16_t*):0);
   if (!impl_->prefix_room(bytes, error))
     return nullptr;
   try {
@@ -50,6 +53,7 @@ CpuEngine::register_prefix(std::span<const std::int32_t> tokens,
     prefix->model = impl_->model;
     prefix->trust_namespace = std::move(trust_namespace);
     prefix->prefill_chunk_size = impl_->config.prefill_chunk_size;
+    prefix->paged_kv=impl_->config.shared_kv_pages;
     prefix->snapshot.prefix_tokens = sequence.spec.prompt_tokens;
     const std::size_t chunk = impl_->config.prefill_chunk_size
                                   ? impl_->config.prefill_chunk_size

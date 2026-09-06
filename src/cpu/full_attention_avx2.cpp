@@ -199,7 +199,8 @@ void weighted_sum_pair_avx2(
   const std::size_t kv_width,
   const std::size_t head_offset,
   const int sequence_length,
-  const int head_dim) noexcept {
+  const int head_dim,
+  const AttentionKvRows *pages) noexcept {
   int column = 0;
   for (; column + 32 <= head_dim; column += 32) {
     __m256 accum00 = _mm256_setzero_ps();
@@ -213,17 +214,17 @@ void weighted_sum_pair_avx2(
     for (int context = 0; context < sequence_length; ++context) {
       const std::size_t offset = static_cast<std::size_t>(context) * kv_width +
         head_offset + static_cast<std::size_t>(column);
-      const __m256 value0 = v_cache_f16 != nullptr
-        ? _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(v_cache_f16 + offset)))
+      const __m256 value0 = (v_cache_f16 != nullptr || (pages && pages->values))
+        ? _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(attention_cache_row(v_cache_f16, pages ? pages->values : nullptr, context, kv_width) + (offset - static_cast<std::size_t>(context) * kv_width))))
         : _mm256_loadu_ps(v_cache + offset);
-      const __m256 value1 = v_cache_f16 != nullptr
-        ? _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(v_cache_f16 + offset + 8)))
+      const __m256 value1 = (v_cache_f16 != nullptr || (pages && pages->values))
+        ? _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(attention_cache_row(v_cache_f16, pages ? pages->values : nullptr, context, kv_width) + (offset - static_cast<std::size_t>(context) * kv_width) + 8)))
         : _mm256_loadu_ps(v_cache + offset + 8);
-      const __m256 value2 = v_cache_f16 != nullptr
-        ? _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(v_cache_f16 + offset + 16)))
+      const __m256 value2 = (v_cache_f16 != nullptr || (pages && pages->values))
+        ? _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(attention_cache_row(v_cache_f16, pages ? pages->values : nullptr, context, kv_width) + (offset - static_cast<std::size_t>(context) * kv_width) + 16)))
         : _mm256_loadu_ps(v_cache + offset + 16);
-      const __m256 value3 = v_cache_f16 != nullptr
-        ? _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(v_cache_f16 + offset + 24)))
+      const __m256 value3 = (v_cache_f16 != nullptr || (pages && pages->values))
+        ? _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(attention_cache_row(v_cache_f16, pages ? pages->values : nullptr, context, kv_width) + (offset - static_cast<std::size_t>(context) * kv_width) + 24)))
         : _mm256_loadu_ps(v_cache + offset + 24);
       const __m256 probability0 = _mm256_set1_ps(probabilities0[context]);
       const __m256 probability1 = _mm256_set1_ps(probabilities1[context]);
@@ -251,8 +252,8 @@ void weighted_sum_pair_avx2(
     for (int context = 0; context < sequence_length; ++context) {
       const std::size_t offset = static_cast<std::size_t>(context) * kv_width +
         head_offset + static_cast<std::size_t>(column);
-      const float value = v_cache_f16 != nullptr
-        ? f16c_half_to_float(v_cache_f16[offset]) : v_cache[offset];
+      const float value = (v_cache_f16 != nullptr || (pages && pages->values))
+        ? f16c_half_to_float(attention_cache_row(v_cache_f16, pages ? pages->values : nullptr, context, kv_width)[offset - static_cast<std::size_t>(context) * kv_width]) : v_cache[offset];
       accum0 += probabilities0[context] * value;
       accum1 += probabilities1[context] * value;
     }
@@ -293,7 +294,8 @@ void weighted_sum_f32_avx2(
   const std::size_t kv_width,
   const std::size_t head_offset,
   const int sequence_length,
-  const int head_dim) noexcept {
+  const int head_dim,
+  const AttentionKvRows *pages) noexcept {
   int column_base = 0;
   for (; column_base + 64 <= head_dim; column_base += 64) {
     __m256 accum0 = _mm256_setzero_ps();
@@ -309,8 +311,8 @@ void weighted_sum_f32_avx2(
         probabilities[static_cast<std::size_t>(context)]);
       const std::size_t offset = static_cast<std::size_t>(context) * kv_width +
         head_offset + static_cast<std::size_t>(column_base);
-      if (v_cache_f16 != nullptr) {
-        const std::uint16_t * value = v_cache_f16 + offset;
+      if ((v_cache_f16 != nullptr || (pages && pages->values))) {
+        const std::uint16_t * value = attention_cache_row(v_cache_f16, pages ? pages->values : nullptr, context, kv_width) + (offset - static_cast<std::size_t>(context) * kv_width);
         accum0 = _mm256_fmadd_ps(probability, _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(value))), accum0);
         accum1 = _mm256_fmadd_ps(probability, _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(value + 8))), accum1);
         accum2 = _mm256_fmadd_ps(probability, _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(value + 16))), accum2);
@@ -348,9 +350,9 @@ void weighted_sum_f32_avx2(
         probabilities[static_cast<std::size_t>(context)]);
       const std::size_t offset = static_cast<std::size_t>(context) * kv_width +
         head_offset + static_cast<std::size_t>(column_base);
-      const __m256 value = v_cache_f16 != nullptr
+      const __m256 value = (v_cache_f16 != nullptr || (pages && pages->values))
         ? _mm256_cvtph_ps(_mm_loadu_si128(
-            reinterpret_cast<const __m128i *>(v_cache_f16 + offset)))
+            reinterpret_cast<const __m128i *>(attention_cache_row(v_cache_f16, pages ? pages->values : nullptr, context, kv_width) + (offset - static_cast<std::size_t>(context) * kv_width))))
         : _mm256_loadu_ps(v_cache + offset);
       accumulator = _mm256_fmadd_ps(probability, value, accumulator);
     }
@@ -360,8 +362,8 @@ void weighted_sum_f32_avx2(
     float accumulator = 0.0F;
     for (int context = 0; context < sequence_length; ++context) {
       const std::size_t offset = static_cast<std::size_t>(context) * kv_width + head_offset;
-      const float value = v_cache_f16 != nullptr
-        ? f16c_half_to_float(v_cache_f16[offset + static_cast<std::size_t>(column_base)])
+      const float value = (v_cache_f16 != nullptr || (pages && pages->values))
+        ? f16c_half_to_float(attention_cache_row(v_cache_f16, pages ? pages->values : nullptr, context, kv_width)[offset - static_cast<std::size_t>(context) * kv_width + static_cast<std::size_t>(column_base)])
         : v_cache[offset + static_cast<std::size_t>(column_base)];
       accumulator += probabilities[static_cast<std::size_t>(context)] * value;
     }
@@ -413,7 +415,8 @@ void causal_attention_batch_rows_avx2(
   const float attention_scale,
   const std::size_t row_begin,
   const std::size_t row_end,
-  const bool reuse_score_row) noexcept {
+  const bool reuse_score_row,
+  const AttentionKvRows *pages) noexcept {
   const int heads_per_kv = head_count / kv_head_count;
   for (std::size_t row = row_begin; row < row_end; ++row) {
     const std::size_t token = row / static_cast<std::size_t>(head_count);
@@ -431,8 +434,8 @@ void causal_attention_batch_rows_avx2(
     for (int context = 0; context < sequence_length; ++context) {
       const std::size_t cache_offset =
         static_cast<std::size_t>(context) * kv_width + kv_head_offset;
-      const float score = (k_cache_f16 != nullptr
-        ? dot_f16_avx2(query, k_cache_f16 + cache_offset, head_dim)
+      const float score = ((k_cache_f16 != nullptr || (pages && pages->keys))
+        ? dot_f16_avx2(query, attention_cache_row(k_cache_f16, pages ? pages->keys : nullptr, context, kv_width) + (cache_offset - static_cast<std::size_t>(context) * kv_width), head_dim)
         : dot_f32_avx2(query, k_cache + cache_offset, head_dim)) * attention_scale;
       score_row[static_cast<std::size_t>(context)] = score;
       max_score = std::max(max_score, score);
@@ -468,7 +471,7 @@ void causal_attention_batch_rows_avx2(
     float * output_head = output + token * query_width + head_offset;
     weighted_sum_f32_avx2(
       v_cache, v_cache_f16, score_row, output_head, kv_width, kv_head_offset,
-      sequence_length, head_dim);
+      sequence_length, head_dim, pages);
     int gate_column = 0;
     const __m256 zero = _mm256_setzero_ps();
     const __m256 one = _mm256_set1_ps(1.0F);
@@ -510,7 +513,8 @@ void causal_attention_decode_gqa_pairs_avx2(
   const int head_dim,
   const float attention_scale,
   const std::size_t pair_begin,
-  const std::size_t pair_end) noexcept {
+  const std::size_t pair_end,
+  const AttentionKvRows *pages) noexcept {
   const int heads_per_kv = head_count / kv_head_count;
   for (std::size_t pair = pair_begin; pair < pair_end; ++pair) {
     const int head0 = static_cast<int>(pair * 2U);
@@ -531,8 +535,8 @@ void causal_attention_decode_gqa_pairs_avx2(
       const std::size_t offset = static_cast<std::size_t>(context) * kv_width + kv_head_offset;
       float dot0 = 0.0F;
       float dot1 = 0.0F;
-      if (k_cache_f16 != nullptr) {
-        dot_pair_f16_avx2(query0, query1, k_cache_f16 + offset, head_dim, dot0, dot1);
+      if ((k_cache_f16 != nullptr || (pages && pages->keys))) {
+        dot_pair_f16_avx2(query0, query1, attention_cache_row(k_cache_f16, pages ? pages->keys : nullptr, context, kv_width) + (offset - static_cast<std::size_t>(context) * kv_width), head_dim, dot0, dot1);
       } else {
         dot_pair_f32_avx2(query0, query1, k_cache + offset, head_dim, dot0, dot1);
       }
@@ -549,7 +553,7 @@ void causal_attention_decode_gqa_pairs_avx2(
     float * output1 = output + head_offset1;
     weighted_sum_pair_avx2(
       v_cache, v_cache_f16, score0, score1, output0, output1,
-      kv_width, kv_head_offset, sequence_length, head_dim);
+      kv_width, kv_head_offset, sequence_length, head_dim, pages);
     apply_gate_avx2(output0, gates + head_offset0, head_dim);
     apply_gate_avx2(output1, gates + head_offset1, head_dim);
   }

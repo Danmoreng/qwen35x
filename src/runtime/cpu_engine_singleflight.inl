@@ -32,6 +32,8 @@ void publish_prefix(Sequence &s, std::vector<float> hidden) {
   const bool fp16 = cpu::q8_0_backend_uses_avx2(model->impl_->backend);
   std::size_t bytes =
       count * sizeof(std::int32_t) + hidden.size() * sizeof(float);
+  const auto kv_tokens=config.shared_kv_pages?
+    ((count+cpu::KvPagesF16::page_tokens-1)/cpu::KvPagesF16::page_tokens)*cpu::KvPagesF16::page_tokens:count;
   for (const auto &layer : model->impl_->weights.layers)
     if (layer.is_linear)
       bytes += (static_cast<std::size_t>(d.linear_kernel - 1) *
@@ -40,8 +42,9 @@ void publish_prefix(Sequence &s, std::vector<float> hidden) {
                     d.linear_head_k_dim * d.linear_head_v_dim) *
                sizeof(float);
     else
-      bytes += count * d.n_kv_heads * d.head_dim * 2 *
-               (fp16 ? sizeof(std::uint16_t) : sizeof(float));
+      bytes += kv_tokens * d.n_kv_heads * d.head_dim * 2 *
+               (fp16 ? sizeof(std::uint16_t) : sizeof(float))+
+               (config.shared_kv_pages?count*2*sizeof(const std::uint16_t*):0);
   std::string ignored;
   bool published = false;
   if (prefix_room(bytes, ignored))
@@ -50,6 +53,7 @@ void publish_prefix(Sequence &s, std::vector<float> hidden) {
       snapshot->model = model;
       snapshot->trust_namespace = s.spec.trust_namespace;
       snapshot->prefill_chunk_size = config.prefill_chunk_size;
+      snapshot->paged_kv=config.shared_kv_pages;
       snapshot->snapshot.prefix_tokens.assign(
           s.spec.prompt_tokens.begin(), s.spec.prompt_tokens.begin() + count);
       snapshot->final_hidden = std::move(hidden);

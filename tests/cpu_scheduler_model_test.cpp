@@ -19,7 +19,7 @@ bool terminal(CpuRequestStatus status) {
 }
 } // namespace
 int main(int argc, char **argv) try {
-  if (argc != 3)
+  if (argc != 3 && argc != 4)
     throw std::runtime_error(
         "Usage: cpu_scheduler_model_test <HF directory> <Q4 artifact>");
   std::string error;
@@ -40,6 +40,10 @@ int main(int argc, char **argv) try {
   config.max_context = 2048;
   auto reference = CpuEngine::create(model, config, error);
   check(bool(reference));
+  if(argc==4) {
+    check(std::string(argv[3])=="--pages");
+    config.shared_kv_pages=true;
+  }
   config.max_queued_requests = 8;
   config.max_decode_batch_size = 2;
   config.max_buffered_tokens = 2;

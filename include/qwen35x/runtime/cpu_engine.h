@@ -54,6 +54,8 @@ struct CpuEngineConfig {
   std::size_t max_queued_requests = 0;
   std::size_t max_decode_batch_size = 32;
   std::size_t max_buffered_tokens = 256;
+  // Opt-in FP16 shared prefix pages; contiguous caches remain the reference.
+  bool shared_kv_pages = false;
 };
 struct CpuRequestSpec {
   std::vector<std::int32_t> prompt_tokens;
@@ -93,6 +95,7 @@ struct CpuEngineStats {
   std::uint64_t state_batches = 0;
   std::size_t queued_requests = 0, resident_requests = 0;
   std::uint64_t prefix_builds = 0, prefix_build_fallbacks = 0;
+  std::size_t physical_kv_bytes = 0;
 };
 
 // One owner calls these methods serially. Each engine owns one executor and
