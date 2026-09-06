@@ -48,7 +48,11 @@ struct CpuEngine::Impl {
     std::vector<float> x, normed, projected, core, row, attention, residual;
     std::vector<float> post_norm, gate_up, mlp_hidden, mlp_output, final_hidden;
     std::vector<float> logits;
+    std::vector<cpu::Q4_0ArgmaxResult> greedy_results;
+    std::vector<int> greedy_tokens;
   } batch;
+
+#include "cpu_engine_greedy.inl"
 
   bool forward_batch(std::span<Sequence *> rows, std::string &error) {
     const auto &d = model->impl_->dims;
@@ -137,7 +141,20 @@ struct CpuEngine::Impl {
     }
     rms_norm_qwen3next_batch(b.x, count, hidden, w.final_norm, d.rms_eps,
                              b.final_hidden);
-    if (!project(w.embed_tokens, b.final_hidden, b.logits))
+    const bool greedy =
+        config.batch_greedy &&
+        std::all_of(rows.begin(), rows.end(), [](const auto *s) {
+          return s->spec.sampling.temperature <= 1e-6F &&
+                 s->spec.forced_output_tokens.empty() &&
+                 !s->spec.logits_callback;
+        });
+    b.greedy_tokens.clear();
+    if (greedy) {
+      if (!greedy_batch(rows, error))
+        return false;
+      ++stats.projection_batches;
+      ++stats.greedy_lm_head_batches;
+    } else if (!project(w.embed_tokens, b.final_hidden, b.logits))
       return false;
     ++stats.lm_head_batches;
     return true;
@@ -408,10 +425,13 @@ bool CpuEngine::advance_batch(std::span<const CpuRequestId> ids,
     ++s.result.decode_forwards;
     // Attribution only, not a substitute for common wall-clock throughput.
     s.result.decode_ms += ms / rows.size();
-    s.logits.assign(impl_->batch.logits.data() + r * vocab,
-                    impl_->batch.logits.data() + (r + 1) * vocab);
+    const bool greedy = !impl_->batch.greedy_tokens.empty();
+    if (!greedy)
+      s.logits.assign(impl_->batch.logits.data() + r * vocab,
+                      impl_->batch.logits.data() + (r + 1) * vocab);
     std::string local_error;
-    if (!impl_->select(s, -1, local_error)) {
+    if (!impl_->select(s, greedy ? impl_->batch.greedy_tokens[r] : -1,
+                       local_error)) {
       s.result.status = CpuRequestStatus::failed;
       s.result.error = local_error;
       if (error.empty())

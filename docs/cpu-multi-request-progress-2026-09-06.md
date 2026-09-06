@@ -101,7 +101,33 @@ is 2265.47 versus 2256.59 for baseline. These noisy runs do not show a material
 single-request regression. Raw records:
 `benchmarks/cpu-experiments-2026-09-06/multi-static-single-confirm`.
 
+## Step 2b: Shared greedy vocabulary reduction
+
+For all-greedy batches, prepare each activation once, scan shared vocabulary
+tiles, and reduce private repetition-penalized maxima with lowest-token tie
+breaking. Each worker uses a small local logits tile instead of writing and
+rereading full vocabulary rows. General sampling, forced tokens and callbacks
+retain full logits. The batch greedy path is enabled by default and can be
+disabled explicitly for comparison.
+
+P512, eight threads, 0xffff, sequential A/B/B/A with three measured runs and
+one warmup per leg (six samples per path):
+
+| B | Full logits token/s | Greedy tiles token/s | Gain | Tick p50 before / after (ms) |
+|---:|---:|---:|---:|---:|
+| 4 | 318.51 | 338.39 | +6.2% | 12.54 / 11.80 |
+| 16 | 501.77 | 566.48 | +12.9% | 31.75 / 28.24 |
+
+Every 128-token request output matches the full-logits reference in every
+measured run. The full-model test also compares 32 greedy outputs with a 1.2
+repetition penalty at B=3/4/5/16/17, reverses row order between ticks and checks
+that the shared greedy LM-head ran on all 31 decode ticks. All cases pass;
+the existing complete-logit/isolation tests continue to pass.
+
+[Samples](cpu-multi-request-greedy-2026-09-06-samples.csv) ·
+[Binary hashes and settings](cpu-multi-request-greedy-2026-09-06-metadata.json).
+
 ## Next
 
-Test thread count and both cache domains for larger batches, then evaluate
-batched greedy vocabulary reduction separately. Steps 3-7 remain pending.
+Confirm thread/topology effects at batch boundaries and test joint dispatch of
+private state updates. Steps 3-7 remain pending.

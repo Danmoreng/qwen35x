@@ -140,7 +140,8 @@ int main(int argc, char **argv) {
       request.logits_callback_context = &actual[r];
       ids.push_back(batched->submit(request, error));
       do {
-        if (!batched->advance(ids.back(), error)) return 12;
+        if (!batched->advance(ids.back(), error))
+          return 12;
         batched->result(ids.back(), result);
       } while (result.status == CpuRequestStatus::prefill);
     }
@@ -179,6 +180,48 @@ int main(int argc, char **argv) {
         stats.projection_batches != stats.batch_ticks * (24 * 4 + 1))
       return 16;
     std::cout << "Exact multi-request logits and sampling B=" << size << '\n';
+  }
+  for (int size : {3, 4, 5, 16, 17}) {
+    std::vector<std::vector<std::int32_t>> expected(size);
+    for (bool tiled : {false, true}) {
+      CpuEngineConfig cfg;
+      cfg.max_context = 512;
+      cfg.batch_greedy = tiled;
+      auto run = CpuEngine::create(model, cfg, error);
+      std::vector<CpuRequestId> ids;
+      for (int r = 0; r < size; ++r) {
+        CpuRequestSpec request;
+        request.prompt_tokens.assign(3 + r % 5, r + 1);
+        request.max_new_tokens = 32;
+        request.sampling.temperature = 0;
+        request.sampling.repetition_penalty = 1.2F;
+        ids.push_back(run->submit(std::move(request), error));
+        if (!run->advance(ids.back(), error))
+          return 17;
+      }
+      for (int tick = 1; tick < 32; ++tick) {
+        std::reverse(ids.begin(), ids.end());
+        if (!run->advance_batch(ids, error)) {
+          std::cerr << error;
+          return 18;
+        }
+      }
+      std::sort(ids.begin(), ids.end());
+      for (int r = 0; r < size; ++r) {
+        CpuRequestResult result;
+        run->result(ids[r], result);
+        if (!tiled)
+          expected[r] = result.output_tokens;
+        else if (result.output_tokens != expected[r]) {
+          std::cerr << "Greedy tile mismatch B=" << size << " row=" << r
+                    << '\n';
+          return 19;
+        }
+      }
+      if (tiled && run->stats().greedy_lm_head_batches != 31)
+        return 20;
+    }
+    std::cout << "Shared greedy vocabulary tiles B=" << size << " passed\n";
   }
   CpuRequestSpec spec;
   spec.prompt_tokens = {1};

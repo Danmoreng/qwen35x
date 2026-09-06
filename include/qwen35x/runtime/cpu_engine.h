@@ -28,6 +28,9 @@ struct CpuEngineConfig {
   std::size_t max_resident_requests = 32;
   std::size_t max_context = 8192;
   std::size_t prefill_chunk_size = 0;
+  // Shared vocabulary-tile reduction for all-greedy batches. False preserves
+  // the full-logits reference. General sampling/callbacks always use logits.
+  bool batch_greedy = true;
 };
 struct CpuRequestSpec {
   std::vector<std::int32_t> prompt_tokens;
@@ -55,6 +58,7 @@ struct CpuRequestResult {
 struct CpuEngineStats {
   std::uint64_t batch_ticks = 0, batch_rows = 0;
   std::uint64_t projection_batches = 0, lm_head_batches = 0;
+  std::uint64_t greedy_lm_head_batches = 0;
 };
 
 // One owner calls these methods serially. Each engine owns one executor and

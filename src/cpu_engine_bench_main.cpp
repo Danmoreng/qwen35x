@@ -60,6 +60,14 @@ int main(int argc, char **argv) try {
     const std::string arg = argv[i];
     if (arg == "--infer-reference")
       continue;
+    if (arg == "--cpu-batch-greedy") {
+      config.batch_greedy = true;
+      continue;
+    }
+    if (arg == "--cpu-batch-full-logits") {
+      config.batch_greedy = false;
+      continue;
+    }
     if (arg == "--cpu-batch-serial") {
       serial = true;
       continue;
@@ -226,6 +234,7 @@ int main(int argc, char **argv) try {
       << ",\"batch_rows\":" << stats.batch_rows
       << ",\"projection_batches\":" << stats.projection_batches
       << ",\"lm_head_batches\":" << stats.lm_head_batches
+      << ",\"greedy_lm_head_batches\":" << stats.greedy_lm_head_batches
       << ",\"cpu_kv_cache\":\""
       << (cpu::q8_0_backend_uses_avx2(options.cpu_q8_backend) ? "fp16" : "fp32")
       << "\",\"requests\":[";

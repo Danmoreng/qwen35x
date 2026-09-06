@@ -1,0 +1,98 @@
+{
+  "p512-b16-0-base": {
+    "revision": "7aeb231547c90e7d047367684fa9e432b93ae9b3",
+    "threads": 8,
+    "affinity": 65535,
+    "executable": "benchmarks/multi-request-2026-09-06/static-full-logits.exe",
+    "executable_sha256": "13C74F742FE284459E82F0B4457DB6F9D5C99562B603F41C75DCC28DCB2D3E90",
+    "fixture": "configs/qwen3_5_0_8b_text_1024x512_tokens.csv",
+    "prompt_rule": "Repeat/truncate fixture; request r increments final prompt token by r modulo vocabulary.",
+    "timing": "Decode after all first tokens; actual B*(N-1) forwards over common wall time including sampling and loop.",
+    "greedy_tiles": false,
+    "serial_reference": false
+  },
+  "p512-b16-1-candidate": {
+    "revision": "7aeb231547c90e7d047367684fa9e432b93ae9b3",
+    "threads": 8,
+    "affinity": 65535,
+    "executable": "benchmarks/multi-request-2026-09-06/greedy-experiment.exe",
+    "executable_sha256": "88797BBFC160E53E3BEE34D73D19B4A244748086838FB97F1542A5A18A5106A3",
+    "fixture": "configs/qwen3_5_0_8b_text_1024x512_tokens.csv",
+    "prompt_rule": "Repeat/truncate fixture; request r increments final prompt token by r modulo vocabulary.",
+    "timing": "Decode after all first tokens; actual B*(N-1) forwards over common wall time including sampling and loop.",
+    "greedy_tiles": true,
+    "serial_reference": false
+  },
+  "p512-b16-2-candidate": {
+    "revision": "7aeb231547c90e7d047367684fa9e432b93ae9b3",
+    "threads": 8,
+    "affinity": 65535,
+    "executable": "benchmarks/multi-request-2026-09-06/greedy-experiment.exe",
+    "executable_sha256": "88797BBFC160E53E3BEE34D73D19B4A244748086838FB97F1542A5A18A5106A3",
+    "fixture": "configs/qwen3_5_0_8b_text_1024x512_tokens.csv",
+    "prompt_rule": "Repeat/truncate fixture; request r increments final prompt token by r modulo vocabulary.",
+    "timing": "Decode after all first tokens; actual B*(N-1) forwards over common wall time including sampling and loop.",
+    "greedy_tiles": true,
+    "serial_reference": false
+  },
+  "p512-b16-3-base": {
+    "revision": "7aeb231547c90e7d047367684fa9e432b93ae9b3",
+    "threads": 8,
+    "affinity": 65535,
+    "executable": "benchmarks/multi-request-2026-09-06/static-full-logits.exe",
+    "executable_sha256": "13C74F742FE284459E82F0B4457DB6F9D5C99562B603F41C75DCC28DCB2D3E90",
+    "fixture": "configs/qwen3_5_0_8b_text_1024x512_tokens.csv",
+    "prompt_rule": "Repeat/truncate fixture; request r increments final prompt token by r modulo vocabulary.",
+    "timing": "Decode after all first tokens; actual B*(N-1) forwards over common wall time including sampling and loop.",
+    "greedy_tiles": false,
+    "serial_reference": false
+  },
+  "p512-b4-0-base": {
+    "revision": "7aeb231547c90e7d047367684fa9e432b93ae9b3",
+    "threads": 8,
+    "affinity": 65535,
+    "executable": "benchmarks/multi-request-2026-09-06/static-full-logits.exe",
+    "executable_sha256": "13C74F742FE284459E82F0B4457DB6F9D5C99562B603F41C75DCC28DCB2D3E90",
+    "fixture": "configs/qwen3_5_0_8b_text_1024x512_tokens.csv",
+    "prompt_rule": "Repeat/truncate fixture; request r increments final prompt token by r modulo vocabulary.",
+    "timing": "Decode after all first tokens; actual B*(N-1) forwards over common wall time including sampling and loop.",
+    "greedy_tiles": false,
+    "serial_reference": false
+  },
+  "p512-b4-1-candidate": {
+    "revision": "7aeb231547c90e7d047367684fa9e432b93ae9b3",
+    "threads": 8,
+    "affinity": 65535,
+    "executable": "benchmarks/multi-request-2026-09-06/greedy-experiment.exe",
+    "executable_sha256": "88797BBFC160E53E3BEE34D73D19B4A244748086838FB97F1542A5A18A5106A3",
+    "fixture": "configs/qwen3_5_0_8b_text_1024x512_tokens.csv",
+    "prompt_rule": "Repeat/truncate fixture; request r increments final prompt token by r modulo vocabulary.",
+    "timing": "Decode after all first tokens; actual B*(N-1) forwards over common wall time including sampling and loop.",
+    "greedy_tiles": true,
+    "serial_reference": false
+  },
+  "p512-b4-2-candidate": {
+    "revision": "7aeb231547c90e7d047367684fa9e432b93ae9b3",
+    "threads": 8,
+    "affinity": 65535,
+    "executable": "benchmarks/multi-request-2026-09-06/greedy-experiment.exe",
+    "executable_sha256": "88797BBFC160E53E3BEE34D73D19B4A244748086838FB97F1542A5A18A5106A3",
+    "fixture": "configs/qwen3_5_0_8b_text_1024x512_tokens.csv",
+    "prompt_rule": "Repeat/truncate fixture; request r increments final prompt token by r modulo vocabulary.",
+    "timing": "Decode after all first tokens; actual B*(N-1) forwards over common wall time including sampling and loop.",
+    "greedy_tiles": true,
+    "serial_reference": false
+  },
+  "p512-b4-3-base": {
+    "revision": "7aeb231547c90e7d047367684fa9e432b93ae9b3",
+    "threads": 8,
+    "affinity": 65535,
+    "executable": "benchmarks/multi-request-2026-09-06/static-full-logits.exe",
+    "executable_sha256": "13C74F742FE284459E82F0B4457DB6F9D5C99562B603F41C75DCC28DCB2D3E90",
+    "fixture": "configs/qwen3_5_0_8b_text_1024x512_tokens.csv",
+    "prompt_rule": "Repeat/truncate fixture; request r increments final prompt token by r modulo vocabulary.",
+    "timing": "Decode after all first tokens; actual B*(N-1) forwards over common wall time including sampling and loop.",
+    "greedy_tiles": false,
+    "serial_reference": false
+  }
+}

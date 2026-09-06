@@ -46,6 +46,13 @@ shared KV pages. Those are subsequent stages in the
 
 ## Reproducible static decode measurement
 
+All-greedy batches now reduce shared vocabulary tiles directly, avoiding full
+logit storage. Penalties and tie breaking remain request-local. General
+sampling, forced-token tests and logits callbacks use the full-logits path.
+Set `CpuEngineConfig::batch_greedy = false` or pass `-FullLogits` to the batch
+benchmark wrapper to retain that reference explicitly. B=1 keeps its existing
+fused greedy path regardless of this batch-only option.
+
 Build `qwen35x_cpu_engine_bench` with `scripts/build.ps1 -BuildAll`. The benchmark
 uses explicit token IDs, initializes prompts individually and starts the common
 decode timer after every request has produced its first token. It counts actual

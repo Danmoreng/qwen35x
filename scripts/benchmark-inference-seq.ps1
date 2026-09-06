@@ -11,6 +11,8 @@ param(
     [int]$CpuThreads = 0,
     [ValidateRange(0, 100)][int]$CpuBatch = 0,
     [switch]$CpuBatchSerial,
+    [switch]$CpuBatchGreedy,
+    [switch]$CpuBatchFullLogits,
     [ValidateSet("auto", "scalar", "avx2", "avx-vnni", "avx512", "avx512-vnni")]
     [string]$CpuIsa = "auto",
     [switch]$CpuIsaStrict,
@@ -205,6 +207,8 @@ function Invoke-BenchmarkRun {
         if ($Mode -ne "cpu-h128") { throw "CpuBatch requires cpu-h128 mode." }
         $args += @("--cpu-batch", "$script:CpuBatch")
         if ($script:CpuBatchSerial) { $args += "--cpu-batch-serial" }
+        if ($script:CpuBatchGreedy) { $args += "--cpu-batch-greedy" }
+        if ($script:CpuBatchFullLogits) { $args += "--cpu-batch-full-logits" }
     }
     switch ($Mode) {
         "gpu-bf16" {
@@ -536,6 +540,7 @@ foreach ($mode in $Modes) {
                 peak_rss_bytes = To-OptionalInvariantString (Get-JsonProperty $profile "peak_rss_bytes")
                 batch_rows = To-OptionalInvariantString (Get-JsonProperty $profile "batch_rows")
                 lm_head_batches = To-OptionalInvariantString (Get-JsonProperty $profile "lm_head_batches")
+                greedy_lm_head_batches = To-OptionalInvariantString (Get-JsonProperty $profile "greedy_lm_head_batches")
                 cpu_kv_cache     = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "cpu_kv_cache")
                 cpu_attention_kernel = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "cpu_attention_kernel")
                 cached_prefix_tokens = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "cached_prefix_tokens")
