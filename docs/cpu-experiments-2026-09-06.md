@@ -74,4 +74,78 @@ Experimental patches remain under `benchmarks/cpu-experiments-2026-09-06`.
 
 ## 4. Intel AVX2 LUT experiment
 
-Pending. H256 remains deferred.
+Implemented and tested a bounded **exact int16 LUT prototype for the LM-head**,
+not a complete T-MAC backend. It uses four bit-planes of the unchanged Q4
+codes, 16 subset sums for each four Q8 activations, byte-shuffle lookups and
+exact int32 accumulation. FP16 scales and the FP32 FMA order are unchanged.
+The packed payload remains 144 bytes per eight rows / 32 columns.
+
+For this prototype the LM-head's bit-plane matrix is prepared once before timed
+prefill/decode; original DOT4 embedding/prefill storage is also retained (about
+136.41 MiB additional resident weights). Activation tables are built once per
+LM-head call and shared by its workers. Conversion/loading and SSH transfer
+are excluded from inference timing. A production adoption would require its
+own checkpoint encoding rather than the prototype's extra runtime packing.
+
+Machine: Intel i7-8750H, GCC 15.2, Linux, CPU Release. Sequential measurements
+use the **same PowerShell benchmark-inference-seq.ps1 runner on Windows**, with
+an executable adapter invoking SSH and copying back the engine's profile JSON.
+The runner's reported times are the remote engine's internal elapsed intervals.
+Six-thread tests bind to CPUs 0-5 (one logical CPU per physical core); twelve
+threads bind to CPUs 0-11. Both variants use the same mask within a comparison.
+AVX2 is requested strictly, FP16 KV, P128, 128 greedy output tokens, context256.
+ABBA with three measured runs plus one warmup per leg; six samples per cell.
+
+| Threads | Existing DOT4 token/s | LUT prototype token/s | Change |
+|---|---:|---:|---:|
+| 6 | 65.83 | 53.19 | -19.21% |
+| 12 | 64.38 | 51.43 | -20.11% |
+
+**Rejected and reverted on both machines.** The extra lookup work and table
+traffic are plausible costs, but these timings alone do not prove which one
+causes the regression. No claim is made that every LUT design or a fully tuned
+T-MAC backend is slower. Six threads are faster than twelve in this measured
+configuration; this is not a universal thread-count default.
+
+Validation on Intel: all 72 LUT shape/pattern cases inside the DOT4 test pass
+against the existing AVX2 kernel bit-for-bit (extreme -128/127 activations,
+zero/negative scales, random weights; argmax also checked). The surrounding
+DOT4 suite reports 144 backend cases. Full-vocabulary model logits for P65/P257
+plus three forced outputs are byte-identical. The persistent-session test with
+FP16/FP32 switching, prefix replay and diagnostic toggling passes. All 24
+recorded benchmark runs produce identical 128-token greedy continuations.
+
+Source for reproduction is retained as separate experimental patches:
+
+- [Thread participants](experiments/cpu-workload-participants-2026-09-06.patch)
+- [Four-chain prefill](experiments/cpu-chains4-prefill-2026-09-06.patch)
+- [Intel LUT](experiments/cpu-avx2-lut-2026-09-06.patch)
+
+Apply each independently to production source at 7c75993 (or af53d38) in a
+separate checkout. The LUT patch is an x64/AVX2 research build, not a portable
+production backend; enable with QWEN35X_EXPERIMENT_LUT=1. Build through
+scripts/build.sh --ninja --no-cuda --all on Linux. Normal inference source
+contains none of these experimental switches after reversion.
+
+Baseline Intel executable SHA-256:
+`732ea20dc8f5191d629ac500f3639e764207d68b86871e3147008d108d658e55`.
+LUT executable SHA-256:
+`25c5a234f6c4756081a84985d79eb2bc01ccd516ae2a4baadf71a88d0730abdd`.
+Both use the checkpoint SHA-256
+`e73de30bf646dee502dd5e519939221f7d2b60068ccbbe16dc1701597919c42f`.
+
+## Outcome
+
+The diagnostic facility is retained; none of the three measured optimization
+candidates demonstrated a reliable improvement and none changes production
+inference. This completes these four experiments, not every possible CPU
+optimization. H256 remains deferred.
+
+Final validation after reverting the candidates: normal CUDA-enabled Windows
+Release build and Linux CPU Release build both succeed; all nine CTest suites
+and the full-model cache/precision/diagnostic regression pass on both hosts.
+The checked-in [Ryzen samples](cpu-experiments-2026-09-06-samples.csv),
+[Intel samples](cpu-experiments-2026-09-06-intel-samples.csv) and
+[diagnostic aggregates](cpu-experiments-2026-09-06-diagnostics.json) retain the
+results. In the aggregate JSON, full-attention columns=0 groups its varying
+context lengths; it does not indicate a zero-width executed operation.

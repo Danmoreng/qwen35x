@@ -1,0 +1,266 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b8d8231..90355a8 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -81,7 +81,7 @@ if (QWEN35X_SYSTEM_PROCESSOR_LOWER MATCHES "^(x86_64|amd64|i[3-6]86)$" OR
+   if (MSVC)
+     set(QWEN35X_Q8_0_HAS_AVX2_TU ON)
+     set_source_files_properties(
+-      src/cpu/activation_avx2.cpp src/cpu/q4_0_avx2.cpp src/cpu/q4_dot4_avx2.cpp src/cpu/q4_h128_avx2.cpp src/cpu/q8_0_avx2.cpp src/cpu/delta_net_avx2.cpp src/cpu/full_attention_avx2.cpp src/cpu/full_attention_tiled_avx2.cpp
++      src/cpu/activation_avx2.cpp src/cpu/q4_0_avx2.cpp src/cpu/q4_dot4_avx2.cpp src/cpu/lut_q4_avx2.cpp src/cpu/q4_h128_avx2.cpp src/cpu/q8_0_avx2.cpp src/cpu/delta_net_avx2.cpp src/cpu/full_attention_avx2.cpp src/cpu/full_attention_tiled_avx2.cpp
+       PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+     # The AVX-VNNI intrinsic spellings used by the isolated backend are
+     # available in the VS 2022 toolset. Older MSVCs keep the AVX2 backend.
+@@ -102,7 +102,7 @@ if (QWEN35X_SYSTEM_PROCESSOR_LOWER MATCHES "^(x86_64|amd64|i[3-6]86)$" OR
+   elseif (CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
+     set(QWEN35X_Q8_0_HAS_AVX2_TU ON)
+     set_source_files_properties(
+-      src/cpu/activation_avx2.cpp src/cpu/q4_0_avx2.cpp src/cpu/q4_dot4_avx2.cpp src/cpu/q4_h128_avx2.cpp src/cpu/q8_0_avx2.cpp src/cpu/delta_net_avx2.cpp src/cpu/full_attention_avx2.cpp src/cpu/full_attention_tiled_avx2.cpp
++      src/cpu/activation_avx2.cpp src/cpu/q4_0_avx2.cpp src/cpu/q4_dot4_avx2.cpp src/cpu/lut_q4_avx2.cpp src/cpu/q4_h128_avx2.cpp src/cpu/q8_0_avx2.cpp src/cpu/delta_net_avx2.cpp src/cpu/full_attention_avx2.cpp src/cpu/full_attention_tiled_avx2.cpp
+       PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-mtune=skylake")
+     check_cxx_compiler_flag("-mavxvnni" QWEN35X_COMPILER_HAS_MAVXVNNI)
+     if (QWEN35X_COMPILER_HAS_MAVXVNNI)
+@@ -132,7 +132,7 @@ endif ()
+ if (QWEN35X_Q8_0_HAS_AVX2_TU)
+   target_sources(
+     qwen35x_core PRIVATE
+-    src/cpu/activation_avx2.cpp src/cpu/q4_0_avx2.cpp src/cpu/q4_dot4_avx2.cpp src/cpu/q4_h128_avx2.cpp src/cpu/q8_0_avx2.cpp src/cpu/delta_net_avx2.cpp src/cpu/full_attention_avx2.cpp src/cpu/full_attention_tiled_avx2.cpp)
++    src/cpu/activation_avx2.cpp src/cpu/q4_0_avx2.cpp src/cpu/q4_dot4_avx2.cpp src/cpu/lut_q4_avx2.cpp src/cpu/q4_h128_avx2.cpp src/cpu/q8_0_avx2.cpp src/cpu/delta_net_avx2.cpp src/cpu/full_attention_avx2.cpp src/cpu/full_attention_tiled_avx2.cpp)
+   target_compile_definitions(qwen35x_core PRIVATE QWEN35X_Q8_0_HAS_AVX2_TU=1)
+ else ()
+   target_compile_definitions(qwen35x_core PRIVATE QWEN35X_Q8_0_HAS_AVX2_TU=0)
+diff --git a/src/runtime/reference_inference.cpp b/src/runtime/reference_inference.cpp
+index 660da27..9224ea5 100644
+--- a/src/runtime/reference_inference.cpp
++++ b/src/runtime/reference_inference.cpp
+@@ -1,3 +1,4 @@
++#include "qwen35x/cpu/lut_q4.h"
+ #include "qwen35x/runtime/reference_inference.h"
+ 
+ #include "qwen35x/cpu/activation.h"
+diff --git a/src/runtime/reference_inference_api.inl b/src/runtime/reference_inference_api.inl
+index a649920..83c997b 100644
+--- a/src/runtime/reference_inference_api.inl
++++ b/src/runtime/reference_inference_api.inl
+@@ -452,6 +452,13 @@ bool run_reference_qwen35_inference(
+     return false;
+   }
+   ModelWeights & weights = *weights_ptr;
++  // Prototype only: amortized conversion before timed prefill/decode, retaining
++  // DOT4 embedding/prefill weights. A production winner needs an artifact ID.
++  if(std::getenv("QWEN35X_EXPERIMENT_LUT") && weights.embed_tokens.q4_dot4 &&
++     cpu::q8_0_backend_uses_avx2(weights.embed_tokens.q8_0_backend) && weights.embed_tokens.lut_weights.empty()) {
++    auto &w=weights.embed_tokens;w.lut_weights.resize(w.packed_q4_0_blocks.size());
++    cpu::lut_q4_pack(w.packed_q4_0_blocks.data(),w.lut_weights.data(),w.lut_weights.size());
++  }
+   if (options.use_cuda && !upload_model_weights_to_cuda(weights, use_cuda_matvec_bf16, error_message)) {
+     release_model_weights_cuda(weights);
+     return false;
+diff --git a/src/runtime/reference_inference_internal_weights_workspace.inl b/src/runtime/reference_inference_internal_weights_workspace.inl
+index 3e1d967..0e7e689 100644
+--- a/src/runtime/reference_inference_internal_weights_workspace.inl
++++ b/src/runtime/reference_inference_internal_weights_workspace.inl
+@@ -47,6 +47,7 @@ struct CpuQ8Runtime {
+   std::vector<float> q4_h128_transform_scratch;
+   std::vector<cpu::Q8_0Block> quantized_input;
+   std::vector<cpu::Q8_0BlockX1> prepared_q4_input;
++  std::vector<cpu::LutQ8Block> prepared_lut;
+   std::vector<cpu::Q8_0Block> quantized_batch;
+   std::vector<float> quantized_batch_scales;
+   std::vector<cpu::Q8_0BlockX4> packed_q8_0_batch;
+@@ -90,6 +91,7 @@ struct TensorData {
+   std::vector<float> data;
+   std::vector<cpu::Q4_0Block> q4_0_blocks;
+   std::vector<cpu::Q4_0BlockX8> packed_q4_0_blocks;
++  std::vector<cpu::LutQ4Block> lut_weights;
+   std::vector<float> q4_0_scales;
+   std::vector<cpu::Q8_0Block> q8_0_blocks;
+   std::vector<float> q8_0_scales;
+@@ -252,6 +254,27 @@ void run_packed_q4_argmax_tiles(
+       job.backend);
+ }
+ 
++struct LutProjectionJob {
++  const cpu::LutQ4Block *weights;
++  const cpu::LutQ8Block *input;
++  float *output;
++  cpu::Q4_0ArgmaxResult *results;
++  const int *counts;
++  float penalty;
++  std::size_t blocks, tiles, partitions;
++};
++void run_lut_projection(void *ctx, std::size_t begin, std::size_t end) noexcept {
++  auto &j=*static_cast<LutProjectionJob*>(ctx);
++  if(j.output) {
++    cpu::lut_q4_matvec(j.weights+begin*j.blocks,j.input,j.output+begin*8,(end-begin)*8,j.blocks);
++  } else {
++    std::size_t p=0;
++    for(;p+1<j.partitions;++p)
++      if(p*(j.tiles/j.partitions)+std::min(p,j.tiles%j.partitions)==begin) break;
++    j.results[p]=cpu::lut_q4_argmax(j.weights+begin*j.blocks,j.input,j.counts,j.penalty,begin*8,(end-begin)*8,j.blocks);
++  }
++}
++
+ struct FullAttentionWeights {
+   TensorData q_proj;
+   TensorData k_proj;
+@@ -1262,6 +1285,15 @@ bool matvec_2d(
+           prepared_input.data(), error_message)) {
+       return false;
+     }
++    if(!w.lut_weights.empty() && w.q8_0_runtime && w.q8_0_runtime->executor) {
++      auto &rt=*w.q8_0_runtime;
++      rt.prepared_lut.resize(blocks_per_row);
++      cpu::lut_q8_prepare(prepared_input.data(),rt.prepared_lut.data(),blocks_per_row);
++      probe.prepared(); out.resize(rows);
++      LutProjectionJob job{w.lut_weights.data(),rt.prepared_lut.data(),out.data(),nullptr,nullptr,1.0F,
++        blocks_per_row,static_cast<std::size_t>(rows)/8,rt.executor->thread_count()};
++      return rt.executor->parallel_for_rows(job.tiles,run_lut_projection,&job,probe.executor_timing())==cpu::CpuExecutorStatus::ok;
++    }
+     probe.prepared();
+     out.resize(static_cast<std::size_t>(rows));
+     if (w.q8_0_runtime != nullptr && w.q8_0_runtime->executor != nullptr) {
+@@ -1384,6 +1416,19 @@ bool greedy_q4_token(
+     return false;
+   }
+ 
++  if(!weights.lut_weights.empty()) {
++    runtime.prepared_lut.resize(blocks_per_row);
++    cpu::lut_q8_prepare(runtime.prepared_q4_input.data(),runtime.prepared_lut.data(),blocks_per_row);
++    probe.prepared();
++    const auto participants=std::min(row_tiles,runtime.executor->thread_count());
++    runtime.greedy_results.assign(participants,cpu::Q4_0ArgmaxResult{-std::numeric_limits<float>::infinity(),0});
++    LutProjectionJob job{weights.lut_weights.data(),runtime.prepared_lut.data(),nullptr,runtime.greedy_results.data(),
++      token_counts.data(),repetition_penalty,blocks_per_row,row_tiles,participants};
++    if(runtime.executor->parallel_for_rows(row_tiles,run_lut_projection,&job,probe.executor_timing())!=cpu::CpuExecutorStatus::ok) return false;
++    cpu::Q4_0ArgmaxResult best{-std::numeric_limits<float>::infinity(),0};
++    for(const auto candidate:runtime.greedy_results) if(candidate.value>best.value) best=candidate;
++    out_token=static_cast<int>(best.index);return true;
++  }
+   probe.prepared();
+   runtime.greedy_results.assign(
+     runtime.executor->thread_count(),
+diff --git a/tests/q4_dot4_test.cpp b/tests/q4_dot4_test.cpp
+index 4839bf5..c84e325 100644
+--- a/tests/q4_dot4_test.cpp
++++ b/tests/q4_dot4_test.cpp
+@@ -1,3 +1,4 @@
++#include "qwen35x/cpu/lut_q4.h"
+ #include "qwen35x/cpu/q4_dot4.h"
+ #include <algorithm>
+ #include <cmath>
+@@ -70,6 +71,16 @@ int main() {
+         for (std::size_t i = 0; i < counts.size(); i += 3) counts[i] = 2;
+         const auto expected_best = q4_0_packed_matvec_prepared_q8_0_argmax(
+           legacy.data(), vector.data(), counts.data(), 1.05F, 7, rows, blocks, reference_backend);
++        if (q8_0_backend_available(Q8_0Backend::avx2)) {
++          std::vector<LutQ4Block> lut_weights(dot4.size());
++          std::vector<LutQ8Block> lut_input(blocks);
++          lut_q4_pack(dot4.data(),lut_weights.data(),dot4.size());
++          lut_q8_prepare(vector.data(),lut_input.data(),blocks);
++          lut_q4_matvec(lut_weights.data(),lut_input.data(),actual.data(),rows,blocks);
++          if(!same_outputs(actual.data(),expected.data(),rows,true)) {std::cerr<<"LUT logits mismatch\n";return 10;}
++          const auto best=lut_q4_argmax(lut_weights.data(),lut_input.data(),counts.data(),1.05F,7,rows,blocks);
++          if(best.index!=expected_best.index || !same_outputs(&best.value,&expected_best.value,1,true)) return 11;
++        }
+         for (auto backend : {Q8_0Backend::scalar, Q8_0Backend::avx2, Q8_0Backend::avx_vnni, Q8_0Backend::avx512_vnni}) {
+           if (!q8_0_backend_available(backend)) continue;
+           q4_dot4_matmul(dot4.data(), batch.data(), actual.data(), rows, tokens, blocks, rows, backend);
+diff --git a/include/qwen35x/cpu/lut_q4.h b/include/qwen35x/cpu/lut_q4.h
+new file mode 100644
+--- /dev/null
++++ b/include/qwen35x/cpu/lut_q4.h
+@@ -0,0 +1,11 @@
++#pragma once
++#include "qwen35x/cpu/q4_0.h"
++namespace qwen35x::cpu {
++// Experimental offline bit-plane representation; same 144-byte payload as DOT4.
++struct LutQ4Block { std::uint16_t d[8]; std::uint8_t masks[8][4][4]; };
++struct alignas(32) LutQ8Block { std::uint8_t lo[8][16], hi[8][16]; float scale; int sum; };
++void lut_q4_pack(const Q4_0BlockX8*, LutQ4Block*, std::size_t) noexcept;
++void lut_q8_prepare(const Q8_0BlockX1*, LutQ8Block*, std::size_t) noexcept;
++void lut_q4_matvec(const LutQ4Block*, const LutQ8Block*, float*, std::size_t, std::size_t) noexcept;
++Q4_0ArgmaxResult lut_q4_argmax(const LutQ4Block*, const LutQ8Block*, const int*, float, std::size_t, std::size_t, std::size_t) noexcept;
++}
+diff --git a/src/cpu/lut_q4_avx2.cpp b/src/cpu/lut_q4_avx2.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/cpu/lut_q4_avx2.cpp
+@@ -0,0 +1,77 @@
++#include "qwen35x/cpu/lut_q4.h"
++#include <immintrin.h>
++#include <cstring>
++#include <limits>
++namespace qwen35x::cpu {
++static_assert(sizeof(LutQ4Block)==sizeof(Q4_0BlockX8));
++void lut_q4_pack(const Q4_0BlockX8 *src,LutQ4Block *dst,std::size_t blocks) noexcept {
++ for(std::size_t b=0;b<blocks;++b) {
++  dst[b]={}; std::memcpy(dst[b].d,src[b].d,sizeof(dst[b].d));
++  for(int g=0;g<8;++g) for(int bit=0;bit<4;++bit) for(int r=0;r<8;++r) {
++   int mask=0;
++   for(int j=0;j<4;++j) {
++    int k=g*4+j;
++    int u=(src[b].qs[32*(k/8)+4*r+k%4]>>(4*((k%8)/4)))&15;
++    mask|=((u>>bit)&1)<<j;
++   }
++   dst[b].masks[g][bit][r%4]|=static_cast<std::uint8_t>(mask<<(4*(r/4)));
++  }
++ }
++}
++void lut_q8_prepare(const Q8_0BlockX1 *src,LutQ8Block *dst,std::size_t blocks) noexcept {
++ for(std::size_t b=0;b<blocks;++b) {
++  dst[b].scale=src[b].scales[0]; dst[b].sum=src[b].sums[0];
++  for(int g=0;g<8;++g) for(int mask=0;mask<16;++mask) {
++   int sum=0;
++   for(int j=0;j<4;++j) if(mask&(1<<j)) sum+=src[b].qs[4*g+j];
++   auto bits=static_cast<std::uint16_t>(sum);
++   dst[b].lo[g][mask]=static_cast<std::uint8_t>(bits);
++   dst[b].hi[g][mask]=static_cast<std::uint8_t>(bits>>8);
++  }
++ }
++}
++static inline __m128i lookup(const std::uint8_t *masks,__m128i lo,__m128i hi) noexcept {
++ int bytes; std::memcpy(&bytes,masks,4);
++ auto raw=_mm_cvtsi32_si128(bytes);
++ auto mask=_mm_set1_epi8(15);
++ auto indices=_mm_unpacklo_epi32(_mm_and_si128(raw,mask),_mm_and_si128(_mm_srli_epi16(raw,4),mask));
++ return _mm_unpacklo_epi8(_mm_shuffle_epi8(lo,indices),_mm_shuffle_epi8(hi,indices));
++}
++static inline __m256 eval(const LutQ4Block *w,const LutQ8Block *a,std::size_t blocks) noexcept {
++ auto acc=_mm256_setzero_ps();
++ for(std::size_t b=0;b<blocks;++b) {
++  auto first=_mm_setzero_si128(),second=_mm_setzero_si128();
++  for(int g=0;g<8;++g) {
++   auto lo=_mm_loadu_si128(reinterpret_cast<const __m128i*>(a[b].lo[g]));
++   auto hi=_mm_loadu_si128(reinterpret_cast<const __m128i*>(a[b].hi[g]));
++   auto x0=lookup(w[b].masks[g][0],lo,hi);
++   auto x1=_mm_slli_epi16(lookup(w[b].masks[g][1],lo,hi),1);
++   auto x2=_mm_slli_epi16(lookup(w[b].masks[g][2],lo,hi),2);
++   auto x3=_mm_slli_epi16(lookup(w[b].masks[g][3],lo,hi),3);
++   auto sum=_mm_add_epi16(_mm_add_epi16(x0,x1),_mm_add_epi16(x2,x3));
++   // Four groups contain 16 products, bounded by 16*15*128=30720.
++   if(g<4)first=_mm_add_epi16(first,sum);else second=_mm_add_epi16(second,sum);
++  }
++  auto dot=_mm256_sub_epi32(_mm256_add_epi32(_mm256_cvtepi16_epi32(first),_mm256_cvtepi16_epi32(second)),_mm256_set1_epi32(8*a[b].sum));
++  auto scale=_mm256_mul_ps(_mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w[b].d))),_mm256_set1_ps(a[b].scale));
++  acc=_mm256_fmadd_ps(_mm256_cvtepi32_ps(dot),scale,acc);
++ }
++ return acc;
++}
++void lut_q4_matvec(const LutQ4Block*w,const LutQ8Block*a,float*out,std::size_t rows,std::size_t blocks) noexcept {
++ for(std::size_t r=0;r<rows/8;++r)_mm256_storeu_ps(out+r*8,eval(w+r*blocks,a,blocks));
++}
++Q4_0ArgmaxResult lut_q4_argmax(const LutQ4Block*w,const LutQ8Block*a,const int*counts,float penalty,std::size_t offset,std::size_t rows,std::size_t blocks) noexcept {
++ Q4_0ArgmaxResult best{-std::numeric_limits<float>::infinity(),offset};
++ alignas(32) float values[8];
++ for(std::size_t r=0;r<rows/8;++r) {
++  _mm256_store_ps(values,eval(w+r*blocks,a,blocks));
++  for(std::size_t lane=0;lane<8;++lane) {
++   std::size_t index=offset+r*8+lane;float v=values[lane];
++   if(counts&&counts[index]>0&&penalty>1)v=v>0?v/penalty:v*penalty;
++   if(v>best.value)best={v,index};
++  }
++ }
++ return best;
++}
++}

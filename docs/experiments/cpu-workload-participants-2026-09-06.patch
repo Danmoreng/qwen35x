@@ -1,0 +1,106 @@
+diff --git a/include/qwen35x/cpu/executor.h b/include/qwen35x/cpu/executor.h
+index b4e8959..d4a74b8 100644
+--- a/include/qwen35x/cpu/executor.h
++++ b/include/qwen35x/cpu/executor.h
+@@ -72,7 +72,8 @@ public:
+     std::size_t row_count,
+     CpuRowRangeTask task,
+     void * context,
+-    CpuExecutorTiming * timing = nullptr) noexcept;
++    CpuExecutorTiming * timing = nullptr,
++    std::size_t max_participants = 0) noexcept;
+ 
+   // Parallel row wrapper around the runtime-dispatched Q8_0 matvec primitive.
+   [[nodiscard]] CpuExecutorStatus q8_0_matvec(
+diff --git a/src/cpu/executor.cpp b/src/cpu/executor.cpp
+index 10c2a09..3b5cd2d 100644
+--- a/src/cpu/executor.cpp
++++ b/src/cpu/executor.cpp
+@@ -228,13 +228,13 @@ public:
+   std::size_t min_parallel_rows() const noexcept { return min_parallel_rows_; }
+ 
+   CpuExecutorStatus parallel_for_rows(std::size_t rows, CpuRowRangeTask task, void * context,
+-                                      CpuExecutorTiming * timing = nullptr) noexcept {
+-    return timing ? parallel_for_rows_impl<true>(rows, task, context, timing)
+-                  : parallel_for_rows_impl<false>(rows, task, context, nullptr);
++                                      CpuExecutorTiming * timing = nullptr, std::size_t max_participants = 0) noexcept {
++    return timing ? parallel_for_rows_impl<true>(rows, task, context, timing, max_participants)
++                  : parallel_for_rows_impl<false>(rows, task, context, nullptr, max_participants);
+   }
+   template<bool Profile>
+   CpuExecutorStatus parallel_for_rows_impl(std::size_t rows, CpuRowRangeTask task, void * context,
+-                                         CpuExecutorTiming * timing) noexcept {
++                                         CpuExecutorTiming * timing, std::size_t max_participants) noexcept {
+     using Clock = std::chrono::steady_clock;
+     Clock::time_point started{}, dispatched{}, worked{};
+     if constexpr(Profile) { *timing = {}; started = Clock::now(); }
+@@ -250,7 +250,7 @@ public:
+     if (task == nullptr) return CpuExecutorStatus::invalid_argument;
+     if (job_in_progress_.test_and_set(std::memory_order_acquire)) return CpuExecutorStatus::busy;
+     const AtomicFlagGuard guard(job_in_progress_);
+-    const std::size_t participants = std::min(rows, thread_count_);
++    const std::size_t participants = std::min(rows, max_participants ? std::min(thread_count_, max_participants) : thread_count_);
+     if constexpr(Profile) timing->participants = participants;
+     if (participants == 1 || rows < min_parallel_rows_) {
+       if constexpr(Profile) { timing->participants = 1; dispatched = Clock::now(); }
+@@ -373,8 +373,8 @@ CpuExecutorStatus CpuExecutor::parallel_for_rows(
+   const std::size_t row_count,
+   const CpuRowRangeTask task,
+   void * context,
+-  CpuExecutorTiming * timing) noexcept {
+-  return impl_->parallel_for_rows(row_count, task, context, timing);
++  CpuExecutorTiming * timing, std::size_t max_participants) noexcept {
++  return impl_->parallel_for_rows(row_count, task, context, timing, max_participants);
+ }
+ 
+ CpuExecutorStatus CpuExecutor::q8_0_matvec(
+diff --git a/src/runtime/reference_inference_api.inl b/src/runtime/reference_inference_api.inl
+index a649920..646af07 100644
+--- a/src/runtime/reference_inference_api.inl
++++ b/src/runtime/reference_inference_api.inl
+@@ -502,6 +502,10 @@ bool run_reference_qwen35_inference(
+   if (weights.cpu_q8_runtime) {
+     auto &rt=*weights.cpu_q8_runtime;
+     rt.decode_stages = nullptr;
++    const char *min_work = std::getenv("QWEN35X_EXPERIMENT_MIN_WORK");
++    const char *delta_threads = std::getenv("QWEN35X_EXPERIMENT_DELTA_THREADS");
++    rt.experiment_min_work = min_work ? std::strtoull(min_work, nullptr, 10) : 0;
++    rt.experiment_delta_threads = delta_threads ? std::strtoull(delta_threads, nullptr, 10) : 0;
+     rt.attention_backend = options.cpu_attention_backend == cpu::Q8_0Backend::auto_select ? options.cpu_q8_backend : options.cpu_attention_backend;
+     rt.automatic_attention = options.cpu_attention == "auto";
+     rt.attention_gqa = options.cpu_attention_gqa || rt.automatic_attention;
+diff --git a/src/runtime/reference_inference_internal_layers.inl b/src/runtime/reference_inference_internal_layers.inl
+index f9e62f3..3d0f71c 100644
+--- a/src/runtime/reference_inference_internal_layers.inl
++++ b/src/runtime/reference_inference_internal_layers.inl
+@@ -411,7 +411,7 @@ bool run_linear_attention_step(
+     const cpu::CpuExecutorStatus status = cpu_runtime->executor->parallel_for_rows(
+       static_cast<std::size_t>(dims.linear_num_v_heads * dims.linear_head_v_dim),
+       run_gated_delta_net_cpu_rows,
+-      &job, probe.executor_timing());
++      &job, probe.executor_timing(), cpu_runtime->experiment_delta_threads);
+     if (status != cpu::CpuExecutorStatus::ok) {
+       error_message = std::string("Gated DeltaNet CPU executor failed: ") +
+         cpu::cpu_executor_status_name(status) + ".";
+diff --git a/src/runtime/reference_inference_internal_weights_workspace.inl b/src/runtime/reference_inference_internal_weights_workspace.inl
+index 3e1d967..3646f73 100644
+--- a/src/runtime/reference_inference_internal_weights_workspace.inl
++++ b/src/runtime/reference_inference_internal_weights_workspace.inl
+@@ -41,6 +41,7 @@ struct CpuQ8Runtime {
+   std::string *attention_kernel_result = nullptr;
+   cpu::Q8_0Backend attention_backend = cpu::Q8_0Backend::auto_select;
+   int query_tile = 8, kv_tile = 64;
++  std::size_t experiment_min_work = 0, experiment_delta_threads = 0;
+   CpuDecodeWorkspace decode;
+   CpuPrefillWorkspace prefill;
+   std::unique_ptr<cpu::CpuExecutor> executor;
+@@ -1273,7 +1274,8 @@ bool matvec_2d(
+         w.q8_0_runtime->executor->parallel_for_rows(
+           static_cast<std::size_t>(rows) / cpu::q4_0_packed_rows,
+           run_packed_q4_matvec_tiles,
+-          &job, probe.executor_timing());
++          &job, probe.executor_timing(), w.q8_0_runtime->experiment_min_work ?
++            std::max<std::size_t>(1, static_cast<std::size_t>(rows) * cols / w.q8_0_runtime->experiment_min_work) : 0);
+       if (status != cpu::CpuExecutorStatus::ok) {
+         error_message = std::string("Q4_0 CPU executor failed: ") +
+           cpu::cpu_executor_status_name(status) + ".";

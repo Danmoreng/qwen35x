@@ -1,0 +1,208 @@
+[
+  {
+    "prompt_tokens": 128,
+    "generated_tokens": 128,
+    "decode_ms": 1016.4517,
+    "stages": [
+      {
+        "kind": "q4-matvec",
+        "rows": 8224,
+        "columns": 1024,
+        "participants": 8,
+        "calls": 2286,
+        "prepare_ms": 1.1675999999999542,
+        "wall_ms": 187.51479999999984,
+        "dispatch_ms": 0.43759999999998495,
+        "caller_ms": 179.66309999999982,
+        "wait_ms": 7.290299999999976
+      },
+      {
+        "kind": "delta-net",
+        "rows": 2048,
+        "columns": 128,
+        "participants": 8,
+        "calls": 2286,
+        "prepare_ms": 0.0,
+        "wall_ms": 40.931700000000106,
+        "dispatch_ms": 0.5087999999999885,
+        "caller_ms": 37.1111,
+        "wait_ms": 3.2085000000000385
+      },
+      {
+        "kind": "q4-matvec",
+        "rows": 1024,
+        "columns": 2048,
+        "participants": 8,
+        "calls": 3048,
+        "prepare_ms": 2.96609999999992,
+        "wall_ms": 60.83899999999994,
+        "dispatch_ms": 0.5646999999999704,
+        "caller_ms": 55.539399999999866,
+        "wait_ms": 4.574600000000046
+      },
+      {
+        "kind": "q4-matvec",
+        "rows": 7168,
+        "columns": 1024,
+        "participants": 8,
+        "calls": 3048,
+        "prepare_ms": 1.5144999999999036,
+        "wall_ms": 214.9216,
+        "dispatch_ms": 0.5580999999999703,
+        "caller_ms": 203.6660999999996,
+        "wait_ms": 10.528299999999932
+      },
+      {
+        "kind": "q4-matvec",
+        "rows": 1024,
+        "columns": 3584,
+        "participants": 8,
+        "calls": 3048,
+        "prepare_ms": 4.90739999999979,
+        "wall_ms": 107.42830000000012,
+        "dispatch_ms": 0.5912999999999705,
+        "caller_ms": 100.49800000000006,
+        "wait_ms": 6.182999999999989
+      },
+      {
+        "kind": "q4-matvec",
+        "rows": 5120,
+        "columns": 1024,
+        "participants": 8,
+        "calls": 762,
+        "prepare_ms": 0.37920000000000037,
+        "wall_ms": 39.48210000000007,
+        "dispatch_ms": 0.1407000000000018,
+        "caller_ms": 37.880399999999945,
+        "wait_ms": 1.4072999999999913
+      },
+      {
+        "kind": "full-attention",
+        "rows": 4,
+        "columns": 0,
+        "participants": 4,
+        "calls": 762,
+        "prepare_ms": 0.0,
+        "wall_ms": 7.274300000000002,
+        "dispatch_ms": 0.05460000000000041,
+        "caller_ms": 6.7351,
+        "wait_ms": 0.4448999999999982
+      },
+      {
+        "kind": "q4-argmax",
+        "rows": 248320,
+        "columns": 1024,
+        "participants": 8,
+        "calls": 127,
+        "prepare_ms": 0.03620000000000005,
+        "wall_ms": 317.25169999999997,
+        "dispatch_ms": 0.02779999999999997,
+        "caller_ms": 309.2721000000001,
+        "wait_ms": 7.912999999999992
+      }
+    ]
+  },
+  {
+    "prompt_tokens": 512,
+    "generated_tokens": 128,
+    "decode_ms": 1057.9356,
+    "stages": [
+      {
+        "kind": "q4-matvec",
+        "rows": 8224,
+        "columns": 1024,
+        "participants": 8,
+        "calls": 2286,
+        "prepare_ms": 1.1768999999999472,
+        "wall_ms": 192.02669999999992,
+        "dispatch_ms": 0.4438999999999834,
+        "caller_ms": 184.66379999999978,
+        "wait_ms": 6.786199999999984
+      },
+      {
+        "kind": "delta-net",
+        "rows": 2048,
+        "columns": 128,
+        "participants": 8,
+        "calls": 2286,
+        "prepare_ms": 0.0,
+        "wall_ms": 42.70320000000004,
+        "dispatch_ms": 0.4948999999999866,
+        "caller_ms": 39.00440000000004,
+        "wait_ms": 3.1011000000000153
+      },
+      {
+        "kind": "q4-matvec",
+        "rows": 1024,
+        "columns": 2048,
+        "participants": 8,
+        "calls": 3048,
+        "prepare_ms": 2.9978999999999116,
+        "wall_ms": 63.163199999999925,
+        "dispatch_ms": 0.6012999999999672,
+        "caller_ms": 60.233000000000025,
+        "wait_ms": 2.169899999999988
+      },
+      {
+        "kind": "q4-matvec",
+        "rows": 7168,
+        "columns": 1024,
+        "participants": 8,
+        "calls": 3048,
+        "prepare_ms": 1.5697999999999026,
+        "wall_ms": 220.7814000000002,
+        "dispatch_ms": 0.589399999999968,
+        "caller_ms": 213.39650000000003,
+        "wait_ms": 6.638700000000002
+      },
+      {
+        "kind": "q4-matvec",
+        "rows": 1024,
+        "columns": 3584,
+        "participants": 8,
+        "calls": 3048,
+        "prepare_ms": 4.945099999999778,
+        "wall_ms": 110.04700000000008,
+        "dispatch_ms": 0.6074999999999664,
+        "caller_ms": 105.00840000000001,
+        "wait_ms": 4.27260000000003
+      },
+      {
+        "kind": "q4-matvec",
+        "rows": 5120,
+        "columns": 1024,
+        "participants": 8,
+        "calls": 762,
+        "prepare_ms": 0.375600000000001,
+        "wall_ms": 40.530300000000054,
+        "dispatch_ms": 0.1468000000000021,
+        "caller_ms": 38.99469999999999,
+        "wait_ms": 1.3482999999999952
+      },
+      {
+        "kind": "full-attention",
+        "rows": 4,
+        "columns": 0,
+        "participants": 4,
+        "calls": 762,
+        "prepare_ms": 0.0,
+        "wall_ms": 22.464,
+        "dispatch_ms": 0.06580000000000075,
+        "caller_ms": 21.778199999999966,
+        "wait_ms": 0.5787999999999986
+      },
+      {
+        "kind": "q4-argmax",
+        "rows": 248320,
+        "columns": 1024,
+        "participants": 8,
+        "calls": 127,
+        "prepare_ms": 0.039100000000000065,
+        "wall_ms": 324.99389999999994,
+        "dispatch_ms": 0.02639999999999996,
+        "caller_ms": 322.77729999999985,
+        "wait_ms": 2.150799999999999
+      }
+    ]
+  }
+]
