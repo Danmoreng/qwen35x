@@ -17,7 +17,7 @@ bool CpuEngine::step(bool &progressed, std::string &error) {
   for (auto &[id, s] : e.requests) {
     e.retire(*s);
     resident += s->resident;
-    if (s->result.status == CpuRequestStatus::queued &&
+    if (s->result.status == CpuRequestStatus::queued && e.prefix_admissible(*s) &&
         (!queued || id < queued))
       queued = id;
   }

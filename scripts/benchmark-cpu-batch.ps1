@@ -15,6 +15,7 @@ param(
     [switch]$ParallelStateBatches,
     [switch]$SerialStateBatches,
     [int]$RegisteredPrefixTokens = 0,
+    [int]$SingleFlightPrefixTokens = 0,
     [switch]$IdenticalPrompts,
     [switch]$Serving,
     [int]$Residents = 16,
@@ -40,6 +41,7 @@ $previousAffinity = $process.ProcessorAffinity
     parallel_state_batches = [bool]$ParallelStateBatches
     serial_state_batches = [bool]$SerialStateBatches
     registered_prefix_tokens = $RegisteredPrefixTokens
+    single_flight_prefix_tokens = $SingleFlightPrefixTokens
     identical_prompts = [bool]$IdenticalPrompts
     serving = [bool]$Serving
     resident_limit = $Residents
@@ -64,6 +66,7 @@ try {
                 CpuBatchParallelState = $ParallelStateBatches
                 CpuBatchSerialState = $SerialStateBatches
                 CpuRegisteredPrefixTokens = $RegisteredPrefixTokens
+                CpuSingleFlightPrefixTokens = $SingleFlightPrefixTokens
                 CpuIdenticalPrompts = $IdenticalPrompts
                 CpuServing = $Serving; CpuResidents = $Residents
                 CpuDecodeBatchLimit = $DecodeBatchLimit; CpuArrivalGapMs = $ArrivalGapMs

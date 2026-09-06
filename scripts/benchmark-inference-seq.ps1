@@ -16,6 +16,7 @@ param(
     [switch]$CpuBatchParallelState,
     [switch]$CpuBatchSerialState,
     [int]$CpuRegisteredPrefixTokens = 0,
+    [int]$CpuSingleFlightPrefixTokens = 0,
     [switch]$CpuServing,
     [int]$CpuResidents = 16,
     [int]$CpuDecodeBatchLimit = 16,
@@ -222,6 +223,7 @@ function Invoke-BenchmarkRun {
         if ($script:CpuBatchParallelState) { $args += "--cpu-batch-parallel-state" }
         if ($script:CpuBatchSerialState) { $args += "--cpu-batch-serial-state" }
         if ($script:CpuRegisteredPrefixTokens -gt 0) { $args += @("--cpu-registered-prefix", "$script:CpuRegisteredPrefixTokens") }
+        if ($script:CpuSingleFlightPrefixTokens -gt 0) { $args += @("--cpu-single-flight-prefix", "$script:CpuSingleFlightPrefixTokens") }
         if ($script:CpuServing) { $args += @("--cpu-serving", "--cpu-residents", "$script:CpuResidents", "--cpu-decode-batch-limit", "$script:CpuDecodeBatchLimit", "--cpu-arrival-gap-ms", $script:CpuArrivalGapMs.ToString([Globalization.CultureInfo]::InvariantCulture)) }
         if ($script:CpuIdenticalPrompts) { $args += "--cpu-identical-prompts" }
     }
@@ -568,6 +570,8 @@ foreach ($mode in $Modes) {
                 state_batches = To-OptionalInvariantString (Get-JsonProperty $profile "state_batches")
                 new_prefill_tokens = To-OptionalInvariantString (Get-JsonProperty $profile "new_prefill_tokens")
                 prefix_build_time_ms = To-OptionalInvariantString (Get-JsonProperty $profile "prefix_build_time_ms")
+                prefix_builds = To-OptionalInvariantString (Get-JsonProperty $profile "prefix_builds")
+                prefix_build_fallbacks = To-OptionalInvariantString (Get-JsonProperty $profile "prefix_build_fallbacks")
                 cpu_kv_cache     = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "cpu_kv_cache")
                 cpu_attention_kernel = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "cpu_attention_kernel")
                 cached_prefix_tokens = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "cached_prefix_tokens")

@@ -162,3 +162,24 @@ the measured serving interval and is reported separately. The CSV field
 tokens_per_second denotes aggregate delivered serving throughput when
 cpu_serving=true; it must not be compared directly with decode-only throughput.
 Separate prefill/decode wall-time fields are blank for this interleaved mode.
+
+## Single-flight prefix construction
+
+In serving mode, set request.register_prefix_tokens and a nonempty
+trust_namespace to register a leading token sequence automatically. Do not also
+supply an explicit prefix handle. The earliest admitted matching request builds
+the prefix in bounded prefill ticks; followers remain queued without model
+state. Once its complete hybrid snapshot is published, followers restore it
+independently. Counts distinguish newly computed and restored tokens.
+
+Cancellation or failure of an unpublished leader allows another queued request
+to become the builder. If a snapshot cannot fit the cache budget or its
+allocation fails, current followers fall back to independent cold execution.
+No waiting request remains attached to a dead builder. The cache key uses exact
+leading token IDs, namespace and the engine's immutable model/configuration.
+This is explicit prefix-length registration, not automatic radix-tree matching.
+
+Stats expose successful prefix_builds and prefix_build_fallbacks. In the serving
+benchmark, -SingleFlightPrefixTokens enables this path; construction is inside
+the common serving interval, unlike -RegisteredPrefixTokens, which prepares a
+snapshot before the interval. Neither mode is enabled by default.

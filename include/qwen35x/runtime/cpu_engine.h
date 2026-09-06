@@ -68,6 +68,9 @@ struct CpuRequestSpec {
   void *logits_callback_context = nullptr;
   std::shared_ptr<const CpuPrefix> prefix;
   std::string trust_namespace;
+  // Serving mode only: build these leading tokens once for concurrent requests
+  // in the same namespace. Zero disables automatic single-flight registration.
+  std::size_t register_prefix_tokens = 0;
 };
 struct CpuRequestResult {
   CpuRequestStatus status = CpuRequestStatus::prefill;
@@ -89,6 +92,7 @@ struct CpuEngineStats {
   std::uint64_t greedy_lm_head_batches = 0;
   std::uint64_t state_batches = 0;
   std::size_t queued_requests = 0, resident_requests = 0;
+  std::uint64_t prefix_builds = 0, prefix_build_fallbacks = 0;
 };
 
 // One owner calls these methods serially. Each engine owns one executor and

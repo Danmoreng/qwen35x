@@ -163,6 +163,69 @@ int main(int argc, char **argv) try {
   check(progressed);
   check(bounded->result(b, result));
   check(result.status == CpuRequestStatus::decode);
+  // Single-flight followers wait without state; cancellation reelects a leader.
+  for (int scenario = 0; scenario < 3; ++scenario) {
+    config.max_resident_requests = 3;
+    config.max_queued_requests = 8;
+    config.max_buffered_tokens = 16;
+    config.max_prefix_bytes = scenario == 2 ? 1 : 256 * 1024 * 1024;
+    auto shared = CpuEngine::create(model, config, error);
+    check(bool(shared));
+    CpuRequestId branches[3];
+    std::vector<float> cold[3], warm[3];
+    for (int r = 0; r < 3; ++r) {
+      CpuRequestSpec request;
+      request.prompt_tokens.assign(257, 1);
+      request.prompt_tokens.push_back(2 + r);
+      request.max_new_tokens = 4;
+      request.forced_output_tokens = {19, 13, 198, 18};
+      request.logits_callback = capture;
+      request.logits_callback_context = &cold[r];
+      auto reference_id = reference->submit(request, error);
+      check(reference_id != 0);
+      do {
+        check(reference->advance(reference_id, error));
+        check(reference->result(reference_id, result));
+      } while (!terminal(result.status));
+      reference->release(reference_id);
+      request.logits_callback_context = &warm[r];
+      request.register_prefix_tokens = 257;
+      request.trust_namespace = "single-flight";
+      branches[r] = shared->submit(request, error);
+      check(branches[r] != 0);
+    }
+    check(shared->step(progressed, error));
+    check(shared->stats().resident_requests == 1 &&
+          shared->stats().queued_requests == 2);
+    if (scenario == 1)
+      check(shared->cancel(branches[0]));
+    bool done = false;
+    for (int i = 0; i < 100 && !done; ++i) {
+      check(shared->step(progressed, error));
+      done = true;
+      for (auto branch : branches) {
+        check(shared->result(branch, result));
+        done &= terminal(result.status);
+      }
+    }
+    check(done);
+    std::size_t cached = 0;
+    for (int r = 0; r < 3; ++r) {
+      check(shared->result(branches[r], result));
+      cached += result.cached_prefix_tokens;
+      if (scenario == 1 && r == 0)
+        continue;
+      check(result.status == CpuRequestStatus::complete);
+      check(cold[r].size() == warm[r].size());
+      check(std::memcmp(cold[r].data(), warm[r].data(),
+                        cold[r].size() * sizeof(float)) == 0);
+    }
+    check(shared->stats().prefix_builds == (scenario == 2 ? 0U : 1U));
+    check(shared->stats().prefix_build_fallbacks == (scenario == 2 ? 1U : 0U));
+    check(cached == (scenario == 0 ? 514U : scenario == 1 ? 257U : 0U));
+  }
+  std::cout << "Single-flight builds, leader cancellation, budget fallback and "
+               "exact branch logits passed\n";
   std::cout
       << "Serving queues, delayed arrivals, private logits, fair progress, "
          "backpressure, stop withholding and cancellation passed\n";

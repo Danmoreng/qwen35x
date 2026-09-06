@@ -322,3 +322,37 @@ follow-ups, not evidence that 100 is the optimal serving batch size.
 
 [Samples](cpu-batch-scale-2026-09-06-samples.csv) and
 [settings/hashes](cpu-batch-scale-2026-09-06-metadata.json).
+
+## Step 4b: Single-flight hybrid prefix builds
+
+Automatic prefix registration now elects one admitted builder per exact
+token-prefix/namespace group. Followers remain queued without private model
+state. A complete hybrid snapshot is published at the requested boundary and
+subsequent admissions restore it. An unpublished leader's cancellation/failure
+allows reelection. A cache budget/allocation miss resolves current followers
+as independent cold requests instead of leaving them waiting or repeatedly
+building an uncacheable snapshot.
+
+Full-model tests compare all branch logits against cold execution and cover
+successful single-flight, cancelled builder and a one-byte cache budget.
+Expected successful-build/fallback counters and cached-token totals all pass.
+
+C16 burst, A16/B16, P512, 128 outputs, 16 physical threads, mask 0x55555555,
+sequential A/B/B/A, six samples per variant. Automatic prefix length 511 versus
+no reuse; all generated output arrays match:
+
+| Prefix reuse | Delivered token/s | Serving interval ms | TTFT p50 ms | ITL p50 ms |
+|---|---:|---:|---:|---:|
+| None | 318.10 | 6438.13 | 2891.58 | 23.06 |
+| Single-flight | 562.24 | 3642.60 | 448.61 | 23.06 |
+
+Unlike the prepared-prefix experiment, construction is inside this serving
+interval. Every candidate run builds exactly once, computes 527 new prefill
+tokens (511 once plus 16 suffix tokens) and restores 7665 tokens (15*511).
+Delivered throughput improves 76.7%; decode ITL is effectively unchanged.
+These results concern a shared-prefix burst, not arbitrary unrelated prompts.
+Steps 4a/4b core behavior is implemented; wider arrival/concurrency traces
+remain validation work before prescribing production serving defaults.
+
+[Samples](cpu-singleflight-2026-09-06-samples.csv) and
+[settings/hashes](cpu-singleflight-2026-09-06-metadata.json).

@@ -109,7 +109,10 @@ int serving_benchmark(CpuEngine &engine, const CpuRequestSpec &spec,
       << ",\"peak_rss_bytes\":" << peak_rss()
       << ",\"batch_ticks\":" << stats.batch_ticks
       << ",\"batch_rows\":" << stats.batch_rows
-      << ",\"state_batches\":" << stats.state_batches << ",\"requests\":[";
+      << ",\"state_batches\":" << stats.state_batches
+      << ",\"prefix_builds\":" << stats.prefix_builds
+      << ",\"prefix_build_fallbacks\":" << stats.prefix_build_fallbacks
+      << ",\"requests\":[";
   for (std::size_t r = 0; r < count; ++r) {
     if (r)
       out << ',';

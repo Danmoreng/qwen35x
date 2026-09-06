@@ -281,6 +281,7 @@ struct CpuEngine::Impl {
     s.result.status = CpuRequestStatus::prefill;
     return true;
   }
+  #include "cpu_engine_singleflight.inl"
   static bool terminal(const Sequence &s) {
     return s.result.status == CpuRequestStatus::complete ||
            s.result.status == CpuRequestStatus::cancelled ||
@@ -380,19 +381,26 @@ struct CpuEngine::Impl {
               : (s.spec.prompt_tokens.size() <= 128 ? 64U : 128U);
       // Restores can stop inside a canonical chunk. Finish that chunk first,
       // so row/tiled attention dispatch does not shift at the prefix boundary.
-      const auto count =
+      auto count =
           std::min(chunk - s.result.committed_tokens % chunk,
                    s.spec.prompt_tokens.size() - s.result.committed_tokens);
+      const auto boundary = s.spec.register_prefix_tokens;
+      const bool building = boundary && !s.spec.prefix;
+      if (building) count = std::min(count, boundary - s.result.committed_tokens);
+      const bool publish = building && s.result.committed_tokens + count == boundary;
+      std::vector<float> prefix_hidden;
       predict =
           s.result.committed_tokens + count == s.spec.prompt_tokens.size();
       ok = run_forward_cpu_q8_batch(
           context.get(), w, d, s.state,
           s.spec.prompt_tokens.data() + s.result.committed_tokens, count,
           static_cast<int>(s.result.committed_tokens), predict, s.logits,
-          greedy ? &sampling : nullptr, nullptr, error);
+          greedy ? &sampling : nullptr, nullptr, error,
+          publish ? &prefix_hidden : nullptr);
       if (ok) {
         s.result.committed_tokens += count;
         s.result.prefill_tokens += count;
+        if (publish) publish_prefix(s, std::move(prefix_hidden));
       }
       s.result.prefill_ms += elapsed_ms(start);
     } else {
@@ -483,6 +491,12 @@ CpuRequestId CpuEngine::submit(CpuRequestSpec spec, std::string &error) {
       error = "Queue full or stop sequence exceeds output buffer capacity.";
       return 0;
     }
+  }
+  if (spec.register_prefix_tokens &&
+      (!impl_->config.max_queued_requests || spec.prefix || spec.trust_namespace.empty() ||
+       spec.register_prefix_tokens > spec.prompt_tokens.size())) {
+    error = "Automatic prefix builds require serving mode, a namespace and a valid prefix length.";
+    return 0;
   }
   try {
     if (spec.prefix) {

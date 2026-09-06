@@ -121,6 +121,8 @@ int main(int argc, char **argv) try {
     }
     else if (arg == "--cpu-registered-prefix")
       prefix_tokens = positive();
+    else if (arg == "--cpu-single-flight-prefix")
+      spec.register_prefix_tokens = positive();
     else if (arg == "--max-context")
       config.max_context = positive();
     else if (arg == "--max-new-tokens")
