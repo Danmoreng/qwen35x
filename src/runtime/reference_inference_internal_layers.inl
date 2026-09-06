@@ -242,14 +242,15 @@ bool run_linear_attention_step(CpuExecutionContext *cpu_context,
   CudaForwardWorkspace * cuda_workspace,
   std::string & error_message,
   const std::span<const float> projected = {},
-  const bool return_core = false) {
+  const bool return_core = false,
+  CpuDecodeWorkspace::Linear * row_workspace = nullptr) {
   if ((!projected.empty() && (use_cuda || projected.size() != static_cast<std::size_t>(dims.linear_conv_channels + dims.linear_v_dim + 2 * dims.linear_num_v_heads))) ||
       (return_core && projected.empty())) {
     error_message = "Invalid preprojected CPU attention row.";
     return false;
   }
   CpuDecodeWorkspace::Linear local_workspace;
-  auto & workspace = !use_cuda && cpu_context != nullptr
+  auto & workspace = row_workspace != nullptr ? *row_workspace : !use_cuda && cpu_context != nullptr
     ? cpu_context->decode.linear : local_workspace;
   auto & mixed_qkv = workspace.mixed_qkv;
   auto & z_vec = workspace.z_vec;
@@ -477,14 +478,15 @@ bool run_full_attention_step(CpuExecutionContext *cpu_context,
   CudaForwardWorkspace * cuda_workspace,
   std::string & error_message,
   const std::span<const float> projected = {},
-  const bool return_core = false) {
+  const bool return_core = false,
+  CpuDecodeWorkspace::Full * row_workspace = nullptr) {
   if ((!projected.empty() && (use_cuda || projected.size() != static_cast<std::size_t>((dims.n_heads + dims.n_kv_heads) * dims.head_dim * 2))) ||
       (return_core && projected.empty())) {
     error_message = "Invalid preprojected CPU attention row.";
     return false;
   }
   CpuDecodeWorkspace::Full local_workspace;
-  auto & workspace = !use_cuda && cpu_context != nullptr
+  auto & workspace = row_workspace != nullptr ? *row_workspace : !use_cuda && cpu_context != nullptr
     ? cpu_context->decode.full : local_workspace;
   auto & q_full = workspace.q_full;
   auto & k_flat = workspace.k_flat;

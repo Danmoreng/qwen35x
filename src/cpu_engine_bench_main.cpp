@@ -68,6 +68,14 @@ int main(int argc, char **argv) try {
       config.batch_greedy = false;
       continue;
     }
+    if (arg == "--cpu-batch-parallel-state") {
+      config.parallel_state_batches = true;
+      continue;
+    }
+    if (arg == "--cpu-batch-serial-state") {
+      config.parallel_state_batches = false;
+      continue;
+    }
     if (arg == "--cpu-batch-serial") {
       serial = true;
       continue;
@@ -235,6 +243,7 @@ int main(int argc, char **argv) try {
       << ",\"projection_batches\":" << stats.projection_batches
       << ",\"lm_head_batches\":" << stats.lm_head_batches
       << ",\"greedy_lm_head_batches\":" << stats.greedy_lm_head_batches
+      << ",\"state_batches\":" << stats.state_batches
       << ",\"cpu_kv_cache\":\""
       << (cpu::q8_0_backend_uses_avx2(options.cpu_q8_backend) ? "fp16" : "fp32")
       << "\",\"requests\":[";

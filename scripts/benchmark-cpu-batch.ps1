@@ -11,7 +11,9 @@ param(
     [int64]$Affinity = 65535,
     [switch]$SerialReference,
     [switch]$GreedyTiles,
-    [switch]$FullLogits
+    [switch]$FullLogits,
+    [switch]$ParallelStateBatches,
+    [switch]$SerialStateBatches
 )
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
@@ -29,6 +31,8 @@ $previousAffinity = $process.ProcessorAffinity
     serial_reference = [bool]$SerialReference
     greedy_tiles = [bool]$GreedyTiles
     full_logits = [bool]$FullLogits
+    parallel_state_batches = [bool]$ParallelStateBatches
+    serial_state_batches = [bool]$SerialStateBatches
     fixture = "configs/qwen3_5_0_8b_text_1024x512_tokens.csv"
     prompt_rule = "Repeat/truncate fixture; request r increments final prompt token by r modulo vocabulary."
     timing = "Decode after all first tokens; actual B*(N-1) forwards over common wall time including sampling and loop."
@@ -45,6 +49,8 @@ try {
                 CpuThreads = $Threads; CpuBatch = $batch; CpuBatchSerial = $SerialReference
                 CpuBatchGreedy = $GreedyTiles
                 CpuBatchFullLogits = $FullLogits
+                CpuBatchParallelState = $ParallelStateBatches
+                CpuBatchSerialState = $SerialStateBatches
                 PromptMode = 'prompt-tokens'; PromptTokensCsv = $prompt; PromptName = $label
                 MaxContext = $length + $MaxNewTokens; MaxNewTokens = $MaxNewTokens
                 Runs = $Runs; WarmupRuns = $WarmupRuns

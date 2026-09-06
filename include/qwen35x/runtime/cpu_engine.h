@@ -31,6 +31,8 @@ struct CpuEngineConfig {
   // Shared vocabulary-tile reduction for all-greedy batches. False preserves
   // the full-logits reference. General sampling/callbacks always use logits.
   bool batch_greedy = true;
+  // Dispatch private state rows jointly when B >= executor thread count.
+  bool parallel_state_batches = true;
 };
 struct CpuRequestSpec {
   std::vector<std::int32_t> prompt_tokens;
@@ -59,6 +61,7 @@ struct CpuEngineStats {
   std::uint64_t batch_ticks = 0, batch_rows = 0;
   std::uint64_t projection_batches = 0, lm_head_batches = 0;
   std::uint64_t greedy_lm_head_batches = 0;
+  std::uint64_t state_batches = 0;
 };
 
 // One owner calls these methods serially. Each engine owns one executor and

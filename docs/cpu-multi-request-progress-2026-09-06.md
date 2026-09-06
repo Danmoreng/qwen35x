@@ -129,5 +129,29 @@ the existing complete-logit/isolation tests continue to pass.
 
 ## Next
 
-Confirm thread/topology effects at batch boundaries and test joint dispatch of
-private state updates. Steps 3-7 remain pending.
+Confirm thread/topology effects on the updated state-dispatch path and extend
+selected batch sizes. Steps 3-7 remain pending.
+
+## Step 2c: Joint dispatch of private state updates
+
+When B >= executor thread count, process independent attention/DeltaNet rows in
+one shared dispatch per layer. Each row has private scratch. Worker callbacks
+run the stateful kernel directly and never recursively dispatch the executor.
+Smaller batches and B=1 retain their earlier paths. A worker failure poisons the
+whole partially updated batch instead of retrying state mutations.
+
+P512, eight threads, 0xffff, greedy vocabulary tiles enabled on both paths,
+sequential A/B/B/A (six samples per path):
+
+| B | Per-request dispatch token/s | Joint dispatch token/s | Gain | Tick p50 before / after (ms) |
+|---:|---:|---:|---:|---:|
+| 8 | 424.34 | 482.51 | +13.7% | 18.84 / 16.57 |
+| 16 | 538.87 | 647.21 | +20.1% | 29.43 / 24.74 |
+
+All measured output arrays match. Full-vocabulary model comparisons exercise
+the joint path with two and eight worker threads, varying prompt positions,
+reordered rows and completion tails; logits remain byte-identical. The shared
+state-dispatch counter is exactly 24*127 = 3048 for each measured batch.
+
+[Samples](cpu-multi-request-state-2026-09-06-samples.csv) ·
+[Binary hashes and settings](cpu-multi-request-state-2026-09-06-metadata.json).

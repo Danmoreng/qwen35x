@@ -110,9 +110,12 @@ int main(int argc, char **argv) {
   // Compare every vocabulary logit across tiled batches, tails, reordered
   // rows and removal. Different prompt lengths also cover convolution rings.
   for (int size : {2, 3, 4, 5, 17}) {
-    auto batched = CpuEngine::create(
-        model, {.threads = 8, .max_resident_requests = 32, .max_context = 512},
-        error);
+    auto batched = CpuEngine::create(model,
+                                     {.threads = size < 8 ? 2 : 8,
+                                      .max_resident_requests = 32,
+                                      .max_context = 512,
+                                      .parallel_state_batches = true},
+                                     error);
     std::vector<CpuRequestId> ids;
     std::vector<std::vector<float>> expected(size), actual(size);
     std::vector<std::vector<std::int32_t>> tokens(size);
@@ -176,6 +179,8 @@ int main(int argc, char **argv) {
       }
     }
     auto stats = batched->stats();
+    if (!stats.state_batches)
+      return 21;
     if (!stats.batch_ticks || stats.lm_head_batches != stats.batch_ticks ||
         stats.projection_batches != stats.batch_ticks * (24 * 4 + 1))
       return 16;
@@ -187,6 +192,7 @@ int main(int argc, char **argv) {
       CpuEngineConfig cfg;
       cfg.max_context = 512;
       cfg.batch_greedy = tiled;
+      cfg.parallel_state_batches = true;
       auto run = CpuEngine::create(model, cfg, error);
       std::vector<CpuRequestId> ids;
       for (int r = 0; r < size; ++r) {

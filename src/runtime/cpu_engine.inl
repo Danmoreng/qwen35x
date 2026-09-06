@@ -53,6 +53,7 @@ struct CpuEngine::Impl {
   } batch;
 
 #include "cpu_engine_greedy.inl"
+#include "cpu_engine_state_batch.inl"
 
   bool forward_batch(std::span<Sequence *> rows, std::string &error) {
     const auto &d = model->impl_->dims;
@@ -89,30 +90,38 @@ struct CpuEngine::Impl {
       const std::size_t core_width =
           layer.is_linear ? d.linear_v_dim : d.n_heads * d.head_dim;
       b.core.resize(count * core_width);
-      // Only projections are shared here. Each stateful kernel sees one
-      // request's state and absolute position; no padded row can mutate state.
-      for (std::size_t r = 0; r < count; ++r) {
-        auto &s = *rows[r];
-        const std::span<const float> projected(b.projected.data() + r * width,
-                                               width);
-        bool ok;
-        if (layer.is_linear)
-          ok = run_linear_attention_step(
-              context.get(), layer, d, s.state.linear_states[linear_index],
-              b.normed, b.row, false, nullptr, error, projected, true);
-        else {
-          const auto position = s.result.committed_tokens;
-          const auto rope_offset = position * (d.rope_dim / 2);
-          ok = run_full_attention_step(
-              context.get(), layer, d, s.state.full_states[full_index],
-              b.normed, static_cast<int>(position),
-              s.state.rope_cosine.data() + rope_offset,
-              s.state.rope_sine.data() + rope_offset, b.row, false, nullptr,
-              error, projected, true);
-        }
-        if (!ok)
+      // Each stateful kernel sees one request's state and absolute position;
+      // no padded row can mutate state or access another request's scratch.
+      if (config.parallel_state_batches &&
+          count >= context->executor->thread_count()) {
+        if (!state_batch(layer, rows, linear_index, full_index, width,
+                         core_width, error))
           return false;
-        std::copy(b.row.begin(), b.row.end(), b.core.begin() + r * core_width);
+      } else {
+        for (std::size_t r = 0; r < count; ++r) {
+          auto &s = *rows[r];
+          const std::span<const float> projected(b.projected.data() + r * width,
+                                                 width);
+          bool ok;
+          if (layer.is_linear)
+            ok = run_linear_attention_step(
+                context.get(), layer, d, s.state.linear_states[linear_index],
+                b.normed, b.row, false, nullptr, error, projected, true);
+          else {
+            const auto position = s.result.committed_tokens;
+            const auto rope_offset = position * (d.rope_dim / 2);
+            ok = run_full_attention_step(
+                context.get(), layer, d, s.state.full_states[full_index],
+                b.normed, static_cast<int>(position),
+                s.state.rope_cosine.data() + rope_offset,
+                s.state.rope_sine.data() + rope_offset, b.row, false, nullptr,
+                error, projected, true);
+          }
+          if (!ok)
+            return false;
+          std::copy(b.row.begin(), b.row.end(),
+                    b.core.begin() + r * core_width);
+        }
       }
       if (layer.is_linear)
         ++linear_index;

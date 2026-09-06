@@ -13,6 +13,8 @@ param(
     [switch]$CpuBatchSerial,
     [switch]$CpuBatchGreedy,
     [switch]$CpuBatchFullLogits,
+    [switch]$CpuBatchParallelState,
+    [switch]$CpuBatchSerialState,
     [ValidateSet("auto", "scalar", "avx2", "avx-vnni", "avx512", "avx512-vnni")]
     [string]$CpuIsa = "auto",
     [switch]$CpuIsaStrict,
@@ -204,11 +206,15 @@ function Invoke-BenchmarkRun {
 
     $args = @()
     if ($script:CpuBatch -gt 0) {
+        if ($script:CpuBatchGreedy -and $script:CpuBatchFullLogits) { throw "Choose greedy tiles or full logits, not both." }
+        if ($script:CpuBatchParallelState -and $script:CpuBatchSerialState) { throw "Choose parallel or serial state dispatch, not both." }
         if ($Mode -ne "cpu-h128") { throw "CpuBatch requires cpu-h128 mode." }
         $args += @("--cpu-batch", "$script:CpuBatch")
         if ($script:CpuBatchSerial) { $args += "--cpu-batch-serial" }
         if ($script:CpuBatchGreedy) { $args += "--cpu-batch-greedy" }
         if ($script:CpuBatchFullLogits) { $args += "--cpu-batch-full-logits" }
+        if ($script:CpuBatchParallelState) { $args += "--cpu-batch-parallel-state" }
+        if ($script:CpuBatchSerialState) { $args += "--cpu-batch-serial-state" }
     }
     switch ($Mode) {
         "gpu-bf16" {
@@ -541,6 +547,7 @@ foreach ($mode in $Modes) {
                 batch_rows = To-OptionalInvariantString (Get-JsonProperty $profile "batch_rows")
                 lm_head_batches = To-OptionalInvariantString (Get-JsonProperty $profile "lm_head_batches")
                 greedy_lm_head_batches = To-OptionalInvariantString (Get-JsonProperty $profile "greedy_lm_head_batches")
+                state_batches = To-OptionalInvariantString (Get-JsonProperty $profile "state_batches")
                 cpu_kv_cache     = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "cpu_kv_cache")
                 cpu_attention_kernel = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "cpu_attention_kernel")
                 cached_prefix_tokens = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "cached_prefix_tokens")

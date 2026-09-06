@@ -11,6 +11,7 @@ param(
     [long]$CandidateAffinity = 65535,
     [switch]$CandidateGreedyTiles,
     [switch]$BaselineFullLogits,
+    [switch]$CandidateParallelStateBatches,
     [int]$Runs = 3,
     [int]$WarmupRuns = 1
 )
@@ -29,6 +30,7 @@ foreach ($length in $PromptLengths) {
                 Affinity = $(if ($isCandidate) { $CandidateAffinity } else { $BaseAffinity })
                 GreedyTiles = $isCandidate -and $CandidateGreedyTiles
                 FullLogits = (-not $isCandidate) -and $BaselineFullLogits
+                ParallelStateBatches = $isCandidate -and $CandidateParallelStateBatches
                 BatchSizes = @($batch); PromptLengths = @($length)
                 OutputDir = "$OutputDir/p$length-b$batch-$leg-$variant"
                 Runs = $Runs; WarmupRuns = $WarmupRuns

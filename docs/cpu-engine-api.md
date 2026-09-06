@@ -39,6 +39,12 @@ the next batch. An empty batch is a no-op; B=1 retains the single-request path.
 Invalid batch IDs are rejected before state changes. A failed forward marks
 affected requests failed because partial state updates cannot be retried.
 
+When B is at least the executor's thread count, private attention/DeltaNet rows
+also share one dispatch per layer. Each worker owns row scratch and executes
+its state kernel directly, without nested executor calls. Smaller batches keep
+per-request state dispatch. Set `parallel_state_batches = false` (or benchmark
+`-SerialStateBatches`) to compare the earlier scheduling path.
+
 The legacy synchronous inference API remains available. This initial API does
 not yet provide a background scheduler, HTTP service, shared prefix store or
 shared KV pages. Those are subsequent stages in the
