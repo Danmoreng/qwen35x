@@ -109,11 +109,10 @@ The default 256 MiB budget counts snapshot payload including DeltaNet, convoluti
 KV, token IDs and final hidden data, not allocator overhead or request copies.
 Externally held handles pin entries; only unpinned entries can be evicted.
 
-**Partial-hit numerical validation is not complete.** The P512 benchmark with
-a 511-token prefix changes 5 of 16 greedy output sequences versus cold prefill.
-The P512 complete-hit benchmark matches all outputs. Smaller forced/full-logit
-tests pass, so those tests alone do not establish general equivalence or quality.
-Keep prefix use explicit while this discrepancy is investigated. See the
+The initial partial-hit discrepancy is fixed: short suffixes now retain tiled
+attention beyond position 128, matching their cold-prefill arithmetic. All
+outputs match in the repeated P512/B16 benchmark, and realistic full-logit tests
+cover prefix boundaries through 4095 tokens. Prefix use remains explicit. See the
 [progress report](cpu-multi-request-progress-2026-09-06.md) for measured scope.
 
 `scripts/benchmark-cpu-prefix.ps1` compares cold/warm/warm/cold runs through the

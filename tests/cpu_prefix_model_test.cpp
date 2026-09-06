@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 using namespace qwen35x;
 namespace {
@@ -15,9 +17,9 @@ bool capture(void *context, std::size_t, std::int32_t, const float *values,
 }
 } // namespace
 int main(int argc, char **argv) try {
-  if (argc != 3)
-    throw std::runtime_error(
-        "Usage: cpu_prefix_model_test <HF directory> <Q4 artifact>");
+  if (argc != 3 && argc != 4)
+    throw std::runtime_error("Usage: cpu_prefix_model_test <HF directory> <Q4 "
+                             "artifact> [token CSV]");
   std::string error;
   auto check = [&](bool ok) {
     if (!ok)
@@ -31,9 +33,62 @@ int main(int argc, char **argv) try {
   auto model = CpuModel::load(*profile, options, error);
   check(bool(model));
   CpuEngineConfig config;
-  config.max_context = 1024;
+  config.max_context = 8192;
   auto engine = CpuEngine::create(model, config, error);
   check(bool(engine));
+  if (argc == 4) {
+    std::ifstream input(argv[3]);
+    if (!input)
+      throw std::runtime_error("Could not open token fixture.");
+    std::string text((std::istreambuf_iterator<char>(input)), {});
+    std::replace(text.begin(), text.end(), ',', ' ');
+    std::istringstream stream(text);
+    std::vector<std::int32_t> fixture;
+    std::int32_t token;
+    while (stream >> token)
+      fixture.push_back(token);
+    if (fixture.size() < 512)
+      throw std::runtime_error("Fixture needs 512 tokens.");
+    for (std::size_t length :
+         {127U, 128U, 129U, 255U, 511U, 512U, 1023U, 4095U})
+      for (std::size_t suffix : {1U, 3U, 129U}) {
+        std::vector<std::int32_t> tokens(length + suffix);
+        for (std::size_t i = 0; i < tokens.size(); ++i)
+          tokens[i] = fixture[i % fixture.size()];
+        auto prefix = engine->register_prefix(std::span(tokens).first(length),
+                                              "fixture", error);
+        check(bool(prefix));
+        std::vector<float> cold, warm;
+        for (bool restore : {false, true}) {
+          CpuRequestSpec request;
+          request.prompt_tokens = tokens;
+          request.max_new_tokens = 8;
+          request.forced_output_tokens = {19, 13, 198, 18, 20, 21, 22, 23};
+          request.logits_callback = capture;
+          request.logits_callback_context = restore ? &warm : &cold;
+          request.trust_namespace = "fixture";
+          if (restore)
+            request.prefix = prefix;
+          auto id = engine->submit(std::move(request), error);
+          check(id != 0);
+          CpuRequestResult result;
+          do {
+            check(engine->advance(id, error));
+            check(engine->result(id, result));
+          } while (result.status != CpuRequestStatus::complete);
+          engine->release(id);
+        }
+        if (cold.size() != warm.size())
+          return 12;
+        double maximum = 0;
+        for (std::size_t i = 0; i < cold.size(); ++i)
+          maximum = std::max(maximum, std::abs(double(cold[i]) - warm[i]));
+        std::cout << "Realistic prefix=" << length << " suffix=" << suffix
+                  << " max_logit_error=" << maximum << std::endl;
+        if (std::memcmp(cold.data(), warm.data(), cold.size() * sizeof(float)))
+          return 12;
+      }
+  }
   for (int length : {65, 128, 257}) {
     std::vector<std::int32_t> prefix_tokens(length, 1);
     auto prefix = engine->register_prefix(prefix_tokens, "tests", error);

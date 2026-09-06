@@ -233,3 +233,29 @@ thread override are an additional design direction discussed with the user,
 not an implemented autotuner or a prerequisite for finishing prefix validation.
 The original implementation plan remains the roadmap; steps 1 and 2 core paths
 are implemented, step 3 is experimental, and steps 4-7 are not implemented.
+
+## Step 3 follow-up: Short-tail attention dispatch fixed
+
+The partial-hit discrepancy was caused by the automatic attention selector:
+fewer than four remaining prefill tokens switched to row attention, although
+the same positions in cold prefill used tiled attention. Removing that batch-size
+gate keeps tiled arithmetic beyond position 128, including one-token suffixes.
+This changes short prefill tails, not the separate single-token decode kernel.
+
+The realistic token fixture now checks prefixes 127/128/129/255/511/512/1023/4095
+with suffixes 1/3/129 and eight forced full-vocabulary outputs. All 24 cases have
+zero logit error and byte-identical vectors. The original 18 prefix cases,
+identity/budget checks, independent engine model test, and all nine CTest tests
+also pass.
+
+Repeated P512/B16/128-output cold/warm/warm/cold comparison (six measured samples
+per path, eight threads, mask 0xffff): all request output arrays now match.
+Median cold initialization is 4244.75 ms versus 210.59 ms warm, with 255.70 ms
+separately measured prefix construction. Cold/warm decode is 668.13/672.27
+token/s; this is a prefill reuse improvement, not a demonstrated decode gain.
+The earlier mismatch records above are retained as historical evidence, not an
+outstanding failure of this revision. Step 3's observed numerical blocker is
+resolved; broader serving and shared-page work remains pending.
+
+[Samples](cpu-prefix-tail-fix-2026-09-06-samples.csv) and
+[settings/hashes](cpu-prefix-tail-fix-2026-09-06-metadata.json).
