@@ -4,6 +4,7 @@ struct CpuModelSessionState {
   mutable std::mutex mutex;
   std::string model_signature;
   ModelWeights weights;
+  std::unique_ptr<CpuExecutionContext> context;
   bool loaded = false;
 };
 
@@ -29,6 +30,7 @@ void ReferenceCpuModelSession::clear() {
   }
   const auto state = std::static_pointer_cast<CpuModelSessionState>(implementation_);
   const std::lock_guard<std::mutex> lock(state->mutex);
+  state->context.reset();
   state->weights = ModelWeights{};
   state->model_signature.clear();
   state->loaded = false;
@@ -72,6 +74,12 @@ bool ensure_cpu_model_session_locked(
     return false;
   }
 
+  std::unique_ptr<CpuExecutionContext> context;
+  if(candidate.embed_tokens.is_cpu_quantized()) {
+    context=make_cpu_execution_context(options.cpu_threads,error_message);
+    if(!context) return false;
+  }
+  session.context=std::move(context);
   session.weights = std::move(candidate);
   session.model_signature = signature;
   session.loaded = true;
@@ -452,6 +460,12 @@ bool run_reference_qwen35_inference(
     return false;
   }
   ModelWeights & weights = *weights_ptr;
+  std::unique_ptr<CpuExecutionContext> request_context;
+  if(!cpu_model_session_state && weights.embed_tokens.is_cpu_quantized()) {
+    request_context=make_cpu_execution_context(options.cpu_threads,error_message);
+    if(!request_context) return false;
+  }
+  CpuExecutionContext *cpu_context=cpu_model_session_state ? cpu_model_session_state->context.get() : request_context.get();
   if (options.use_cuda && !upload_model_weights_to_cuda(weights, use_cuda_matvec_bf16, error_message)) {
     release_model_weights_cuda(weights);
     return false;
@@ -490,7 +504,7 @@ bool run_reference_qwen35_inference(
     std::to_string(options.cpu_prefill_chunk_size) + ":" +
     std::to_string(options.cpu_attention_query_tile) + ":" + std::to_string(options.cpu_attention_kv_tile) +
     ":" + std::to_string(options.cpu_attention_gqa) + ":" + cpu::q8_0_backend_name(options.cpu_attention_backend);
-  const bool use_f16_cpu_cache = !options.use_cuda && weights.cpu_q8_runtime != nullptr &&
+  const bool use_f16_cpu_cache = !options.use_cuda && cpu_context != nullptr &&
     !options.cpu_kv_cache_f32 && cpu::q8_0_backend_uses_avx2(options.cpu_q8_backend);
   if ((options.cpu_attention != "rows" && options.cpu_attention != "tiled" && options.cpu_attention != "auto") ||
       options.cpu_prefill_chunk_size < 0 || options.cpu_prefill_chunk_size > 2048 ||
@@ -499,8 +513,8 @@ bool run_reference_qwen35_inference(
     error_message = "Invalid CPU attention mode or tile/chunk size.";
     return false;
   }
-  if (weights.cpu_q8_runtime) {
-    auto &rt=*weights.cpu_q8_runtime;
+  if (cpu_context) {
+    auto &rt=*cpu_context;
     rt.decode_stages = nullptr;
     rt.attention_backend = options.cpu_attention_backend == cpu::Q8_0Backend::auto_select ? options.cpu_q8_backend : options.cpu_attention_backend;
     rt.automatic_attention = options.cpu_attention == "auto";
@@ -636,8 +650,8 @@ bool run_reference_qwen35_inference(
     !options.use_cuda && options.sampling.temperature <= 1.0e-6F &&
       options.capture_top_logits == 0 &&
       options.logits_callback == nullptr &&
-      weights.embed_tokens.is_q4_0() && weights.cpu_q8_runtime != nullptr &&
-      weights.cpu_q8_runtime->executor != nullptr,
+      weights.embed_tokens.is_q4_0() && cpu_context != nullptr &&
+      cpu_context->executor != nullptr,
   };
   CpuGreedySamplingState * cpu_greedy_sampling_ptr =
     cpu_greedy_sampling.enabled ? &cpu_greedy_sampling : nullptr;
@@ -790,7 +804,7 @@ bool run_reference_qwen35_inference(
     options.cpu_prefix_cache->implementation_ = std::move(snapshot);
   };
   const bool use_cpu_q8_batch_prefill =
-    !options.use_cuda && weights.cpu_q8_runtime != nullptr &&
+    !options.use_cuda && cpu_context != nullptr &&
     options.qwen35x_prefill_mode == Qwen35xPrefillMode::batched;
   if (use_cpu_q8_batch_prefill) {
     const std::size_t cpu_prefill_chunk_size = options.cpu_prefill_chunk_size ?
@@ -807,7 +821,7 @@ bool run_reference_qwen35_inference(
       }
       const bool compute_next_logits =
         !options.prefill_only && (chunk_begin + chunk_size == options.prompt_tokens.size());
-      if (!run_forward_cpu_q8_batch(
+      if (!run_forward_cpu_q8_batch(cpu_context,
             weights,
             dims,
             state,
@@ -832,7 +846,7 @@ bool run_reference_qwen35_inference(
       const std::int32_t prompt_token = options.prompt_tokens[prompt_index];
       const bool compute_next_logits =
         !options.prefill_only && (prompt_index + 1 == options.prompt_tokens.size());
-      if (!decode_step_with_runtime_backend(
+      if (!decode_step_with_runtime_backend(cpu_context,
             decode_backend,
             weights,
             dims,
@@ -883,8 +897,8 @@ bool run_reference_qwen35_inference(
   }
 
   result.generated_tokens.reserve(static_cast<std::size_t>(options.max_new_tokens));
-  if (weights.cpu_q8_runtime && options.profile_cpu_decode)
-    weights.cpu_q8_runtime->decode_stages = &result.cpu_decode_stages;
+  if (cpu_context && options.profile_cpu_decode)
+    cpu_context->decode_stages = &result.cpu_decode_stages;
   const auto decode_start = std::chrono::steady_clock::now();
   if (use_cuda_gpu_sampling) {
     const bool defer_stop_checks = stop_token_set.empty() && options.stop_token_sequences.empty();
@@ -940,7 +954,7 @@ bool run_reference_qwen35_inference(
 
         if (i + 1 < options.max_new_tokens) {
           ++profiling.forward_pass_tokens;
-          if (!decode_step_with_runtime_backend_from_device_token(
+          if (!decode_step_with_runtime_backend_from_device_token(cpu_context,
                 decode_backend,
                 weights,
                 dims,
@@ -1046,7 +1060,7 @@ bool run_reference_qwen35_inference(
           break;
         }
 
-        if (!decode_step_with_runtime_backend(
+        if (!decode_step_with_runtime_backend(cpu_context,
               decode_backend,
               weights,
               dims,
@@ -1166,7 +1180,7 @@ bool run_reference_qwen35_inference(
         break;
       }
 
-      if (!decode_step_with_runtime_backend(
+      if (!decode_step_with_runtime_backend(cpu_context,
             decode_backend,
             weights,
             dims,

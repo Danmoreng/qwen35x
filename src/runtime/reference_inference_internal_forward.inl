@@ -1,4 +1,4 @@
-bool run_forward_single_token_cuda_device_core(
+bool run_forward_single_token_cuda_device_core(CpuExecutionContext *cpu_context,
   const ModelWeights & weights,
   const RuntimeDims & dims,
   ModelState & state,
@@ -201,7 +201,7 @@ bool run_forward_single_token_cuda_device_core(
     if (!cuda::download_from_buffer_f32(workspace.hidden_out, hidden_count, 0, final_hidden, error_message)) {
       return false;
     }
-    ok = compute_next_logits_from_embedding(weights.embed_tokens, final_hidden, false, next_logits, error_message);
+    ok = compute_next_logits_from_embedding(cpu_context, weights.embed_tokens, final_hidden, false, next_logits, error_message);
   }
   if (!maybe_sync_cuda_for_stage_timing(true, profile_cuda_sync, error_message)) {
     return false;
@@ -212,7 +212,7 @@ bool run_forward_single_token_cuda_device_core(
   return ok;
 }
 
-bool run_forward_single_token_cuda_device(
+bool run_forward_single_token_cuda_device(CpuExecutionContext *cpu_context,
   const ModelWeights & weights,
   const RuntimeDims & dims,
   ModelState & state,
@@ -249,7 +249,7 @@ bool run_forward_single_token_cuda_device(
     profiling->embedding_ms += elapsed_ms(embedding_start);
   }
 
-  return run_forward_single_token_cuda_device_core(
+  return run_forward_single_token_cuda_device_core(cpu_context,
     weights,
     dims,
     state,
@@ -263,7 +263,7 @@ bool run_forward_single_token_cuda_device(
     error_message);
 }
 
-bool run_forward_single_token_cuda_device_from_token_buffer(
+bool run_forward_single_token_cuda_device_from_token_buffer(CpuExecutionContext *cpu_context,
   const ModelWeights & weights,
   const RuntimeDims & dims,
   ModelState & state,
@@ -300,7 +300,7 @@ bool run_forward_single_token_cuda_device_from_token_buffer(
     profiling->embedding_ms += elapsed_ms(embedding_start);
   }
 
-  return run_forward_single_token_cuda_device_core(
+  return run_forward_single_token_cuda_device_core(cpu_context,
     weights,
     dims,
     state,
@@ -314,7 +314,7 @@ bool run_forward_single_token_cuda_device_from_token_buffer(
     error_message);
 }
 
-bool run_forward_single_token(
+bool run_forward_single_token(CpuExecutionContext *cpu_context,
   const ModelWeights & weights,
   const RuntimeDims & dims,
   ModelState & state,
@@ -342,7 +342,7 @@ bool run_forward_single_token(
     use_cuda && use_cuda_gpu_sampling && cuda_workspace != nullptr && cuda_workspace->has_device_buffers &&
     cuda_workspace->has_gpu_sampling_buffers;
   if (use_cuda_device_forward) {
-    return run_forward_single_token_cuda_device(
+    return run_forward_single_token_cuda_device(cpu_context,
       weights,
       dims,
       state,
@@ -359,8 +359,8 @@ bool run_forward_single_token(
 
   const auto embedding_start = std::chrono::steady_clock::now();
   CpuDecodeWorkspace::Forward local_workspace;
-  auto & workspace = !use_cuda && weights.embed_tokens.q8_0_runtime != nullptr
-    ? weights.embed_tokens.q8_0_runtime->decode.forward : local_workspace;
+  auto & workspace = !use_cuda && cpu_context != nullptr
+    ? cpu_context->decode.forward : local_workspace;
   auto & x = workspace.x;
   x.resize(static_cast<std::size_t>(dims.hidden));
   if (weights.embed_tokens.is_cpu_quantized()) {
@@ -415,7 +415,7 @@ bool run_forward_single_token(
 
     const auto attention_start = std::chrono::steady_clock::now();
     if (layer.is_linear) {
-      if (!run_linear_attention_step(
+      if (!run_linear_attention_step(cpu_context,
             layer,
             dims,
             state.linear_states[static_cast<std::size_t>(linear_idx)],
@@ -428,7 +428,7 @@ bool run_forward_single_token(
       }
       ++linear_idx;
     } else {
-      if (!run_full_attention_step(
+      if (!run_full_attention_step(cpu_context,
             layer,
             dims,
             state.full_states[static_cast<std::size_t>(full_idx)],
@@ -466,7 +466,7 @@ bool run_forward_single_token(
       const float * up_values;
       if (layer.mlp_gate_up_cpu.is_cpu_quantized()) {
         auto & packed = workspace.mlp_packed;
-        if (!matvec_2d(layer.mlp_gate_up_cpu, post_norm, packed, false, error_message)) {
+        if (!matvec_2d(cpu_context, layer.mlp_gate_up_cpu, post_norm, packed, false, error_message)) {
           return false;
         }
         const std::size_t intermediate = static_cast<std::size_t>(dims.intermediate);
@@ -477,8 +477,8 @@ bool run_forward_single_token(
         gate_values = packed.data();
         up_values = packed.data() + intermediate;
       } else {
-        if (!matvec_2d(layer.mlp_gate, post_norm, mlp_gate, use_cuda, error_message) ||
-            !matvec_2d(layer.mlp_up, post_norm, mlp_up, use_cuda, error_message)) {
+        if (!matvec_2d(cpu_context, layer.mlp_gate, post_norm, mlp_gate, use_cuda, error_message) ||
+            !matvec_2d(cpu_context, layer.mlp_up, post_norm, mlp_up, use_cuda, error_message)) {
           return false;
         }
         gate_values = mlp_gate.data();
@@ -490,7 +490,7 @@ bool run_forward_single_token(
         layer.mlp_down.is_cpu_quantized()
           ? layer.mlp_down.q8_0_backend
           : cpu::Q8_0Backend::auto_select);
-      if (!matvec_2d(layer.mlp_down, mlp_hidden, mlp_out, use_cuda, error_message)) {
+      if (!matvec_2d(cpu_context, layer.mlp_down, mlp_hidden, mlp_out, use_cuda, error_message)) {
         return false;
       }
     }
@@ -526,13 +526,13 @@ bool run_forward_single_token(
     }
   } else if (greedy_sampling != nullptr && greedy_sampling->enabled &&
              greedy_sampling->token_counts != nullptr) {
-    ok = greedy_q4_token(
+    ok = greedy_q4_token(cpu_context,
       weights.embed_tokens, final_hidden, *greedy_sampling->token_counts,
       greedy_sampling->repetition_penalty, greedy_sampling->next_token,
       error_message);
     next_logits.clear();
   } else {
-    ok = compute_next_logits_from_embedding(weights.embed_tokens, final_hidden, use_cuda, next_logits, error_message);
+    ok = compute_next_logits_from_embedding(cpu_context, weights.embed_tokens, final_hidden, use_cuda, next_logits, error_message);
   }
   if (profiling != nullptr) {
     profiling->logits_ms += elapsed_ms(logits_start);

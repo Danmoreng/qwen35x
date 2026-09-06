@@ -33,7 +33,7 @@ struct CpuPrefillWorkspace {
   } full;
 };
 
-struct CpuQ8Runtime {
+struct CpuExecutionContext {
   std::vector<CpuDecodeStage> *decode_stages = nullptr;
   std::vector<CpuPrefillStage> *stages = nullptr;
   bool tiled_attention = false, attention_gqa = false, automatic_attention = false;
@@ -54,13 +54,23 @@ struct CpuQ8Runtime {
 };
 
 // A null sink avoids clock reads and allocations in production runs.
+std::unique_ptr<CpuExecutionContext> make_cpu_execution_context(int threads, std::string &error) {
+  auto context=std::make_unique<CpuExecutionContext>();
+  cpu::CpuExecutorConfig config;
+  config.thread_count=static_cast<std::size_t>(threads); config.min_parallel_rows=1;
+  std::error_code ec;
+  context->executor=cpu::CpuExecutor::create(config,ec);
+  if(!context->executor) { error="Could not create CPU executor: "+ec.message(); return nullptr; }
+  return context;
+}
+
 struct CpuDecodeProbe {
   using Clock = std::chrono::steady_clock;
   std::vector<CpuDecodeStage> *sink;
   CpuDecodeStage event;
   cpu::CpuExecutorTiming timing;
   Clock::time_point start{}, kernel_start{};
-  CpuDecodeProbe(CpuQ8Runtime *rt, const char *kind, std::size_t rows, std::size_t cols)
+  CpuDecodeProbe(CpuExecutionContext *rt, const char *kind, std::size_t rows, std::size_t cols)
       : sink(rt ? rt->decode_stages : nullptr) {
     if (sink) { event.kind=kind; event.rows=rows; event.columns=cols; start=kernel_start=Clock::now(); }
   }
@@ -94,7 +104,6 @@ struct TensorData {
   std::vector<cpu::Q8_0Block> q8_0_blocks;
   std::vector<float> q8_0_scales;
   cpu::Q8_0Backend q8_0_backend = cpu::Q8_0Backend::auto_select;
-  CpuQ8Runtime * q8_0_runtime = nullptr;
   std::vector<cpu::Q4H128SignBlock> q4_h128_signs;
   bool q4_dot4 = false;
   bool uses_q4_h128_transform = false;
@@ -310,7 +319,6 @@ struct LayerWeights {
 struct ModelWeights {
   TensorData embed_tokens;
   TensorData final_norm;
-  std::unique_ptr<CpuQ8Runtime> cpu_q8_runtime;
   cuda::CudaDeviceBufferF32 final_norm_device;
   bool has_device_final_norm = false;
   std::vector<LayerWeights> layers;
@@ -826,7 +834,6 @@ bool load_gguf_quantized_checked(
   const std::int64_t rows,
   const std::int64_t cols,
   const cpu::Q8_0Backend backend,
-  CpuQ8Runtime * runtime,
   TensorData & out,
   std::string & error_message,
   const bool retain_scales = true) {
@@ -885,7 +892,7 @@ bool load_gguf_quantized_checked(
     }
   }
   out.q8_0_backend = backend;
-  out.q8_0_runtime = runtime;
+
   return true;
 }
 
@@ -956,7 +963,6 @@ bool load_q4_h128_quantized_checked(
   const std::int64_t cols,
   const bool expect_h128,
   const cpu::Q8_0Backend backend,
-  CpuQ8Runtime * runtime,
   TensorData & out,
   std::string & error_message,
   const bool retain_scales = true) {
@@ -994,7 +1000,7 @@ bool load_q4_h128_quantized_checked(
       return false;
     }
     out.q8_0_backend = backend;
-    out.q8_0_runtime = runtime;
+
     out.uses_q4_h128_transform = expect_h128;
     out.q4_h128_sign_seed = expect_h128 ? info->sign_seed : 0;
     out.q4_h128_signs.resize(out.uses_q4_h128_transform
@@ -1031,7 +1037,7 @@ bool load_q4_h128_quantized_checked(
       out.q4_0_blocks.data(), out.q4_0_scales.data(), out.q4_0_blocks.size());
   }
   out.q8_0_backend = backend;
-  out.q8_0_runtime = runtime;
+
   out.uses_q4_h128_transform = expect_h128;
   out.q4_h128_sign_seed = expect_h128 ? info->sign_seed : 0;
   out.q4_h128_signs.resize(out.uses_q4_h128_transform
@@ -1086,7 +1092,6 @@ bool pack_quantized_row_concat(
   std::int64_t cols = -1;
   std::int64_t total_rows = 0;
   cpu::Q8_0Backend backend = cpu::Q8_0Backend::auto_select;
-  CpuQ8Runtime * runtime = nullptr;
   bool q4_dot4 = false;
   bool uses_q4_h128_transform = false;
   std::uint64_t q4_h128_sign_seed = 0;
@@ -1110,18 +1115,17 @@ bool pack_quantized_row_concat(
     if (first) {
       cols = part->shape[1];
       backend = part->q8_0_backend;
-      runtime = part->q8_0_runtime;
       use_q4_0 = part_q4_0;
       q4_dot4 = part->q4_dot4;
       uses_q4_h128_transform = part->uses_q4_h128_transform;
       q4_h128_sign_seed = part->q4_h128_sign_seed;
       first = false;
     } else if (part->shape[1] != cols || part->q8_0_backend != backend ||
-               part->q8_0_runtime != runtime || part_q4_0 != use_q4_0 ||
+               part_q4_0 != use_q4_0 ||
                part->q4_dot4 != q4_dot4 ||
                part->uses_q4_h128_transform != uses_q4_h128_transform ||
                part->q4_h128_sign_seed != q4_h128_sign_seed) {
-      error_message = "Quantized packed tensor source tensors have incompatible formats or runtimes.";
+      error_message = "Quantized packed tensor source tensors have incompatible formats.";
       return false;
     }
     if (part->shape[0] <= 0 || total_rows > std::numeric_limits<std::int64_t>::max() - part->shape[0] ||
@@ -1159,7 +1163,7 @@ bool pack_quantized_row_concat(
     out.q8_0_scales.reserve(total_blocks);
   }
   out.q8_0_backend = backend;
-  out.q8_0_runtime = runtime;
+
   out.q4_dot4 = q4_dot4;
   out.uses_q4_h128_transform = uses_q4_h128_transform;
   out.q4_h128_sign_seed = q4_h128_sign_seed;
@@ -1219,7 +1223,7 @@ bool prepare_q4_decode_activation(
   return true;
 }
 
-bool matvec_2d(
+bool matvec_2d(CpuExecutionContext *cpu_context,
   const TensorData & w,
   const std::vector<float> & x,
   std::vector<float> & out,
@@ -1253,10 +1257,10 @@ bool matvec_2d(
       error_message = "Packed Q4_0 matvec weight storage size mismatch.";
       return false;
     }
-    CpuDecodeProbe probe(w.q8_0_runtime, "q4-matvec", rows, cols);
+    CpuDecodeProbe probe(cpu_context, "q4-matvec", rows, cols);
     std::vector<cpu::Q8_0BlockX1> local_prepared_input;
-    auto & prepared_input = w.q8_0_runtime != nullptr
-      ? w.q8_0_runtime->prepared_q4_input : local_prepared_input;
+    auto & prepared_input = cpu_context != nullptr
+      ? cpu_context->prepared_q4_input : local_prepared_input;
     prepared_input.resize(blocks_per_row);
     if (!prepare_q4_decode_activation(w, x.data(), static_cast<std::size_t>(cols),
           prepared_input.data(), error_message)) {
@@ -1264,13 +1268,13 @@ bool matvec_2d(
     }
     probe.prepared();
     out.resize(static_cast<std::size_t>(rows));
-    if (w.q8_0_runtime != nullptr && w.q8_0_runtime->executor != nullptr) {
+    if (cpu_context != nullptr && cpu_context->executor != nullptr) {
       PackedQ4MatvecJob job{
         w.packed_q4_0_blocks.data(), prepared_input.data(), out.data(),
         blocks_per_row, w.q8_0_backend, w.q4_dot4,
       };
       const cpu::CpuExecutorStatus status =
-        w.q8_0_runtime->executor->parallel_for_rows(
+        cpu_context->executor->parallel_for_rows(
           static_cast<std::size_t>(rows) / cpu::q4_0_packed_rows,
           run_packed_q4_matvec_tiles,
           &job, probe.executor_timing());
@@ -1302,14 +1306,14 @@ bool matvec_2d(
 
     std::vector<cpu::Q8_0Block> local_quantized_input;
     std::vector<cpu::Q8_0Block> * quantized_input = &local_quantized_input;
-    if (w.q8_0_runtime != nullptr) {
-      quantized_input = &w.q8_0_runtime->quantized_input;
+    if (cpu_context != nullptr) {
+      quantized_input = &cpu_context->quantized_input;
     }
     quantized_input->resize(blocks_per_row);
     cpu::q8_0_quantize(x.data(), quantized_input->data(), blocks_per_row, w.q8_0_backend);
     out.resize(static_cast<std::size_t>(rows));
-    if (w.q8_0_runtime != nullptr && w.q8_0_runtime->executor != nullptr) {
-      const cpu::CpuExecutorStatus status = w.q8_0_runtime->executor->q8_0_matvec(
+    if (cpu_context != nullptr && cpu_context->executor != nullptr) {
+      const cpu::CpuExecutorStatus status = cpu_context->executor->q8_0_matvec(
         w.q8_0_blocks.data(),
         quantized_input->data(),
         out.data(),
@@ -1349,15 +1353,15 @@ bool matvec_2d(
   return true;
 }
 
-bool greedy_q4_token(
+bool greedy_q4_token(CpuExecutionContext *cpu_context,
   const TensorData & weights,
   const std::vector<float> & input,
   const std::vector<int> & token_counts,
   const float repetition_penalty,
   int & out_token,
   std::string & error_message) {
-  if (!weights.is_q4_0() || weights.q8_0_runtime == nullptr ||
-      weights.q8_0_runtime->executor == nullptr || weights.shape.size() != 2) {
+  if (!weights.is_q4_0() || cpu_context == nullptr ||
+      cpu_context->executor == nullptr || weights.shape.size() != 2) {
     error_message = "Fused greedy Q4 selection requires packed weights and a CPU executor.";
     return false;
   }
@@ -1376,7 +1380,7 @@ bool greedy_q4_token(
     return false;
   }
 
-  CpuQ8Runtime & runtime = *weights.q8_0_runtime;
+  CpuExecutionContext & runtime = *cpu_context;
   CpuDecodeProbe probe(&runtime, "q4-argmax", rows, cols);
   runtime.prepared_q4_input.resize(blocks_per_row);
   if (!prepare_q4_decode_activation(weights, input.data(), cols,
@@ -1417,13 +1421,13 @@ bool greedy_q4_token(
   return out_token >= 0 && static_cast<std::size_t>(out_token) < rows;
 }
 
-bool matmul_2d_quantized_batch(
+bool matmul_2d_quantized_batch(CpuExecutionContext *cpu_context,
   const TensorData & w,
   const std::vector<float> & inputs,
   const std::size_t batch_size,
   std::vector<float> & out,
   std::string & error_message) {
-  if (!w.is_cpu_quantized() || w.shape.size() != 2 || w.q8_0_runtime == nullptr) {
+  if (!w.is_cpu_quantized() || w.shape.size() != 2 || cpu_context == nullptr) {
     error_message = "CPU batched matmul requires a 2D Q4_0/Q8_0 tensor with a runtime.";
     return false;
   }
@@ -1464,15 +1468,15 @@ bool matmul_2d_quantized_batch(
     !w.packed_q4_0_blocks.empty();
   const float * quantization_inputs = inputs.data();
   if (w.uses_q4_h128_transform && !fuse_h128_packed_q4) {
-    std::vector<float> & transformed = w.q8_0_runtime->q4_h128_transform_scratch;
+    std::vector<float> & transformed = cpu_context->q4_h128_transform_scratch;
     transformed.resize(batch_size * cols);
-    if (w.q8_0_runtime->executor != nullptr && batch_size > 1) {
+    if (cpu_context->executor != nullptr && batch_size > 1) {
       Q4H128TransformJob transform_job{
         inputs.data(), transformed.data(), cols, w.q4_h128_sign_seed,
         w.q8_0_backend,
       };
       const cpu::CpuExecutorStatus status =
-        w.q8_0_runtime->executor->parallel_for_rows(
+        cpu_context->executor->parallel_for_rows(
           batch_size, run_q4_h128_transform_rows, &transform_job);
       if (status != cpu::CpuExecutorStatus::ok) {
         error_message = std::string("Q4_H128 activation transform executor failed: ") +
@@ -1500,19 +1504,19 @@ bool matmul_2d_quantized_batch(
     }
     if (packed_vector_count != 0) {
       std::vector<cpu::Q8_0BlockX4> & packed =
-        w.q8_0_runtime->packed_q8_0_batch;
+        cpu_context->packed_q8_0_batch;
       packed.resize(
         (packed_vector_count / cpu::q8_0_packed_vectors) * blocks_per_row);
       if (fuse_h128_packed_q4) {
         const std::size_t vector_tiles =
           packed_vector_count / cpu::q8_0_packed_vectors;
-        if (w.q8_0_runtime->executor != nullptr && vector_tiles > 1) {
+        if (cpu_context->executor != nullptr && vector_tiles > 1) {
           Q4H128PreparePackedJob prepare_job{
             inputs.data(), packed.data(), cols, blocks_per_row,
             w.q4_h128_sign_seed, w.q8_0_backend, w.q4_h128_signs.data(),
           };
           const cpu::CpuExecutorStatus status =
-            w.q8_0_runtime->executor->parallel_for_rows(
+            cpu_context->executor->parallel_for_rows(
               vector_tiles, run_q4_h128_prepare_packed_tiles, &prepare_job);
           if (status != cpu::CpuExecutorStatus::ok) {
             error_message =
@@ -1531,13 +1535,13 @@ bool matmul_2d_quantized_batch(
           quantization_inputs, packed.data(), packed_vector_count, blocks_per_row,
           w.q8_0_backend);
       }
-      if (w.q8_0_runtime->executor != nullptr) {
+      if (cpu_context->executor != nullptr) {
         PackedQ4PrefillJob job{
           w.packed_q4_0_blocks.data(), packed.data(), out.data(),
           packed_vector_count, blocks_per_row, rows, w.q8_0_backend, w.q4_dot4,
         };
         const cpu::CpuExecutorStatus status =
-          w.q8_0_runtime->executor->parallel_for_rows(
+          cpu_context->executor->parallel_for_rows(
             rows / cpu::q4_0_packed_rows, run_packed_q4_prefill_tiles, &job);
         if (status != cpu::CpuExecutorStatus::ok) {
           error_message = std::string("Packed Q4_0 CPU batch executor failed: ") +
@@ -1553,7 +1557,7 @@ bool matmul_2d_quantized_batch(
 
     const std::size_t tail_vector_count = batch_size - packed_vector_count;
     if (tail_vector_count != 0) {
-      auto & prepared = w.q8_0_runtime->prepared_q4_input;
+      auto & prepared = cpu_context->prepared_q4_input;
       prepared.resize(tail_vector_count * blocks_per_row);
       for (std::size_t token = 0; token < tail_vector_count; ++token) {
         if (!prepare_q4_decode_activation(w,
@@ -1567,13 +1571,13 @@ bool matmul_2d_quantized_batch(
         const cpu::Q8_0BlockX1 * tail_vector =
           prepared.data() + token * blocks_per_row;
         float * token_output = tail_output + token * rows;
-        if (w.q8_0_runtime->executor != nullptr) {
+        if (cpu_context->executor != nullptr) {
           PackedQ4MatvecJob job{
             w.packed_q4_0_blocks.data(), tail_vector, token_output,
             blocks_per_row, w.q8_0_backend, w.q4_dot4,
           };
           const cpu::CpuExecutorStatus status =
-            w.q8_0_runtime->executor->parallel_for_rows(
+            cpu_context->executor->parallel_for_rows(
               rows / cpu::q4_0_packed_rows,
               run_packed_q4_matvec_tiles,
               &job);
@@ -1592,9 +1596,9 @@ bool matmul_2d_quantized_batch(
     return true;
   }
 
-  std::vector<cpu::Q8_0Block> & quantized = w.q8_0_runtime->quantized_batch;
+  std::vector<cpu::Q8_0Block> & quantized = cpu_context->quantized_batch;
   quantized.resize(batch_size * blocks_per_row);
-  std::vector<float> & quantized_scales = w.q8_0_runtime->quantized_batch_scales;
+  std::vector<float> & quantized_scales = cpu_context->quantized_batch_scales;
   quantized_scales.resize(quantized.size());
   for (std::size_t token = 0; token < batch_size; ++token) {
     cpu::q8_0_quantize_with_scales(
@@ -1604,8 +1608,8 @@ bool matmul_2d_quantized_batch(
       blocks_per_row,
       w.q8_0_backend);
   }
-  if (w.q8_0_runtime->executor != nullptr) {
-    const cpu::CpuExecutorStatus status = w.q8_0_runtime->executor->q8_0_matmul(
+  if (cpu_context->executor != nullptr) {
+    const cpu::CpuExecutorStatus status = cpu_context->executor->q8_0_matmul(
           w.q8_0_blocks.data(), quantized.data(), out.data(), rows, batch_size,
           blocks_per_row, w.q8_0_backend, quantized_scales.data(), w.q8_0_scales.data());
     if (status != cpu::CpuExecutorStatus::ok) {
@@ -1828,24 +1832,12 @@ bool load_model_weights_from_quantized_gguf(
     return false;
   }
 
-  cpu::CpuExecutorConfig executor_config;
-  executor_config.thread_count = static_cast<std::size_t>(cpu_threads);
-  executor_config.min_parallel_rows = 1;
-  std::error_code executor_error;
-  weights.cpu_q8_runtime = std::make_unique<CpuQ8Runtime>();
-  weights.cpu_q8_runtime->executor = cpu::CpuExecutor::create(executor_config, executor_error);
-  if (!weights.cpu_q8_runtime->executor) {
-    error_message = "Could not create persistent CPU executor: " + executor_error.message();
-    return false;
-  }
-  CpuQ8Runtime * const runtime = weights.cpu_q8_runtime.get();
   if (!load_gguf_quantized_checked(
         reader,
         "token_embd.weight",
         dims.vocab_size,
         dims.hidden,
         backend,
-        runtime,
         weights.embed_tokens,
         error_message,
         false) ||
@@ -1879,11 +1871,11 @@ bool load_model_weights_from_quantized_gguf(
           layer.post_attention_layernorm,
           error_message) ||
         !load_gguf_quantized_checked(
-          reader, base + "ffn_gate.weight", dims.intermediate, dims.hidden, backend, runtime, layer.mlp_gate, error_message) ||
+          reader, base + "ffn_gate.weight", dims.intermediate, dims.hidden, backend, layer.mlp_gate, error_message) ||
         !load_gguf_quantized_checked(
-          reader, base + "ffn_up.weight", dims.intermediate, dims.hidden, backend, runtime, layer.mlp_up, error_message) ||
+          reader, base + "ffn_up.weight", dims.intermediate, dims.hidden, backend, layer.mlp_up, error_message) ||
         !load_gguf_quantized_checked(
-          reader, base + "ffn_down.weight", dims.hidden, dims.intermediate, backend, runtime, layer.mlp_down, error_message)) {
+          reader, base + "ffn_down.weight", dims.hidden, dims.intermediate, backend, layer.mlp_down, error_message)) {
       return false;
     }
 
@@ -1894,8 +1886,7 @@ bool load_model_weights_from_quantized_gguf(
             dims.linear_conv_channels,
             dims.hidden,
             backend,
-            runtime,
-            layer.linear.in_proj_qkv,
+                layer.linear.in_proj_qkv,
             error_message) ||
           !load_gguf_quantized_checked(
             reader,
@@ -1903,8 +1894,7 @@ bool load_model_weights_from_quantized_gguf(
             dims.linear_v_dim,
             dims.hidden,
             backend,
-            runtime,
-            layer.linear.in_proj_z,
+                layer.linear.in_proj_z,
             error_message) ||
           !load_gguf_quantized_checked(
             reader,
@@ -1912,8 +1902,7 @@ bool load_model_weights_from_quantized_gguf(
             dims.linear_num_v_heads,
             dims.hidden,
             backend,
-            runtime,
-            layer.linear.in_proj_b,
+                layer.linear.in_proj_b,
             error_message) ||
           !load_gguf_quantized_checked(
             reader,
@@ -1921,8 +1910,7 @@ bool load_model_weights_from_quantized_gguf(
             dims.linear_num_v_heads,
             dims.hidden,
             backend,
-            runtime,
-            layer.linear.in_proj_a,
+                layer.linear.in_proj_a,
             error_message) ||
           !load_gguf_f32_checked(
             reader,
@@ -1937,8 +1925,7 @@ bool load_model_weights_from_quantized_gguf(
             dims.hidden,
             dims.linear_v_dim,
             backend,
-            runtime,
-            layer.linear.out_proj,
+                layer.linear.out_proj,
             error_message) ||
           !load_gguf_f32_checked(
             reader,
@@ -1968,13 +1955,13 @@ bool load_model_weights_from_quantized_gguf(
       pack_conv1d_kernel_major(layer.linear, dims);
     } else {
       if (!load_gguf_quantized_checked(
-            reader, base + "attn_q.weight", full_q_out, dims.hidden, backend, runtime, layer.full.q_proj, error_message) ||
+            reader, base + "attn_q.weight", full_q_out, dims.hidden, backend, layer.full.q_proj, error_message) ||
           !load_gguf_quantized_checked(
-            reader, base + "attn_k.weight", full_kv_out, dims.hidden, backend, runtime, layer.full.k_proj, error_message) ||
+            reader, base + "attn_k.weight", full_kv_out, dims.hidden, backend, layer.full.k_proj, error_message) ||
           !load_gguf_quantized_checked(
-            reader, base + "attn_v.weight", full_kv_out, dims.hidden, backend, runtime, layer.full.v_proj, error_message) ||
+            reader, base + "attn_v.weight", full_kv_out, dims.hidden, backend, layer.full.v_proj, error_message) ||
           !load_gguf_quantized_checked(
-            reader, base + "attn_output.weight", dims.hidden, full_o_in, backend, runtime, layer.full.o_proj, error_message) ||
+            reader, base + "attn_output.weight", dims.hidden, full_o_in, backend, layer.full.o_proj, error_message) ||
           !load_gguf_f32_checked(
             reader, base + "attn_q_norm.weight", {dims.head_dim}, true, layer.full.q_norm, error_message) ||
           !load_gguf_f32_checked(
@@ -2035,24 +2022,11 @@ bool load_model_weights_from_q4_h128(
     return false;
   }
 
-  cpu::CpuExecutorConfig executor_config;
-  executor_config.thread_count = static_cast<std::size_t>(cpu_threads);
-  executor_config.min_parallel_rows = 1;
-  std::error_code executor_error;
-  weights.cpu_q8_runtime = std::make_unique<CpuQ8Runtime>();
-  weights.cpu_q8_runtime->executor = cpu::CpuExecutor::create(
-    executor_config, executor_error);
-  if (!weights.cpu_q8_runtime->executor) {
-    error_message = "Could not create persistent Q4_H128 CPU executor: " +
-      executor_error.message();
-    return false;
-  }
-  CpuQ8Runtime * const runtime = weights.cpu_q8_runtime.get();
   const auto load_q4 = [&](const std::string & name, const int rows,
                            const int cols, TensorData & output,
                            const bool retain_scales = true) {
     return load_q4_h128_quantized_checked(
-      reader, name, rows, cols, true, backend, runtime, output,
+      reader, name, rows, cols, true, backend, output,
       error_message, retain_scales);
   };
   const auto load_f32 = [&](const std::string & name,
@@ -2064,7 +2038,7 @@ bool load_model_weights_from_q4_h128(
 
   if (!load_q4_h128_quantized_checked(
         reader, "model.language_model.embed_tokens.weight",
-        dims.vocab_size, dims.hidden, false, backend, runtime,
+        dims.vocab_size, dims.hidden, false, backend,
         weights.embed_tokens, error_message, false) ||
       !load_f32(
         "model.language_model.norm.weight", {dims.hidden},

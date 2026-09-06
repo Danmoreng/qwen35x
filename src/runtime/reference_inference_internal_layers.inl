@@ -232,7 +232,7 @@ void run_gated_delta_net_cpu_rows(
     job.backend);
 }
 
-bool run_linear_attention_step(
+bool run_linear_attention_step(CpuExecutionContext *cpu_context,
   const LayerWeights & layer,
   const RuntimeDims & dims,
   LinearAttentionState & state,
@@ -242,8 +242,8 @@ bool run_linear_attention_step(
   CudaForwardWorkspace * cuda_workspace,
   std::string & error_message) {
   CpuDecodeWorkspace::Linear local_workspace;
-  auto & workspace = !use_cuda && layer.linear.out_proj.q8_0_runtime != nullptr
-    ? layer.linear.out_proj.q8_0_runtime->decode.linear : local_workspace;
+  auto & workspace = !use_cuda && cpu_context != nullptr
+    ? cpu_context->decode.linear : local_workspace;
   auto & mixed_qkv = workspace.mixed_qkv;
   auto & z_vec = workspace.z_vec;
   auto & b_vec = workspace.b_vec;
@@ -325,7 +325,7 @@ bool run_linear_attention_step(
   } else {
     if (layer.linear.in_proj_all_cpu.is_cpu_quantized()) {
       auto & packed = workspace.packed;
-      if (!matvec_2d(layer.linear.in_proj_all_cpu, x, packed, false, error_message)) {
+      if (!matvec_2d(cpu_context, layer.linear.in_proj_all_cpu, x, packed, false, error_message)) {
         return false;
       }
       const std::size_t qkv_count = static_cast<std::size_t>(dims.linear_conv_channels);
@@ -338,10 +338,10 @@ bool run_linear_attention_step(
       }
       packed_projection = true;
     } else {
-      if (!matvec_2d(layer.linear.in_proj_qkv, x, mixed_qkv, use_cuda, error_message) ||
-          !matvec_2d(layer.linear.in_proj_z, x, z_vec, use_cuda, error_message) ||
-          !matvec_2d(layer.linear.in_proj_b, x, b_vec, use_cuda, error_message) ||
-          !matvec_2d(layer.linear.in_proj_a, x, a_vec, use_cuda, error_message)) {
+      if (!matvec_2d(cpu_context, layer.linear.in_proj_qkv, x, mixed_qkv, use_cuda, error_message) ||
+          !matvec_2d(cpu_context, layer.linear.in_proj_z, x, z_vec, use_cuda, error_message) ||
+          !matvec_2d(cpu_context, layer.linear.in_proj_b, x, b_vec, use_cuda, error_message) ||
+          !matvec_2d(cpu_context, layer.linear.in_proj_a, x, a_vec, use_cuda, error_message)) {
         return false;
       }
     }
@@ -392,7 +392,7 @@ bool run_linear_attention_step(
   const cpu::Q8_0Backend cpu_backend = layer.linear.out_proj.is_cpu_quantized()
     ? layer.linear.out_proj.q8_0_backend
     : cpu::Q8_0Backend::auto_select;
-  CpuQ8Runtime * const cpu_runtime = layer.linear.out_proj.q8_0_runtime;
+  CpuExecutionContext * const cpu_runtime = cpu_context;
   if (cpu_runtime != nullptr && cpu_runtime->executor != nullptr) {
     GatedDeltaNetCpuJob job{
       state.recurrent_state.data(),
@@ -445,13 +445,13 @@ bool run_linear_attention_step(
     z_values, gated_norm.data(), gated_norm.data(), gated_norm.size(),
     cpu_backend);
 
-  if (!matvec_2d(layer.linear.out_proj, gated_norm, out, use_cuda, error_message)) {
+  if (!matvec_2d(cpu_context, layer.linear.out_proj, gated_norm, out, use_cuda, error_message)) {
     return false;
   }
   return true;
 }
 
-bool run_full_attention_step(
+bool run_full_attention_step(CpuExecutionContext *cpu_context,
   const LayerWeights & layer,
   const RuntimeDims & dims,
   FullAttentionState & state,
@@ -464,8 +464,8 @@ bool run_full_attention_step(
   CudaForwardWorkspace * cuda_workspace,
   std::string & error_message) {
   CpuDecodeWorkspace::Full local_workspace;
-  auto & workspace = !use_cuda && layer.full.o_proj.q8_0_runtime != nullptr
-    ? layer.full.o_proj.q8_0_runtime->decode.full : local_workspace;
+  auto & workspace = !use_cuda && cpu_context != nullptr
+    ? cpu_context->decode.full : local_workspace;
   auto & q_full = workspace.q_full;
   auto & k_flat = workspace.k_flat;
   auto & v_flat = workspace.v_flat;
@@ -484,7 +484,7 @@ bool run_full_attention_step(
   } else {
     if (layer.full.qkv_proj_cpu.is_cpu_quantized()) {
       auto & packed = workspace.packed;
-      if (!matvec_2d(layer.full.qkv_proj_cpu, x, packed, false, error_message)) {
+      if (!matvec_2d(cpu_context, layer.full.qkv_proj_cpu, x, packed, false, error_message)) {
         return false;
       }
       const std::size_t expected = full_q_out + 2 * full_kv_out;
@@ -494,9 +494,9 @@ bool run_full_attention_step(
       }
       packed_projection = true;
     } else {
-      if (!matvec_2d(layer.full.q_proj, x, q_full, use_cuda, error_message) ||
-          !matvec_2d(layer.full.k_proj, x, k_flat, use_cuda, error_message) ||
-          !matvec_2d(layer.full.v_proj, x, v_flat, use_cuda, error_message)) {
+      if (!matvec_2d(cpu_context, layer.full.q_proj, x, q_full, use_cuda, error_message) ||
+          !matvec_2d(cpu_context, layer.full.k_proj, x, k_flat, use_cuda, error_message) ||
+          !matvec_2d(cpu_context, layer.full.v_proj, x, v_flat, use_cuda, error_message)) {
         return false;
       }
     }
@@ -617,7 +617,7 @@ bool run_full_attention_step(
     scale,
     layer.full.o_proj.q8_0_backend,
   };
-  CpuQ8Runtime * const runtime = layer.full.o_proj.q8_0_runtime;
+  CpuExecutionContext * const runtime = cpu_context;
   if (runtime != nullptr && runtime->executor != nullptr) {
     CpuDecodeProbe probe(runtime, "full-attention", attention_pairs, seq_len);
     const cpu::CpuExecutorStatus status = runtime->executor->parallel_for_rows(
@@ -631,13 +631,13 @@ bool run_full_attention_step(
     run_full_attention_decode_cpu_pairs(&job, 0, attention_pairs);
   }
 
-  if (!matvec_2d(layer.full.o_proj, attn_cat, out, use_cuda, error_message)) {
+  if (!matvec_2d(cpu_context, layer.full.o_proj, attn_cat, out, use_cuda, error_message)) {
     return false;
   }
   return true;
 }
 
-bool compute_next_logits_from_embedding(
+bool compute_next_logits_from_embedding(CpuExecutionContext *cpu_context,
   const TensorData & embed,
   const std::vector<float> & hidden,
   const bool use_cuda,
@@ -655,7 +655,7 @@ bool compute_next_logits_from_embedding(
       return false;
     }
   } else {
-    if (!matvec_2d(embed, hidden, out_logits, false, error_message)) {
+    if (!matvec_2d(cpu_context, embed, hidden, out_logits, false, error_message)) {
       return false;
     }
   }

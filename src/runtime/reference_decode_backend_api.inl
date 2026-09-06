@@ -51,7 +51,7 @@ void release_runtime_decode_backend(RuntimeDecodeBackend & backend) {
   backend = RuntimeDecodeBackend{};
 }
 
-bool decode_step_with_runtime_backend(
+bool decode_step_with_runtime_backend(CpuExecutionContext *cpu_context,
   RuntimeDecodeBackend & backend,
   const ModelWeights & weights,
   const RuntimeDims & dims,
@@ -74,7 +74,7 @@ bool decode_step_with_runtime_backend(
 
   switch (backend.kind) {
     case RuntimeDecodeBackendKind::runtime_default:
-      return run_forward_single_token(
+      return run_forward_single_token(cpu_context,
         weights,
         dims,
         state,
@@ -115,7 +115,7 @@ bool decode_step_with_runtime_backend(
   }
 }
 
-bool decode_step_with_runtime_backend_from_device_token(
+bool decode_step_with_runtime_backend_from_device_token(CpuExecutionContext *cpu_context,
   RuntimeDecodeBackend & backend,
   const ModelWeights & weights,
   const RuntimeDims & dims,
@@ -136,7 +136,7 @@ bool decode_step_with_runtime_backend_from_device_token(
 
   switch (backend.kind) {
     case RuntimeDecodeBackendKind::runtime_default:
-      return run_forward_single_token_cuda_device_from_token_buffer(
+      return run_forward_single_token_cuda_device_from_token_buffer(cpu_context,
         weights,
         dims,
         state,

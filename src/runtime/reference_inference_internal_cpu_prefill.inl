@@ -74,7 +74,7 @@ void run_gated_delta_net_batch_cpu_rows(
     job.backend);
 }
 
-bool run_linear_attention_batch_cpu_q8(
+bool run_linear_attention_batch_cpu_q8(CpuExecutionContext *cpu_context,
   const LayerWeights & layer,
   const RuntimeDims & dims,
   LinearAttentionState & state,
@@ -106,7 +106,7 @@ bool run_linear_attention_batch_cpu_q8(
     return false;
   }
 
-  CpuQ8Runtime * const runtime = layer.linear.out_proj.q8_0_runtime;
+  CpuExecutionContext * const runtime = cpu_context;
   CpuPrefillWorkspace::Linear fallback;
   auto & scratch = runtime != nullptr ? runtime->prefill.linear : fallback;
   const bool fine = runtime && runtime->stages;
@@ -114,7 +114,7 @@ bool run_linear_attention_batch_cpu_q8(
   std::chrono::steady_clock::time_point mark;
   if(fine) { stage.kind="linear"; stage.position=position_start; stage.tokens=batch_size; mark=std::chrono::steady_clock::now(); }
   auto & projected = scratch.projected;
-  if (!matmul_2d_quantized_batch(
+  if (!matmul_2d_quantized_batch(cpu_context,
         layer.linear.in_proj_all_cpu, input, batch_size, projected, error_message)) {
     return false;
   }
@@ -263,13 +263,13 @@ bool run_linear_attention_batch_cpu_q8(
       layer.linear.out_proj.q8_0_backend);
   }
 
-  const bool ok = matmul_2d_quantized_batch(
+  const bool ok = matmul_2d_quantized_batch(cpu_context,
     layer.linear.out_proj, gated, batch_size, output, error_message);
   if(fine) {stage.output_ms=elapsed_ms(mark);runtime->stages->push_back(stage);}
   return ok;
 }
 
-bool run_full_attention_batch_cpu_q8(
+bool run_full_attention_batch_cpu_q8(CpuExecutionContext *cpu_context,
   const LayerWeights & layer,
   const RuntimeDims & dims,
   FullAttentionState & state,
@@ -288,7 +288,7 @@ bool run_full_attention_batch_cpu_q8(
   const std::size_t q_full_width = 2 * query_width;
   const std::size_t kv_width = static_cast<std::size_t>(dims.n_kv_heads * dims.head_dim);
   const std::size_t projection_width = q_full_width + 2 * kv_width;
-  CpuQ8Runtime * const runtime = layer.full.o_proj.q8_0_runtime;
+  CpuExecutionContext * const runtime = cpu_context;
   CpuPrefillWorkspace::Full fallback;
   auto & scratch = runtime != nullptr ? runtime->prefill.full : fallback;
   const bool fine = runtime && runtime->stages;
@@ -296,7 +296,7 @@ bool run_full_attention_batch_cpu_q8(
   std::chrono::steady_clock::time_point mark;
   if(fine) { stage.kind="full"; stage.tokens=batch_size; mark=std::chrono::steady_clock::now(); }
   auto & projected = scratch.projected;
-  if (!matmul_2d_quantized_batch(
+  if (!matmul_2d_quantized_batch(cpu_context,
         layer.full.qkv_proj_cpu, input, batch_size, projected, error_message)) {
     return false;
   }
@@ -476,13 +476,13 @@ bool run_full_attention_batch_cpu_q8(
   }
 
   if(fine) {stage.attention_wall_ms=elapsed_ms(mark);mark=std::chrono::steady_clock::now();}
-  const bool ok = matmul_2d_quantized_batch(
+  const bool ok = matmul_2d_quantized_batch(cpu_context,
     layer.full.o_proj, attention, batch_size, output, error_message);
   if(fine) {stage.output_ms=elapsed_ms(mark);runtime->stages->push_back(stage);}
   return ok;
 }
 
-bool run_forward_cpu_q8_batch(
+bool run_forward_cpu_q8_batch(CpuExecutionContext *cpu_context,
   const ModelWeights & weights,
   const RuntimeDims & dims,
   ModelState & state,
@@ -494,7 +494,7 @@ bool run_forward_cpu_q8_batch(
   CpuGreedySamplingState * greedy_sampling,
   DecodeProfilingAccumulator * profiling,
   std::string & error_message) {
-  if (weights.cpu_q8_runtime == nullptr || token_ids == nullptr || batch_size == 0) {
+  if (cpu_context == nullptr || token_ids == nullptr || batch_size == 0) {
     error_message = "Batched CPU Q8_0 forward received an invalid runtime or empty batch.";
     return false;
   }
@@ -510,7 +510,7 @@ bool run_forward_cpu_q8_batch(
   }
 
   const auto embedding_start = std::chrono::steady_clock::now();
-  auto & scratch = weights.cpu_q8_runtime->prefill.forward;
+  auto & scratch = cpu_context->prefill.forward;
   auto & x = scratch.x;
   x.resize(batch_size * hidden);
   for (std::size_t token = 0; token < batch_size; ++token) {
@@ -556,7 +556,7 @@ bool run_forward_cpu_q8_batch(
     const auto attention_start = std::chrono::steady_clock::now();
     bool attention_ok = false;
     if (layer.is_linear) {
-      attention_ok = run_linear_attention_batch_cpu_q8(
+      attention_ok = run_linear_attention_batch_cpu_q8(cpu_context,
         layer,
         dims,
         state.linear_states[static_cast<std::size_t>(linear_index++)],
@@ -566,7 +566,7 @@ bool run_forward_cpu_q8_batch(
         attention,
         error_message);
     } else {
-      attention_ok = run_full_attention_batch_cpu_q8(
+      attention_ok = run_full_attention_batch_cpu_q8(cpu_context,
         layer,
         dims,
         state.full_states[static_cast<std::size_t>(full_index++)],
@@ -592,7 +592,7 @@ bool run_forward_cpu_q8_batch(
     rms_norm_qwen3next_batch(
       residual, batch_size, hidden, layer.post_attention_layernorm, dims.rms_eps, post_norm);
     if (!layer.mlp_gate_up_cpu.is_cpu_quantized() ||
-        !matmul_2d_quantized_batch(
+        !matmul_2d_quantized_batch(cpu_context,
           layer.mlp_gate_up_cpu, post_norm, batch_size, gate_up, error_message)) {
       if (error_message.empty()) {
         error_message = "Batched CPU MLP requires packed Q4_0/Q8_0 gate/up weights.";
@@ -608,7 +608,7 @@ bool run_forward_cpu_q8_batch(
         intermediate,
         layer.mlp_down.q8_0_backend);
     }
-    if (!matmul_2d_quantized_batch(
+    if (!matmul_2d_quantized_batch(cpu_context,
           layer.mlp_down, mlp_hidden, batch_size, mlp_output, error_message)) {
       return false;
     }
@@ -631,13 +631,13 @@ bool run_forward_cpu_q8_batch(
   bool ok = false;
   if (greedy_sampling != nullptr && greedy_sampling->enabled &&
       greedy_sampling->token_counts != nullptr) {
-    ok = greedy_q4_token(
+    ok = greedy_q4_token(cpu_context,
       weights.embed_tokens, final_hidden, *greedy_sampling->token_counts,
       greedy_sampling->repetition_penalty, greedy_sampling->next_token,
       error_message);
     next_logits.clear();
   } else {
-    ok = compute_next_logits_from_embedding(
+    ok = compute_next_logits_from_embedding(cpu_context,
       weights.embed_tokens, final_hidden, false, next_logits, error_message);
   }
   if (profiling != nullptr) {
