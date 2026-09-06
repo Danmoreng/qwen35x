@@ -1,4 +1,5 @@
 #include "qwen35x/runtime/reference_inference.h"
+#include "qwen35x/runtime/cpu_engine.h"
 
 #include "qwen35x/cpu/activation.h"
 
@@ -28,6 +29,7 @@
 #include <sstream>
 #include <span>
 #include <unordered_set>
+#include <unordered_map>
 
 namespace qwen35x {
 
@@ -37,5 +39,6 @@ namespace qwen35x {
 #include "reference_inference_internal_cpu_prefill.inl"
 #include "reference_decode_backend_api.inl"
 #include "reference_inference_api.inl"
+#include "cpu_engine.inl"
 
 } // namespace qwen35x

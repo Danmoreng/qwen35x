@@ -377,3 +377,6 @@ if (CMAKE_CUDA_COMPILER)
   )
   target_link_libraries(qwen35x_flashqla_prepare_parity PRIVATE CUDA::cudart)
 endif ()
+
+add_executable(qwen35x_cpu_engine_model_test tests/cpu_engine_model_test.cpp)
+target_link_libraries(qwen35x_cpu_engine_model_test PRIVATE qwen35x_core)

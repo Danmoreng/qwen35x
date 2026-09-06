@@ -32,7 +32,22 @@ is retained as an independently validated structural prerequisite.
 Raw records: benchmarks/cpu-experiments-2026-09-06/multi-context.
 The frozen pre-change executable is benchmarks/multi-request-2026-09-06/baseline.exe.
 
+## Step 1b: Persistent incremental requests
+
+Added immutable `CpuModel` sharing and an explicit single-owner `CpuEngine` API
+with submit, bounded advance, result, cancellation and release. Each request
+owns hybrid state, position, a pending token, RNG, penalties and stopping state.
+Resident and context limits apply before allocation; IDs are never reused.
+The synchronous API remains compatible and uses the same forward helpers.
+
+The optional `qwen35x_cpu_engine_model_test` compares complete raw logits and
+outputs against the synchronous API, interleaving prompts of 65 and 257 tokens
+with both forced tokens and seeded sampling. Results are byte-identical. It
+also checks cancellation, admission limits, stopping, IDs and model sharing
+between engines. The existing full-model cache/precision regression passes.
+These are structural changes; no additional speedup is claimed.
+
 ## Next
 
-Step 1b: persistent incremental request state and immutable model sharing.
-Steps 2-7 remain pending; no multi-request throughput gain is claimed yet.
+Steps 2-7 remain pending. Step 2 adds actual shared decode projections and
+measurement of aggregate throughput over a common wall-clock interval.
