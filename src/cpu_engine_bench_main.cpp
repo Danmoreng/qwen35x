@@ -54,12 +54,18 @@ int main(int argc, char **argv) try {
   CpuEngineConfig config;
   CpuRequestSpec spec;
   std::size_t batch_size = 1;
+  std::size_t prefix_tokens = 0;
+  bool identical_prompts = false;
   std::string profile_path;
   bool serial = false, strict = false;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--infer-reference")
       continue;
+    if (arg == "--cpu-identical-prompts") {
+      identical_prompts = true;
+      continue;
+    }
     if (arg == "--cpu-batch-greedy") {
       config.batch_greedy = true;
       continue;
@@ -100,6 +106,8 @@ int main(int argc, char **argv) try {
       options.cpu_q4_h128_path = value;
     else if (arg == "--cpu-batch")
       batch_size = positive();
+    else if (arg == "--cpu-registered-prefix")
+      prefix_tokens = positive();
     else if (arg == "--max-context")
       config.max_context = positive();
     else if (arg == "--max-new-tokens")
@@ -166,14 +174,31 @@ int main(int argc, char **argv) try {
   auto engine = CpuEngine::create(model, config, error);
   check(bool(engine));
   const double load_ms = ms(load_start);
+  if (prefix_tokens > spec.prompt_tokens.size() ||
+      (prefix_tokens == spec.prompt_tokens.size() && !identical_prompts))
+    throw std::runtime_error(
+        "Invalid prefix length; full hits require identical prompts");
+  std::shared_ptr<const CpuPrefix> prefix;
+  double prefix_build_ms = 0;
+  if (prefix_tokens) {
+    const auto start = Clock::now();
+    prefix = engine->register_prefix(
+        std::span<const std::int32_t>(spec.prompt_tokens.data(), prefix_tokens),
+        "benchmark", error);
+    check(bool(prefix));
+    prefix_build_ms = ms(start);
+  }
   std::vector<CpuRequestId> ids;
   const auto prefill_start = Clock::now();
   for (std::size_t r = 0; r < batch_size; ++r) {
     auto request = spec;
     // Same prefix, deterministic distinct final prompt token; no prefix cache.
-    request.prompt_tokens.back() =
-        (request.prompt_tokens.back() + static_cast<int>(r)) %
-        profile->text.vocab_size;
+    request.prefix = prefix;
+    request.trust_namespace = "benchmark";
+    if (!identical_prompts)
+      request.prompt_tokens.back() =
+          (request.prompt_tokens.back() + static_cast<int>(r)) %
+          profile->text.vocab_size;
     auto id = engine->submit(std::move(request), error);
     check(id != 0);
     ids.push_back(id);
@@ -205,12 +230,16 @@ int main(int argc, char **argv) try {
   }
   const double decode_ms = ms(decode_start);
   const auto stats = engine->stats();
-  std::size_t forwards = 0, delivered = 0;
+  std::size_t forwards = 0, delivered = 0, newly_prefilled = 0, cached = 0;
+  double restore_ms = 0;
   std::vector<CpuRequestResult> results(batch_size);
   for (std::size_t r = 0; r < ids.size(); ++r) {
     check(engine->result(ids[r], results[r]));
     forwards += results[r].decode_forwards;
     delivered += results[r].output_tokens.size();
+    newly_prefilled += results[r].prefill_tokens;
+    cached += results[r].cached_prefix_tokens;
+    restore_ms += results[r].prefix_restore_ms;
   }
   std::sort(ticks.begin(), ticks.end());
   auto percentile = [&](double p) {
@@ -230,7 +259,12 @@ int main(int argc, char **argv) try {
       << ",\"decode_forwards\":" << forwards << ",\"load_time_ms\":" << load_ms
       << ",\"prefill_time_ms\":" << prefill_ms
       << ",\"prefill_tokens_per_second\":"
-      << spec.prompt_tokens.size() * batch_size * 1000.0 / prefill_ms
+      << newly_prefilled * 1000.0 / prefill_ms
+      << ",\"new_prefill_tokens\":" << newly_prefilled
+      << ",\"cached_prefix_tokens\":" << cached
+      << ",\"prefix_build_time_ms\":" << prefix_build_ms
+      << ",\"prefix_cache_restore_time_ms\":" << restore_ms
+      << ",\"prefix_cache_bytes\":" << (prefix ? prefix->size_bytes() : 0)
       << ",\"decode_time_ms\":" << decode_ms
       << ",\"tokens_per_second\":" << throughput
       << ",\"per_request_tokens_per_second\":" << throughput / batch_size
@@ -243,8 +277,7 @@ int main(int argc, char **argv) try {
       << ",\"projection_batches\":" << stats.projection_batches
       << ",\"lm_head_batches\":" << stats.lm_head_batches
       << ",\"greedy_lm_head_batches\":" << stats.greedy_lm_head_batches
-      << ",\"state_batches\":" << stats.state_batches
-      << ",\"cpu_kv_cache\":\""
+      << ",\"state_batches\":" << stats.state_batches << ",\"cpu_kv_cache\":\""
       << (cpu::q8_0_backend_uses_avx2(options.cpu_q8_backend) ? "fp16" : "fp32")
       << "\",\"requests\":[";
   for (std::size_t r = 0; r < results.size(); ++r) {

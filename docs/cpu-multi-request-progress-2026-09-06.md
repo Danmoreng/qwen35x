@@ -127,11 +127,6 @@ the existing complete-logit/isolation tests continue to pass.
 [Samples](cpu-multi-request-greedy-2026-09-06-samples.csv) ·
 [Binary hashes and settings](cpu-multi-request-greedy-2026-09-06-metadata.json).
 
-## Next
-
-Confirm thread/topology effects on the updated state-dispatch path and extend
-selected batch sizes. Steps 3-7 remain pending.
-
 ## Step 2c: Joint dispatch of private state updates
 
 When B >= executor thread count, process independent attention/DeltaNet rows in
@@ -155,3 +150,86 @@ state-dispatch counter is exactly 24*127 = 3048 for each measured batch.
 
 [Samples](cpu-multi-request-state-2026-09-06-samples.csv) ·
 [Binary hashes and settings](cpu-multi-request-state-2026-09-06-metadata.json).
+
+## Step 3 checkpoint: Experimental copy-based hybrid prefixes
+
+Implemented explicit immutable prefix registration, bounded payload storage,
+namespace/model/configuration checks, private hybrid-state restore, and complete
+hits using cached normalized hidden vectors with request-local sampling.
+Prefix restore resumes at the remaining part of the original prefill chunk,
+avoiding a shift of all subsequent chunk boundaries.
+
+The full-model test checks prefix lengths 65/128/257 with suffix lengths
+0/3/129 under forced tokens and seeded sampling: all 18 full-logit comparisons
+are byte-identical. Deduplication, namespace/token rejection, distinct loaded
+model rejection and pinned-budget eviction tests pass. The existing engine
+model tests passed, and all nine CTest tests passed at this checkpoint.
+
+However, the longer benchmark exposes an unresolved numerical difference:
+with a 511-token prefix and one private suffix token, 5 of 16 greedy output
+sequences differ from cold prefill, starting as early as output index 1.
+Every warm measured run reproduces those differences. This is not yet evidence
+of a quality loss, but it prevents claiming general equivalence. Investigate
+prefix construction and split prefill arithmetic, add a representative
+regression fixture and evaluate logit/state error before declaring step 3 done.
+The earlier short-token tests are insufficient. Prefix use remains explicit
+and experimental; existing requests do not automatically enable it.
+
+P512, B16, eight threads, 0xffff, 128 outputs, sequential cold/warm/warm/cold,
+three measured runs after one warmup per leg (six samples per variant):
+
+| Prefix case | Cold initialization ms | Warm initialization ms | Separate prefix build ms | Output equality |
+|---|---:|---:|---:|---|
+| 511 tokens + private final token | 4675.79 | 209.00 | 403.96 | 5/16 sequences differ |
+| Complete 512-token hit | 3761.18 | 108.94 | 301.84 | All identical |
+
+Initialization includes allocation, restore and first-token selection for all
+16 requests. Prefix build is excluded from warm time, so the complete-hit
+34.5x initialization ratio is not an end-to-end or cold-start speedup. The
+complete snapshot contains 26,499,072 payload bytes; total restore-copy time is
+16.12 ms. Warm complete hits compute zero new prefill tokens. Decode throughput
+is 671.06 cold versus 668.06 warm token/s: no demonstrated decode gain.
+Partial-hit timing is diagnostic only until numerical validation is resolved.
+
+## Thread and topology confirmation
+
+Using the committed joint-state/greedy path, P512/B16/128 outputs, same frozen
+binary, sequential A/B/B/A with six measured samples per configuration:
+
+| Configuration | Decode token/s | Range |
+|---|---:|---:|
+| 8 threads, 96 MiB L3 domain, mask 0xffff | 674.96 | 673.11-678.78 |
+| 16 threads, one per physical core, mask 0x55555555 | 698.05 | 678.73-709.77 |
+
+All generated output arrays match. The 3.4% median gain applies to this batch
+and topology; it is not a universal thread recommendation. Thread count and
+placement both change. Larger batches, 24/32 threads, and the selective
+B10/20/50/100 extension remain to be measured.
+
+[Samples](cpu-multi-request-prefix-threads-2026-09-06-samples.csv) and
+[binary hashes/settings](cpu-multi-request-prefix-threads-2026-09-06-metadata.json)
+retain all measured runs. A first-difference index of 128 means no mismatch
+within the 128 generated tokens. Thread runs predate the new prefix counters,
+so blank prefix fields mean unavailable, not zero measured work.
+
+## Remaining work, in order
+
+1. Finish step 3 numerical validation for realistic partial prefixes and
+   suffixes, including long contexts and batched branches. Do not generalize
+   the passing complete-hit result to arbitrary prefixes.
+2. Complete selected step 2 scale/thread measurements, including larger batches
+   and SMT candidates; report latency and memory alongside throughput.
+3. Step 4: bounded admission/queues, continuous batching with fair prefill/decode
+   ticks, cancellation, output backpressure and single-flight prefix builds.
+   Current submit allocates private state immediately and callers manage batches.
+4. Step 5: physically shared immutable KV pages, private suffixes and tail-page
+   copy-on-write, keeping DeltaNet/convolution state private.
+5. Step 6: grouped attention over common prefix panels with stable partial
+   softmax merging; demonstrate gains over the same shared-page baseline.
+6. Step 7: mixed prefill/decode projection experiment; adopt only measured gains.
+
+Portable topology detection, optional saved workload calibration and a manual
+thread override are an additional design direction discussed with the user,
+not an implemented autotuner or a prerequisite for finishing prefix validation.
+The original implementation plan remains the roadmap; steps 1 and 2 core paths
+are implemented, step 3 is experimental, and steps 4-7 are not implemented.

@@ -493,7 +493,8 @@ bool run_forward_cpu_q8_batch(CpuExecutionContext *cpu_context,
   std::vector<float> & next_logits,
   CpuGreedySamplingState * greedy_sampling,
   DecodeProfilingAccumulator * profiling,
-  std::string & error_message) {
+  std::string & error_message,
+  std::vector<float> * normalized_output = nullptr) {
   if (cpu_context == nullptr || token_ids == nullptr || batch_size == 0) {
     error_message = "Batched CPU Q8_0 forward received an invalid runtime or empty batch.";
     return false;
@@ -619,7 +620,7 @@ bool run_forward_cpu_q8_batch(CpuExecutionContext *cpu_context,
     }
   }
 
-  if (!compute_next_logits) {
+  if (!compute_next_logits && normalized_output == nullptr) {
     return true;
   }
   const auto logits_start = std::chrono::steady_clock::now();
@@ -628,6 +629,8 @@ bool run_forward_cpu_q8_batch(CpuExecutionContext *cpu_context,
   final_hidden.resize(hidden);
   cpu::rms_norm_f32(last_hidden, weights.final_norm.data.data(), final_hidden.data(),
     1, hidden, dims.rms_eps, 1.0F);
+  if (normalized_output != nullptr) *normalized_output = final_hidden;
+  if (!compute_next_logits) return true;
   bool ok = false;
   if (greedy_sampling != nullptr && greedy_sampling->enabled &&
       greedy_sampling->token_counts != nullptr) {

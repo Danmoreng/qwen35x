@@ -1,0 +1,254 @@
+[
+  {
+    "experiment": "prefix-copy-partial",
+    "leg": "p512-0-cold",
+    "settings": {
+      "executable": "benchmarks/multi-request-2026-09-06/prefix-copy-experiment.exe",
+      "serial_state_batches": false,
+      "affinity": 65535,
+      "greedy_tiles": false,
+      "revision": "de59ca056b252510d705f4da549ae6cb81e0ceb1",
+      "registered_prefix_tokens": 0,
+      "prompt_rule": "Repeat/truncate fixture; request r increments final prompt token by r modulo vocabulary.",
+      "timing": "Decode after all first tokens; actual B*(N-1) forwards over common wall time including sampling and loop.",
+      "identical_prompts": false,
+      "threads": 8,
+      "parallel_state_batches": false,
+      "executable_sha256": "1223EB027A476AD7125A1653C0C4D095793F9E1D89B204BDD4251A20E06E96F5",
+      "serial_reference": false,
+      "full_logits": false,
+      "fixture": "configs/qwen3_5_0_8b_text_1024x512_tokens.csv"
+    }
+  },
+  {
+    "experiment": "prefix-copy-partial",
+    "leg": "p512-1-warm",
+    "settings": {
+      "executable": "benchmarks/multi-request-2026-09-06/prefix-copy-experiment.exe",
+      "serial_state_batches": false,
+      "affinity": 65535,
+      "greedy_tiles": false,
+      "revision": "de59ca056b252510d705f4da549ae6cb81e0ceb1",
+      "registered_prefix_tokens": 511,
+      "prompt_rule": "Repeat/truncate fixture; request r increments final prompt token by r modulo vocabulary.",
+      "timing": "Decode after all first tokens; actual B*(N-1) forwards over common wall time including sampling and loop.",
+      "identical_prompts": false,
+      "threads": 8,
+      "parallel_state_batches": false,
+      "executable_sha256": "1223EB027A476AD7125A1653C0C4D095793F9E1D89B204BDD4251A20E06E96F5",
+      "serial_reference": false,
+      "full_logits": false,
+      "fixture": "configs/qwen3_5_0_8b_text_1024x512_tokens.csv"
+    }
+  },
+  {
+    "experiment": "prefix-copy-partial",
+    "leg": "p512-2-warm",
+    "settings": {
+      "executable": "benchmarks/multi-request-2026-09-06/prefix-copy-experiment.exe",
+      "serial_state_batches": false,
+      "affinity": 65535,
+      "greedy_tiles": false,
+      "revision": "de59ca056b252510d705f4da549ae6cb81e0ceb1",
+      "registered_prefix_tokens": 511,
+      "prompt_rule": "Repeat/truncate fixture; request r increments final prompt token by r modulo vocabulary.",
+      "timing": "Decode after all first tokens; actual B*(N-1) forwards over common wall time including sampling and loop.",
+      "identical_prompts": false,
+      "threads": 8,
+      "parallel_state_batches": false,
+      "executable_sha256": "1223EB027A476AD7125A1653C0C4D095793F9E1D89B204BDD4251A20E06E96F5",
+      "serial_reference": false,
+      "full_logits": false,
+      "fixture": "configs/qwen3_5_0_8b_text_1024x512_tokens.csv"
+    }
+  },
+  {
+    "experiment": "prefix-copy-partial",
+    "leg": "p512-3-cold",
+    "settings": {
+      "executable": "benchmarks/multi-request-2026-09-06/prefix-copy-experiment.exe",
+      "serial_state_batches": false,
+      "affinity": 65535,
+      "greedy_tiles": false,
+      "revision": "de59ca056b252510d705f4da549ae6cb81e0ceb1",
+      "registered_prefix_tokens": 0,
+      "prompt_rule": "Repeat/truncate fixture; request r increments final prompt token by r modulo vocabulary.",
+      "timing": "Decode after all first tokens; actual B*(N-1) forwards over common wall time including sampling and loop.",
+      "identical_prompts": false,
+      "threads": 8,
+      "parallel_state_batches": false,
+      "executable_sha256": "1223EB027A476AD7125A1653C0C4D095793F9E1D89B204BDD4251A20E06E96F5",
+      "serial_reference": false,
+      "full_logits": false,
+      "fixture": "configs/qwen3_5_0_8b_text_1024x512_tokens.csv"
+    }
+  },
+  {
+    "experiment": "prefix-copy-full",
+    "leg": "p512-0-cold",
+    "settings": {
+      "executable": "benchmarks/multi-request-2026-09-06/prefix-copy-experiment.exe",
+      "serial_state_batches": false,
+      "affinity": 65535,
+      "greedy_tiles": false,
+      "revision": "de59ca056b252510d705f4da549ae6cb81e0ceb1",
+      "registered_prefix_tokens": 0,
+      "prompt_rule": "Repeat/truncate fixture; request r increments final prompt token by r modulo vocabulary.",
+      "timing": "Decode after all first tokens; actual B*(N-1) forwards over common wall time including sampling and loop.",
+      "identical_prompts": true,
+      "threads": 8,
+      "parallel_state_batches": false,
+      "executable_sha256": "1223EB027A476AD7125A1653C0C4D095793F9E1D89B204BDD4251A20E06E96F5",
+      "serial_reference": false,
+      "full_logits": false,
+      "fixture": "configs/qwen3_5_0_8b_text_1024x512_tokens.csv"
+    }
+  },
+  {
+    "experiment": "prefix-copy-full",
+    "leg": "p512-1-warm",
+    "settings": {
+      "executable": "benchmarks/multi-request-2026-09-06/prefix-copy-experiment.exe",
+      "serial_state_batches": false,
+      "affinity": 65535,
+      "greedy_tiles": false,
+      "revision": "de59ca056b252510d705f4da549ae6cb81e0ceb1",
+      "registered_prefix_tokens": 512,
+      "prompt_rule": "Repeat/truncate fixture; request r increments final prompt token by r modulo vocabulary.",
+      "timing": "Decode after all first tokens; actual B*(N-1) forwards over common wall time including sampling and loop.",
+      "identical_prompts": true,
+      "threads": 8,
+      "parallel_state_batches": false,
+      "executable_sha256": "1223EB027A476AD7125A1653C0C4D095793F9E1D89B204BDD4251A20E06E96F5",
+      "serial_reference": false,
+      "full_logits": false,
+      "fixture": "configs/qwen3_5_0_8b_text_1024x512_tokens.csv"
+    }
+  },
+  {
+    "experiment": "prefix-copy-full",
+    "leg": "p512-2-warm",
+    "settings": {
+      "executable": "benchmarks/multi-request-2026-09-06/prefix-copy-experiment.exe",
+      "serial_state_batches": false,
+      "affinity": 65535,
+      "greedy_tiles": false,
+      "revision": "de59ca056b252510d705f4da549ae6cb81e0ceb1",
+      "registered_prefix_tokens": 512,
+      "prompt_rule": "Repeat/truncate fixture; request r increments final prompt token by r modulo vocabulary.",
+      "timing": "Decode after all first tokens; actual B*(N-1) forwards over common wall time including sampling and loop.",
+      "identical_prompts": true,
+      "threads": 8,
+      "parallel_state_batches": false,
+      "executable_sha256": "1223EB027A476AD7125A1653C0C4D095793F9E1D89B204BDD4251A20E06E96F5",
+      "serial_reference": false,
+      "full_logits": false,
+      "fixture": "configs/qwen3_5_0_8b_text_1024x512_tokens.csv"
+    }
+  },
+  {
+    "experiment": "prefix-copy-full",
+    "leg": "p512-3-cold",
+    "settings": {
+      "executable": "benchmarks/multi-request-2026-09-06/prefix-copy-experiment.exe",
+      "serial_state_batches": false,
+      "affinity": 65535,
+      "greedy_tiles": false,
+      "revision": "de59ca056b252510d705f4da549ae6cb81e0ceb1",
+      "registered_prefix_tokens": 0,
+      "prompt_rule": "Repeat/truncate fixture; request r increments final prompt token by r modulo vocabulary.",
+      "timing": "Decode after all first tokens; actual B*(N-1) forwards over common wall time including sampling and loop.",
+      "identical_prompts": true,
+      "threads": 8,
+      "parallel_state_batches": false,
+      "executable_sha256": "1223EB027A476AD7125A1653C0C4D095793F9E1D89B204BDD4251A20E06E96F5",
+      "serial_reference": false,
+      "full_logits": false,
+      "fixture": "configs/qwen3_5_0_8b_text_1024x512_tokens.csv"
+    }
+  },
+  {
+    "experiment": "threads-state-confirm",
+    "leg": "p512-b16-0-base",
+    "settings": {
+      "executable": "benchmarks/multi-request-2026-09-06/state-default.exe",
+      "serial_state_batches": false,
+      "affinity": 65535,
+      "greedy_tiles": false,
+      "revision": "de59ca056b252510d705f4da549ae6cb81e0ceb1",
+      "registered_prefix_tokens": 0,
+      "prompt_rule": "Repeat/truncate fixture; request r increments final prompt token by r modulo vocabulary.",
+      "timing": "Decode after all first tokens; actual B*(N-1) forwards over common wall time including sampling and loop.",
+      "identical_prompts": false,
+      "threads": 8,
+      "parallel_state_batches": false,
+      "executable_sha256": "0BB36F0EB81756380BB2D28014B8B8339B95F80C4F27FB9A706FA1AE8DCFC30E",
+      "serial_reference": false,
+      "full_logits": false,
+      "fixture": "configs/qwen3_5_0_8b_text_1024x512_tokens.csv"
+    }
+  },
+  {
+    "experiment": "threads-state-confirm",
+    "leg": "p512-b16-1-candidate",
+    "settings": {
+      "executable": "benchmarks/multi-request-2026-09-06/state-default.exe",
+      "serial_state_batches": false,
+      "affinity": 1431655765,
+      "greedy_tiles": false,
+      "revision": "de59ca056b252510d705f4da549ae6cb81e0ceb1",
+      "registered_prefix_tokens": 0,
+      "prompt_rule": "Repeat/truncate fixture; request r increments final prompt token by r modulo vocabulary.",
+      "timing": "Decode after all first tokens; actual B*(N-1) forwards over common wall time including sampling and loop.",
+      "identical_prompts": false,
+      "threads": 16,
+      "parallel_state_batches": false,
+      "executable_sha256": "0BB36F0EB81756380BB2D28014B8B8339B95F80C4F27FB9A706FA1AE8DCFC30E",
+      "serial_reference": false,
+      "full_logits": false,
+      "fixture": "configs/qwen3_5_0_8b_text_1024x512_tokens.csv"
+    }
+  },
+  {
+    "experiment": "threads-state-confirm",
+    "leg": "p512-b16-2-candidate",
+    "settings": {
+      "executable": "benchmarks/multi-request-2026-09-06/state-default.exe",
+      "serial_state_batches": false,
+      "affinity": 1431655765,
+      "greedy_tiles": false,
+      "revision": "de59ca056b252510d705f4da549ae6cb81e0ceb1",
+      "registered_prefix_tokens": 0,
+      "prompt_rule": "Repeat/truncate fixture; request r increments final prompt token by r modulo vocabulary.",
+      "timing": "Decode after all first tokens; actual B*(N-1) forwards over common wall time including sampling and loop.",
+      "identical_prompts": false,
+      "threads": 16,
+      "parallel_state_batches": false,
+      "executable_sha256": "0BB36F0EB81756380BB2D28014B8B8339B95F80C4F27FB9A706FA1AE8DCFC30E",
+      "serial_reference": false,
+      "full_logits": false,
+      "fixture": "configs/qwen3_5_0_8b_text_1024x512_tokens.csv"
+    }
+  },
+  {
+    "experiment": "threads-state-confirm",
+    "leg": "p512-b16-3-base",
+    "settings": {
+      "executable": "benchmarks/multi-request-2026-09-06/state-default.exe",
+      "serial_state_batches": false,
+      "affinity": 65535,
+      "greedy_tiles": false,
+      "revision": "de59ca056b252510d705f4da549ae6cb81e0ceb1",
+      "registered_prefix_tokens": 0,
+      "prompt_rule": "Repeat/truncate fixture; request r increments final prompt token by r modulo vocabulary.",
+      "timing": "Decode after all first tokens; actual B*(N-1) forwards over common wall time including sampling and loop.",
+      "identical_prompts": false,
+      "threads": 8,
+      "parallel_state_batches": false,
+      "executable_sha256": "0BB36F0EB81756380BB2D28014B8B8339B95F80C4F27FB9A706FA1AE8DCFC30E",
+      "serial_reference": false,
+      "full_logits": false,
+      "fixture": "configs/qwen3_5_0_8b_text_1024x512_tokens.csv"
+    }
+  }
+]

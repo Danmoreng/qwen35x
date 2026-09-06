@@ -46,8 +46,8 @@ per-request state dispatch. Set `parallel_state_batches = false` (or benchmark
 `-SerialStateBatches`) to compare the earlier scheduling path.
 
 The legacy synchronous inference API remains available. This initial API does
-not yet provide a background scheduler, HTTP service, shared prefix store or
-shared KV pages. Those are subsequent stages in the
+not yet provide a background scheduler, HTTP service or shared KV pages.
+An experimental registered prefix store is described below. Further stages follow the
 [implementation plan](cpu-multi-request-plan-2026-09-06.md).
 
 ## Reproducible static decode measurement
@@ -91,3 +91,35 @@ No stopping tokens are configured, so every request delivers the fixed count.
 The optional `qwen35x_cpu_engine_model_test <HF directory> <Q4 artifact>` checks
 full-model correctness using local model files. It is separate from CTest so
 ordinary source builds do not require downloading a checkpoint.
+
+## Experimental registered prefixes
+
+Call `register_prefix(token_ids, trust_namespace, error)` to build a synchronous,
+immutable hybrid snapshot. Set `CpuRequestSpec::prefix` to its handle, set the
+same nonempty `trust_namespace`, and supply the complete prompt including those
+exact prefix tokens. Restore copies KV, DeltaNet and convolution state into
+private request storage. Complete hits use the cached final normalized hidden
+vector, but compute the LM-head and sample independently for each request.
+
+Compatibility requires the same loaded `CpuModel` object and prefill chunk
+configuration. Handles retain that object, preventing address reuse. Reloading
+even the same artifact creates a different identity and is rejected; this is an
+in-process cache, with no persistent snapshot format or filename-based identity.
+The default 256 MiB budget counts snapshot payload including DeltaNet, convolution,
+KV, token IDs and final hidden data, not allocator overhead or request copies.
+Externally held handles pin entries; only unpinned entries can be evicted.
+
+**Partial-hit numerical validation is not complete.** The P512 benchmark with
+a 511-token prefix changes 5 of 16 greedy output sequences versus cold prefill.
+The P512 complete-hit benchmark matches all outputs. Smaller forced/full-logit
+tests pass, so those tests alone do not establish general equivalence or quality.
+Keep prefix use explicit while this discrepancy is investigated. See the
+[progress report](cpu-multi-request-progress-2026-09-06.md) for measured scope.
+
+`scripts/benchmark-cpu-prefix.ps1` compares cold/warm/warm/cold runs through the
+sequential benchmark runner. `-FullHits` uses identical complete prompts;
+otherwise each request has a distinct final token after the shared prefix.
+Prefix construction is timed separately from warm request initialization.
+Cached tokens are reported separately and never counted as newly computed
+prefill throughput. The optional `qwen35x_cpu_prefix_model_test` takes the same
+two model paths as the engine model test.

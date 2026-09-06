@@ -15,6 +15,8 @@ param(
     [switch]$CpuBatchFullLogits,
     [switch]$CpuBatchParallelState,
     [switch]$CpuBatchSerialState,
+    [int]$CpuRegisteredPrefixTokens = 0,
+    [switch]$CpuIdenticalPrompts,
     [ValidateSet("auto", "scalar", "avx2", "avx-vnni", "avx512", "avx512-vnni")]
     [string]$CpuIsa = "auto",
     [switch]$CpuIsaStrict,
@@ -215,6 +217,8 @@ function Invoke-BenchmarkRun {
         if ($script:CpuBatchFullLogits) { $args += "--cpu-batch-full-logits" }
         if ($script:CpuBatchParallelState) { $args += "--cpu-batch-parallel-state" }
         if ($script:CpuBatchSerialState) { $args += "--cpu-batch-serial-state" }
+        if ($script:CpuRegisteredPrefixTokens -gt 0) { $args += @("--cpu-registered-prefix", "$script:CpuRegisteredPrefixTokens") }
+        if ($script:CpuIdenticalPrompts) { $args += "--cpu-identical-prompts" }
     }
     switch ($Mode) {
         "gpu-bf16" {
@@ -548,6 +552,8 @@ foreach ($mode in $Modes) {
                 lm_head_batches = To-OptionalInvariantString (Get-JsonProperty $profile "lm_head_batches")
                 greedy_lm_head_batches = To-OptionalInvariantString (Get-JsonProperty $profile "greedy_lm_head_batches")
                 state_batches = To-OptionalInvariantString (Get-JsonProperty $profile "state_batches")
+                new_prefill_tokens = To-OptionalInvariantString (Get-JsonProperty $profile "new_prefill_tokens")
+                prefix_build_time_ms = To-OptionalInvariantString (Get-JsonProperty $profile "prefix_build_time_ms")
                 cpu_kv_cache     = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "cpu_kv_cache")
                 cpu_attention_kernel = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "cpu_attention_kernel")
                 cached_prefix_tokens = To-OptionalInvariantString (Get-JsonProperty -Object $profile -Name "cached_prefix_tokens")

@@ -13,7 +13,9 @@ param(
     [switch]$GreedyTiles,
     [switch]$FullLogits,
     [switch]$ParallelStateBatches,
-    [switch]$SerialStateBatches
+    [switch]$SerialStateBatches,
+    [int]$RegisteredPrefixTokens = 0,
+    [switch]$IdenticalPrompts
 )
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
@@ -33,6 +35,8 @@ $previousAffinity = $process.ProcessorAffinity
     full_logits = [bool]$FullLogits
     parallel_state_batches = [bool]$ParallelStateBatches
     serial_state_batches = [bool]$SerialStateBatches
+    registered_prefix_tokens = $RegisteredPrefixTokens
+    identical_prompts = [bool]$IdenticalPrompts
     fixture = "configs/qwen3_5_0_8b_text_1024x512_tokens.csv"
     prompt_rule = "Repeat/truncate fixture; request r increments final prompt token by r modulo vocabulary."
     timing = "Decode after all first tokens; actual B*(N-1) forwards over common wall time including sampling and loop."
@@ -51,6 +55,8 @@ try {
                 CpuBatchFullLogits = $FullLogits
                 CpuBatchParallelState = $ParallelStateBatches
                 CpuBatchSerialState = $SerialStateBatches
+                CpuRegisteredPrefixTokens = $RegisteredPrefixTokens
+                CpuIdenticalPrompts = $IdenticalPrompts
                 PromptMode = 'prompt-tokens'; PromptTokensCsv = $prompt; PromptName = $label
                 MaxContext = $length + $MaxNewTokens; MaxNewTokens = $MaxNewTokens
                 Runs = $Runs; WarmupRuns = $WarmupRuns

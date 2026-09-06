@@ -27,6 +27,14 @@ CpuModel::load(const ModelProfile &profile,
   return std::shared_ptr<const CpuModel>(new CpuModel(std::move(model)));
 }
 
+struct CpuPrefix::Impl {
+  std::shared_ptr<const CpuModel> model;
+  CpuPrefixCacheSnapshot snapshot;
+  std::vector<float> final_hidden;
+  std::string trust_namespace;
+  std::size_t prefill_chunk_size = 0, bytes = 0;
+};
+
 struct CpuEngine::Impl {
   struct Sequence {
     CpuRequestSpec spec;
@@ -44,6 +52,38 @@ struct CpuEngine::Impl {
   CpuRequestId next_id = 1;
   std::string attention_kernel;
   CpuEngineStats stats;
+  std::vector<std::shared_ptr<const CpuPrefix>> prefixes;
+  std::size_t prefix_bytes = 0;
+  bool prefix_room(std::size_t bytes, std::string &error) {
+    if (bytes > config.max_prefix_bytes) {
+      error = "Prefix exceeds the hybrid snapshot budget.";
+      return false;
+    }
+    for (auto it = prefixes.begin();
+         prefix_bytes > config.max_prefix_bytes - bytes &&
+         it != prefixes.end();) {
+      if (it->use_count() == 1) {
+        prefix_bytes -= (*it)->size_bytes();
+        it = prefixes.erase(it);
+      } else
+        ++it;
+    }
+    if (prefix_bytes > config.max_prefix_bytes - bytes) {
+      error = "Prefix store is full; active handles pin its snapshots.";
+      return false;
+    }
+    return true;
+  }
+  bool adopt_prefix(const std::shared_ptr<const CpuPrefix> &prefix,
+                    std::string &error) {
+    if (std::find(prefixes.begin(), prefixes.end(), prefix) != prefixes.end())
+      return true;
+    if (!prefix_room(prefix->size_bytes(), error))
+      return false;
+    prefixes.push_back(prefix);
+    prefix_bytes += prefix->size_bytes();
+    return true;
+  }
   struct BatchScratch {
     std::vector<float> x, normed, projected, core, row, attention, residual;
     std::vector<float> post_norm, gate_up, mlp_hidden, mlp_output, final_hidden;
@@ -270,13 +310,28 @@ struct CpuEngine::Impl {
         &s.counts, s.spec.sampling.repetition_penalty, -1, greedy};
     bool predict = true, ok;
     const auto start = std::chrono::steady_clock::now();
-    if (prefill) {
+    if (prefill && s.result.committed_tokens == s.spec.prompt_tokens.size()) {
+      // A complete hit still performs private head selection; a cached sample
+      // must never substitute for this request's penalties or RNG state.
+      const auto &hidden = s.spec.prefix->impl_->final_hidden;
+      if (greedy)
+        ok = greedy_q4_token(context.get(), w.embed_tokens, hidden, s.counts,
+                             s.spec.sampling.repetition_penalty,
+                             sampling.next_token, error);
+      else
+        ok = compute_next_logits_from_embedding(context.get(), w.embed_tokens,
+                                                hidden, false, s.logits, error);
+      s.result.prefill_ms += elapsed_ms(start);
+    } else if (prefill) {
       const auto chunk =
           config.prefill_chunk_size
               ? config.prefill_chunk_size
               : (s.spec.prompt_tokens.size() <= 128 ? 64U : 128U);
-      const auto count = std::min(chunk, s.spec.prompt_tokens.size() -
-                                             s.result.committed_tokens);
+      // Restores can stop inside a canonical chunk. Finish that chunk first,
+      // so row/tiled attention dispatch does not shift at the prefix boundary.
+      const auto count =
+          std::min(chunk - s.result.committed_tokens % chunk,
+                   s.spec.prompt_tokens.size() - s.result.committed_tokens);
       predict =
           s.result.committed_tokens + count == s.spec.prompt_tokens.size();
       ok = run_forward_cpu_q8_batch(
@@ -367,10 +422,39 @@ CpuRequestId CpuEngine::submit(CpuRequestSpec spec, std::string &error) {
     return 0;
   }
   try {
+    if (spec.prefix) {
+      const auto &prefix = *spec.prefix->impl_;
+      if (prefix.model != impl_->model ||
+          prefix.trust_namespace != spec.trust_namespace ||
+          prefix.prefill_chunk_size != impl_->config.prefill_chunk_size ||
+          prefix.snapshot.prefix_tokens.size() > spec.prompt_tokens.size() ||
+          !std::equal(prefix.snapshot.prefix_tokens.begin(),
+                      prefix.snapshot.prefix_tokens.end(),
+                      spec.prompt_tokens.begin())) {
+        error = "Prefix model, configuration, namespace or token identity "
+                "mismatch.";
+        return 0;
+      }
+    }
     auto sequence = std::make_unique<Impl::Sequence>();
     sequence->spec = std::move(spec);
     if (!impl_->initialize(*sequence, error))
       return 0;
+    if (sequence->spec.prefix) {
+      const auto start = std::chrono::steady_clock::now();
+      const auto count = sequence->spec.prefix->token_count();
+      if (!restore_cpu_prefix_state(sequence->spec.prefix->impl_->snapshot,
+                                    sequence->state, count,
+                                    d.n_kv_heads * d.head_dim)) {
+        error = "Invalid complete hybrid prefix snapshot.";
+        return 0;
+      }
+      sequence->result.prefix_restore_ms = elapsed_ms(start);
+      sequence->result.cached_prefix_tokens = count;
+      sequence->result.committed_tokens = count;
+      if (!impl_->adopt_prefix(sequence->spec.prefix, error))
+        return 0;
+    }
     const auto id = impl_->next_id;
     impl_->requests.emplace(id, std::move(sequence));
     ++impl_->next_id;
@@ -471,3 +555,5 @@ bool CpuEngine::result(CpuRequestId id, CpuRequestResult &out) const {
   out = it->second->result;
   return true;
 }
+
+#include "cpu_engine_prefix.inl"

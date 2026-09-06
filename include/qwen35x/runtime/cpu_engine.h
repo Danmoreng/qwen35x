@@ -22,6 +22,20 @@ private:
 };
 
 using CpuRequestId = std::uint64_t;
+// Immutable in-process hybrid snapshot. Handles pin storage until released.
+// Compatibility is bound to the actual loaded CpuModel object, not filenames.
+class CpuPrefix final {
+public:
+  ~CpuPrefix();
+  std::size_t token_count() const;
+  std::size_t size_bytes() const;
+
+private:
+  struct Impl;
+  explicit CpuPrefix(std::shared_ptr<const Impl> impl);
+  std::shared_ptr<const Impl> impl_;
+  friend class CpuEngine;
+};
 enum class CpuRequestStatus { prefill, decode, complete, cancelled, failed };
 struct CpuEngineConfig {
   int threads = 8;
@@ -33,6 +47,7 @@ struct CpuEngineConfig {
   bool batch_greedy = true;
   // Dispatch private state rows jointly when B >= executor thread count.
   bool parallel_state_batches = true;
+  std::size_t max_prefix_bytes = 256 * 1024 * 1024;
 };
 struct CpuRequestSpec {
   std::vector<std::int32_t> prompt_tokens;
@@ -45,12 +60,16 @@ struct CpuRequestSpec {
   // not reenter this engine. The callback context must outlive the request.
   ReferenceLogitsCallback logits_callback = nullptr;
   void *logits_callback_context = nullptr;
+  std::shared_ptr<const CpuPrefix> prefix;
+  std::string trust_namespace;
 };
 struct CpuRequestResult {
   CpuRequestStatus status = CpuRequestStatus::prefill;
   std::vector<std::int32_t> output_tokens;
   std::size_t committed_tokens = 0;
   std::size_t prefill_tokens = 0, decode_forwards = 0;
+  std::size_t cached_prefix_tokens = 0;
+  double prefix_restore_ms = 0;
   // Forward-call time only; aggregate serving timing must also include sampling
   // and scheduling.
   double prefill_ms = 0, decode_ms = 0;
@@ -76,6 +95,12 @@ public:
   CpuEngine(const CpuEngine &) = delete;
   CpuEngine &operator=(const CpuEngine &) = delete;
   CpuRequestId submit(CpuRequestSpec spec, std::string &error);
+  // Experimental: partial-hit numerical validation remains open; see progress doc.
+  // Explicit synchronous build, deduplicated by exact tokens and namespace.
+  // Budgets include KV, DeltaNet, convolution, token IDs and final hidden data.
+  std::shared_ptr<const CpuPrefix>
+  register_prefix(std::span<const std::int32_t> tokens,
+                  std::string trust_namespace, std::string &error);
   // One bounded prefill chunk or one decode forward; no background work.
   bool advance(CpuRequestId id, std::string &error);
   // One decode row per distinct active request, in the supplied row order.
