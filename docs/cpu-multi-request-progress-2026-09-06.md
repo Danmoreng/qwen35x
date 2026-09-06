@@ -294,3 +294,31 @@ subsequent changes.
 
 [Samples](cpu-serving-2026-09-06-samples.csv) and
 [settings/hashes](cpu-serving-2026-09-06-metadata.json).
+
+## Selected batch/thread scale extension
+
+P512, 128 outputs, three measured runs after one warmup per configuration,
+sequentially. These are screening medians, not ABBA confirmation at every B.
+
+| B | 8 threads, 96 MiB L3 token/s | 16 physical threads token/s | 16-thread tick p50 ms | 16-thread peak RSS GB |
+|---:|---:|---:|---:|---:|
+| 10 | not measured | 440.62 | 22.70 | 0.758 |
+| 20 | not measured | 707.42 | 28.25 | 1.056 |
+| 32 | 708.36 | 746.53 | 42.68 | 1.410 |
+| 50 | 699.86 | 757.49 | 65.26 | 1.942 |
+| 100 | 696.37 | 800.86 | 124.67 | 3.419 |
+
+At B32, 24/32 threads over all logical CPUs give 713.57/714.37 token/s,
+below 16 physical threads. At B100, 16 physical threads improve screening
+throughput by 15.0% over eight threads, but increase aggregate throughput only
+5.7% over B50 while nearly doubling tick latency. The B10 result also cautions
+against using 16 threads universally: joint state dispatch requires B >= threads.
+All 30 measured request arrays match their corresponding rows in the B100
+reference, including changes in batch size and thread placement.
+
+The original selected B10/20/50/100 extension is now measured at P512. Wider
+contexts, arrival traces and platform calibration remain workload-specific
+follow-ups, not evidence that 100 is the optimal serving batch size.
+
+[Samples](cpu-batch-scale-2026-09-06-samples.csv) and
+[settings/hashes](cpu-batch-scale-2026-09-06-metadata.json).
