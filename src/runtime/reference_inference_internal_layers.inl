@@ -407,10 +407,11 @@ bool run_linear_attention_step(
       static_cast<std::size_t>(dims.linear_head_v_dim),
       cpu_backend,
     };
+    CpuDecodeProbe probe(cpu_runtime, "delta-net", dims.linear_num_v_heads * dims.linear_head_v_dim, dims.linear_head_k_dim);
     const cpu::CpuExecutorStatus status = cpu_runtime->executor->parallel_for_rows(
       static_cast<std::size_t>(dims.linear_num_v_heads * dims.linear_head_v_dim),
       run_gated_delta_net_cpu_rows,
-      &job);
+      &job, probe.executor_timing());
     if (status != cpu::CpuExecutorStatus::ok) {
       error_message = std::string("Gated DeltaNet CPU executor failed: ") +
         cpu::cpu_executor_status_name(status) + ".";
@@ -618,8 +619,9 @@ bool run_full_attention_step(
   };
   CpuQ8Runtime * const runtime = layer.full.o_proj.q8_0_runtime;
   if (runtime != nullptr && runtime->executor != nullptr) {
+    CpuDecodeProbe probe(runtime, "full-attention", attention_pairs, seq_len);
     const cpu::CpuExecutorStatus status = runtime->executor->parallel_for_rows(
-      attention_pairs, run_full_attention_decode_cpu_pairs, &job);
+      attention_pairs, run_full_attention_decode_cpu_pairs, &job, probe.executor_timing());
     if (status != cpu::CpuExecutorStatus::ok) {
       error_message = std::string("Full-attention CPU executor failed: ") +
         cpu::cpu_executor_status_name(status) + ".";

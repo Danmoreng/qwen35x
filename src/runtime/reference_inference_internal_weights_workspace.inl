@@ -34,6 +34,7 @@ struct CpuPrefillWorkspace {
 };
 
 struct CpuQ8Runtime {
+  std::vector<CpuDecodeStage> *decode_stages = nullptr;
   std::vector<CpuPrefillStage> *stages = nullptr;
   bool tiled_attention = false, attention_gqa = false, automatic_attention = false;
   bool attention_rows_used = false, attention_tiles_used = false;
@@ -50,6 +51,31 @@ struct CpuQ8Runtime {
   std::vector<float> quantized_batch_scales;
   std::vector<cpu::Q8_0BlockX4> packed_q8_0_batch;
   std::vector<cpu::Q4_0ArgmaxResult> greedy_results;
+};
+
+// A null sink avoids clock reads and allocations in production runs.
+struct CpuDecodeProbe {
+  using Clock = std::chrono::steady_clock;
+  std::vector<CpuDecodeStage> *sink;
+  CpuDecodeStage event;
+  cpu::CpuExecutorTiming timing;
+  Clock::time_point start{}, kernel_start{};
+  CpuDecodeProbe(CpuQ8Runtime *rt, const char *kind, std::size_t rows, std::size_t cols)
+      : sink(rt ? rt->decode_stages : nullptr) {
+    if (sink) { event.kind=kind; event.rows=rows; event.columns=cols; start=kernel_start=Clock::now(); }
+  }
+  void prepared() {
+    if (sink) { kernel_start=Clock::now(); event.prepare_ms=std::chrono::duration<double,std::milli>(kernel_start-start).count(); }
+  }
+  cpu::CpuExecutorTiming *executor_timing() { return sink ? &timing : nullptr; }
+  ~CpuDecodeProbe() {
+    if (sink) {
+      event.wall_ms=std::chrono::duration<double,std::milli>(Clock::now()-kernel_start).count();
+      event.participants=timing.participants; event.dispatch_ms=timing.dispatch_ms;
+      event.caller_ms=timing.caller_ms; event.wait_ms=timing.wait_ms;
+      sink->push_back(std::move(event));
+    }
+  }
 };
 
 struct CpuGreedySamplingState {
@@ -1227,6 +1253,7 @@ bool matvec_2d(
       error_message = "Packed Q4_0 matvec weight storage size mismatch.";
       return false;
     }
+    CpuDecodeProbe probe(w.q8_0_runtime, "q4-matvec", rows, cols);
     std::vector<cpu::Q8_0BlockX1> local_prepared_input;
     auto & prepared_input = w.q8_0_runtime != nullptr
       ? w.q8_0_runtime->prepared_q4_input : local_prepared_input;
@@ -1235,6 +1262,7 @@ bool matvec_2d(
           prepared_input.data(), error_message)) {
       return false;
     }
+    probe.prepared();
     out.resize(static_cast<std::size_t>(rows));
     if (w.q8_0_runtime != nullptr && w.q8_0_runtime->executor != nullptr) {
       PackedQ4MatvecJob job{
@@ -1245,7 +1273,7 @@ bool matvec_2d(
         w.q8_0_runtime->executor->parallel_for_rows(
           static_cast<std::size_t>(rows) / cpu::q4_0_packed_rows,
           run_packed_q4_matvec_tiles,
-          &job);
+          &job, probe.executor_timing());
       if (status != cpu::CpuExecutorStatus::ok) {
         error_message = std::string("Q4_0 CPU executor failed: ") +
           cpu::cpu_executor_status_name(status) + ".";
@@ -1349,12 +1377,14 @@ bool greedy_q4_token(
   }
 
   CpuQ8Runtime & runtime = *weights.q8_0_runtime;
+  CpuDecodeProbe probe(&runtime, "q4-argmax", rows, cols);
   runtime.prepared_q4_input.resize(blocks_per_row);
   if (!prepare_q4_decode_activation(weights, input.data(), cols,
         runtime.prepared_q4_input.data(), error_message)) {
     return false;
   }
 
+  probe.prepared();
   runtime.greedy_results.assign(
     runtime.executor->thread_count(),
     cpu::Q4_0ArgmaxResult{-std::numeric_limits<float>::infinity(), 0});
@@ -1370,7 +1400,7 @@ bool greedy_q4_token(
     weights.q8_0_backend, weights.q4_dot4,
   };
   const cpu::CpuExecutorStatus status = runtime.executor->parallel_for_rows(
-    row_tiles, run_packed_q4_argmax_tiles, &job);
+    row_tiles, run_packed_q4_argmax_tiles, &job, probe.executor_timing());
   if (status != cpu::CpuExecutorStatus::ok) {
     error_message = std::string("Fused greedy Q4 executor failed: ") +
       cpu::cpu_executor_status_name(status) + ".";

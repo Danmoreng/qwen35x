@@ -20,6 +20,13 @@ struct CpuExecutorConfig {
   std::size_t spin_count = 1024U * 128U * 50U;
 };
 
+// Diagnostic caller-side intervals. wait_ms is elapsed time after the caller's
+// partition completes, not worker CPU time or necessarily wasted CPU work.
+struct CpuExecutorTiming {
+  std::size_t participants = 0;
+  double dispatch_ms = 0, caller_ms = 0, wait_ms = 0;
+};
+
 enum class CpuExecutorStatus : std::uint8_t {
   ok = 0,
   invalid_argument = 1,
@@ -64,7 +71,8 @@ public:
   [[nodiscard]] CpuExecutorStatus parallel_for_rows(
     std::size_t row_count,
     CpuRowRangeTask task,
-    void * context) noexcept;
+    void * context,
+    CpuExecutorTiming * timing = nullptr) noexcept;
 
   // Parallel row wrapper around the runtime-dispatched Q8_0 matvec primitive.
   [[nodiscard]] CpuExecutorStatus q8_0_matvec(

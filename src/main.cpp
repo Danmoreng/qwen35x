@@ -308,6 +308,18 @@ bool write_profile_json(
   out << "  \"cpu_prefill_chunk_size\": " << options.cpu_prefill_chunk_size << ",\n";
   out << "  \"cpu_prefill_chunk_size_resolved\": " << result.cpu_prefill_chunk_size_resolved << ",\n";
   out << "  \"cpu_prefill_fine_profile\": " << (options.profile_cpu_prefill ? "true" : "false") << ",\n";
+  out << "  \"cpu_decode_fine_profile\": " << (options.profile_cpu_decode ? "true" : "false") << ",\n";
+  out << "  \"cpu_decode_stages\": [";
+  for (std::size_t i=0; i<result.cpu_decode_stages.size(); ++i) {
+    const auto &s=result.cpu_decode_stages[i];
+    if(i) out << ',';
+    out << "{\"kind\":\"" << s.kind << "\",\"rows\":" << s.rows
+        << ",\"columns\":" << s.columns << ",\"participants\":" << s.participants
+        << ",\"prepare_ms\":" << s.prepare_ms << ",\"wall_ms\":" << s.wall_ms
+        << ",\"dispatch_ms\":" << s.dispatch_ms << ",\"caller_ms\":" << s.caller_ms
+        << ",\"wait_ms\":" << s.wait_ms << '}';
+  }
+  out << "],\n";
   out << "  \"cpu_prefill_stages\": [";
   for (std::size_t i=0;i<result.cpu_prefill_stages.size();++i) {
     const auto &s=result.cpu_prefill_stages[i];
@@ -495,6 +507,8 @@ int main(int argc, char ** argv) {
       infer_options.cpu_gguf_path = argv[++i];
     } else if (arg == "--cpu-q4-h128" && i + 1 < argc) {
       infer_options.cpu_q4_h128_path = argv[++i];
+    } else if (arg == "--profile-cpu-decode") {
+      infer_options.profile_cpu_decode = true;
     } else if (arg == "--profile-cpu-prefill") {
       infer_options.profile_cpu_prefill = true;
     } else if (arg == "--cpu-attention-gqa") {
@@ -716,7 +730,7 @@ int main(int argc, char ** argv) {
       std::cout << "       qwen35x --bench-nvfp4-projection --hf-model-dir <path> [--nvfp4-tensor <base-name>] [--nvfp4-projection-kernel <row|warp|scale-group|blackwell-fp4>] [--bench-warmup <n>] [--bench-iters <n>]\n";
       std::cout << "       qwen35x --bench-nvfp4-prefill-projection --hf-model-dir <path> [--nvfp4-tensor <base-name>] [--nvfp4-prefill-seq-len <n>] [--bench-warmup <n>] [--bench-iters <n>]\n";
       std::cout << "       qwen35x --bench-nvfp4-gate-up --hf-model-dir <path> [--nvfp4-gate-tensor <base-name>] [--nvfp4-up-tensor <base-name>] [--bench-warmup <n>] [--bench-iters <n>]\n";
-      std::cout << "       qwen35x --infer-reference --hf-model-dir <path> [--cpu-gguf <q4_0-or-q8_0.gguf> | --cpu-q4-h128 <artifact>] [--cpu-threads <n>] [--cpu-kv-cache <fp16|fp32>] [--cpu-attention <rows|tiled|auto>] [--cpu-attention-isa <auto|avx2|avx512>] [--cpu-attention-gqa] [--cpu-prefill-chunk-size <0=auto|1..2048>] [--cpu-attention-query-tile <0=auto|4|8|16>] [--cpu-attention-kv-tile <32|64|128>] [--profile-cpu-prefill] [--cpu-isa <auto|scalar|avx2|avx-vnni|avx512|avx512-vnni>] [--cpu-isa-strict] [--cpu-model-session-replays <n>] [--cpu-prefix-cache-tokens <n> --cpu-prefix-cache-replays <n>] [--top-logits <n>] (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--forced-output-tokens <csv> | --forced-output-text <text>] [--logits-out <path>] [--max-new-tokens <n>] [--max-context <n>]\n";
+      std::cout << "       qwen35x --infer-reference --hf-model-dir <path> [--cpu-gguf <q4_0-or-q8_0.gguf> | --cpu-q4-h128 <artifact>] [--cpu-threads <n>] [--cpu-kv-cache <fp16|fp32>] [--cpu-attention <rows|tiled|auto>] [--cpu-attention-isa <auto|avx2|avx512>] [--cpu-attention-gqa] [--cpu-prefill-chunk-size <0=auto|1..2048>] [--cpu-attention-query-tile <0=auto|4|8|16>] [--cpu-attention-kv-tile <32|64|128>] [--profile-cpu-prefill] [--profile-cpu-decode] [--cpu-isa <auto|scalar|avx2|avx-vnni|avx512|avx512-vnni>] [--cpu-isa-strict] [--cpu-model-session-replays <n>] [--cpu-prefix-cache-tokens <n> --cpu-prefix-cache-replays <n>] [--top-logits <n>] (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--forced-output-tokens <csv> | --forced-output-text <text>] [--logits-out <path>] [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "       qwen35x --infer-gpu --hf-model-dir <path> (--prompt-tokens <csv> | --prompt-text <text> | --prompt-file <path> | --chat-user <text>) [--max-new-tokens <n>] [--max-context <n>]\n";
       std::cout << "               [--temperature <float>] [--top-p <float>] [--top-k <int>] [--repeat-penalty <float>] [--seed <int64>]\n";
       std::cout << "               [--gpu-bf16|--gpu-f32-matvec] [--gpu-decode-backend <default|qwen35x>] [--gpu-decode-blocks <n>] [--qwen35x-prefill-mode <replay|batched>]\n";

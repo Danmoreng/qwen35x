@@ -16,6 +16,7 @@ param(
     [string]$CpuKvCache = "fp16",
     [ValidateSet("", "rows", "tiled", "auto")][string]$CpuAttention = "",
     [switch]$ProfileCpuPrefill,
+    [switch]$ProfileCpuDecode,
     [switch]$CpuAttentionGqa,
     [ValidateSet("auto", "avx2", "avx512")][string]$CpuAttentionIsa = "auto",
     [int]$CpuPrefillChunkSize = 64,
@@ -242,6 +243,7 @@ function Invoke-BenchmarkRun {
         if ($CpuIsaStrict) { $args += "--cpu-isa-strict" }
         if ($script:CpuAttentionGqa) { $args += "--cpu-attention-gqa" }
         if ($script:CpuAttentionIsa -ne "auto") { $args += @("--cpu-attention-isa",$script:CpuAttentionIsa) }
+        if ($script:ProfileCpuDecode) { $args += "--profile-cpu-decode" }
         if ($script:ProfileCpuPrefill) { $args += "--profile-cpu-prefill" }
         if ($script:CpuAttention) {
             $args += @("--cpu-attention", $script:CpuAttention,

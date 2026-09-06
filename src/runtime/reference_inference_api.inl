@@ -501,6 +501,7 @@ bool run_reference_qwen35_inference(
   }
   if (weights.cpu_q8_runtime) {
     auto &rt=*weights.cpu_q8_runtime;
+    rt.decode_stages = nullptr;
     rt.attention_backend = options.cpu_attention_backend == cpu::Q8_0Backend::auto_select ? options.cpu_q8_backend : options.cpu_attention_backend;
     rt.automatic_attention = options.cpu_attention == "auto";
     rt.attention_gqa = options.cpu_attention_gqa || rt.automatic_attention;
@@ -882,6 +883,8 @@ bool run_reference_qwen35_inference(
   }
 
   result.generated_tokens.reserve(static_cast<std::size_t>(options.max_new_tokens));
+  if (weights.cpu_q8_runtime && options.profile_cpu_decode)
+    weights.cpu_q8_runtime->decode_stages = &result.cpu_decode_stages;
   const auto decode_start = std::chrono::steady_clock::now();
   if (use_cuda_gpu_sampling) {
     const bool defer_stop_checks = stop_token_set.empty() && options.stop_token_sequences.empty();

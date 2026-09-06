@@ -118,6 +118,7 @@ struct ReferenceInferenceOptions {
   // rows remains the frozen numerical/performance baseline.
   std::string cpu_attention = "auto";
   bool profile_cpu_prefill = false;
+  bool profile_cpu_decode = false;
   bool cpu_attention_gqa = false;
   cpu::Q8_0Backend cpu_attention_backend = cpu::Q8_0Backend::auto_select;
   // Zero selects a bounded automatic chunk/query tile; explicit values aid A/B tests.
@@ -164,6 +165,13 @@ struct ReferenceTransferBreakdown {
   std::uint64_t copy_calls = 0;
 };
 
+// One synchronous operation during decode only; diagnostics perturb timings.
+struct CpuDecodeStage {
+  std::string kind;
+  std::size_t rows{}, columns{}, participants{};
+  double prepare_ms{}, wall_ms{}, dispatch_ms{}, caller_ms{}, wait_ms{};
+};
+
 struct CpuPrefillStage {
   std::string kind, kernel;
   int query_tile{}, kv_tile{};
@@ -176,6 +184,7 @@ struct CpuPrefillStage {
 };
 struct ReferenceInferenceResult {
   std::vector<CpuPrefillStage> cpu_prefill_stages;
+  std::vector<CpuDecodeStage> cpu_decode_stages;
   std::size_t cpu_prefill_chunk_size_resolved{};
   std::vector<std::int32_t> generated_tokens;
   std::vector<ReferenceTopLogitsStep> top_logits_by_step;

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -226,15 +227,36 @@ public:
   std::size_t worker_thread_count() const noexcept { return thread_count_ - 1; }
   std::size_t min_parallel_rows() const noexcept { return min_parallel_rows_; }
 
-  CpuExecutorStatus parallel_for_rows(std::size_t rows, CpuRowRangeTask task, void * context) noexcept {
+  CpuExecutorStatus parallel_for_rows(std::size_t rows, CpuRowRangeTask task, void * context,
+                                      CpuExecutorTiming * timing = nullptr) noexcept {
+    return timing ? parallel_for_rows_impl<true>(rows, task, context, timing)
+                  : parallel_for_rows_impl<false>(rows, task, context, nullptr);
+  }
+  template<bool Profile>
+  CpuExecutorStatus parallel_for_rows_impl(std::size_t rows, CpuRowRangeTask task, void * context,
+                                         CpuExecutorTiming * timing) noexcept {
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point started{}, dispatched{}, worked{};
+    if constexpr(Profile) { *timing = {}; started = Clock::now(); }
+    const auto finish = [&]() {
+      if constexpr(Profile) {
+        timing->dispatch_ms = std::chrono::duration<double, std::milli>(dispatched-started).count();
+        timing->caller_ms = std::chrono::duration<double, std::milli>(worked-dispatched).count();
+        timing->wait_ms = std::chrono::duration<double, std::milli>(Clock::now()-worked).count();
+      }
+      return CpuExecutorStatus::ok;
+    };
     if (rows == 0) return CpuExecutorStatus::ok;
     if (task == nullptr) return CpuExecutorStatus::invalid_argument;
     if (job_in_progress_.test_and_set(std::memory_order_acquire)) return CpuExecutorStatus::busy;
     const AtomicFlagGuard guard(job_in_progress_);
     const std::size_t participants = std::min(rows, thread_count_);
+    if constexpr(Profile) timing->participants = participants;
     if (participants == 1 || rows < min_parallel_rows_) {
+      if constexpr(Profile) { timing->participants = 1; dispatched = Clock::now(); }
       task(context, 0, rows);
-      return CpuExecutorStatus::ok;
+      if constexpr(Profile) worked = Clock::now();
+      return finish();
     }
     const std::size_t workers = participants - 1;
     completed_workers_.store(0, std::memory_order_relaxed);
@@ -247,9 +269,11 @@ public:
       slot.generation.notify_one();
     }
     const auto range = static_row_range(rows, participants, 0);
+    if constexpr(Profile) dispatched = Clock::now();
     task(context, range.begin, range.end);
+    if constexpr(Profile) worked = Clock::now();
     for (std::size_t spin = 0; spin < spin_count_; ++spin) {
-      if (completed_workers_.load(std::memory_order_acquire) == workers) return CpuExecutorStatus::ok;
+      if (completed_workers_.load(std::memory_order_acquire) == workers) return finish();
       cpu_relax();
     }
     auto completed = completed_workers_.load(std::memory_order_acquire);
@@ -257,7 +281,7 @@ public:
       completed_workers_.wait(completed, std::memory_order_acquire);
       completed = completed_workers_.load(std::memory_order_acquire);
     }
-    return CpuExecutorStatus::ok;
+    return finish();
   }
 private:
   void worker_loop(std::size_t index) noexcept {
@@ -348,8 +372,9 @@ std::size_t CpuExecutor::min_parallel_rows() const noexcept {
 CpuExecutorStatus CpuExecutor::parallel_for_rows(
   const std::size_t row_count,
   const CpuRowRangeTask task,
-  void * context) noexcept {
-  return impl_->parallel_for_rows(row_count, task, context);
+  void * context,
+  CpuExecutorTiming * timing) noexcept {
+  return impl_->parallel_for_rows(row_count, task, context, timing);
 }
 
 CpuExecutorStatus CpuExecutor::q8_0_matvec(

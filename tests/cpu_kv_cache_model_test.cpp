@@ -54,6 +54,7 @@ int main(int argc, char ** argv) {
       qwen35x::cpu::q8_0_backend_uses_avx2(options.cpu_q8_backend);
     std::vector<float> reference;
     for (int run = 0; run < 3; ++run) {
+      options.profile_cpu_decode = run == 1;
       options.cpu_prefix_cache = run == 0 ? nullptr : &cache;
       options.cpu_prefix_token_count = run == 0 ? 0 : 256;
       std::vector<float> logits;
@@ -62,6 +63,9 @@ int main(int argc, char ** argv) {
       if (!qwen35x::run_reference_qwen35_inference(*profile, options, result, error)) {
         std::cerr << error << '\n';
         return 1;
+      }
+      if (result.cpu_decode_stages.empty() == options.profile_cpu_decode) {
+        std::cerr << "Decode diagnostic flag did not control records\n"; return 1;
       }
       bool actual_prefill=false;
       for(const auto &stage:result.cpu_prefill_stages) {

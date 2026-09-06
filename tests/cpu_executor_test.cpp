@@ -311,6 +311,18 @@ int main() {
     expect(executor->thread_count() == 4, "thread count must include main thread") &&
     expect(executor->worker_thread_count() == 3, "worker thread count mismatch") &&
     expect(executor->min_parallel_rows() == 8, "serial threshold mismatch");
+  for (std::size_t rows : {0U, 1U, 7U, 17U}) {
+    RangeContext context;
+    qwen35x::cpu::CpuExecutorTiming timing;
+    ok = expect(executor->parallel_for_rows(rows, record_ranges, &context, &timing) == CpuExecutorStatus::ok,
+                "profiled job failed") && ok;
+    ok = expect(timing.participants == (rows == 0 ? 0U : rows < 8 ? 1U : 4U),
+                "profiled participant count incorrect") && ok;
+    ok = expect(timing.dispatch_ms >= 0 && timing.caller_ms >= 0 && timing.wait_ms >= 0,
+                "negative diagnostic interval") && ok;
+    for (std::size_t row=0; row<rows; ++row)
+      ok = expect(context.hits[row] == 1, "profiled row not visited exactly once") && ok;
+  }
   ok = test_static_partitions(*executor) && ok;
   ok = test_serial_threshold(*executor) && ok;
   ok = test_repeated_jobs(*executor) && ok;
