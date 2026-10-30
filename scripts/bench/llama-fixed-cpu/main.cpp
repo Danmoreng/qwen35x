@@ -53,12 +53,17 @@ int main(int argc, char ** argv) try {
       (!prefill_only && (generated < 2 || forced.size() != std::size_t(generated))) ||
       context < int(prompt.size()) + (prefill_only ? 0 : generated))
     throw std::runtime_error("Invalid fixed benchmark configuration");
+  #ifdef _WIN32
+  ggml_backend_load_all_from_path(CENTRAL_LLAMA_BIN);
+#else
   ggml_backend_load_all();
+#endif
+
   llama_backend_init();
   const auto load_start = Clock::now();
   auto mp = llama_model_default_params();
   mp.n_gpu_layers = 0;
-  // CPU-only build and explicit empty device list prevent accelerator offload.
+  // An explicit empty device list prevents accelerator offload.
   ggml_backend_dev_t devices[] = {nullptr}; mp.devices = devices;
   std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
     llama_model_load_from_file(model_path.c_str(), mp), llama_model_free);

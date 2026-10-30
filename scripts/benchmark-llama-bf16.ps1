@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param (
-    [string]$LlamaCppDir = "third_party/reference/llama.cpp",
+    [string]$LlamaCppDir = "C:/llama.cpp",
     [string]$HFModelDir = "models/qwen3.5-0.8b",
     [string]$GgufOut = "models/gguf/qwen3.5-0.8b-bf16.gguf",
     [ValidateSet("bf16", "f16", "f32", "q8_0", "auto")]
@@ -94,7 +94,7 @@ if (-not (Test-Path $ResolvedHFModelDir)) {
     throw "HF model directory not found: $ResolvedHFModelDir"
 }
 
-$ResolvedBuildDir = Join-Path $ResolvedLlamaCppDir "build-qwen35x"
+$ResolvedBuildDir = Join-Path $ResolvedLlamaCppDir "build"
 $ConvertScript = Join-Path $ResolvedLlamaCppDir "convert_hf_to_gguf.py"
 if (-not (Test-Path $ConvertScript)) {
     throw "convert_hf_to_gguf.py not found in llama.cpp dir: $ResolvedLlamaCppDir"
@@ -125,67 +125,13 @@ if (-not (Test-Path $ResolvedGgufOut)) {
     throw "GGUF file not found: $ResolvedGgufOut"
 }
 
+if ($CleanBuild) { throw "CleanBuild is not supported for the shared llama.cpp build." }
 if (-not $SkipBuild) {
-    Import-VSEnv
-
-    if ($CleanBuild -and (Test-Path $ResolvedBuildDir)) {
-        Write-Host "Cleaning llama.cpp build directory: $ResolvedBuildDir" -ForegroundColor Yellow
-        Remove-Item -Path $ResolvedBuildDir -Recurse -Force
-    }
-    New-Item -ItemType Directory -Path $ResolvedBuildDir -Force | Out-Null
-
-    $GeneratorArgs = @()
-    $isNinja = $false
-    if ($UseNinja) {
-        if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
-            throw "Ninja was requested with -UseNinja but was not found on PATH."
-        }
-        $GeneratorArgs += @("-G", "Ninja")
-        $isNinja = $true
-        Write-Host "Generator: Ninja"
-    } else {
-        $GeneratorArgs += @("-G", "Visual Studio 17 2022", "-A", "x64")
-        Write-Host "Generator: Visual Studio 17 2022"
-    }
-
-    $configuredGenerator = Get-ConfiguredGenerator -buildDir $ResolvedBuildDir
-    $expectedGenerator = if ($isNinja) { "Ninja" } else { "Visual Studio 17 2022" }
-    if ($configuredGenerator -and $configuredGenerator -ne $expectedGenerator) {
-        Write-Host "Build directory generator mismatch: '$configuredGenerator' -> '$expectedGenerator'" -ForegroundColor Yellow
-        Remove-Item -Path $ResolvedBuildDir -Recurse -Force
-        New-Item -Path $ResolvedBuildDir -ItemType Directory -Force | Out-Null
-    }
-
-    $cudaFlag = if ($EnableCuda) { "ON" } else { "OFF" }
-    $ConfigureArgs = @(
-        "-S", $ResolvedLlamaCppDir,
-        "-B", $ResolvedBuildDir
-    ) + $GeneratorArgs + @(
-        "-DGGML_CUDA=$cudaFlag"
-    )
-    if ($isNinja) {
-        $ConfigureArgs += "-DCMAKE_BUILD_TYPE=$Configuration"
-    }
-
-    Write-Host "Configuring llama.cpp in: $ResolvedBuildDir" -ForegroundColor Cyan
-    & cmake @ConfigureArgs
-    if ($LASTEXITCODE -ne 0) {
-        throw "llama.cpp CMake configuration failed."
-    }
-
-    $BuildArgs = @("--build", $ResolvedBuildDir)
     foreach ($target in $BuildTargets) {
-        $BuildArgs += @("--target", $target)
-    }
-    $BuildArgs += "--parallel"
-    if (-not $isNinja) {
-        $BuildArgs += @("--config", $Configuration)
-    }
-
-    Write-Host ("Building target(s): {0} ({1})" -f ($BuildTargets -join ", "), $Configuration) -ForegroundColor Cyan
-    & cmake @BuildArgs
-    if ($LASTEXITCODE -ne 0) {
-        throw "llama.cpp build failed."
+        $binary = Join-Path $ResolvedBuildDir "bin/$target.exe"
+        if (-not (Test-Path -LiteralPath $binary)) {
+            throw "Shared llama.cpp target not found: $binary. Update C:/llama.cpp first."
+        }
     }
 }
 

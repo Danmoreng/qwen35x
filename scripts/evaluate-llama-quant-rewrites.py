@@ -4,6 +4,7 @@
 import argparse
 import csv
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -17,7 +18,7 @@ def parse_args():
     repo = pathlib.Path(__file__).resolve().parent.parent
     parser = argparse.ArgumentParser()
     parser.add_argument("--llama-cli", type=pathlib.Path,
-                        default=repo / "third_party/reference/llama.cpp/build-cpu-native/bin/llama-cli")
+                        default=(pathlib.Path(os.environ.get("LLAMA_CPP_HOME", "C:/llama.cpp")) / "build/bin/llama-cli.exe" if os.name == "nt" else repo / "third_party/reference/llama.cpp/build-cpu-native/bin/llama-cli"))
     parser.add_argument("--model-dir", type=pathlib.Path,
                         default=repo / "models/gguf/bartowski-f36b1ea")
     parser.add_argument("--cases", type=pathlib.Path,

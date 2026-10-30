@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$LlamaExe = "third_party/reference/llama.cpp/build-qwen35x/bin/llama-completion.exe",
+    [string]$LlamaExe = "C:/llama.cpp/build/bin/llama-completion.exe",
     [string]$Model = "models/gguf/qwen3.5-0.8b-bf16.gguf",
     [string]$PromptFile = "benchmarks/inputs/wiki_artificial_intelligence_64k_prompt.txt",
     [string]$OutputDir = "benchmarks/llama-cli/wiki-ai-64k-gen128",

@@ -35,7 +35,7 @@ try {
     foreach ($length in $OutputLengths) { $workloads += [pscustomobject]@{Name="p${DecodePromptLength}-out$length";Prompt=$DecodePromptLength;Output=$length} }
     $metadata = [ordered]@{
         created_utc = [DateTime]::UtcNow.ToString('o'); engine_commit = (git rev-parse HEAD)
-        llama_commit = (git -C third_party/reference/llama.cpp rev-parse HEAD)
+        llama_commit = (git -C C:/llama.cpp rev-parse HEAD)
         thread_counts = $ThreadCounts; affinity = $Affinity; runs = $Runs; warmups = $WarmupRuns
         cpu = @(Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors)
         qwen_model = $QwenModel; llama_model = $LlamaModel

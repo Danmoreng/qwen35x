@@ -13,7 +13,7 @@ param(
     [switch]$BuildQwenVariants,
     [switch]$BuildLlama,
     [switch]$CleanLlamaBuild,
-    [string]$LlamaExe = "third_party/reference/llama.cpp/build-qwen35x/bin/llama-completion.exe",
+    [string]$LlamaExe = "C:/llama.cpp/build/bin/llama-completion.exe",
     [string]$Qwen08Exe = "build-0p8b-bench/qwen35x.exe",
     [string]$Qwen4BExe = "build-4b-bench/qwen35x.exe",
     [string]$Qwen08ModelDir = "models/qwen3.5-0.8b",

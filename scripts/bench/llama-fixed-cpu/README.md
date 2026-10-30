@@ -1,7 +1,6 @@
 # Fixed-token CPU comparison adapter
 
-This executable calls the public API of the pinned, unmodified llama.cpp
-submodule. Use `scripts/benchmark-inference-seq.ps1 -Modes cpu-llama-fixed`, or
+On Windows this executable calls the public API of the central `C:/llama.cpp` build. Use `scripts/benchmark-inference-seq.ps1 -Modes cpu-llama-fixed`, or
 `scripts/benchmark-cpu-engine-comparison.ps1` for the complete paired matrix.
 The adapter deliberately accepts only fixed prompt/continuation IDs, FP16 KV,
 a single sequence, and CPU execution. It does not implement another inference
@@ -10,19 +9,18 @@ kernel or modify the upstream implementation.
 In a Visual Studio x64 developer PowerShell (CMake and Ninja available):
 
 ```powershell
-cmake -S scripts/bench/llama-fixed-cpu -B build-llama-fixed-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_AVX512_VNNI=ON -DGGML_AVX_VNNI=ON
-cmake --build build-llama-fixed-cpu --target llama-fixed-cpu-bench llama-bench llama-quantize -j 16
+cmake -S scripts/bench/llama-fixed-cpu -B build-llama-fixed-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build-llama-fixed-cpu --target llama-fixed-cpu-bench -j 16
 ```
 
-The explicit VNNI flags above match the measured Ryzen 9 9955HX3D. Omit them
-on CPUs without those extensions. `GGML_NATIVE` otherwise follows upstream's
-native feature detection. GPU backends are disabled in this project.
+CPU instruction flags and GPU support are configured in the central build.
+The adapter explicitly selects CPU execution.
 
 Convert the same HF source as the H128 artifact, excluding unused MTP weights:
 
 ```powershell
-.venv-hf-parity/Scripts/python.exe third_party/reference/llama.cpp/convert_hf_to_gguf.py models/qwen3.5-0.8b --outfile models/gguf/qwen3.5-0.8b-review-target-bf16.gguf --outtype bf16 --no-mtp
-build-llama-fixed-cpu/bin/llama-quantize.exe --pure models/gguf/qwen3.5-0.8b-review-target-bf16.gguf models/gguf/qwen3.5-0.8b-review-target-Q4_0.gguf Q4_0 12
+.venv-hf-parity/Scripts/python.exe C:/llama.cpp/convert_hf_to_gguf.py models/qwen3.5-0.8b --outfile models/gguf/qwen3.5-0.8b-review-target-bf16.gguf --outtype bf16 --no-mtp
+C:/llama.cpp/build/bin/llama-quantize.exe --pure models/gguf/qwen3.5-0.8b-review-target-bf16.gguf models/gguf/qwen3.5-0.8b-review-target-Q4_0.gguf Q4_0 12
 ```
 
 The converter Python environment needs the upstream conversion dependencies.
